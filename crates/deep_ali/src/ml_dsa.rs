@@ -151,13 +151,21 @@ pub mod params {
     #[cfg(feature = "mldsa-87")]
     pub const SIGNING_KEY_BYTES: usize = 4_896;
 
-    /// Size of the encoded signature.
+    /// Size of the encoded signature (FIPS 204 §3.5.5 sigEncode).
+    /// Verified against rustcrypto ml-dsa crate.
     #[cfg(feature = "mldsa-44")]
     pub const SIGNATURE_BYTES: usize = 2_420;
     #[cfg(feature = "mldsa-65")]
-    pub const SIGNATURE_BYTES: usize = 3_293;
+    pub const SIGNATURE_BYTES: usize = 3_309;
     #[cfg(feature = "mldsa-87")]
     pub const SIGNATURE_BYTES: usize = 4_627;
+
+    /// Bits per coefficient in z encoding: bitlen(2γ_1) = 18 for L1
+    /// (γ_1=2¹⁷), 20 for L3/L5 (γ_1=2¹⁹).
+    #[cfg(feature = "mldsa-44")]
+    pub const Z_BITS_PER_COEF: usize = 18;
+    #[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+    pub const Z_BITS_PER_COEF: usize = 20;
 
     /// NIST PQ level of this parameter set (for runtime introspection).
     #[cfg(feature = "mldsa-44")]

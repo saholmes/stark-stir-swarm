@@ -1,10 +1,9 @@
-//! FIPS 204 byte-level encoders / decoders + ExpandA for ML-DSA-44.
+//! FIPS 204 byte-level encoders / decoders + ExpandA — multi-level.
 //!
-//! Supports the "real ML-DSA signature PoK" path: takes the
-//! upstream `ml-dsa` crate's encoded `pk_bytes` (1 312 B) and
-//! `signature_bytes` (2 420 B) and decodes into the polynomial
-//! values our verify-AIR needs.  References below tag the specific
-//! FIPS 204 algorithm being implemented.
+//! Supports the "real ML-DSA signature PoK" path for ALL THREE
+//! parameter sets ML-DSA-44 / ML-DSA-65 / ML-DSA-87, selected by
+//! the active `mldsa-N` Cargo feature.  All sizes and bit widths
+//! auto-derive from `ml_dsa::params`.
 //!
 //! Conventions:
 //!   * All polynomial coefficients are returned in canonical
@@ -15,20 +14,31 @@
 
 #![allow(non_snake_case, dead_code)]
 
-use crate::ml_dsa::params::{D, GAMMA1, K, L, N, Q};
+use crate::ml_dsa::params::{
+    D, GAMMA1, K, L, N, Q, OMEGA, Z_BITS_PER_COEF,
+    C_TILDE_BYTES as PARAM_C_TILDE_BYTES,
+    PUBLIC_KEY_BYTES as PARAM_PK_BYTES,
+    SIGNATURE_BYTES as PARAM_SIG_BYTES,
+};
 
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake128,
 };
 
-/// Encoded sizes (FIPS 204 Table 1, ML-DSA-44).
-pub const PUBLIC_KEY_BYTES: usize = 1_312;
-pub const SIGNATURE_BYTES:  usize = 2_420;
-pub const C_TILDE_BYTES:    usize = 32;
-pub const T1_BYTES_PER_POLY: usize = N * 10 / 8;          // 320
-pub const Z_BYTES_PER_POLY:  usize = N * 18 / 8;          // 576
-pub const HINT_BYTES:        usize = 80 /* OMEGA */ + K;  //  84
+/// Encoded sizes — auto-derived from active `mldsa-N` feature.
+pub const PUBLIC_KEY_BYTES: usize = PARAM_PK_BYTES;
+pub const SIGNATURE_BYTES:  usize = PARAM_SIG_BYTES;
+pub const C_TILDE_BYTES:    usize = PARAM_C_TILDE_BYTES;
+pub const T1_BYTES_PER_POLY: usize = N * 10 / 8;            // 320 (same all levels)
+pub const Z_BYTES_PER_POLY:  usize = N * Z_BITS_PER_COEF / 8;  // 576 (L1) / 640 (L3,L5)
+pub const HINT_BYTES:        usize = OMEGA + K;             // ω + K, level-dependent
+
+// Z-decode group structure: 4 coefs × Z_BITS_PER_COEF bits per group.
+// L1: 4 × 18 = 72 bits = 9 bytes per group.
+// L3/L5: 4 × 20 = 80 bits = 10 bytes per group.
+const Z_BYTES_PER_GROUP: usize = 4 * Z_BITS_PER_COEF / 8;
+const Z_GROUPS: usize = N / 4;  // 64 groups
 
 /// Decode `pk_bytes` per FIPS 204 §3.5.4 pkDecode.
 /// Returns `(rho, t1)` where `t1[k][i] ∈ [0, 2^10)`.
@@ -87,15 +97,18 @@ fn decode_t1_poly(packed: &[u8], out: &mut [u32; N]) {
 
 fn decode_z_poly(packed: &[u8], out: &mut [u32; N]) {
     debug_assert_eq!(packed.len(), Z_BYTES_PER_POLY);
-    // 4 coefficients × 18 bits = 72 bits = 9 bytes per group; 64 groups.
-    for g in 0..64 {
-        let c = &packed[g * 9..(g + 1) * 9];
+    // 4 coefficients × Z_BITS_PER_COEF bits per group; N/4 groups.
+    // L1 (γ_1=2¹⁷): 4 × 18 = 72 bits = 9 bytes per group.
+    // L3/L5 (γ_1=2¹⁹): 4 × 20 = 80 bits = 10 bytes per group.
+    let mask: u32 = (1u32 << Z_BITS_PER_COEF) - 1;
+    for g in 0..Z_GROUPS {
+        let c = &packed[g * Z_BYTES_PER_GROUP..(g + 1) * Z_BYTES_PER_GROUP];
         let mut bits: u128 = 0;
-        for i in 0..9 {
+        for i in 0..Z_BYTES_PER_GROUP {
             bits |= (c[i] as u128) << (i * 8);
         }
         for j in 0..4 {
-            let raw = ((bits >> (j * 18)) & 0x3_FFFF) as u32;
+            let raw = ((bits >> (j * Z_BITS_PER_COEF)) & (mask as u128)) as u32;
             // FIPS 204 §3.5.5 zDecode: z = γ_1 − raw  (centred residue),
             // then lift into [0, q).
             let z_signed = (GAMMA1 as i32) - (raw as i32);
@@ -109,9 +122,9 @@ fn decode_z_poly(packed: &[u8], out: &mut [u32; N]) {
 }
 
 fn decode_hint(packed: &[u8]) -> Option<Box<[[bool; N]; K]>> {
-    // FIPS 204 §3.5.5 Algorithm 18 (hintBitUnpack).
+    // FIPS 204 §3.5.5 Algorithm 18 (hintBitUnpack).  Auto-adapts to
+    // the active param set's ω: 80 (L1) / 55 (L3) / 75 (L5).
     debug_assert_eq!(packed.len(), HINT_BYTES);
-    const OMEGA: usize = 80;
     let mut h = Box::new([[false; N]; K]);
     let mut idx = 0usize;
     for k in 0..K {
@@ -217,9 +230,11 @@ mod tests {
             let signed: i32 = ((i as i32) - 100) * 31;  // mix of positive and negative
             original[i] = if signed >= 0 { signed as u32 } else { (signed + Q as i32) as u32 };
         }
-        // Encode to packed form.
-        let mut packed = [0u8; Z_BYTES_PER_POLY];
-        for g in 0..64 {
+        // Encode to packed form (auto-adapts to Z_BITS_PER_COEF and
+        // Z_BYTES_PER_GROUP per active mldsa-N feature).
+        let mut packed = vec![0u8; Z_BYTES_PER_POLY];
+        let mask: u128 = (1u128 << Z_BITS_PER_COEF) - 1;
+        for g in 0..Z_GROUPS {
             let mut bits: u128 = 0;
             for j in 0..4 {
                 let z = original[g * 4 + j];
@@ -227,10 +242,10 @@ mod tests {
                 let raw = (GAMMA1 as i64) - z_signed;
                 debug_assert!((0..=2 * GAMMA1 as i64).contains(&raw),
                     "test setup: z out of (-γ_1, γ_1]: {z_signed}");
-                bits |= ((raw as u32) as u128 & 0x3_FFFF) << (j * 18);
+                bits |= ((raw as u128) & mask) << (j * Z_BITS_PER_COEF);
             }
-            for i in 0..9 {
-                packed[g * 9 + i] = ((bits >> (i * 8)) & 0xFF) as u8;
+            for i in 0..Z_BYTES_PER_GROUP {
+                packed[g * Z_BYTES_PER_GROUP + i] = ((bits >> (i * 8)) & 0xFF) as u8;
             }
         }
         let mut decoded = [0u32; N];
