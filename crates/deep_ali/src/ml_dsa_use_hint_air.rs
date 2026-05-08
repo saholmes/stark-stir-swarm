@@ -71,12 +71,17 @@
 use ark_ff::{One, Zero};
 use ark_goldilocks::Goldilocks as F;
 
-/// `m = (q − 1) / (2·γ_2) = 44` for ML-DSA-44.  Each `r1` and
-/// `adjusted_r1` lives in `[0, M)`.
-pub const M: u32 = 44;
+/// `m = (q − 1) / (2·γ_2)`.  Each `r1` and `adjusted_r1` lives in
+/// `[0, M)`.  Auto-derived from `ml_dsa::params::GAMMA2`:
+/// - ML-DSA-44 (γ_2 = (q-1)/88): M = 44, fits in 6 bits.
+/// - ML-DSA-65 / ML-DSA-87 (γ_2 = (q-1)/32): M = 16, fits in 4 bits.
+pub const M: u32 = (crate::ml_dsa::params::Q - 1) / (2 * crate::ml_dsa::params::GAMMA2);
 
-/// Bits needed to range-check values in `[0, M)`.  M = 44 < 64 = 2⁶.
+/// Bits needed to range-check values in `[0, M)`.
+#[cfg(feature = "mldsa-44")]
 pub const RANGE_BITS: usize = 6;
+#[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+pub const RANGE_BITS: usize = 4;
 
 // ─── Column layout ────────────────────────────────────────────────
 
