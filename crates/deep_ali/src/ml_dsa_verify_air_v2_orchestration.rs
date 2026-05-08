@@ -700,6 +700,116 @@ mod tests {
         assert!(res.is_err(), "v2 skeleton must reject tampered pi_hash");
     }
 
+    /// **All 5 v2 sub-AIR merge functions run on honest traces.**
+    /// Builds the v2 sub-traces, LDE-extends each, runs the merge,
+    /// asserts the merge succeeds (poly_div_zh has no remainder ⇒
+    /// constraints vanish on the trace domain) and produces output
+    /// of the right shape.
+    #[test]
+    fn all_v2_merges_run_on_honest_traces() {
+        use crate::trace_import::lde_trace_columns;
+        use crate::{
+            deep_ali_merge_t7_chained_ntt,
+            deep_ali_merge_t_decompose,
+            deep_ali_merge_t_use_hint,
+            deep_ali_merge_t_w1_encode,
+            deep_ali_merge_t_mem,
+            deep_ali_merge_t_transcript,
+        };
+        use crate::ml_dsa_shake_absorb_multi_air;
+
+        let w = synthesize_witness();
+        let traces = fill_v2_traces(&w);
+        let blowup = 4;  // small for fast test
+
+        // T7 (INTT) — first instance only, the others are identical shape.
+        {
+            let n_trace = traces.intt[0][0].len();
+            let lde = lde_trace_columns(&traces.intt[0], n_trace, blowup)
+                .expect("INTT LDE");
+            let kk = t7::NUM_CONSTRAINTS;
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let (c_eval, info) = deep_ali_merge_t7_chained_ntt(
+                &lde, &coeffs, F::zero(), n_trace, blowup,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+
+        // COEFF Decompose
+        {
+            let n_trace = traces.coeff_decompose[0].len();
+            let lde = lde_trace_columns(&traces.coeff_decompose, n_trace, blowup)
+                .expect("Decompose LDE");
+            let kk = ml_dsa_decompose_air::NUM_CONSTRAINTS;
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let (c_eval, info) = deep_ali_merge_t_decompose(
+                &lde, &coeffs, F::zero(), n_trace, blowup,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+
+        // COEFF UseHint
+        {
+            let n_trace = traces.coeff_use_hint[0].len();
+            let lde = lde_trace_columns(&traces.coeff_use_hint, n_trace, blowup)
+                .expect("UseHint LDE");
+            let kk = ml_dsa_use_hint_air::NUM_CONSTRAINTS;
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let (c_eval, info) = deep_ali_merge_t_use_hint(
+                &lde, &coeffs, F::zero(), n_trace, blowup,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+
+        // COEFF W1Encode
+        {
+            let n_trace = traces.coeff_w1_encode[0].len();
+            let lde = lde_trace_columns(&traces.coeff_w1_encode, n_trace, blowup)
+                .expect("W1Encode LDE");
+            let kk = ml_dsa_w1_encode_air::NUM_CONSTRAINTS;
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let (c_eval, info) = deep_ali_merge_t_w1_encode(
+                &lde, &coeffs, F::zero(), n_trace, blowup,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+
+        // T_MEM
+        {
+            let n_trace = traces.t_mem[0].len();
+            let lde = lde_trace_columns(&traces.t_mem, n_trace, blowup)
+                .expect("T_MEM LDE");
+            let kk = t_mem::NUM_CONSTRAINTS;
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let gamma = F::from(0xC0FFEEu64);
+            let alpha = F::from(0xDEAD_BEEFu64);
+            let (c_eval, info) = deep_ali_merge_t_mem(
+                &lde, &coeffs, F::zero(), n_trace, blowup, gamma, alpha,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+
+        // TRANSCRIPT
+        {
+            let n_trace = traces.transcript[0].len();
+            let lde = lde_trace_columns(&traces.transcript, n_trace, blowup)
+                .expect("Transcript LDE");
+            let layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
+            let kk = ml_dsa_shake_absorb_multi_air::num_constraints(&layout);
+            let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
+            let (c_eval, info) = deep_ali_merge_t_transcript(
+                &lde, &coeffs, F::zero(), n_trace, blowup, &layout,
+            );
+            assert_eq!(c_eval.len(), n_trace * blowup);
+            assert_eq!(info.num_constraints, kk);
+        }
+    }
+
     /// Sub-trace dimensions match the v2 layout module's projections.
     #[test]
     fn fill_v2_traces_dimensions_match_layout() {

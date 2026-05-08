@@ -853,6 +853,239 @@ pub fn deep_ali_merge_t7_chained_ntt(
     (c_eval, info)
 }
 
+/// DEEP-ALI merge for `ml_dsa_decompose_air`.  Used in v2 COEFF
+/// sub-region (1024 rows = K·N coefficients, no row-to-row chain).
+/// Per-row eval has no `nxt` reference, so cyclic-wrap is not an
+/// issue here — but we still gate the LAST row's constraint to
+/// zero for uniformity.
+pub fn deep_ali_merge_t_decompose(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::ml_dsa_decompose_air::{eval_per_row, NUM_CONSTRAINTS as KK, WIDTH as WW};
+    deep_ali_merge_per_row_no_layout(
+        trace_evals_on_lde, combination_coeffs, omega, n_trace, blowup,
+        WW, KK, eval_per_row,
+    )
+}
+
+/// DEEP-ALI merge for `ml_dsa_use_hint_air`.
+pub fn deep_ali_merge_t_use_hint(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::ml_dsa_use_hint_air::{eval_per_row, NUM_CONSTRAINTS as KK, WIDTH as WW};
+    deep_ali_merge_per_row_no_layout(
+        trace_evals_on_lde, combination_coeffs, omega, n_trace, blowup,
+        WW, KK, eval_per_row,
+    )
+}
+
+/// DEEP-ALI merge for `ml_dsa_w1_encode_air`.
+pub fn deep_ali_merge_t_w1_encode(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::ml_dsa_w1_encode_air::{eval_per_row, NUM_CONSTRAINTS as KK, WIDTH as WW};
+    deep_ali_merge_per_row_no_layout(
+        trace_evals_on_lde, combination_coeffs, omega, n_trace, blowup,
+        WW, KK, eval_per_row,
+    )
+}
+
+/// DEEP-ALI merge for `permutation_argument` (T-MEM).  Takes the
+/// Fiat-Shamir challenges γ and α.
+pub fn deep_ali_merge_t_mem(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+    gamma: F,
+    alpha: F,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::permutation_argument::{eval_per_row, NUM_CONSTRAINTS as KK, WIDTH as WW};
+    let _ = omega;
+    let n = n_trace * blowup;
+    assert_eq!(trace_evals_on_lde.len(), WW);
+    assert_eq!(combination_coeffs.len(), KK);
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    let last_trace_row = n_trace - 1;
+    let eval_gated = |i: usize| -> F {
+        let trace_row = i / blowup;
+        if trace_row >= last_trace_row { return F::zero(); }
+        let cur: Vec<F> = (0..WW).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..WW).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_per_row(&cur, &nxt, trace_row, gamma, alpha);
+        let mut acc = F::zero();
+        for j in 0..KK { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_gated).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_gated).collect() }
+    } else {
+        (0..n).map(eval_gated).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two");
+    let phi_coeffs = domain.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: KK,
+        max_constraint_degree: max_deg,
+        trace_width: WW,
+    };
+    (c_eval, info)
+}
+
+/// DEEP-ALI merge for the T-Transcript (T1.5 multi-block SHAKE
+/// absorb).  Takes the `MultiAbsorbLayout` describing the message
+/// + rate.
+pub fn deep_ali_merge_t_transcript(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+    layout: &crate::ml_dsa_shake_absorb_multi_air::MultiAbsorbLayout,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::ml_dsa_shake_absorb_multi_air::{eval_per_row, num_constraints, WIDTH as WW};
+    let _ = omega;
+    let n = n_trace * blowup;
+    let kk = num_constraints(layout);
+    assert_eq!(trace_evals_on_lde.len(), WW);
+    assert_eq!(combination_coeffs.len(), kk);
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    let last_trace_row = n_trace - 1;
+    let eval_gated = |i: usize| -> F {
+        let trace_row = i / blowup;
+        if trace_row >= last_trace_row { return F::zero(); }
+        let cur: Vec<F> = (0..WW).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..WW).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_per_row(&cur, &nxt, trace_row, layout);
+        let mut acc = F::zero();
+        for j in 0..kk { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_gated).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_gated).collect() }
+    } else {
+        (0..n).map(eval_gated).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two");
+    let phi_coeffs = domain.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: kk,
+        max_constraint_degree: max_deg,
+        trace_width: WW,
+    };
+    (c_eval, info)
+}
+
+/// Generic DEEP-ALI merge for sub-AIRs whose `eval_per_row` takes
+/// `(cur, nxt, row)` and no extra layout/parameters.  Used by the
+/// COEFF sub-AIRs (Decompose, UseHint, W1Encode).
+fn deep_ali_merge_per_row_no_layout(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    _omega: F,
+    n_trace: usize,
+    blowup: usize,
+    width: usize,
+    num_constraints: usize,
+    eval_per_row: fn(&[F], &[F], usize) -> Vec<F>,
+) -> (Vec<F>, CompositionInfo) {
+    let n = n_trace * blowup;
+    assert_eq!(trace_evals_on_lde.len(), width);
+    assert_eq!(combination_coeffs.len(), num_constraints);
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    let last_trace_row = n_trace - 1;
+    let eval_gated = |i: usize| -> F {
+        let trace_row = i / blowup;
+        if trace_row >= last_trace_row { return F::zero(); }
+        let cur: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_per_row(&cur, &nxt, trace_row);
+        let mut acc = F::zero();
+        for j in 0..num_constraints { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_gated).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_gated).collect() }
+    } else {
+        (0..n).map(eval_gated).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two");
+    let phi_coeffs = domain.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints,
+        max_constraint_degree: max_deg,
+        trace_width: width,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Ed25519 verify AIR — parametric merge (Phase 6 v2 wiring)
 // ═══════════════════════════════════════════════════════════════════
