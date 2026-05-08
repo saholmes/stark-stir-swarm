@@ -438,8 +438,78 @@ pub struct V2ProofReal {
     pub fri_t_mem:      Vec<u8>,
 }
 
+impl V2ProofReal {
+    /// Serialize to bytes: 32 + 32 (pi_hash + c̃') + length-prefixed
+    /// Vec<u8> for each FRI sub-proof (length encoded as 4-byte LE u32).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        fn write_v(out: &mut Vec<u8>, v: &[u8]) {
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.pi_hash);
+        out.extend_from_slice(&self.c_tilde_prime);
+        write_v(&mut out, &self.fri_v17);
+        out.extend_from_slice(&(self.fri_intt.len() as u32).to_le_bytes());
+        for v in &self.fri_intt { write_v(&mut out, v); }
+        write_v(&mut out, &self.fri_decompose);
+        write_v(&mut out, &self.fri_use_hint);
+        write_v(&mut out, &self.fri_w1_encode);
+        write_v(&mut out, &self.fri_transcript);
+        write_v(&mut out, &self.fri_t_mem);
+        out
+    }
+
+    /// Deserialize from bytes; returns `Err` on any framing problem.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        let mut pos = 0usize;
+        let take_n = |data: &[u8], pos: &mut usize, n: usize| -> Result<Vec<u8>, String> {
+            if *pos + n > data.len() {
+                return Err(format!("V2ProofReal: not enough bytes (need {}, have {})", n, data.len() - *pos));
+            }
+            let out = data[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(out)
+        };
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            let bytes = take_n(data, pos, 4)?;
+            Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        };
+        let read_v = |data: &[u8], pos: &mut usize| -> Result<Vec<u8>, String> {
+            let len = read_u32(data, pos)? as usize;
+            take_n(data, pos, len)
+        };
+
+        let mut pi_hash = [0u8; 32]; pi_hash.copy_from_slice(&take_n(data, &mut pos, 32)?);
+        let mut c_tilde_prime = [0u8; 32]; c_tilde_prime.copy_from_slice(&take_n(data, &mut pos, 32)?);
+        let fri_v17 = read_v(data, &mut pos)?;
+        let n_intt = read_u32(data, &mut pos)? as usize;
+        let mut fri_intt = Vec::with_capacity(n_intt);
+        for _ in 0..n_intt { fri_intt.push(read_v(data, &mut pos)?); }
+        let fri_decompose = read_v(data, &mut pos)?;
+        let fri_use_hint = read_v(data, &mut pos)?;
+        let fri_w1_encode = read_v(data, &mut pos)?;
+        let fri_transcript = read_v(data, &mut pos)?;
+        let fri_t_mem = read_v(data, &mut pos)?;
+        if pos != data.len() {
+            return Err(format!("V2ProofReal: {} trailing bytes", data.len() - pos));
+        }
+        Ok(Self {
+            pi_hash, c_tilde_prime,
+            fri_v17, fri_intt, fri_decompose, fri_use_hint, fri_w1_encode,
+            fri_transcript, fri_t_mem,
+        })
+    }
+}
+
 const V2_BLOWUP: usize = 32;
-const V2_NUM_QUERIES: usize = 54;
+/// NIST PQ Level 3 query count (Johnson-regime unconditional):
+/// 79 × ½·log₂(1/ρ_0) = 79 × 2.5 = 197.5 ≥ 192 bits.  See
+/// `feedback_stir_johnson_unconditional_only.md` — STIR's per-query
+/// rate at capacity (~5 bits) is conjectural; only the Johnson
+/// regime is proven and matches FRI under BCIKS.  Revert to 54
+/// for Level 1 (sha3-256, λ=128).
+const V2_NUM_QUERIES: usize = 79;
 const V2_SEED_Z: u64 = 0xDEEF_BAAD;
 const V2_TMEM_GAMMA: u64 = 0xC0FFEEu64;
 const V2_TMEM_ALPHA: u64 = 0xDEAD_BEEFu64;
