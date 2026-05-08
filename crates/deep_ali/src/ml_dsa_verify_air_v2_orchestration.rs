@@ -258,7 +258,10 @@ pub const PI_HASH_DOMAIN_V2: &[u8] = b"mmiyc/v2/ml-dsa-pok/public-inputs";
 /// Compute the v2 public-input hash that every sub-proof must
 /// commit to via Fiat-Shamir.  Mirrors `MlDsaPokPublicInputs::compute_pi_hash`'s
 /// structure but adds `mu_bytes`, `h`, and the v2 domain tag.
-pub fn compute_pi_hash_v2(w: &V2Witness, c_tilde_bytes: &[u8; 32]) -> [u8; 32] {
+pub fn compute_pi_hash_v2(
+    w: &V2Witness,
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
+) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update(PI_HASH_DOMAIN_V2);
     for k in 0..K {
@@ -295,7 +298,7 @@ pub fn compute_pi_hash_v2(w: &V2Witness, c_tilde_bytes: &[u8; 32]) -> [u8; 32] {
 #[derive(Clone, Debug)]
 pub struct V2Proof {
     pub pi_hash:               [u8; 32],
-    pub c_tilde_prime:         [u8; 32],   // computed by TRANSCRIPT
+    pub c_tilde_prime:         [u8; crate::ml_dsa::params::C_TILDE_BYTES],   // TRANSCRIPT output
     /// FRI sub-proofs (deferred): in the prototype these hold trace
     /// digests; in production they hold serialized `DeepFriProof`s.
     pub fri_v17_digest:        [u8; 32],
@@ -324,7 +327,10 @@ fn digest_trace(trace: &[Vec<F>]) -> [u8; 32] {
 ///
 /// In production this would be replaced by `prove_v2`: same
 /// orchestration but with FRI prove for each sub-AIR.
-pub fn prove_v2_skeleton(w: &V2Witness, c_tilde_bytes: &[u8; 32]) -> (V2SubTraces, V2Proof) {
+pub fn prove_v2_skeleton(
+    w: &V2Witness,
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
+) -> (V2SubTraces, V2Proof) {
     let traces = fill_v2_traces(w);
 
     // c_tilde_prime: extract from TRANSCRIPT trace.
@@ -366,7 +372,7 @@ pub fn prove_v2_skeleton(w: &V2Witness, c_tilde_bytes: &[u8; 32]) -> (V2SubTrace
 /// Returns `Ok(())` iff all checks pass.
 pub fn verify_v2_skeleton(
     w: &V2Witness,
-    c_tilde_bytes: &[u8; 32],
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
     proof: &V2Proof,
 ) -> Result<(), String> {
     // 1. pi_hash consistency.
@@ -428,7 +434,7 @@ pub fn verify_v2_skeleton(
 #[derive(Clone, Debug)]
 pub struct V2ProofReal {
     pub pi_hash:        [u8; 32],
-    pub c_tilde_prime:  [u8; 32],
+    pub c_tilde_prime:  [u8; crate::ml_dsa::params::C_TILDE_BYTES],
     pub fri_v17:        Vec<u8>,
     pub fri_intt:       Vec<Vec<u8>>,    // K = 4
     pub fri_decompose:  Vec<u8>,
@@ -481,7 +487,9 @@ impl V2ProofReal {
         };
 
         let mut pi_hash = [0u8; 32]; pi_hash.copy_from_slice(&take_n(data, &mut pos, 32)?);
-        let mut c_tilde_prime = [0u8; 32]; c_tilde_prime.copy_from_slice(&take_n(data, &mut pos, 32)?);
+        let ctb = crate::ml_dsa::params::C_TILDE_BYTES;
+        let mut c_tilde_prime = [0u8; crate::ml_dsa::params::C_TILDE_BYTES];
+        c_tilde_prime.copy_from_slice(&take_n(data, &mut pos, ctb)?);
         let fri_v17 = read_v(data, &mut pos)?;
         let n_intt = read_u32(data, &mut pos)? as usize;
         let mut fri_intt = Vec::with_capacity(n_intt);
@@ -585,7 +593,7 @@ fn verify_one_sub_air(
 /// (the latter for tests; production callers can ignore them).
 pub fn prove_v2_real(
     w: &V2Witness,
-    c_tilde_bytes: &[u8; 32],
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
     blowup: usize,
 ) -> V2ProofReal {
     let traces = fill_v2_traces(w);
@@ -683,7 +691,7 @@ pub fn prove_v2_real(
 /// **NO Layer 1 native `ml_dsa::verify`.**  v2's defining feature.
 pub fn verify_v2_real(
     public: &V2Witness,        // public fields are what the verifier receives via PI
-    c_tilde_bytes: &[u8; 32],
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
     proof: &V2ProofReal,
     blowup: usize,
 ) -> Result<(), String> {
@@ -835,16 +843,18 @@ mod tests {
             }
         }
 
-        // Step 7: Synthesise w1bytes as a 6-bit-per-coefficient
-        // packed encoding of adjusted_r1.  K·N·6/8 = 768 bytes.
+        // Step 7: Synthesise w1bytes per FIPS 204 §3.5.7 BitPack —
+        // W1_BITS_PER_COEF bits per coefficient (6 for L1, 4 for L3/L5).
+        // Length = K · N · W1_BITS_PER_COEF / 8: 768 B (L1, L3) / 1024 B (L5).
         let mu_bytes = [0x37u8; 64];
-        let total_bits = K * N * 6;
+        use crate::ml_dsa::params::W1_BITS_PER_COEF;
+        let total_bits = K * N * W1_BITS_PER_COEF;
         let mut w1bytes = vec![0u8; total_bits / 8];
         for k in 0..K {
             for i in 0..N {
-                let bit_offset = (k * N + i) * 6;
+                let bit_offset = (k * N + i) * W1_BITS_PER_COEF;
                 let val = adjusted_r1[k][i] as u64;
-                for b in 0..6 {
+                for b in 0..W1_BITS_PER_COEF {
                     let bit = ((val >> b) & 1) as u8;
                     let byte_idx = (bit_offset + b) / 8;
                     let bit_idx = (bit_offset + b) % 8;

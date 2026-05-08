@@ -46,7 +46,7 @@ use crate::ml_dsa_shake_absorb_multi_air::{
 /// Number of c̃' bytes consumed by the verify equality check.
 /// FIPS 204 §3 Algorithm 3 step 7 reads the first **32 bytes** of
 /// SHAKE-256 output; the comparison `c̃' == c̃` then accepts/rejects.
-pub const C_TILDE_PRIME_BYTES: usize = 32;
+pub const C_TILDE_PRIME_BYTES: usize = crate::ml_dsa::params::C_TILDE_BYTES;
 
 // ─── Native ───────────────────────────────────────────────────────
 

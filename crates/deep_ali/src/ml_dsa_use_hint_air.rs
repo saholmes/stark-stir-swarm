@@ -374,7 +374,10 @@ mod tests {
         let (adj, wp, wn) = use_hint(M - 1, 1, 1);  // r1=M-1, r0>0, h=1 → M → wrap_neg
         assert_eq!((adj, wp, wn), (0, 0, 1));
 
-        let (adj, wp, wn) = use_hint(20, 0, 0);   // h=0 → no wrap
-        assert_eq!((adj, wp, wn), (20, 0, 0));
+        // Pick an r1 strictly inside [0, M) for any active level
+        // (L1: M=44, L3/L5: M=16): use M/2.
+        let mid = M / 2;
+        let (adj, wp, wn) = use_hint(mid, 0, 0);   // h=0 → no wrap
+        assert_eq!((adj, wp, wn), (mid, 0, 0));
     }
 }

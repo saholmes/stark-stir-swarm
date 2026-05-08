@@ -43,8 +43,17 @@ use crate::ml_dsa_decompose::{decompose, NUM_R1_VALUES};
 
 // ─── Column layout ──────────────────────────────────────────────────
 
-const R1_RANGE_BITS: usize = 6;          // 44 < 64 = 2^6
-const R0_ABS_RANGE_BITS: usize = 17;     // γ₂ = 95232 < 2^17
+// r1 ∈ [0, NUM_R1_VALUES): L1 → r1 < 44 (6 bits); L3/L5 → r1 < 16 (4 bits).
+#[cfg(feature = "mldsa-44")]
+const R1_RANGE_BITS: usize = 6;
+#[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+const R1_RANGE_BITS: usize = 4;
+
+// |r0_centred| ∈ [0, γ_2]: L1 → γ_2 = 95232 (17 bits); L3/L5 → γ_2 = 261888 (18 bits).
+#[cfg(feature = "mldsa-44")]
+const R0_ABS_RANGE_BITS: usize = 17;
+#[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+const R0_ABS_RANGE_BITS: usize = 18;
 
 #[inline] pub const fn col_r() -> usize { 0 }
 #[inline] pub const fn col_r1() -> usize { 1 }

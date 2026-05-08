@@ -32,7 +32,14 @@ use ark_goldilocks::Goldilocks as F;
 use crate::ml_dsa::params::Q;
 use crate::ml_dsa_norm_check::Z_BOUND;
 
+// |z|_∞ < Z_BOUND = γ_1 − β.
+// L1 (γ_1 = 2¹⁷): Z_BOUND ≈ 130994 < 2¹⁷, fits in 17 bits.
+// L3 (γ_1 = 2¹⁹): Z_BOUND ≈ 524092 < 2²⁰, needs 20 bits.
+// L5 (γ_1 = 2¹⁹): Z_BOUND ≈ 524168 < 2²⁰, also 20 bits.
+#[cfg(feature = "mldsa-44")]
 const RANGE_BITS: usize = 17;
+#[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+const RANGE_BITS: usize = 20;
 
 #[inline] pub const fn col_c() -> usize { 0 }
 #[inline] pub const fn col_sign() -> usize { 1 }

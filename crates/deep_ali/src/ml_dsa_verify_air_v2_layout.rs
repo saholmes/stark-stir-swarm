@@ -82,8 +82,8 @@ use crate::ml_dsa::params::{K, L, N};
 /// V17: v1.7's existing verify-AIR (`ml_dsa_verify_air_v17`).
 pub mod v17 {
     use crate::ml_dsa_verify_air_v17::{VERIFY_AIR_V17_ACTIVE_ROWS, WIDTH};
-    pub const N_ROWS_ACTIVE: usize = VERIFY_AIR_V17_ACTIVE_ROWS;       // 6148
-    pub const N_ROWS_POW2:   usize = 8192;                             // next_power_of_two(6148)
+    pub const N_ROWS_ACTIVE: usize = VERIFY_AIR_V17_ACTIVE_ROWS;
+    pub const N_ROWS_POW2:   usize = N_ROWS_ACTIVE.next_power_of_two();
     pub const N_COLS:        usize = WIDTH;                            // 323
 }
 
@@ -94,10 +94,8 @@ pub mod intt {
     /// Each instance: 1024 butterfly rows + 1 output row = 1025.
     pub const ROWS_PER_INSTANCE: usize = BUTTERFLIES_PER_NTT + 1;      // 1025
     pub const N_INSTANCES:       usize = K;                            // 4
-    pub const N_ROWS_ACTIVE:     usize = N_INSTANCES * ROWS_PER_INSTANCE; // 4100
-    /// next_power_of_two(4100) = 8192.  4100 doesn't fit in 4096
-    /// because 4·1025 = 4100, slightly over 2¹².
-    pub const N_ROWS_POW2:       usize = 8192;
+    pub const N_ROWS_ACTIVE:     usize = N_INSTANCES * ROWS_PER_INSTANCE;
+    pub const N_ROWS_POW2:       usize = N_ROWS_ACTIVE.next_power_of_two();
     pub const N_COLS:            usize = WIDTH;                        // 260
 }
 
@@ -108,8 +106,8 @@ pub mod coeff_chain {
     use crate::ml_dsa_use_hint_air::WIDTH as USE_HINT_WIDTH;
     use crate::ml_dsa_w1_encode_air::WIDTH as W1ENCODE_WIDTH;
 
-    pub const N_ROWS_ACTIVE: usize = K * N;                            // 1024
-    pub const N_ROWS_POW2:   usize = 1024;
+    pub const N_ROWS_ACTIVE: usize = K * N;     // 1024 (L1) / 1536 (L3) / 2048 (L5)
+    pub const N_ROWS_POW2:   usize = N_ROWS_ACTIVE.next_power_of_two();
     /// 3 sub-AIR widths stacked side-by-side (disjoint cols).
     pub const N_COLS: usize = DECOMPOSE_WIDTH + USE_HINT_WIDTH + W1ENCODE_WIDTH;
 }
@@ -137,8 +135,8 @@ pub mod t_mem {
     /// - B3: adjusted_r1 ↔ W1Encode input.  K·N = 1024 pairs.
     /// - B4: w1bytes ↔ Transcript absorb input.  768 pairs (1 byte each).
     pub const TOTAL_PAIRS: usize = (K * N) + (2 * K * N) + (K * N) + 768; // 4864
-    pub const N_ROWS_ACTIVE: usize = 2 * TOTAL_PAIRS;                  // 9728 (read + write per pair)
-    pub const N_ROWS_POW2:   usize = 16384;                            // next_power_of_two(9728)
+    pub const N_ROWS_ACTIVE: usize = 2 * TOTAL_PAIRS;  // (read + write per pair)
+    pub const N_ROWS_POW2:   usize = N_ROWS_ACTIVE.next_power_of_two();
     pub const N_COLS:        usize = WIDTH;                            // 8
 }
 
@@ -210,13 +208,19 @@ mod tests {
         assert!(transcript::N_ROWS_ACTIVE <= transcript::N_ROWS_POW2);
         assert!(t_mem::N_ROWS_ACTIVE <= t_mem::N_ROWS_POW2);
 
-        // Total LDE cells, with INTT's 4100 active rows rounded up
-        // to 8192 (just over 2¹²): ~253 M cells = ~2 GiB working
-        // set across all 5 sub-proofs at blowup = 32.  Production
-        // tuning could shrink with column sharing across sub-AIRs.
+        // Total LDE cells across the 5 sub-proofs at blowup=32.
+        // L1 (mldsa-44): ~253 M cells = ~2 GiB working set.
+        // L3 (mldsa-65): ~330 M cells = ~2.6 GiB.
+        // L5 (mldsa-87): ~750 M cells = ~6 GiB — feasible on 8 GiB+ RAM.
         let total = l.total_lde_cells();
-        assert!(total < 280_000_000,
-            "v2 LDE total > 280 M cells: {total}");
+        #[cfg(feature = "mldsa-44")]
+        let cell_bound = 280_000_000usize;
+        #[cfg(feature = "mldsa-65")]
+        let cell_bound = 400_000_000usize;
+        #[cfg(feature = "mldsa-87")]
+        let cell_bound = 1_000_000_000usize;
+        assert!(total < cell_bound,
+            "v2 LDE total {total} > level cap {cell_bound}");
 
         eprintln!("v2 LDE breakdown @ blowup=32:");
         eprintln!("  V17        : {:>10} cells ({:.1} MiB)",
@@ -257,6 +261,12 @@ mod tests {
         //   B4: 768      (w1bytes ↔ Transcript bytes)
         let expected = (K * N) + (2 * K * N) + (K * N) + 768;
         assert_eq!(t_mem::TOTAL_PAIRS, expected);
-        assert_eq!(t_mem::TOTAL_PAIRS, 4864);  // = 4·1024 + 768
+        // 4·K·N + 768: 4864 (L1) / 6912 (L3) / 8960 (L5).
+        #[cfg(feature = "mldsa-44")]
+        assert_eq!(t_mem::TOTAL_PAIRS, 4864);
+        #[cfg(feature = "mldsa-65")]
+        assert_eq!(t_mem::TOTAL_PAIRS, 6912);
+        #[cfg(feature = "mldsa-87")]
+        assert_eq!(t_mem::TOTAL_PAIRS, 8960);
     }
 }

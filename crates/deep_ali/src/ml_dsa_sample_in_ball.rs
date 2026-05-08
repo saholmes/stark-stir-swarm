@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use crate::ml_dsa::params::{N, TAU};
+use crate::ml_dsa::params::{C_TILDE_BYTES, N, TAU};
 
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
@@ -24,7 +24,7 @@ use sha3::{
 /// Output of SampleInBall: a polynomial in R_q with exactly τ
 /// non-zero coefficients in {q-1, 1} (the centred ±1).  We
 /// represent it as `[u32; N]` with values in {0, 1, q−1}.
-pub fn sample_in_ball(c_tilde: &[u8; 32]) -> [u32; N] {
+pub fn sample_in_ball(c_tilde: &[u8; C_TILDE_BYTES]) -> [u32; N] {
     use crate::ml_dsa::params::Q;
 
     let mut shake = Shake256::default();
@@ -61,7 +61,7 @@ mod tests {
     /// each ±1 (lifted into Z_q as 1 or q − 1).
     #[test]
     fn output_has_exactly_tau_nonzero_pm1() {
-        let c_tilde = [0x42u8; 32];
+        let c_tilde = [0x42u8; C_TILDE_BYTES];
         let c = sample_in_ball(&c_tilde);
         let nonzero: Vec<u32> = c.iter().copied().filter(|&v| v != 0).collect();
         assert_eq!(nonzero.len(), TAU);
@@ -74,7 +74,7 @@ mod tests {
     /// probability) different output.
     #[test]
     fn deterministic_on_input() {
-        let c_tilde = [0x07u8; 32];
+        let c_tilde = [0x07u8; C_TILDE_BYTES];
         let a = sample_in_ball(&c_tilde);
         let b = sample_in_ball(&c_tilde);
         assert_eq!(a, b);

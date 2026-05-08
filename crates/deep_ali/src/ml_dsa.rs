@@ -167,6 +167,14 @@ pub mod params {
     #[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
     pub const Z_BITS_PER_COEF: usize = 20;
 
+    /// Bits per coefficient in w1Encode (FIPS 204 §3.5.7 BitPack):
+    /// bitlen(m − 1) where m = (q−1)/(2γ_2).
+    /// L1: m = 44 ⇒ 6 bits.  L3/L5: m = 16 ⇒ 4 bits.
+    #[cfg(feature = "mldsa-44")]
+    pub const W1_BITS_PER_COEF: usize = 6;
+    #[cfg(any(feature = "mldsa-65", feature = "mldsa-87"))]
+    pub const W1_BITS_PER_COEF: usize = 4;
+
     /// NIST PQ level of this parameter set (for runtime introspection).
     #[cfg(feature = "mldsa-44")]
     pub const NIST_LEVEL: u8 = 1;

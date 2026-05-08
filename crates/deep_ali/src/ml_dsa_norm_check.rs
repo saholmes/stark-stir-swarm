@@ -46,8 +46,16 @@ mod tests {
 
     #[test]
     fn z_bound_is_correct() {
-        // γ₁ = 2^17 = 131072, β = 78  → Z_BOUND = 130994
-        assert_eq!(Z_BOUND, GAMMA1 - 78);
+        // Z_BOUND = γ₁ − β, level-dependent:
+        // L1 (mldsa-44): 2¹⁷ − 78 = 130994
+        // L3 (mldsa-65): 2¹⁹ − 196 = 524092
+        // L5 (mldsa-87): 2¹⁹ − 120 = 524168
+        assert_eq!(Z_BOUND, GAMMA1 - (BETA as u32));
+        #[cfg(feature = "mldsa-44")]
         assert_eq!(Z_BOUND, 130994);
+        #[cfg(feature = "mldsa-65")]
+        assert_eq!(Z_BOUND, 524092);
+        #[cfg(feature = "mldsa-87")]
+        assert_eq!(Z_BOUND, 524168);
     }
 }
