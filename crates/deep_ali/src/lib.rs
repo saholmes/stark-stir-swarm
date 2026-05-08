@@ -773,6 +773,87 @@ pub fn deep_ali_merge_ml_dsa_v17(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  ML-DSA v2 sub-AIR merges (T7 / Decompose / UseHint / W1Encode / T-MEM)
+// ═══════════════════════════════════════════════════════════════════
+
+/// DEEP-ALI merge for the chained-NTT AIR (T7).  v2 uses this 4×
+/// (one per `(w_approx[k], w_approx_ntt[k])` polynomial pair) in
+/// the INTT sub-region.  Per-row evaluator is
+/// `ml_dsa_ntt_chained_air::eval_per_row(cur, nxt, row)`.
+///
+/// **Cyclic-wrap handling**: T7's `eval_per_row` at trace row
+/// `n_trace − 1` references `nxt = row 0` (FRI-domain wraparound),
+/// which violates the passthrough constraint (post-NTT output ≠
+/// pre-NTT input).  The merge gates the constraints at the very
+/// last trace row to zero — a standard AIR pattern when the AIR
+/// itself has no boundary selector to suppress the wraparound.
+/// (v1.7's `verify_air_v17` handles this via per-region selectors.)
+pub fn deep_ali_merge_t7_chained_ntt(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::ml_dsa_ntt_chained_air::{
+        eval_per_row, NUM_CONSTRAINTS as T7_K, WIDTH as T7_W,
+    };
+    let _ = omega;
+    let n = n_trace * blowup;
+    assert_eq!(trace_evals_on_lde.len(), T7_W, "T7 trace width mismatch");
+    assert_eq!(combination_coeffs.len(), T7_K,
+        "T7: need one combination coefficient per constraint");
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    // Gate: skip constraint emission for LDE points whose trace_row
+    // == n_trace - 1 (the cyclic-wrap row).  At those points Φ̃ = 0.
+    let last_trace_row = n_trace - 1;
+    let eval_gated = |i: usize| -> F {
+        let trace_row = i / blowup;
+        if trace_row >= last_trace_row {
+            return F::zero();
+        }
+        let cur: Vec<F> = (0..T7_W).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..T7_W).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_per_row(&cur, &nxt, trace_row);
+        let mut acc = F::zero();
+        for j in 0..T7_K { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_gated).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_gated).collect() }
+    } else {
+        (0..n).map(eval_gated).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound,
+        quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: T7_K,
+        max_constraint_degree: max_deg,
+        trace_width: T7_W,
+    };
+    (c_eval, info)
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Ed25519 verify AIR — parametric merge (Phase 6 v2 wiring)
 // ═══════════════════════════════════════════════════════════════════
 

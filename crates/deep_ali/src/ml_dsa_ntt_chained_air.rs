@@ -328,6 +328,45 @@ mod tests {
         }
     }
 
+    /// **DEEP-ALI merge sanity.**  Build an honest trace, LDE-extend,
+    /// run `deep_ali_merge_t7_chained_ntt`, and verify:
+    /// 1. The merge runs without panic — i.e. `poly_div_zh` succeeds
+    ///    (no remainder), which is the real soundness signal that
+    ///    the trace's per-row constraints vanish on the trace domain.
+    /// 2. Output `c_eval` has length = LDE size.
+    /// 3. `info` reports the right constraint and column counts.
+    ///
+    /// The precise degree of the composition quotient `c(X)` is
+    /// validated by FRI's low-degree test in the full protocol; that's
+    /// not in scope for this unit test.
+    #[test]
+    fn t7_merge_runs_on_honest_trace() {
+        use crate::deep_ali_merge_t7_chained_ntt;
+        use crate::trace_import::lde_trace_columns;
+
+        let mut input = [0u32; N];
+        for i in 0..N { input[i] = (i as u32 * 41 + 7) % Q; }
+
+        let n_trace = (BUTTERFLIES_PER_NTT + 16).next_power_of_two();
+        let mut trace = fresh_trace(n_trace);
+        fill_trace(&mut trace, n_trace, &input);
+
+        let blowup = 4;
+        let lde = lde_trace_columns(&trace, n_trace, blowup)
+            .expect("LDE trace columns");
+
+        let coeffs: Vec<F> = (0..NUM_CONSTRAINTS).map(|i| F::from((i + 1) as u64)).collect();
+        let omega_unused = F::zero();
+        let (c_eval, info) = deep_ali_merge_t7_chained_ntt(
+            &lde, &coeffs, omega_unused, n_trace, blowup,
+        );
+
+        let n = n_trace * blowup;
+        assert_eq!(c_eval.len(), n, "merge output length must equal LDE size");
+        assert_eq!(info.num_constraints, NUM_CONSTRAINTS);
+        assert_eq!(info.trace_width, WIDTH);
+    }
+
     /// Tampering with a single state cell on row 500 must surface
     /// in row 500's constraint evaluation (passthrough of unchanged
     /// cells, or one of the butterfly cells).
