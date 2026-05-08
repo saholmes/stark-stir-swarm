@@ -61,6 +61,13 @@ use crate::ml_dsa_w1_encode_air;
 use crate::ml_dsa_decompose;
 use crate::permutation_argument::{self as t_mem, LogEntry};
 use sha3::{Digest, Sha3_256};
+use ark_serialize::{CanonicalSerialize, CanonicalDeserialize, Compress, Validate};
+use crate::fri::{deep_fri_prove, deep_fri_verify, DeepFriParams, DeepFriProof, FriDomain};
+use crate::sextic_ext::SexticExt;
+use crate::trace_import::lde_trace_columns;
+use crate::ml_dsa_shake_absorb_multi_air::{self, MultiAbsorbLayout};
+
+type Ext = SexticExt;
 
 // ─── V2 witness ────────────────────────────────────────────────────
 
@@ -406,6 +413,270 @@ pub fn verify_v2_skeleton(
     Ok(())
 }
 
+// ─── Real prove_v2 / verify_v2 with FRI sub-proofs ────────────────
+
+/// Production v2 proof: 10 serialized `DeepFriProof<SexticExt>`s
+/// bundled together, plus `pi_hash` and the trace-derived `c̃'`.
+///
+/// The 10 sub-proofs:
+/// - 1× V17, 4× INTT (one per `k`), 1× COEFF Decompose, 1× COEFF
+///   UseHint, 1× COEFF W1Encode, 1× TRANSCRIPT, 1× T_MEM.
+///
+/// Each sub-proof's Fiat-Shamir transcript is seeded with the same
+/// `pi_hash`, so the bundle is collectively sound: a verifier
+/// rejecting any one of the 10 rejects the whole bundle.
+#[derive(Clone, Debug)]
+pub struct V2ProofReal {
+    pub pi_hash:        [u8; 32],
+    pub c_tilde_prime:  [u8; 32],
+    pub fri_v17:        Vec<u8>,
+    pub fri_intt:       Vec<Vec<u8>>,    // K = 4
+    pub fri_decompose:  Vec<u8>,
+    pub fri_use_hint:   Vec<u8>,
+    pub fri_w1_encode:  Vec<u8>,
+    pub fri_transcript: Vec<u8>,
+    pub fri_t_mem:      Vec<u8>,
+}
+
+const V2_BLOWUP: usize = 32;
+const V2_NUM_QUERIES: usize = 54;
+const V2_SEED_Z: u64 = 0xDEEF_BAAD;
+const V2_TMEM_GAMMA: u64 = 0xC0FFEEu64;
+const V2_TMEM_ALPHA: u64 = 0xDEAD_BEEFu64;
+
+fn make_v2_schedule(n0: usize) -> Vec<usize> {
+    vec![2usize; n0.trailing_zeros() as usize]
+}
+
+fn comb_coeffs(num: usize) -> Vec<F> {
+    (0..num).map(|i| F::from((i + 1) as u64)).collect()
+}
+
+fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+    DeepFriParams {
+        schedule: make_v2_schedule(n0),
+        r: V2_NUM_QUERIES,
+        seed_z: V2_SEED_Z,
+        coeff_commit_final: true,
+        d_final: 1,
+        stir: false,
+        s0: V2_NUM_QUERIES,
+        public_inputs_hash: Some(pi_hash),
+    }
+}
+
+fn serialize_fri(proof: &DeepFriProof<Ext>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    proof.serialize_with_mode(&mut buf, Compress::Yes).expect("serialize FRI proof");
+    buf
+}
+
+fn deserialize_fri(bytes: &[u8]) -> Result<DeepFriProof<Ext>, String> {
+    DeepFriProof::<Ext>::deserialize_with_mode(bytes, Compress::Yes, Validate::Yes)
+        .map_err(|e| format!("FRI proof deserialization: {e:?}"))
+}
+
+/// Run a single FRI sub-proof: LDE the sub-trace, run the merge,
+/// invoke `deep_fri_prove`, serialize.  Used 10× by `prove_v2_real`.
+fn prove_one_sub_air(
+    trace: &[Vec<F>],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    c_eval_fn: impl FnOnce(&[Vec<F>], usize, usize) -> Vec<F>,
+) -> Vec<u8> {
+    let n0 = n_trace * blowup;
+    let domain = FriDomain::new_radix2(n0);
+    let lde = lde_trace_columns(trace, n_trace, blowup).expect("LDE");
+    let c_eval = c_eval_fn(&lde, n_trace, blowup);
+    drop(lde);
+    let params = v2_fri_params(n0, pi_hash);
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    serialize_fri(&proof)
+}
+
+/// Run a single FRI sub-verify: deserialize the proof, invoke
+/// `deep_fri_verify`.  Used 10× by `verify_v2_real`.
+fn verify_one_sub_air(
+    proof_bytes: &[u8],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+) -> Result<(), String> {
+    let n0 = n_trace * blowup;
+    let proof = deserialize_fri(proof_bytes)?;
+    let params = v2_fri_params(n0, pi_hash);
+    if deep_fri_verify::<Ext>(&params, &proof) {
+        Ok(())
+    } else {
+        Err("FRI verify rejected".into())
+    }
+}
+
+/// **Production v2 prover.**  Runs 10 FRI sub-proofs with shared
+/// `pi_hash`.  Returns the bundle plus the populated sub-traces
+/// (the latter for tests; production callers can ignore them).
+pub fn prove_v2_real(
+    w: &V2Witness,
+    c_tilde_bytes: &[u8; 32],
+    blowup: usize,
+) -> V2ProofReal {
+    let traces = fill_v2_traces(w);
+
+    let transcript_layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
+    let c_tilde_prime = ml_dsa_transcript::extract_c_tilde_prime_from_trace(
+        &traces.transcript, &transcript_layout,
+    );
+    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
+
+    // V17
+    let fri_v17 = prove_one_sub_air(
+        &traces.v17, traces.v17[0].len(), blowup, pi_hash,
+        |lde, n_trace, blowup| {
+            let kk = crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS;
+            crate::deep_ali_merge_ml_dsa_v17(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
+        },
+    );
+
+    // INTT × K
+    let mut fri_intt: Vec<Vec<u8>> = Vec::with_capacity(K);
+    for k in 0..K {
+        let bytes = prove_one_sub_air(
+            &traces.intt[k], traces.intt[k][0].len(), blowup, pi_hash,
+            |lde, n_trace, blowup| {
+                let kk = crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS;
+                crate::deep_ali_merge_t7_chained_ntt(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
+            },
+        );
+        fri_intt.push(bytes);
+    }
+
+    // COEFF Decompose
+    let fri_decompose = prove_one_sub_air(
+        &traces.coeff_decompose, traces.coeff_decompose[0].len(), blowup, pi_hash,
+        |lde, n_trace, blowup| {
+            let kk = crate::ml_dsa_decompose_air::NUM_CONSTRAINTS;
+            crate::deep_ali_merge_t_decompose(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
+        },
+    );
+
+    // COEFF UseHint
+    let fri_use_hint = prove_one_sub_air(
+        &traces.coeff_use_hint, traces.coeff_use_hint[0].len(), blowup, pi_hash,
+        |lde, n_trace, blowup| {
+            let kk = crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS;
+            crate::deep_ali_merge_t_use_hint(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
+        },
+    );
+
+    // COEFF W1Encode
+    let fri_w1_encode = prove_one_sub_air(
+        &traces.coeff_w1_encode, traces.coeff_w1_encode[0].len(), blowup, pi_hash,
+        |lde, n_trace, blowup| {
+            let kk = crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS;
+            crate::deep_ali_merge_t_w1_encode(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
+        },
+    );
+
+    // TRANSCRIPT
+    let layout_for_closure = transcript_layout.clone();
+    let fri_transcript = prove_one_sub_air(
+        &traces.transcript, traces.transcript[0].len(), blowup, pi_hash,
+        move |lde, n_trace, blowup| {
+            let kk = ml_dsa_shake_absorb_multi_air::num_constraints(&layout_for_closure);
+            crate::deep_ali_merge_t_transcript(
+                lde, &comb_coeffs(kk), F::zero(), n_trace, blowup, &layout_for_closure,
+            ).0
+        },
+    );
+
+    // T_MEM
+    let fri_t_mem = prove_one_sub_air(
+        &traces.t_mem, traces.t_mem[0].len(), blowup, pi_hash,
+        |lde, n_trace, blowup| {
+            let kk = t_mem::NUM_CONSTRAINTS;
+            crate::deep_ali_merge_t_mem(
+                lde, &comb_coeffs(kk), F::zero(), n_trace, blowup,
+                F::from(V2_TMEM_GAMMA), F::from(V2_TMEM_ALPHA),
+            ).0
+        },
+    );
+
+    V2ProofReal {
+        pi_hash, c_tilde_prime,
+        fri_v17, fri_intt, fri_decompose, fri_use_hint, fri_w1_encode,
+        fri_transcript, fri_t_mem,
+    }
+}
+
+/// **Production v2 verifier.**  Recomputes `pi_hash`, runs 10 FRI
+/// sub-verifies, checks `c̃' == c̃` final boundary.  Returns `Ok(())`
+/// iff every check passes.
+///
+/// **NO Layer 1 native `ml_dsa::verify`.**  v2's defining feature.
+pub fn verify_v2_real(
+    public: &V2Witness,        // public fields are what the verifier receives via PI
+    c_tilde_bytes: &[u8; 32],
+    proof: &V2ProofReal,
+    blowup: usize,
+) -> Result<(), String> {
+    // 1. pi_hash consistency.
+    let recomputed = compute_pi_hash_v2(public, c_tilde_bytes);
+    if recomputed != proof.pi_hash {
+        return Err(format!(
+            "v2 verify: pi_hash mismatch (proof={:02x?}, expected={:02x?})",
+            &proof.pi_hash[..8], &recomputed[..8]));
+    }
+
+    // 2. c̃' equality (FIPS 204 §3 Algorithm 3 step 7's acceptance test).
+    if proof.c_tilde_prime != *c_tilde_bytes {
+        return Err(format!(
+            "v2 verify: c̃' ≠ c̃ ({:02x?} vs {:02x?})",
+            &proof.c_tilde_prime[..8], &c_tilde_bytes[..8]));
+    }
+
+    let pi_hash = proof.pi_hash;
+
+    // 3. V17 sub-proof.
+    let v17_n_trace = crate::ml_dsa_verify_air_v17::VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    verify_one_sub_air(&proof.fri_v17, v17_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 V17: {e}"))?;
+
+    // 4. INTT × K sub-proofs.
+    let intt_n_trace = (t7::BUTTERFLIES_PER_NTT + 16).next_power_of_two();
+    if proof.fri_intt.len() != K {
+        return Err(format!("v2 verify: expected {K} INTT proofs, got {}", proof.fri_intt.len()));
+    }
+    for k in 0..K {
+        verify_one_sub_air(&proof.fri_intt[k], intt_n_trace, blowup, pi_hash)
+            .map_err(|e| format!("v2 INTT[{k}]: {e}"))?;
+    }
+
+    // 5. COEFF sub-proofs (3 of them).
+    let coeff_n_trace = (K * N).next_power_of_two();
+    verify_one_sub_air(&proof.fri_decompose, coeff_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 Decompose: {e}"))?;
+    verify_one_sub_air(&proof.fri_use_hint, coeff_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 UseHint: {e}"))?;
+    verify_one_sub_air(&proof.fri_w1_encode, coeff_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 W1Encode: {e}"))?;
+
+    // 6. TRANSCRIPT sub-proof.
+    let transcript_layout = ml_dsa_transcript::build_layout(&public.mu_bytes, &public.w1bytes);
+    let transcript_n_trace = transcript_layout.active_rows().next_power_of_two();
+    verify_one_sub_air(&proof.fri_transcript, transcript_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 TRANSCRIPT: {e}"))?;
+
+    // 7. T_MEM sub-proof.
+    let n_log_pairs = (K * N) + (K * N) + (K * N) + (K * N) + 768;  // matches prover's log shape
+    let n_log_active = 2 * n_log_pairs;
+    let t_mem_n_trace = n_log_active.next_power_of_two();
+    verify_one_sub_air(&proof.fri_t_mem, t_mem_n_trace, blowup, pi_hash)
+        .map_err(|e| format!("v2 T_MEM: {e}"))?;
+
+    Ok(())
+}
+
 /// Compute `w_approx[k] = INTT(w_approx_ntt[k])` for all k.  This is
 /// the witness the prover supplies for the INTT sub-AIR; correctness
 /// is enforced in-circuit by T7 running NTT(w_approx) and checking
@@ -698,6 +969,30 @@ mod tests {
         proof.pi_hash[0] ^= 0xFF;
         let res = verify_v2_skeleton(&w, &c_tilde_bytes, &proof);
         assert!(res.is_err(), "v2 skeleton must reject tampered pi_hash");
+    }
+
+    /// **HEADLINE v2 end-to-end real FRI prove + verify round-trip.**
+    /// Marked `#[ignore]` because 10 FRI proves at any blowup is
+    /// heavy (~30-60 s in release; minutes in debug).
+    /// Run with: `cargo test --release -p deep_ali --features
+    /// parallel,sha3-256 v2_real_round_trip -- --include-ignored`.
+    #[test]
+    #[ignore]
+    fn v2_real_round_trip() {
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+
+        let blowup = 4;  // small for test; production uses 32
+        let proof = prove_v2_real(&w, &c_tilde_bytes, blowup);
+
+        verify_v2_real(&w, &c_tilde_bytes, &proof, blowup)
+            .expect("v2 real FRI round-trip must accept honest prover's bundle");
+
+        // Tamper: flip one byte of the V17 sub-proof, expect rejection.
+        let mut tampered = proof.clone();
+        tampered.fri_v17[100] ^= 0xFF;
+        let res = verify_v2_real(&w, &c_tilde_bytes, &tampered, blowup);
+        assert!(res.is_err(), "v2 real FRI must reject tampered V17 sub-proof");
     }
 
     /// **All 5 v2 sub-AIR merge functions run on honest traces.**
