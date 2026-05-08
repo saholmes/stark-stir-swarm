@@ -1207,3 +1207,5 @@ pub mod ml_dsa_rej_count_air;
 pub mod ml_dsa_expand_a_one_lite;
 pub mod ml_dsa_sample_in_ball_t1_t2;
 pub mod permutation_argument;
+pub mod ml_dsa_use_hint_air;
+pub mod ml_dsa_transcript;
