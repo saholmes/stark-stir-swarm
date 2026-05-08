@@ -9,6 +9,65 @@ use ark_goldilocks::Goldilocks as F;
 
 pub mod trace_import;
 
+/// **STARK calibration constants** auto-derived from the active
+/// `sha3-256` / `sha3-384` / `sha3-512` Cargo feature.
+///
+/// Provides `NUM_QUERIES_LEVEL` (the unconditional Johnson-regime
+/// query count needed to reach the target NIST PQ Level's IT
+/// soundness) and `NIST_LEVEL` (the named level: 1, 3, or 5).
+///
+/// The Johnson-regime per-query rate is ½·log₂(1/ρ_0) ≈ 2.5 bits at
+/// ρ_0 = 1/32 (BCIKS / STIR Theorem 1, both proven unconditionally).
+/// The capacity-regime rate (~5 bits/query) is conjectural and not
+/// used here; see `feedback_stir_johnson_unconditional_only.md`.
+///
+/// |  Active feature  | NUM_QUERIES_LEVEL | NIST_LEVEL | IT bits |
+/// |------------------|--------------------|------------|----------|
+/// |  sha3-256        |  54                |  1         | 135      |
+/// |  sha3-384        |  79                |  3         | 197.5    |
+/// |  sha3-512        |  105               |  5         | 262.5    |
+///
+/// Downstream callers (mmiyc-prover/verifier) just write
+/// `const NUM_QUERIES: usize = deep_ali::stark_level::NUM_QUERIES_LEVEL;`
+/// and the right value flows through from the workspace Cargo.toml's
+/// `deep_ali = { features = [...] }` line.
+pub mod stark_level {
+    /// Per-query soundness bits at ρ_0 = 1/32, Johnson regime
+    /// (unconditional, both FRI under BCIKS and STIR Theorem 1).
+    pub const PER_QUERY_BITS_JOHNSON: f64 = 2.5;
+
+    #[cfg(feature = "sha3-256")]
+    pub const NUM_QUERIES_LEVEL: usize = 54;
+    #[cfg(feature = "sha3-384")]
+    pub const NUM_QUERIES_LEVEL: usize = 79;
+    #[cfg(feature = "sha3-512")]
+    pub const NUM_QUERIES_LEVEL: usize = 105;
+
+    #[cfg(feature = "sha3-256")]
+    pub const NIST_LEVEL: u8 = 1;
+    #[cfg(feature = "sha3-384")]
+    pub const NIST_LEVEL: u8 = 3;
+    #[cfg(feature = "sha3-512")]
+    pub const NIST_LEVEL: u8 = 5;
+
+    /// Target collision-resistance bits (matches `min(n_out, c)` of
+    /// the active SHA-3 instance).
+    #[cfg(feature = "sha3-256")]
+    pub const COLLISION_BITS: u32 = 256;
+    #[cfg(feature = "sha3-384")]
+    pub const COLLISION_BITS: u32 = 384;
+    #[cfg(feature = "sha3-512")]
+    pub const COLLISION_BITS: u32 = 512;
+
+    /// SHA-3 sponge capacity bits (governs QROM ε_bind ≤ O(q³/2^c)).
+    #[cfg(feature = "sha3-256")]
+    pub const SPONGE_CAPACITY: u32 = 512;
+    #[cfg(feature = "sha3-384")]
+    pub const SPONGE_CAPACITY: u32 = 768;
+    #[cfg(feature = "sha3-512")]
+    pub const SPONGE_CAPACITY: u32 = 1024;
+}
+
 use ark_poly::{
     EvaluationDomain,
     GeneralEvaluationDomain,

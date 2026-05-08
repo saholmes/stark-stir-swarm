@@ -7,7 +7,7 @@ description = "DEEP-ALI and FRI scaffolding"
 repository = "https://example.com/your/repo"
 
 [features]
-default    = []
+default    = ["mldsa-44"]
 parallel = ["dep:rayon", "merkle/parallel"]
 fri_bench_log = []
 sha3-256   = ["hash/sha3-256",   "merkle/sha3-256",   "transcript/sha3-256"]
@@ -16,6 +16,27 @@ sha3-512   = ["hash/sha3-512",   "merkle/sha3-512",   "transcript/sha3-512"]
 blake3-hash = ["hash/blake3-hash", "merkle/blake3-hash", "transcript/blake3-hash"]
 # Forward the merkle leaf-compression accelerator (paper dual-hash, §III).
 poseidon-accel = ["merkle/poseidon-accel"]
+
+# ─── ML-DSA parameter set selection ──────────────────────────────────
+# Exactly one of these MUST be enabled.  Selects the FIPS 204 §4 Table 1
+# parameter set used by `ml_dsa::params` and downstream AIRs.
+#
+# - mldsa-44 → ML-DSA-44 (NIST PQ Level 1, λ_sig = 128 bits).
+#              K=4, L=4, τ=39, β=78, γ_1=2¹⁷, γ_2=(q−1)/88, ω=80,
+#              c̃ = 32 B; pk = 1312 B; sig = 2420 B.
+# - mldsa-65 → ML-DSA-65 (NIST PQ Level 3, λ_sig = 192 bits).
+#              K=6, L=5, τ=49, β=196, γ_1=2¹⁹, γ_2=(q−1)/32, ω=55,
+#              c̃ = 48 B; pk = 1952 B; sig = 3293 B.
+# - mldsa-87 → ML-DSA-87 (NIST PQ Level 5, λ_sig = 256 bits).
+#              K=8, L=7, τ=60, β=120, γ_1=2¹⁹, γ_2=(q−1)/32, ω=75,
+#              c̃ = 64 B; pk = 2592 B; sig = 4627 B.
+#
+# Pair with `sha3-256`/`sha3-384`/`sha3-512` for the matching STARK
+# Merkle hash level.  The STARK level may be ≥ the signature level
+# (over-provisioning is fine; under-provisioning is unsafe).
+mldsa-44 = []
+mldsa-65 = []
+mldsa-87 = []
 
 [dependencies]
 ark-ff = { version = "0.4.2" }

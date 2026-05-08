@@ -503,13 +503,10 @@ impl V2ProofReal {
 }
 
 const V2_BLOWUP: usize = 32;
-/// NIST PQ Level 3 query count (Johnson-regime unconditional):
-/// 79 × ½·log₂(1/ρ_0) = 79 × 2.5 = 197.5 ≥ 192 bits.  See
-/// `feedback_stir_johnson_unconditional_only.md` — STIR's per-query
-/// rate at capacity (~5 bits) is conjectural; only the Johnson
-/// regime is proven and matches FRI under BCIKS.  Revert to 54
-/// for Level 1 (sha3-256, λ=128).
-const V2_NUM_QUERIES: usize = 79;
+/// Auto-derived from the active `sha3-N` Cargo feature: 54 / 79 / 105
+/// for NIST PQ Levels 1 / 3 / 5 (Johnson-regime unconditional).
+/// See `crate::stark_level::NUM_QUERIES_LEVEL`.
+const V2_NUM_QUERIES: usize = crate::stark_level::NUM_QUERIES_LEVEL;
 const V2_SEED_Z: u64 = 0xDEEF_BAAD;
 const V2_TMEM_GAMMA: u64 = 0xC0FFEEu64;
 const V2_TMEM_ALPHA: u64 = 0xDEAD_BEEFu64;
