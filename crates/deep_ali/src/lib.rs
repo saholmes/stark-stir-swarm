@@ -1209,3 +1209,4 @@ pub mod ml_dsa_sample_in_ball_t1_t2;
 pub mod permutation_argument;
 pub mod ml_dsa_use_hint_air;
 pub mod ml_dsa_transcript;
+pub mod ml_dsa_intt_via_t7;
