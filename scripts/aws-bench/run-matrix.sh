@@ -21,6 +21,14 @@ SCRIPT_DIR="$(pwd)"
 
 mkdir -p results
 
+# ─── Pin Rayon thread count for reproducibility ──────────────────
+# Rayon auto-detects all available cores by default; we set this
+# explicitly so the meta log captures exactly what's used and so
+# benchmarks across runs/levels are comparable.
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$NPROC}"
+echo "[run-matrix] Pinning RAYON_NUM_THREADS=$RAYON_NUM_THREADS (detected $NPROC cores)"
+
 # ─── 6-cell matrix ───────────────────────────────────────────────
 # Each row: LEVEL_LABEL EXT_LABEL SHA3 MLDSA q_max_label
 MATRIX=(
@@ -37,6 +45,12 @@ RUNS="${BENCH_RUNS:-3}"
 {
     echo "## Matrix run started: $(date -Iseconds)"
     echo "## Host: $(hostname)"
+    echo "## CPU model: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+    echo "## Cores detected: $NPROC"
+    echo "## RAYON_NUM_THREADS: $RAYON_NUM_THREADS"
+    echo "## Memory: $(free -h 2>/dev/null | awk '/^Mem/ {print $2}' || echo unknown)"
+    echo "## Rust: $(rustc --version)"
+    echo "## Git HEAD: $(git -C ../.. rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "## Cells: ${#MATRIX[@]}"
     echo "## Runs per cell: $RUNS"
     echo "## Cells:"

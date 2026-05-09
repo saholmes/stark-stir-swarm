@@ -14,7 +14,10 @@ cd "$REPO_ROOT"
 LOG="$RESULTS_DIR/hash-rollup.run${RUN_IDX}.log"
 
 echo "[hash-rollup] running at trace sizes 16/18/20, blowup=$BLOWUP..."
-cargo run --release -p cairo-bench --example hash_rollup_scale -- 16 18 20 \
+echo "[hash-rollup] RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-auto}"
+cargo run --release -p cairo-bench --example hash_rollup_scale \
+    --features "parallel sha3-256" \
+    -- 16 18 20 \
     2>&1 | tee "$LOG"
 
 # Parse output lines of form:

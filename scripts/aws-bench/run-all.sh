@@ -9,15 +9,22 @@ cd "$(dirname "$0")"
 SCRIPT_DIR="$(pwd)"
 mkdir -p results
 
+# ─── Pin Rayon thread count for reproducibility ──────────────────
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$NPROC}"
+echo "[run-all] Pinning RAYON_NUM_THREADS=$RAYON_NUM_THREADS (detected $NPROC cores)"
+
 # ─── Header info ─────────────────────────────────────────────────
 {
     echo "## AWS bench run started: $(date -Iseconds)"
     echo "## Host: $(hostname)"
-    echo "## CPU: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
-    echo "## Cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
-    echo "## Mem: $(free -h 2>/dev/null | awk '/^Mem/ {print $2}' || echo unknown)"
+    echo "## CPU model: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+    echo "## Cores detected: $NPROC"
+    echo "## RAYON_NUM_THREADS: $RAYON_NUM_THREADS"
+    echo "## Memory: $(free -h 2>/dev/null | awk '/^Mem/ {print $2}' || echo unknown)"
     echo "## Rust: $(rustc --version)"
-    echo "## Git: $(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "## Git HEAD: $(git -C ../.. rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "## CPU features: $(grep -m1 'flags' /proc/cpuinfo 2>/dev/null | grep -oE 'avx512[a-z]+' | sort -u | tr '\n' ' ')"
 } > results/run-meta.txt
 cat results/run-meta.txt
 

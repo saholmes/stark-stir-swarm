@@ -81,7 +81,10 @@ fn main() {
         _                 => unreachable!(),
     };
 
-    eprintln!("=== simple_air_scaling: AIR={air_name}, blowup={blowup}, r={r} ===");
+    let rayon_threads = rayon::current_num_threads();
+    eprintln!(
+        "=== simple_air_scaling: AIR={air_name}, blowup={blowup}, r={r}, rayon_threads={rayon_threads} ==="
+    );
 
     for k in log2_sizes {
         let n_trace: usize = 1 << k;
@@ -139,8 +142,8 @@ fn main() {
         // tokens and lifts the (sha3, mldsa) Cargo features via env.
         println!(
             "simple_air_scaling air={air_name} log2_n={k} n_trace={n_trace} \
-             blowup={blowup} r={r} prove_ms={prove_ms:.0} \
-             verify_ms={verify_ms:.2} proof_kib={proof_kib:.1}"
+             blowup={blowup} r={r} threads={rayon_threads} \
+             prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} proof_kib={proof_kib:.1}"
         );
     }
 }

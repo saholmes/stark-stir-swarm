@@ -15,7 +15,11 @@ cd "$REPO_ROOT"
 LOG="$RESULTS_DIR/ed25519.run${RUN_IDX}.log"
 
 echo "[ed25519] running zsk_ksk_bench (full STARK pass)..."
-cargo run --release -p swarm-dns --example zsk_ksk_bench 2>&1 | tee "$LOG"
+echo "[ed25519] RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-auto}"
+# swarm-dns default features include parallel + sha3-256, but we
+# pass them explicitly for reproducibility.
+cargo run --release -p swarm-dns --example zsk_ksk_bench \
+    --features "parallel sha3-256" 2>&1 | tee "$LOG"
 
 # Parse lines of the form:
 #   "STARK prove: <X>s"  /  "STARK verify: <Y>ms"

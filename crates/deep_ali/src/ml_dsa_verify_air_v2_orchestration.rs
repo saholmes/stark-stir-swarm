@@ -996,7 +996,18 @@ mod tests {
         };
         let ext_label = if level == 5 { "Fp8" } else { "Fp6" };
 
-        eprintln!("[v2_bench] level=L{level} scheme={scheme} r={r} blowup={blowup}");
+        // Confirm parallel feature is active and report thread count.
+        #[cfg(feature = "parallel")]
+        let rayon_threads = rayon::current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let rayon_threads = 1usize;
+
+        eprintln!(
+            "[v2_bench] level=L{level} scheme={scheme} r={r} blowup={blowup} \
+             rayon_threads={rayon_threads}"
+        );
+        #[cfg(not(feature = "parallel"))]
+        eprintln!("[v2_bench] WARNING: built without `parallel` feature; single-threaded!");
 
         let t0 = Instant::now();
         let proof = prove_v2_real(&w, &c_tilde_bytes, blowup);
@@ -1023,7 +1034,8 @@ mod tests {
         // CSV-friendly stdout line for the bench harness to scrape.
         println!(
             "v2_bench level=L{level} scheme={scheme} ext={ext_label} hash={hash_label} \
-             r={r} blowup={blowup} prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} \
+             r={r} blowup={blowup} threads={rayon_threads} \
+             prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} \
              proof_kib={proof_kib:.1}"
         );
     }

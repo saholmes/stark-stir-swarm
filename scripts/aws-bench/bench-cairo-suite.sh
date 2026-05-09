@@ -14,11 +14,14 @@ csv_init "cairo-suite"
 
 cd "$REPO_ROOT"
 echo "[cairo-suite] running criterion bench at blowup=$BLOWUP, run $RUN_IDX..."
+echo "[cairo-suite] RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-auto}"
 
 # Criterion outputs to target/criterion/.../report.html and prints summary.
-# We capture stdout for parsing.
+# Explicit feature pin (cairo-bench's default already includes
+# parallel + sha3-256, but pin for reproducibility).
 LOG="$RESULTS_DIR/cairo-suite.run${RUN_IDX}.log"
-cargo bench --release -p cairo-bench --bench cairo_air_bench -- \
+cargo bench --release -p cairo-bench --bench cairo_air_bench \
+    --features "parallel sha3-256" -- \
     --output-format bencher 2>&1 | tee "$LOG"
 
 # Parse 'test cairo_air/<name>/<size> ... bench: <prove_ns> ns/iter' lines.

@@ -51,7 +51,10 @@ fn gen_biguint_below(rng: &mut rand::rngs::StdRng, n: &BigUint) -> BigUint {
 }
 
 fn main() {
-    eprintln!("=== rsa2048_bench: stacked RSA-2048 verify AIR (1 record) ===");
+    let rayon_threads = rayon::current_num_threads();
+    eprintln!(
+        "=== rsa2048_bench: stacked RSA-2048 verify AIR (1 record), rayon_threads={rayon_threads} ==="
+    );
 
     // ── Synthesise one honest RSA verification record ──
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD);
@@ -128,6 +131,7 @@ fn main() {
 
     println!(
         "rsa2048_bench n_trace={n_trace} blowup={blowup} r={r} \
+         threads={rayon_threads} \
          prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} proof_kib={proof_kib:.1}"
     );
 }
