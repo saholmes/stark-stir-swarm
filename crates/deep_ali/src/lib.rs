@@ -1088,7 +1088,7 @@ pub fn deep_ali_merge_t_transcript(
 /// Generic DEEP-ALI merge for sub-AIRs whose `eval_per_row` takes
 /// `(cur, nxt, row)` and no extra layout/parameters.  Used by the
 /// COEFF sub-AIRs (Decompose, UseHint, W1Encode).
-fn deep_ali_merge_per_row_no_layout(
+pub fn deep_ali_merge_per_row_no_layout(
     trace_evals_on_lde: &[Vec<F>],
     combination_coeffs: &[F],
     _omega: F,

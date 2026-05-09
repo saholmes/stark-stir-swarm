@@ -963,8 +963,73 @@ mod tests {
     use crate::keccak_f1600::ROUNDS;
     use crate::ml_dsa_shake_absorb_multi_air;
 
+    /// **Benchmark harness** for the v2 ML-DSA verify STARK (Phase 1
+    /// trace-commit binding).  Prints one CSV-friendly stdout line
+    /// with prove_ms / verify_ms / proof_kib at the active NIST PQ
+    /// Level (selected via Cargo features sha3-N + mldsa-N).
+    ///
+    /// Run with:
+    /// ```
+    /// cargo test --release -p deep_ali \
+    ///     --features "parallel sha3-256 mldsa-44" --no-default-features \
+    ///     v2_bench -- --ignored --nocapture
+    /// ```
+    /// Set `BENCH_BLOWUP=32` to use the paper-aligned production blowup.
+    #[test]
+    #[ignore]
+    fn v2_bench() {
+        use std::time::Instant;
+
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let level = crate::stark_level::NIST_LEVEL;
+        let scheme = crate::ml_dsa::params::SCHEME_NAME;
+        let r = crate::stark_level::NUM_QUERIES_LEVEL;
+        let hash_label = match level {
+            1 => "SHA3-256",
+            3 => "SHA3-384",
+            5 => "SHA3-512",
+            _ => "SHA3-?",
+        };
+        let ext_label = if level == 5 { "Fp8" } else { "Fp6" };
+
+        eprintln!("[v2_bench] level=L{level} scheme={scheme} r={r} blowup={blowup}");
+
+        let t0 = Instant::now();
+        let proof = prove_v2_real(&w, &c_tilde_bytes, blowup);
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[v2_bench] prove_ms = {prove_ms:.1}");
+
+        let proof_bytes = proof.to_bytes();
+        let proof_kib = proof_bytes.len() as f64 / 1024.0;
+        eprintln!("[v2_bench] proof_kib = {proof_kib:.1}");
+
+        // 3 verify runs, take median.
+        let mut samples: Vec<f64> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let t0 = Instant::now();
+            verify_v2_real(&w, &c_tilde_bytes, &proof, blowup)
+                .expect("v2 verify must accept honest prover's bundle");
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[v2_bench] verify {} ms = {ms:.2}", i + 1);
+            samples.push(ms);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let verify_ms = samples[1];
+
+        // CSV-friendly stdout line for the bench harness to scrape.
+        println!(
+            "v2_bench level=L{level} scheme={scheme} ext={ext_label} hash={hash_label} \
+             r={r} blowup={blowup} prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} \
+             proof_kib={proof_kib:.1}"
+        );
+    }
+
     /// Synthesise a fully-consistent V2 witness for testing.
-    fn synthesize_witness() -> V2Witness {
+    pub(crate) fn synthesize_witness() -> V2Witness {
         // Step 1: small centred z, lift to z_cleartext.
         let mut z_cleartext = Box::new([[0u32; N]; L]);
         for l in 0..L {
