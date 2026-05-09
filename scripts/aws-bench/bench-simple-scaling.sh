@@ -25,6 +25,20 @@ HASH_LABEL="$(echo "$SHA3" | tr '[:lower:]' '[:upper:]' | sed 's/SHA3-/SHA3-/')"
 # (e.g. "11 12 13 14") for a smaller sweep on memory-constrained boxes.
 K_RANGE="${BENCH_K_RANGE:-11 12 13 14 15 16 17 18 19 20 21 22 23 24}"
 
+# r (NUM_QUERIES) is determined by the NIST PQ Level, NOT by the hash
+# width.  Paper Table 5: r ∈ {54, 79, 105} for L1/L3/L5.  At L1 with
+# SHA3-384 or SHA3-512 we keep r=54 — the larger hash buys binding-
+# wall headroom (q=2^65 / 2^90), not per-query soundness.  Without
+# this override the simple_air_scaling example would inherit
+# deep_ali's compile-time `NUM_QUERIES_LEVEL`, which is hash-derived
+# and therefore wrong for the off-diagonal (L1+SHA3-384/512 etc.) cells.
+case "$LEVEL_LABEL" in
+    L1) export BENCH_QUERIES=54  ;;
+    L3) export BENCH_QUERIES=79  ;;
+    L5) export BENCH_QUERIES=105 ;;
+    *)  echo "[simple-scaling] WARN: unknown LEVEL_LABEL=$LEVEL_LABEL — leaving r at example default" ;;
+esac
+
 export BENCH_BLOWUP="$BLOWUP"
 
 for AIR in Fibonacci PoseidonChain RegisterMachine; do

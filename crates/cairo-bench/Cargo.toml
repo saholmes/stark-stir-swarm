@@ -6,8 +6,13 @@ license.workspace = true
 description = "Criterion benchmarks for all Cairo AIR workloads on the STARK/DEEP-ALI/FRI prover"
 
 [features]
-default  = ["sha3-256", "parallel"]
+default  = ["sha3-256", "parallel", "mldsa-44"]
 sha3-256 = ["deep_ali/sha3-256"]
+sha3-384 = ["deep_ali/sha3-384"]
+sha3-512 = ["deep_ali/sha3-512"]
+mldsa-44 = ["deep_ali/mldsa-44"]
+mldsa-65 = ["deep_ali/mldsa-65"]
+mldsa-87 = ["deep_ali/mldsa-87"]
 parallel = ["deep_ali/parallel"]
 # Optional Poseidon-accelerated leaf compression (paper dual-hash).
 poseidon-accel = ["deep_ali/poseidon-accel"]
@@ -25,7 +30,12 @@ sha3 = { workspace = true }
 hex = "0.4"
 fips204 = { workspace = true }
 
-deep_ali    = { path = "../deep_ali" }
+# default-features = false so that the bench harness can pick the
+# (sha3-N, mldsa-N) pair via `cargo run --features "deep_ali/sha3-384
+# deep_ali/mldsa-65 deep_ali/parallel" --no-default-features` without
+# `mldsa-44` from `deep_ali`'s own default leaking in and triggering
+# the "cannot enable both `mldsa-44` and `mldsa-N`" compile_error.
+deep_ali    = { path = "../deep_ali", default-features = false }
 hash        = { path = "../hash",       default-features = false }
 merkle      = { path = "../merkle",     default-features = false }
 transcript  = { path = "../transcript", default-features = false }

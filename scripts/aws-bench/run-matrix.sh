@@ -31,12 +31,22 @@ echo "[run-matrix] Pinning RAYON_NUM_THREADS=$RAYON_NUM_THREADS (detected $NPROC
 
 # ─── 6-cell matrix ───────────────────────────────────────────────
 # Each row: LEVEL_LABEL EXT_LABEL SHA3 MLDSA q_max_label
+# Note: deep_ali ties the extension-field choice to the SHA-3 feature
+# (see crates/deep_ali/src/permutation_argument.rs lines 116–126):
+#   sha3-256 / sha3-384 → SexticExt (Fp6)
+#   sha3-512            → OcticExt  (Fp8)
+# So the SHA3-512 rows below are Fp8 regardless of NIST level — the
+# bigger ext-field is bundled with the bigger hash in the current
+# build, even when the level only requires Fp6 mathematically.  Paper
+# Table 6 should mirror this (the existing $^\dagger$-projected
+# rows mark these cells "Fp6" which is a typo to fix when the
+# measurements land).
 MATRIX=(
     "L1 Fp6 sha3-256 mldsa-44 q=2^40"
     "L1 Fp6 sha3-384 mldsa-44 q=2^65"
-    "L1 Fp6 sha3-512 mldsa-44 q=2^90"
+    "L1 Fp8 sha3-512 mldsa-44 q=2^90"
     "L3 Fp6 sha3-384 mldsa-65 q=2^65"
-    "L3 Fp6 sha3-512 mldsa-65 q=2^90"
+    "L3 Fp8 sha3-512 mldsa-65 q=2^90"
     "L5 Fp8 sha3-512 mldsa-87 q=2^65"
 )
 
