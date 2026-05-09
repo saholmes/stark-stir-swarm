@@ -58,7 +58,7 @@ pub const N_SQUEEZE_BLOCKS_PROVISION: usize = 5;
 /// algorithm bit-for-bit; the only difference is where the SHAKE
 /// bytes come from (this version uses my AIR primitives instead of
 /// `sha3::Shake256`).
-pub fn sample_in_ball_via_primitives(c_tilde: &[u8; 32]) -> [u32; N] {
+pub fn sample_in_ball_via_primitives(c_tilde: &[u8; crate::ml_dsa::params::C_TILDE_BYTES]) -> [u32; N] {
     // ── Absorb (T1): single-block SHAKE-256 of c̃ (32 < rate=136) ──
     let pre_permute = build_absorbed_state(c_tilde, SHAKE_256_RATE_BYTES);
     let mut post_absorb_state = pre_permute;
@@ -108,9 +108,12 @@ mod tests {
     /// multiple distinct `c̃` seeds.
     #[test]
     fn t1_t2_sample_in_ball_matches_native_reference() {
+        use crate::ml_dsa::params::C_TILDE_BYTES;
         for seed in 0u8..8 {
-            let mut c_tilde = [0u8; 32];
-            for k in 0..32 { c_tilde[k] = seed.wrapping_mul(13).wrapping_add(k as u8); }
+            let mut c_tilde = [0u8; C_TILDE_BYTES];
+            for k in 0..C_TILDE_BYTES {
+                c_tilde[k] = seed.wrapping_mul(13).wrapping_add(k as u8);
+            }
 
             let theirs = ml_dsa_sample_in_ball::sample_in_ball(&c_tilde);
             let ours = sample_in_ball_via_primitives(&c_tilde);
@@ -123,7 +126,7 @@ mod tests {
     /// Output structure sanity: exactly τ nonzero entries, each ±1.
     #[test]
     fn output_has_exactly_tau_nonzero_pm1() {
-        let c_tilde = [0x42u8; 32];
+        let c_tilde = [0x42u8; crate::ml_dsa::params::C_TILDE_BYTES];
         let c = sample_in_ball_via_primitives(&c_tilde);
         let nonzero: Vec<u32> = c.iter().copied().filter(|&v| v != 0).collect();
         assert_eq!(nonzero.len(), TAU,
@@ -137,7 +140,7 @@ mod tests {
     /// Determinism: same `c̃` yields same output.
     #[test]
     fn deterministic_on_input() {
-        let c_tilde = [0x07u8; 32];
+        let c_tilde = [0x07u8; crate::ml_dsa::params::C_TILDE_BYTES];
         let a = sample_in_ball_via_primitives(&c_tilde);
         let b = sample_in_ball_via_primitives(&c_tilde);
         assert_eq!(a, b);
@@ -146,7 +149,7 @@ mod tests {
     /// Different inputs yield different outputs (with overwhelming probability).
     #[test]
     fn distinct_inputs_yield_distinct_outputs() {
-        let c0 = [0x11u8; 32];
+        let c0 = [0x11u8; crate::ml_dsa::params::C_TILDE_BYTES];
         let mut c1 = c0;
         c1[0] ^= 0xFF;
         assert_ne!(
@@ -161,9 +164,12 @@ mod tests {
     /// any provisioning gap empirically.
     #[test]
     fn provisioning_sufficient_for_64_seeds() {
+        use crate::ml_dsa::params::C_TILDE_BYTES;
         for seed in 0u32..64 {
-            let mut c_tilde = [0u8; 32];
-            for k in 0..32 { c_tilde[k] = ((seed as u8).wrapping_mul(31)).wrapping_add(k as u8); }
+            let mut c_tilde = [0u8; C_TILDE_BYTES];
+            for k in 0..C_TILDE_BYTES {
+                c_tilde[k] = ((seed as u8).wrapping_mul(31)).wrapping_add(k as u8);
+            }
             // Should not panic on any seed under our provisioning.
             let _ = sample_in_ball_via_primitives(&c_tilde);
         }

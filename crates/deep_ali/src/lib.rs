@@ -962,15 +962,16 @@ pub fn deep_ali_merge_t_w1_encode(
 }
 
 /// DEEP-ALI merge for `permutation_argument` (T-MEM).  Takes the
-/// Fiat-Shamir challenges γ and α.
+/// Fiat-Shamir challenges γ and α as **F_ext** elements (Fp6 for
+/// L1/L3, Fp8 for L5) — see `permutation_argument::ExtField`.
 pub fn deep_ali_merge_t_mem(
     trace_evals_on_lde: &[Vec<F>],
     combination_coeffs: &[F],
     omega: F,
     n_trace: usize,
     blowup: usize,
-    gamma: F,
-    alpha: F,
+    gamma: crate::permutation_argument::ExtField,
+    alpha: crate::permutation_argument::ExtField,
 ) -> (Vec<F>, CompositionInfo) {
     use crate::permutation_argument::{eval_per_row, NUM_CONSTRAINTS as KK, WIDTH as WW};
     let _ = omega;
@@ -1585,3 +1586,4 @@ pub mod ml_dsa_transcript;
 pub mod ml_dsa_intt_via_t7;
 pub mod ml_dsa_verify_air_v2_layout;
 pub mod ml_dsa_verify_air_v2_orchestration;
+pub mod sub_air_with_trace;

@@ -110,7 +110,17 @@ pub struct V2SubTraces {
 /// Build all 3 architecturally-significant v2 sub-traces from the
 /// witness.  Returns sub-traces sized to each sub-proof's pow2 row
 /// count (per `ml_dsa_verify_air_v2_layout`).
-pub fn fill_v2_traces(witness: &V2Witness) -> V2SubTraces {
+/// Fill all v2 sub-traces.
+///
+/// `pi_hash` is the Fiat-Shamir digest of the public inputs +
+/// `c_tilde` (i.e. the value `compute_pi_hash_v2(witness, c_tilde)`
+/// returns).  It seeds the T-MEM permutation-argument challenges
+/// (γ, α) so they are unpredictable to the prover at trace-
+/// construction time — see `derive_t_mem_challenges`.  Tests that
+/// only exercise per-row trace consistency may pass `[0u8; 32]`;
+/// real proofs MUST pass the same `pi_hash` the prover and verifier
+/// independently compute.
+pub fn fill_v2_traces(witness: &V2Witness, pi_hash: [u8; 32]) -> V2SubTraces {
     // ── V17 (v1.7 verify-AIR) ──
     let mut v17_trace: Vec<Vec<F>> = (0..v17_dim::N_COLS)
         .map(|_| vec![F::zero(); v17_dim::N_ROWS_POW2]).collect();
@@ -232,8 +242,11 @@ pub fn fill_v2_traces(witness: &V2Witness) -> V2SubTraces {
     let t_mem_n_trace = log.len().next_power_of_two();
     let mut t_mem_trace: Vec<Vec<F>> = (0..t_mem::WIDTH)
         .map(|_| vec![F::zero(); t_mem_n_trace]).collect();
-    let gamma = F::from(0xC0FFEEu64);   // would be Fiat-Shamir derived in production
-    let alpha = F::from(0xDEAD_BEEFu64);
+    // Fiat-Shamir derive (γ, α) from pi_hash — sampled AFTER the
+    // public inputs are fixed, so the prover cannot craft structured
+    // (address, value) collisions.  Without this, the perm-arg is
+    // algebraically predictable in adversarial settings (web/browser).
+    let (gamma, alpha) = derive_t_mem_challenges(&pi_hash);
     t_mem::fill_trace(&mut t_mem_trace, t_mem_n_trace, &log, gamma, alpha);
 
     V2SubTraces {
@@ -331,15 +344,17 @@ pub fn prove_v2_skeleton(
     w: &V2Witness,
     c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
 ) -> (V2SubTraces, V2Proof) {
-    let traces = fill_v2_traces(w);
+    // pi_hash must be fixed BEFORE the trace is filled, so the
+    // T-MEM perm-arg challenges (γ, α) derived from it are
+    // unpredictable to the prover at trace-construction time.
+    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
+    let traces = fill_v2_traces(w, pi_hash);
 
     // c_tilde_prime: extract from TRANSCRIPT trace.
     let transcript_layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
     let c_tilde_prime = ml_dsa_transcript::extract_c_tilde_prime_from_trace(
         &traces.transcript, &transcript_layout,
     );
-
-    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
 
     // Compute trace digests as proof "fingerprints".  In production
     // these slots hold serialized DeepFriProof bytes.
@@ -516,18 +531,88 @@ const V2_BLOWUP: usize = 32;
 /// See `crate::stark_level::NUM_QUERIES_LEVEL`.
 const V2_NUM_QUERIES: usize = crate::stark_level::NUM_QUERIES_LEVEL;
 const V2_SEED_Z: u64 = 0xDEEF_BAAD;
-const V2_TMEM_GAMMA: u64 = 0xC0FFEEu64;
-const V2_TMEM_ALPHA: u64 = 0xDEAD_BEEFu64;
+
+/// Derive the T-MEM permutation-argument challenges (γ, α) via
+/// Fiat-Shamir from `pi_hash`.  These MUST be sampled after the
+/// prover commits to the trace; static constants would let the
+/// adversary craft structured (address, value) collisions.
+///
+/// **Field**: γ, α ∈ `ExtField` = Fp⁶ (L1/L3) / Fp⁸ (L5), matching
+/// the FRI/STIR extension field.  Schwartz-Zippel gives
+/// Pr[multiset collision] ≤ N / |F_ext| ≈ 2⁻³⁷⁰ (Fp⁶) / 2⁻⁴⁹⁸ (Fp⁸)
+/// for log size N ≈ 2¹⁴ — comfortably below the per-level ε target.
+/// See `permutation_argument` module docs.
+///
+/// Each challenge consumes `EXT_DEGREE × 8` bytes from a SHAKE-256
+/// stream, reduced into Goldilocks coefficients of the F_ext element.
+/// Distinct domain tags ensure γ ≠ α even on pi_hash collisions.
+fn derive_t_mem_challenges(pi_hash: &[u8; 32]) -> (
+    crate::permutation_argument::ExtField,
+    crate::permutation_argument::ExtField,
+) {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    use crate::permutation_argument::{ExtField, EXT_DEGREE};
+    use crate::tower_field::TowerField;
+
+    let mut shake = sha3::Shake256::default();
+    shake.update(b"mmiyc/v2/t_mem/challenges");
+    shake.update(pi_hash);
+    let mut reader = shake.finalize_xof();
+
+    // EXT_DEGREE Goldilocks coefficients per challenge.  Each takes
+    // 8 bytes → u64 → F::from() (canonical Goldilocks reduction).
+    let read_ext_challenge = |reader: &mut <sha3::Shake256 as ExtendableOutput>::Reader| -> ExtField {
+        let mut comps: Vec<F> = Vec::with_capacity(EXT_DEGREE);
+        for _ in 0..EXT_DEGREE {
+            let mut buf = [0u8; 8];
+            reader.read(&mut buf);
+            comps.push(F::from(u64::from_le_bytes(buf)));
+        }
+        ExtField::from_fp_components(&comps)
+            .expect("EXT_DEGREE Goldilocks coefficients form a valid F_ext element")
+    };
+
+    let gamma = read_ext_challenge(&mut reader);
+    let alpha = read_ext_challenge(&mut reader);
+    (gamma, alpha)
+}
 
 fn make_v2_schedule(n0: usize) -> Vec<usize> {
     vec![2usize; n0.trailing_zeros() as usize]
 }
 
-fn comb_coeffs(num: usize) -> Vec<F> {
-    (0..num).map(|i| F::from((i + 1) as u64)).collect()
+/// Fiat-Shamir-derive the constraint composition coefficients
+/// `α_1, …, α_num ∈ F` for a sub-AIR.  These are the per-constraint
+/// coefficients in `Φ(X) = Σ α_j Φ_j(X)` from the DEEP-ALI merge
+/// (paper eq 1).
+///
+/// **Soundness note**: the previous version used static integers
+/// `[1, 2, …, num]`, which broke Theorem 1's Event-E1 Schwartz-Zippel
+/// argument (the bound `Pr[Φ(ω_T^{i⋆}) = 0] ≤ 1/|F_pe|` requires α_j
+/// to be uniformly random over F_pe from the prover's perspective).
+/// With predictable α a malicious prover could craft constraint
+/// values whose linear combination cancels at specific trace-domain
+/// points — defeating the merge's distance argument.
+///
+/// `domain_sep` distinguishes sub-AIRs so each gets its own α
+/// vector (otherwise an attacker who controls one sub-AIR's witness
+/// could exploit shared α across sub-AIRs).
+pub(crate) fn comb_coeffs(num: usize, pi_hash: &[u8; 32], domain_sep: &[u8]) -> Vec<F> {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let mut shake = sha3::Shake256::default();
+    shake.update(b"mmiyc/v2/comb_coeffs");
+    shake.update(domain_sep);
+    shake.update(pi_hash);
+    let mut reader = shake.finalize_xof();
+
+    (0..num).map(|_| {
+        let mut buf = [0u8; 8];
+        reader.read(&mut buf);
+        F::from(u64::from_le_bytes(buf))
+    }).collect()
 }
 
-fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+pub(crate) fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     DeepFriParams {
         schedule: make_v2_schedule(n0),
         r: V2_NUM_QUERIES,
@@ -596,85 +681,122 @@ pub fn prove_v2_real(
     c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
     blowup: usize,
 ) -> V2ProofReal {
-    let traces = fill_v2_traces(w);
+    // pi_hash MUST be computed before trace fill — the T-MEM
+    // perm-arg challenges (γ, α) are Fiat-Shamir derived from it,
+    // and the trace bakes those challenges into RP/WP running
+    // products.  See `derive_t_mem_challenges`.
+    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
+    let (t_mem_gamma, t_mem_alpha) = derive_t_mem_challenges(&pi_hash);
+    let traces = fill_v2_traces(w, pi_hash);
 
     let transcript_layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
     let c_tilde_prime = ml_dsa_transcript::extract_c_tilde_prime_from_trace(
         &traces.transcript, &transcript_layout,
     );
-    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
 
     // V17
-    let fri_v17 = prove_one_sub_air(
-        &traces.v17, traces.v17[0].len(), blowup, pi_hash,
-        |lde, n_trace, blowup| {
-            let kk = crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS;
-            crate::deep_ali_merge_ml_dsa_v17(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
-        },
+    let fri_v17 = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.v17, traces.v17[0].len(), blowup, pi_hash,
+            b"v17",
+            crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+            |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_ml_dsa_v17(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+            },
+            v2_fri_params,
+        )
     );
 
-    // INTT × K
+    // INTT × K — domain-sep tag includes the instance index k so each
+    // INTT instance gets independent α even though they share an AIR.
     let mut fri_intt: Vec<Vec<u8>> = Vec::with_capacity(K);
     for k in 0..K {
-        let bytes = prove_one_sub_air(
-            &traces.intt[k], traces.intt[k][0].len(), blowup, pi_hash,
-            |lde, n_trace, blowup| {
-                let kk = crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS;
-                crate::deep_ali_merge_t7_chained_ntt(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
-            },
+        let mut tag = b"intt:".to_vec();
+        tag.push(k as u8);
+        let bytes = crate::sub_air_with_trace::serialize_proof(
+            &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+                &traces.intt[k], traces.intt[k][0].len(), blowup, pi_hash,
+                &tag,
+                crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t7_chained_ntt(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                v2_fri_params,
+            )
         );
         fri_intt.push(bytes);
     }
 
     // COEFF Decompose
-    let fri_decompose = prove_one_sub_air(
-        &traces.coeff_decompose, traces.coeff_decompose[0].len(), blowup, pi_hash,
-        |lde, n_trace, blowup| {
-            let kk = crate::ml_dsa_decompose_air::NUM_CONSTRAINTS;
-            crate::deep_ali_merge_t_decompose(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
-        },
+    let fri_decompose = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.coeff_decompose, traces.coeff_decompose[0].len(), blowup, pi_hash,
+            b"decompose",
+            crate::ml_dsa_decompose_air::NUM_CONSTRAINTS,
+            |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_t_decompose(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+            },
+            v2_fri_params,
+        )
     );
 
     // COEFF UseHint
-    let fri_use_hint = prove_one_sub_air(
-        &traces.coeff_use_hint, traces.coeff_use_hint[0].len(), blowup, pi_hash,
-        |lde, n_trace, blowup| {
-            let kk = crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS;
-            crate::deep_ali_merge_t_use_hint(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
-        },
+    let fri_use_hint = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.coeff_use_hint, traces.coeff_use_hint[0].len(), blowup, pi_hash,
+            b"use_hint",
+            crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS,
+            |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_t_use_hint(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+            },
+            v2_fri_params,
+        )
     );
 
     // COEFF W1Encode
-    let fri_w1_encode = prove_one_sub_air(
-        &traces.coeff_w1_encode, traces.coeff_w1_encode[0].len(), blowup, pi_hash,
-        |lde, n_trace, blowup| {
-            let kk = crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS;
-            crate::deep_ali_merge_t_w1_encode(lde, &comb_coeffs(kk), F::zero(), n_trace, blowup).0
-        },
+    let fri_w1_encode = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.coeff_w1_encode, traces.coeff_w1_encode[0].len(), blowup, pi_hash,
+            b"w1_encode",
+            crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS,
+            |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_t_w1_encode(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+            },
+            v2_fri_params,
+        )
     );
 
     // TRANSCRIPT
     let layout_for_closure = transcript_layout.clone();
-    let fri_transcript = prove_one_sub_air(
-        &traces.transcript, traces.transcript[0].len(), blowup, pi_hash,
-        move |lde, n_trace, blowup| {
-            let kk = ml_dsa_shake_absorb_multi_air::num_constraints(&layout_for_closure);
-            crate::deep_ali_merge_t_transcript(
-                lde, &comb_coeffs(kk), F::zero(), n_trace, blowup, &layout_for_closure,
-            ).0
-        },
+    let transcript_num_constraints = ml_dsa_shake_absorb_multi_air::num_constraints(&layout_for_closure);
+    let fri_transcript = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.transcript, traces.transcript[0].len(), blowup, pi_hash,
+            b"transcript",
+            transcript_num_constraints,
+            move |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_t_transcript(
+                    lde, comb_coeffs, F::zero(), n_trace, blowup, &layout_for_closure,
+                ).0
+            },
+            v2_fri_params,
+        )
     );
 
-    // T_MEM
-    let fri_t_mem = prove_one_sub_air(
-        &traces.t_mem, traces.t_mem[0].len(), blowup, pi_hash,
-        |lde, n_trace, blowup| {
-            let kk = t_mem::NUM_CONSTRAINTS;
-            crate::deep_ali_merge_t_mem(
-                lde, &comb_coeffs(kk), F::zero(), n_trace, blowup,
-                F::from(V2_TMEM_GAMMA), F::from(V2_TMEM_ALPHA),
-            ).0
-        },
+    // T_MEM — γ, α are Fiat-Shamir derived (see derive_t_mem_challenges).
+    let fri_t_mem = crate::sub_air_with_trace::serialize_proof(
+        &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+            &traces.t_mem, traces.t_mem[0].len(), blowup, pi_hash,
+            b"t_mem",
+            t_mem::NUM_CONSTRAINTS,
+            move |lde, n_trace, blowup, comb_coeffs| {
+                crate::deep_ali_merge_t_mem(
+                    lde, comb_coeffs, F::zero(), n_trace, blowup,
+                    t_mem_gamma, t_mem_alpha,
+                ).0
+            },
+            v2_fri_params,
+        )
     );
 
     V2ProofReal {
@@ -714,8 +836,17 @@ pub fn verify_v2_real(
 
     // 3. V17 sub-proof.
     let v17_n_trace = crate::ml_dsa_verify_air_v17::VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
-    verify_one_sub_air(&proof.fri_v17, v17_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 V17: {e}"))?;
+    {
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_v17)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, v17_n_trace, blowup, pi_hash,
+            b"v17",
+            crate::ml_dsa_verify_air_v17::WIDTH,
+            crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+            |cur, nxt, row| crate::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 V17: {e}"))?;
+    }
 
     // 4. INTT × K sub-proofs.
     let intt_n_trace = (t7::BUTTERFLIES_PER_NTT + 16).next_power_of_two();
@@ -723,31 +854,88 @@ pub fn verify_v2_real(
         return Err(format!("v2 verify: expected {K} INTT proofs, got {}", proof.fri_intt.len()));
     }
     for k in 0..K {
-        verify_one_sub_air(&proof.fri_intt[k], intt_n_trace, blowup, pi_hash)
-            .map_err(|e| format!("v2 INTT[{k}]: {e}"))?;
+        let mut tag = b"intt:".to_vec();
+        tag.push(k as u8);
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_intt[k])?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, intt_n_trace, blowup, pi_hash,
+            &tag,
+            crate::ml_dsa_ntt_chained_air::WIDTH,
+            crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| crate::ml_dsa_ntt_chained_air::eval_per_row(cur, nxt, row),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 INTT[{k}]: {e}"))?;
     }
 
     // 5. COEFF sub-proofs (3 of them).
     let coeff_n_trace = (K * N).next_power_of_two();
-    verify_one_sub_air(&proof.fri_decompose, coeff_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 Decompose: {e}"))?;
-    verify_one_sub_air(&proof.fri_use_hint, coeff_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 UseHint: {e}"))?;
-    verify_one_sub_air(&proof.fri_w1_encode, coeff_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 W1Encode: {e}"))?;
+    {
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_decompose)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, coeff_n_trace, blowup, pi_hash,
+            b"decompose",
+            crate::ml_dsa_decompose_air::WIDTH,
+            crate::ml_dsa_decompose_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| crate::ml_dsa_decompose_air::eval_per_row(cur, nxt, row),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 Decompose: {e}"))?;
+    }
+    {
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_use_hint)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, coeff_n_trace, blowup, pi_hash,
+            b"use_hint",
+            crate::ml_dsa_use_hint_air::WIDTH,
+            crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| crate::ml_dsa_use_hint_air::eval_per_row(cur, nxt, row),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 UseHint: {e}"))?;
+    }
+    {
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_w1_encode)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, coeff_n_trace, blowup, pi_hash,
+            b"w1_encode",
+            crate::ml_dsa_w1_encode_air::WIDTH,
+            crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| crate::ml_dsa_w1_encode_air::eval_per_row(cur, nxt, row),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 W1Encode: {e}"))?;
+    }
 
     // 6. TRANSCRIPT sub-proof.
     let transcript_layout = ml_dsa_transcript::build_layout(&public.mu_bytes, &public.w1bytes);
     let transcript_n_trace = transcript_layout.active_rows().next_power_of_two();
-    verify_one_sub_air(&proof.fri_transcript, transcript_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 TRANSCRIPT: {e}"))?;
+    {
+        let layout = transcript_layout.clone();
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_transcript)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, transcript_n_trace, blowup, pi_hash,
+            b"transcript",
+            ml_dsa_shake_absorb_multi_air::WIDTH,
+            ml_dsa_shake_absorb_multi_air::num_constraints(&layout),
+            move |cur, nxt, row| ml_dsa_shake_absorb_multi_air::eval_per_row(cur, nxt, row, &layout),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 TRANSCRIPT: {e}"))?;
+    }
 
     // 7. T_MEM sub-proof.
     let n_log_pairs = (K * N) + (K * N) + (K * N) + (K * N) + 768;  // matches prover's log shape
     let n_log_active = 2 * n_log_pairs;
     let t_mem_n_trace = n_log_active.next_power_of_two();
-    verify_one_sub_air(&proof.fri_t_mem, t_mem_n_trace, blowup, pi_hash)
-        .map_err(|e| format!("v2 T_MEM: {e}"))?;
+    {
+        // T-MEM's eval_per_row needs (γ, α) — derive them like the prover.
+        let (t_mem_gamma, t_mem_alpha) = derive_t_mem_challenges(&pi_hash);
+        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_t_mem)?;
+        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+            &p, t_mem_n_trace, blowup, pi_hash,
+            b"t_mem",
+            t_mem::WIDTH,
+            t_mem::NUM_CONSTRAINTS,
+            move |cur, nxt, row| t_mem::eval_per_row(cur, nxt, row, t_mem_gamma, t_mem_alpha),
+            v2_fri_params,
+        ).map_err(|e| format!("v2 T_MEM: {e}"))?;
+    }
 
     Ok(())
 }
@@ -876,7 +1064,12 @@ mod tests {
     #[test]
     fn fill_v2_traces_end_to_end_orchestration() {
         let w = synthesize_witness();
-        let traces = fill_v2_traces(&w);
+        // Test-only: a fixed dummy pi_hash is fine — we only check
+        // per-row trace consistency, which holds regardless of the
+        // particular (γ, α) the perm-arg uses (as long as the trace
+        // was filled with the same ones — which fill_v2_traces does
+        // via derive_t_mem_challenges(pi_hash)).
+        let traces = fill_v2_traces(&w, [0u8; 32]);
 
         // V17 sub-trace: every per-row constraint zero on rows 0..6147.
         let v17_n = traces.v17[0].len();
@@ -979,14 +1172,18 @@ mod tests {
         }
 
         // T_MEM sub-trace: every per-row constraint zero AND final
-        // RP = WP (multiset equality).
+        // RP = WP (multiset equality).  Match the (γ, α) baked into
+        // the trace by fill_v2_traces — derived from the same dummy
+        // pi_hash this test passed in.
         let t_mem_n = traces.t_mem[0].len();
-        let gamma = F::from(0xC0FFEEu64);
-        let alpha = F::from(0xDEAD_BEEFu64);
+        let (gamma, alpha) = derive_t_mem_challenges(&[0u8; 32]);
         // n_active for our binding log: 2·(K·N + K·N + K·N + K·N + 768) = 2·(4·K·N + 768).
         let n_pairs = (K * N) + (K * N) + (K * N) + (K * N) + 768;
         let n_active = 2 * n_pairs;
-        for row in 0..(n_active - 1) {
+        // Sweep through every row including the active→padding
+        // boundary at row n_active - 1, where the new boundary
+        // constraint enforces RP_F_ext = WP_F_ext.
+        for row in 0..(t_mem_n - 1) {
             let cur: Vec<F> = (0..t_mem::WIDTH).map(|c| traces.t_mem[c][row]).collect();
             let nxt: Vec<F> = (0..t_mem::WIDTH).map(|c| traces.t_mem[c][row + 1]).collect();
             let cvals = t_mem::eval_per_row(&cur, &nxt, row, gamma, alpha);
@@ -995,11 +1192,12 @@ mod tests {
                     "v2 T_MEM: constraint {i} on row {row} not zero: {v:?}");
             }
         }
-        // Final consistency: RP[n_active-1] = WP[n_active-1].
+        // Final consistency: RP_F_ext[n_active-1] = WP_F_ext[n_active-1].
+        // Returns an ExtField element; honest trace ⇒ exactly zero.
         assert_eq!(
             t_mem::final_consistency(&traces.t_mem, n_active),
-            F::zero(),
-            "v2 T_MEM: multiset equality fails — read multiset ≠ write multiset"
+            t_mem::ExtField::zero(),
+            "v2 T_MEM: F_ext multiset equality fails — read multiset ≠ write multiset"
         );
     }
 
@@ -1091,7 +1289,8 @@ mod tests {
         use crate::ml_dsa_shake_absorb_multi_air;
 
         let w = synthesize_witness();
-        let traces = fill_v2_traces(&w);
+        let test_pi_hash = [0u8; 32];
+        let traces = fill_v2_traces(&w, test_pi_hash);
         let blowup = 4;  // small for fast test
 
         // T7 (INTT) — first instance only, the others are identical shape.
@@ -1157,8 +1356,8 @@ mod tests {
                 .expect("T_MEM LDE");
             let kk = t_mem::NUM_CONSTRAINTS;
             let coeffs: Vec<F> = (0..kk).map(|i| F::from((i + 1) as u64)).collect();
-            let gamma = F::from(0xC0FFEEu64);
-            let alpha = F::from(0xDEAD_BEEFu64);
+            // Match the (γ, α) baked into the trace by fill_v2_traces.
+            let (gamma, alpha) = derive_t_mem_challenges(&test_pi_hash);
             let (c_eval, info) = deep_ali_merge_t_mem(
                 &lde, &coeffs, F::zero(), n_trace, blowup, gamma, alpha,
             );
@@ -1186,7 +1385,7 @@ mod tests {
     #[test]
     fn fill_v2_traces_dimensions_match_layout() {
         let w = synthesize_witness();
-        let traces = fill_v2_traces(&w);
+        let traces = fill_v2_traces(&w, [0u8; 32]);
 
         assert_eq!(traces.v17.len(), v17_dim::N_COLS);
         assert_eq!(traces.v17[0].len(), v17_dim::N_ROWS_POW2);

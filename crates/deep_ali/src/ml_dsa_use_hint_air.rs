@@ -179,6 +179,31 @@ pub fn fill_trace(trace: &mut [Vec<F>], n_trace: usize, inputs: &[(u32, u32, u32
             trace[col_slack_bit(b)][row] = F::from(((slack >> b) & 1) as u64);
         }
     }
+
+    // Padding rows: fill with constraint-satisfying values so phi
+    // vanishes on all H points (gap #5b in the soundness audit).
+    //
+    // Strategy: r1 = adjusted_r1 = 0, h = wrap_pos = wrap_neg = 0,
+    // r0_sign = 0, delta = 0, adj_bits all 0, slack = M-1 with bits
+    // = binary(M-1).  Walking the constraints:
+    //   1. h boolean (0): 0
+    //   2. r0_sign boolean (0): 0
+    //   3. delta correctness: 0 - 0·(2·0 - 1) = 0
+    //   4-6. wrap booleans + mutex (all 0): 0
+    //   7. adjusted gate: 0 - 0 - 0 - M·0 + M·0 = 0
+    //   8. adj bit booleans (0): 0
+    //   9. adj reconstruction: 0 - 0 = 0
+    //  10. slack bit booleans (0/1): 0
+    //  11. slack reconstruction: (M-1) - (M-1) = 0
+    //  12. adj + slack + 1 - M: 0 + (M-1) + 1 - M = 0 ✓
+    let slack_pad = M - 1;
+    for row in inputs.len()..n_trace {
+        trace[COL_SLACK][row] = F::from(slack_pad as u64);
+        for b in 0..RANGE_BITS {
+            trace[col_slack_bit(b)][row] = F::from(((slack_pad >> b) & 1) as u64);
+        }
+        // All other columns remain zero from initial allocation.
+    }
 }
 
 // ─── Constraint evaluation ────────────────────────────────────────
