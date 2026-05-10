@@ -619,7 +619,7 @@ pub(crate) fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
         seed_z: V2_SEED_Z,
         coeff_commit_final: true,
         d_final: 1,
-        stir: false,
+        stir: crate::use_stir_from_env(),
         s0: V2_NUM_QUERIES,
         public_inputs_hash: Some(pi_hash),
     }

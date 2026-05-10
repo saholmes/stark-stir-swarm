@@ -68,6 +68,25 @@ pub mod stark_level {
     pub const SPONGE_CAPACITY: u32 = 1024;
 }
 
+/// Returns `true` if `BENCH_LDT` is set to `"stir"` (case-insensitive).
+///
+/// Centralised LDT mode toggle for all `DeepFriParams.stir` callsites
+/// across the workspace.  Paired with the per-bench env var the
+/// `aws-bench/run-matrix.sh` harness already exports.  Default is FRI
+/// (returns `false`) — preserves the historical behaviour of every
+/// callsite that previously hardcoded `stir: false`.
+///
+/// Callsites that historically hardcoded `stir: true` (e.g. the
+/// RSA-2048 PoK gate in `mmiyc-prover` / `mmiyc-verifier`) should NOT
+/// migrate to this helper unless the deployment explicitly wants
+/// the env-controlled toggle there too.
+pub fn use_stir_from_env() -> bool {
+    matches!(
+        std::env::var("BENCH_LDT").as_deref(),
+        Ok("stir") | Ok("STIR"),
+    )
+}
+
 use ark_poly::{
     EvaluationDomain,
     GeneralEvaluationDomain,
