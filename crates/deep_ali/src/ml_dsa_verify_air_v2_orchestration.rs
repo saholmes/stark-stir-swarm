@@ -619,7 +619,21 @@ pub(crate) fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
         seed_z: V2_SEED_Z,
         coeff_commit_final: true,
         d_final: 1,
-        stir: crate::use_stir_from_env(),
+        // FORCE FRI for v2 — `verify_one_sub_air_with_trace` in
+        // `sub_air_with_trace.rs:294` reads query positions from
+        // `fri_proof.queries[k].per_layer_refs[0].i`, which is a
+        // FRI-mode-only structure (STIR mode populates
+        // `stir_proximity_queries` instead and leaves
+        // `fri_proof.queries = vec![]`).  Running v2 in STIR mode
+        // would cause the trace-opening loop to iterate 0 times,
+        // silently skipping the per-query trace-cell checks — a
+        // soundness gap.  Until `verify_one_sub_air_with_trace`
+        // grows STIR-mode query handling, v2 must run on FRI.
+        // The simple-AIR scaling bench (which uses `deep_fri_verify`
+        // directly without an outer trace-opening flow) is
+        // unaffected and continues to support STIR via
+        // `BENCH_LDT={fri,stir}`.
+        stir: false,
         s0: V2_NUM_QUERIES,
         public_inputs_hash: Some(pi_hash),
     }
