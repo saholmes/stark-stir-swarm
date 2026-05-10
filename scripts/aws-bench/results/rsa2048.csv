@@ -1,0 +1,4 @@
+air,level,ext_field,hash,r,n_trace,blowup,prove_ms,verify_ms,proof_kib,peak_rss_mib,run_idx,ldt
+rsa2048-verify,L1,Fp6,SHA3-256,54,4096,32,142869,1.09,151.1,,1,stir
+rsa2048-verify,L1,Fp6,SHA3-256,54,4096,32,142386,1.08,151.1,,2,stir
+rsa2048-verify,L1,Fp6,SHA3-256,54,4096,32,142504,1.08,151.1,,3,stir

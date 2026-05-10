@@ -1,0 +1,17 @@
+## Matrix run started: 2026-05-10T09:31:59+00:00
+## Host: ip-172-31-34-85.us-east-2.compute.internal
+## CPU model: unknown
+## Cores detected: 16
+## RAYON_NUM_THREADS: 16
+## Memory: 123Gi
+## Rust: rustc 1.95.0 (59807616e 2026-04-14)
+## Git HEAD: 36adc55
+## Cells: 6
+## Runs per cell: 3
+## Cells:
+##   L1 Fp6 sha3-256 mldsa-44 q=2^40
+##   L1 Fp6 sha3-384 mldsa-44 q=2^65
+##   L1 Fp8 sha3-512 mldsa-44 q=2^90
+##   L3 Fp6 sha3-384 mldsa-65 q=2^65
+##   L3 Fp8 sha3-512 mldsa-65 q=2^90
+##   L5 Fp8 sha3-512 mldsa-87 q=2^65

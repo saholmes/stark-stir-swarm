@@ -1,0 +1,5 @@
+air,level,ext_field,hash,r,n_trace,blowup,prove_ms,verify_ms,proof_kib,peak_rss_mib,run_idx,ldt
+mldsa-v2-verify,L1,Fp6,SHA3-256,54,,32,36888,16.75,1511.9,,1,stir
+mldsa-v2-verify,L1,Fp6,SHA3-256,54,,32,36843,16.73,1511.9,,2,stir
+mldsa-v2-verify,L1,Fp6,SHA3-256,54,,32,36912,16.70,1511.9,,3,stir
+mldsa-v2-verify,L1,Fp6,SHA3-256,54,,32,36888,16.77,1511.9,,1,stir
