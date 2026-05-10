@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Hash-rollup STARK at trace sizes 2^16, 2^18, 2^20.
+# Hash-rollup STARK at trace sizes 2^16, 2^18 (was 2^16/18/20;
+# 2^20 OOM-thrashes the c5.4xlarge 32 GiB ceiling because the
+# hash-rollup trace is wide).  2^18 matches the paper's headline
+# trace size for the simple-AIR table.  Override via
+# `BENCH_HASH_ROLLUP_K` for higher-memory hosts.
 # Source: cairo-bench/examples/hash_rollup_scale.rs.
 
 set -euo pipefail
@@ -13,11 +17,13 @@ csv_init "hash-rollup"
 cd "$REPO_ROOT"
 LOG="$RESULTS_DIR/hash-rollup.run${RUN_IDX}.log"
 
-echo "[hash-rollup] running at trace sizes 16/18/20, blowup=$BLOWUP..."
+K_RANGE="${BENCH_HASH_ROLLUP_K:-16 18}"
+echo "[hash-rollup] running at trace sizes $K_RANGE, blowup=$BLOWUP..."
 echo "[hash-rollup] RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-auto}"
+# shellcheck disable=SC2086
 cargo run --release -p cairo-bench --example hash_rollup_scale \
     --features "parallel sha3-256" \
-    -- 16 18 20 \
+    -- $K_RANGE \
     2>&1 | tee "$LOG"
 
 # Parse output lines of form:
