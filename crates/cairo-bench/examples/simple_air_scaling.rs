@@ -135,7 +135,11 @@ fn main() {
         let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let proof_kib = deep_fri_proof_size_bytes(&proof, false) as f64 / 1024.0;
+        // The size fn gates STIR-specific fields (stir_coset_evals,
+        // stir_proximity_queries) behind its `stir` parameter — must
+        // match the DeepFriParams.stir flag the prover used or the
+        // reported size under-counts the STIR-mode proof.
+        let proof_kib = deep_fri_proof_size_bytes(&proof, use_stir) as f64 / 1024.0;
 
         // ── Verify (3 runs, median) ──
         let mut samples: Vec<f64> = Vec::with_capacity(3);

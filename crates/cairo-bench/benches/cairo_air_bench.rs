@@ -68,7 +68,7 @@ fn make_params(n0: usize) -> DeepFriParams {
         seed_z: SEED_Z,
         coeff_commit_final: true,
         d_final: 1,
-        stir: false,
+        stir: deep_ali::use_stir_from_env(),
         s0: NUM_QUERIES,
         public_inputs_hash: None,
     }
@@ -108,7 +108,9 @@ fn run_pipeline(air: AirType, n_trace: usize) -> (usize, f64, f64) {
 
     assert!(ok, "proof verification failed for {} n_trace={}", air.label(), n_trace);
 
-    (deep_fri_proof_size_bytes::<Ext>(&proof, false), prove_ms, verify_us)
+    // Match params.stir or the size fn under-counts STIR-mode
+    // (stir_coset_evals + stir_proximity_queries are gated).
+    (deep_fri_proof_size_bytes::<Ext>(&proof, deep_ali::use_stir_from_env()), prove_ms, verify_us)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

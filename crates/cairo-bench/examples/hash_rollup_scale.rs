@@ -109,7 +109,9 @@ fn run_one(log_n_trace: u32) {
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
     assert!(ok, "verify failed at log2(n_trace) = {log_n_trace}");
 
-    let in_mem_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, false);
+    // Must match params.stir or the size fn under-counts STIR-mode
+    // proofs (stir_coset_evals + stir_proximity_queries gated).
+    let in_mem_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, use_stir);
     let serialized   = serialize_proof(&proof);
     let json_bytes    = serialized.to_json_size();
     let bincode_bytes = serialized.to_bincode_compact().len();
