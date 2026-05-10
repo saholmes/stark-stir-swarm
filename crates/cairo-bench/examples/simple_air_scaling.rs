@@ -73,6 +73,15 @@ fn main() {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let r: usize = env::var("BENCH_QUERIES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+    // BENCH_LDT toggles the low-degree test between FRI (default) and
+    // STIR.  Both run at the same r per Johnson-bound NIST level; the
+    // structural wins (fewer Merkle paths per query, fewer rounds) live
+    // inside `deep_fri_prove` / `deep_fri_verify` and are switched on
+    // via the `stir: true` flag in DeepFriParams.
+    let use_stir: bool = matches!(
+        env::var("BENCH_LDT").as_deref(),
+        Ok("stir") | Ok("STIR"),
+    );
 
     let air = match air_name {
         "Fibonacci"       => AirType::Fibonacci,
@@ -82,8 +91,9 @@ fn main() {
     };
 
     let rayon_threads = rayon::current_num_threads();
+    let ldt_label = if use_stir { "stir" } else { "fri" };
     eprintln!(
-        "=== simple_air_scaling: AIR={air_name}, blowup={blowup}, r={r}, rayon_threads={rayon_threads} ==="
+        "=== simple_air_scaling: AIR={air_name}, blowup={blowup}, r={r}, ldt={ldt_label}, rayon_threads={rayon_threads} ==="
     );
 
     for k in log2_sizes {
@@ -112,7 +122,7 @@ fn main() {
             seed_z: 0xDEEFu64,
             coeff_commit_final: true,
             d_final: 1,
-            stir: false,
+            stir: use_stir,
             s0: r,
             public_inputs_hash: Some(pi_hash),
         };
@@ -142,7 +152,7 @@ fn main() {
         // tokens and lifts the (sha3, mldsa) Cargo features via env.
         println!(
             "simple_air_scaling air={air_name} log2_n={k} n_trace={n_trace} \
-             blowup={blowup} r={r} threads={rayon_threads} \
+             blowup={blowup} r={r} ldt={ldt_label} threads={rayon_threads} \
              prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} proof_kib={proof_kib:.1}"
         );
     }

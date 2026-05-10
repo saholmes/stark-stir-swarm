@@ -77,11 +77,17 @@ fn main() {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let r: usize = std::env::var("BENCH_QUERIES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+    // BENCH_LDT={fri,stir} toggles low-degree test (default: fri).
+    let use_stir: bool = matches!(
+        std::env::var("BENCH_LDT").as_deref(),
+        Ok("stir") | Ok("STIR"),
+    );
+    let ldt_label = if use_stir { "stir" } else { "fri" };
 
     let kk = rsa_stacked_constraints(&layout);
     eprintln!(
-        "trace cols: {}, rows: {}, constraints: {}, blowup: {}, r: {}",
-        layout.width, n_trace, kk, blowup, r
+        "trace cols: {}, rows: {}, constraints: {}, blowup: {}, r: {}, ldt: {}",
+        layout.width, n_trace, kk, blowup, r, ldt_label
     );
 
     // ── Prove ──
@@ -99,7 +105,7 @@ fn main() {
         seed_z: 0xDEEFu64,
         coeff_commit_final: true,
         d_final: 1,
-        stir: false,
+        stir: use_stir,
         s0: r,
         public_inputs_hash: Some(pi_hash),
     };

@@ -66,6 +66,11 @@ fn peak_rss_mb() -> u64 {
 fn peak_rss_mb() -> u64 { 0 }
 
 fn run_one(log_n_trace: u32) {
+    // BENCH_LDT={fri,stir} toggles low-degree test (default: fri).
+    let use_stir = matches!(
+        std::env::var("BENCH_LDT").as_deref(),
+        Ok("stir") | Ok("STIR"),
+    );
     let n_trace = 1usize << log_n_trace;
     let n0 = n_trace * BLOWUP;
     let domain = FriDomain::new_radix2(n0);
@@ -90,7 +95,7 @@ fn run_one(log_n_trace: u32) {
         seed_z: SEED_Z,
         coeff_commit_final: true,
         d_final: 1,
-        stir: false,
+        stir: use_stir,
         s0: NUM_QUERIES,
         public_inputs_hash: None,
     };

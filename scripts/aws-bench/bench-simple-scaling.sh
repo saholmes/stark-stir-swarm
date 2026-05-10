@@ -21,16 +21,16 @@ LEVEL_LABEL="${BENCH_LEVEL_LABEL:-L1}"
 EXT_LABEL="${BENCH_EXT_LABEL:-Fp6}"
 HASH_LABEL="$(echo "$SHA3" | tr '[:lower:]' '[:upper:]' | sed 's/SHA3-/SHA3-/')"
 
-# The set of trace sizes to sweep.  Default capped at $2^{19}$ to stay
-# within the c5.4xlarge $32$\,GiB ceiling: at $T = 2^{20}$+ the wider
-# AIRs (PoseidonChain width 12, RegisterMachine width 8) approach the
-# OOM boundary because peak memory scales as
+# Trace-size sweep, default 11..24 (full FRI-paper Table 5 range).
+# Memory profile per AIR scales as
 # $T \times \mathrm{blowup} \times \max(\mathrm{width} \times 8\,B,
-# \mathrm{ext\_size}, \mathrm{hash\_size})$ and crosses 30\,GiB before
-# $k = 21$.  $11..19$ is $8.5$ doublings — enough for a clean
-# linear-in-$T$ regression.  Override via `BENCH_K_RANGE` for higher-
-# memory hosts (e.g. r5.4xlarge / r5.8xlarge).
-K_RANGE="${BENCH_K_RANGE:-11 12 13 14 15 16 17 18 19}"
+# \mathrm{ext\_size}, \mathrm{hash\_size})$.  At T=2^24 with PoseidonChain
+# (width 12) peak memory is ~96 GiB before working temporaries — fits
+# r8g.4xlarge / r5.4xlarge / r5.8xlarge (128 GiB) but OOM-thrashes on
+# c5.4xlarge (32 GiB).  Cap the range explicitly via `BENCH_K_RANGE`
+# for memory-constrained hosts: e.g. `BENCH_K_RANGE="11 12 13 14 15
+# 16 17 18 19"` for c5.4xlarge.
+K_RANGE="${BENCH_K_RANGE:-11 12 13 14 15 16 17 18 19 20 21 22 23 24}"
 
 # r (NUM_QUERIES) is determined by the NIST PQ Level, NOT by the hash
 # width.  Paper Table 5: r ∈ {54, 79, 105} for L1/L3/L5.  At L1 with
