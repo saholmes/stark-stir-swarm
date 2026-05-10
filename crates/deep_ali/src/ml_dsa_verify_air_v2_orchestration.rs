@@ -665,7 +665,15 @@ fn verify_one_sub_air(
 ) -> Result<(), String> {
     let n0 = n_trace * blowup;
     let proof = deserialize_fri(proof_bytes)?;
-    let params = v2_fri_params(n0, pi_hash);
+    // Auto-detect LDT mode from the proof structure rather than the
+    // env: WASM has no env access, so `v2_fri_params` (which calls
+    // `use_stir_from_env`) returns `stir = false` unconditionally
+    // in the browser even when the prover ran STIR.  The proof
+    // itself carries this metadata: `stir_coset_evals.is_some()`
+    // iff STIR was used.  Override the env-derived default with
+    // the proof-derived truth.
+    let mut params = v2_fri_params(n0, pi_hash);
+    params.stir = proof.stir_coset_evals.is_some();
     if deep_fri_verify::<Ext>(&params, &proof) {
         Ok(())
     } else {
