@@ -202,7 +202,33 @@ fn eval_poly_at_ext<E: TowerField>(coeffs: &[F], z: E) -> E {
     E::eval_base_poly(coeffs, z)
 }
 
-fn compute_q_layer_ext<E: TowerField + Send + Sync>(
+/// Compute the OOD quotient `Q(X) = (f(X) − f(z)) / (X − z)` and the OOD
+/// value `f(z)` for a polynomial `f` given by its LDE evaluations.
+///
+/// **Made public 2026-05-10** (was private) to support the v2 perm-arg
+/// rebuild's cross-trace consistency mechanism (see
+/// `project_mmiyc_v2_soundness_gap.md`, Sessions 3-8 plan).
+///
+/// Inputs:
+/// - `f_l: &[F]` — LDE evaluations of f on a radix-2 domain (base field).
+/// - `z: E` — out-of-domain evaluation point (extension field).
+/// - `omega: F` — generator of the LDE domain.
+///
+/// Returns `(Q_evals, f(z))` where `Q_evals` are the quotient
+/// polynomial's evaluations on the same LDE domain (extension-field
+/// valued).  FRI-proving `Q_evals` is low-degree (degree < n_trace − 1
+/// in coefficient form) binds the claimed `f(z)` to the committed `f`
+/// via Schwartz-Zippel: if `f(z)` is wrong, `Q` cannot be a polynomial
+/// of degree < n_trace − 1 (the division `(f(X) − f̃(z))/(X − z)` would
+/// not be exact).
+///
+/// **Cross-trace soundness use case:** given two FRI-committed
+/// polynomials `f` and `g`, evaluate both at the same FS-derived ζ
+/// (via this function on each LDE).  Schwartz-Zippel: if `f(ζ) = g(ζ)`,
+/// then `f ≡ g` as polynomials of degree `< n` with probability
+/// `≥ 1 − n/|F_ext|`.  At F_ext = Fp⁶, |F_ext| ≈ 2³⁸⁴, so for n ≈ 2¹⁴
+/// the soundness slack is ≈ 2⁻³⁷⁰ — well below per-level ε targets.
+pub fn compute_q_layer_ext<E: TowerField + Send + Sync>(
     f_l: &[F],
     z: E,
     omega: F,
@@ -1394,6 +1420,43 @@ fn absorb_ext<E: TowerField>(tr: &mut Transcript, v: E) {
 // =============================================================================
 // ── Transcript builder — generic over E : TowerField ──
 // =============================================================================
+
+/// **Session 8 (2026-05-12) — v2 perm-arg rebuild support.**
+///
+/// Replicate the FRI prover's Fiat-Shamir transcript exactly up to
+/// the point where `z_ext` is sampled (at `fri.rs:1469` in
+/// `fri_build_transcript`).  Returns the same z_ext the prover used
+/// for OOD evaluation at layer 0.
+///
+/// **Use case:** the v2 perm-arg rebuild's public-input OOD bindings
+/// (L2c: public.h ↔ UseHint COL_H; L5: public a_ntt/c_ntt/t1d_ntt/
+/// w_approx_ntt ↔ V17 EQ columns) need the verifier to evaluate a
+/// known public polynomial at the SAME z_ext as the BCC.  This
+/// helper unblocks that — without it, the verifier had no way to
+/// derive z_ext since it's FS-derived from a transcript including
+/// the polynomial's `root_f0`.
+///
+/// Soundness: the function is deterministic in
+/// `(params, proof.n0, proof.root_f0)`, exactly matching the
+/// prover's transcript flow.  Any tampering with `root_f0` produces
+/// a different z_ext, which makes the OOD value mismatch detectable.
+pub fn derive_z_ext_for_proof<E: TowerField>(
+    proof: &DeepFriProof<E>,
+    params: &DeepFriParams,
+) -> E {
+    let mut tr = Transcript::new_matching_hash(b"FRI/FS");
+    bind_statement_to_transcript::<E>(
+        &mut tr,
+        &params.schedule,
+        proof.n0,
+        params.seed_z,
+        params.coeff_commit_final,
+        params.stir,
+        params.public_inputs_hash,
+    );
+    tr.absorb_bytes(&proof.root_f0);
+    challenge_ext::<E>(&mut tr, b"z_fp3")
+}
 
 pub fn fri_build_transcript<E: TowerField>(
     f0: Vec<F>,
@@ -3565,6 +3628,115 @@ mod tests {
     #[test]
     fn test_stir_ood_fold_consistency() {
         test_stir_ood_fold_consistency_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  v2 perm-arg rebuild — Session 3 foundation
+    //  OOD quotient round-trip test for `compute_q_layer_ext`
+    // ────────────────────────────────────────────────────────────────
+
+    /// Round-trip test for the now-public `compute_q_layer_ext`:
+    /// given a random polynomial `f` of degree `< n`, its OOD value
+    /// `f(z)` returned by `compute_q_layer_ext` must equal direct
+    /// evaluation, and the quotient `Q(x) = (f(x)-f(z))/(x-z)` must
+    /// satisfy `Q(x)·(x-z) = f(x) - f(z)` at every LDE point.
+    ///
+    /// This validates that `compute_q_layer_ext` can serve as the
+    /// foundation for the v2 perm-arg rebuild's cross-trace OOD-eval
+    /// machinery (see `project_mmiyc_v2_soundness_gap.md` Session 3 plan).
+    fn test_q_layer_ext_round_trip_for<E: TowerField + Send + Sync>() {
+        let mut rng = StdRng::seed_from_u64(2026_05_10);
+        let n = 64usize;
+        let degree = n - 1;
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let f_l: Vec<TestField> = dom.fft(poly.coeffs());
+        let omega = dom.group_gen();
+
+        // Choose an out-of-domain z in F_ext that doesn't coincide
+        // with any LDE point.
+        let z_comps: Vec<TestField> = (0..E::DEGREE)
+            .map(|i| TestField::from((9999 + i as u64 * 7) as u64))
+            .collect();
+        let z = E::from_fp_components(&z_comps).unwrap();
+
+        let (q_evals, fz) = compute_q_layer_ext::<E>(&f_l, z, omega);
+
+        // 1. fz must equal direct evaluation poly(z).
+        let coeffs_base = poly.coeffs();
+        let mut direct_fz = E::zero();
+        for k in (0..coeffs_base.len()).rev() {
+            direct_fz = direct_fz * z + E::from_fp(coeffs_base[k]);
+        }
+        assert_eq!(
+            fz, direct_fz,
+            "compute_q_layer_ext: f(z) ≠ direct polynomial evaluation"
+        );
+
+        // 2. Quotient identity Q(x_i) · (x_i - z) = f(x_i) - fz at every LDE point.
+        let omega_ext = E::from_fp(omega);
+        let mut x = E::one();
+        for i in 0..n {
+            let lhs = q_evals[i] * (x - z);
+            let rhs = E::from_fp(f_l[i]) - fz;
+            assert_eq!(
+                lhs, rhs,
+                "compute_q_layer_ext: quotient identity violated at LDE position {i}"
+            );
+            x = x * omega_ext;
+        }
+    }
+
+    #[test]
+    fn test_q_layer_ext_round_trip_cube() {
+        test_q_layer_ext_round_trip_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    /// Tampered round-trip: if the claimed `fz` is wrong, the
+    /// quotient identity must fail at most LDE points (Schwartz-
+    /// Zippel).  This is the soundness foundation for using
+    /// `compute_q_layer_ext` to bind committed polynomials at OOD ζ.
+    #[test]
+    fn test_q_layer_ext_tampered_fz_breaks_identity() {
+        type E = CubeExt<GoldilocksCubeConfig>;
+        let mut rng = StdRng::seed_from_u64(2026_05_11);
+        let n = 64usize;
+        let degree = n - 1;
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let f_l: Vec<TestField> = dom.fft(poly.coeffs());
+        let omega = dom.group_gen();
+
+        let z_comps: Vec<TestField> = (0..E::DEGREE)
+            .map(|i| TestField::from((9999 + i as u64 * 7) as u64))
+            .collect();
+        let z = E::from_fp_components(&z_comps).unwrap();
+
+        let (q_evals, fz) = compute_q_layer_ext::<E>(&f_l, z, omega);
+
+        // Tamper fz by adding 1 in F_ext.
+        let fz_tampered = fz + E::one();
+
+        // The quotient identity should now fail at every LDE point
+        // (since both fz_correct and fz_tampered are constants, the
+        // identity `Q·(x-z) = f - fz_tampered` would only hold at
+        // points where `fz_tampered = fz`, which is nowhere).
+        let omega_ext = E::from_fp(omega);
+        let mut x = E::one();
+        let mut violation_count = 0;
+        for i in 0..n {
+            let lhs = q_evals[i] * (x - z);
+            let rhs = E::from_fp(f_l[i]) - fz_tampered;
+            if lhs != rhs { violation_count += 1; }
+            x = x * omega_ext;
+        }
+        assert_eq!(
+            violation_count, n,
+            "tampered fz must violate quotient identity at every LDE point \
+             (got {violation_count} / {n} violations)"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────

@@ -1606,3 +1606,9 @@ pub mod ml_dsa_intt_via_t7;
 pub mod ml_dsa_verify_air_v2_layout;
 pub mod ml_dsa_verify_air_v2_orchestration;
 pub mod sub_air_with_trace;
+/// v2 perm-arg rebuild foundation (Session 4): FRI commit on a
+/// sub-AIR's binding cells, packed into a single polynomial.  The
+/// OOD-eval cross-trace consistency check (Session 5+) will build
+/// on top of this.  See module docstring + memory entry
+/// `project_mmiyc_v2_soundness_gap.md`.
+pub mod binding_cells_commit;

@@ -188,6 +188,76 @@ fn deserialize_fri(bytes: &[u8]) -> Result<DeepFriProof<Ext>, String> {
         .map_err(|e| format!("deserialize FRI: {e:?}"))
 }
 
+/// Extract the LDE query positions from a FRI or STIR proof.
+///
+/// In FRI mode, query positions are stored as `queries[k].per_layer_refs[0].i`
+/// (the f0-layer index = LDE position).  In STIR mode, the proof's
+/// `queries` vector is empty; the proximity-test queries live in
+/// `stir_proximity_queries[k].raw_query_index`.  This helper unifies
+/// both modes so the trace-opening loop in `prove_one_sub_air_*` works
+/// in either LDT mode.
+///
+/// Returns `Err` if neither source has any queries (catches the
+/// silent-skip soundness gap that the empty-queries guard was added
+/// for — but allows STIR proofs through cleanly).
+fn extract_query_positions(fri_proof: &DeepFriProof<Ext>) -> Result<Vec<usize>, String> {
+    if !fri_proof.queries.is_empty() {
+        Ok(fri_proof.queries.iter().map(|q| q.per_layer_refs[0].i).collect())
+    } else if let Some(prox) = &fri_proof.stir_proximity_queries {
+        if prox.is_empty() {
+            return Err("sub-air verify: both FRI queries and STIR proximity queries are empty \
+                        — no per-query trace-cell soundness check possible".into());
+        }
+        Ok(prox.iter().map(|p| p.raw_query_index).collect())
+    } else {
+        Err("sub-air verify: FRI queries vector is empty AND no STIR proximity queries present \
+             — proof structure is invalid or both LDT modes were skipped".into())
+    }
+}
+
+/// Extract the (LDE position, c_eval value) for query `k` from a
+/// FRI or STIR proof.  Used by `verify_one_sub_air_with_trace`'s
+/// per-query constraint check: `c_eval(x) · Z_H(x) == Σ α_j Φ_j(trace[x], x)`.
+///
+/// In FRI mode: `c_eval(x) = queries[k].per_layer_payloads[0].f_val` (Ext).
+///
+/// In STIR mode: `c_eval(x) = Ext::from_fp(stir_proximity_queries[k]
+/// .fiber_f_vals[j])` where `j = (raw_query_index - base_index) /
+/// n_next`.  Both arrays are bound to `proof.root_f0` via the f0
+/// packed-Merkle commitment in `f0_packed_opening`, which the
+/// outer `deep_fri_verify` separately checks.  Schwartz-Zippel
+/// soundness for the per-query constraint check is identical in
+/// both modes.
+fn extract_query_position_and_c_eval(
+    fri_proof: &DeepFriProof<Ext>,
+    k: usize,
+    n0: usize,
+    m0: usize,
+) -> Result<(usize, Ext), String> {
+    if !fri_proof.queries.is_empty() {
+        let q = &fri_proof.queries[k];
+        let pos = q.per_layer_refs[0].i;
+        let c_eval = q.per_layer_payloads[0].f_val;
+        Ok((pos, c_eval))
+    } else if let Some(prox) = &fri_proof.stir_proximity_queries {
+        let pq = &prox[k];
+        let pos = pq.raw_query_index;
+        let n_next = n0 / m0;
+        let base_index = pos % n_next;
+        let j_for_raw = (pos - base_index) / n_next;
+        if j_for_raw >= pq.fiber_f_vals.len() {
+            return Err(format!(
+                "STIR query {k}: fiber index {j_for_raw} out of bounds (fiber len = {})",
+                pq.fiber_f_vals.len()
+            ));
+        }
+        let c_eval = Ext::from_fp(pq.fiber_f_vals[j_for_raw]);
+        Ok((pos, c_eval))
+    } else {
+        Err(format!("query {k}: no FRI nor STIR query data available"))
+    }
+}
+
 // ─── Prove ────────────────────────────────────────────────────────
 
 /// FS-derive constraint composition coefficients α_j ∈ F from
@@ -255,25 +325,21 @@ pub fn prove_one_sub_air_with_trace(
     let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
 
     // 4. Open trace at each queried position (cur + nxt for eval_per_row).
-    let n_queries = fri_proof.queries.len();
+    //    `extract_query_positions` returns positions from FRI mode's
+    //    `queries[k].per_layer_refs[0].i` or STIR mode's
+    //    `stir_proximity_queries[k].raw_query_index`.
+    let positions = extract_query_positions(&fri_proof)
+        .expect("FRI/STIR proof has at least one query position");
+    let n_queries = positions.len();
     let mut openings_cur = Vec::with_capacity(n_queries);
     let mut openings_nxt = Vec::with_capacity(n_queries);
     let width = lde.len();
-    for k in 0..n_queries {
-        let pos = fri_proof.queries[k].per_layer_refs[0].i;
+    for &pos in &positions {
         let nxt_pos = (pos + blowup) % n0;
-
         let cur_cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
         let nxt_cells: Vec<F> = (0..width).map(|c| lde[c][nxt_pos]).collect();
-
-        openings_cur.push(TraceOpening {
-            cells: cur_cells,
-            merkle: tree.open(pos),
-        });
-        openings_nxt.push(TraceOpening {
-            cells: nxt_cells,
-            merkle: tree.open(nxt_pos),
-        });
+        openings_cur.push(TraceOpening { cells: cur_cells, merkle: tree.open(pos) });
+        openings_nxt.push(TraceOpening { cells: nxt_cells, merkle: tree.open(nxt_pos) });
     }
 
     SubAirProofWithTrace {
@@ -282,6 +348,120 @@ pub fn prove_one_sub_air_with_trace(
         openings_cur,
         openings_nxt,
     }
+}
+
+/// Variant of `prove_one_sub_air_with_trace` that returns the LDE and
+/// the committed Merkle tree alongside the proof.  Use this when the
+/// caller needs to open *additional* trace rows (e.g. cross-region
+/// bindings for F2b) at known positions after the FRI proof is built.
+///
+/// The returned tree shares its commitment with `proof.trace_root`,
+/// so subsequent `tree.open(pos)` calls produce openings the verifier
+/// can authenticate via `verify_trace_row_at_raw_position`.
+pub fn prove_one_sub_air_with_trace_capturing(
+    trace: &[Vec<F>],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    num_constraints: usize,
+    c_eval_fn: impl FnOnce(&[Vec<F>], usize, usize, &[F]) -> Vec<F>,
+    fri_params_fn: impl FnOnce(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> (SubAirProofWithTrace, Vec<Vec<F>>, MerkleTreeChannel) {
+    let n0 = n_trace * blowup;
+    let lde = crate::trace_import::lde_trace_columns(trace, n_trace, blowup)
+        .expect("LDE construction");
+
+    let (trace_root, tree) = commit_trace_lde(&lde, domain_sep);
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &trace_root, domain_sep);
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    let c_eval = c_eval_fn(&lde, n_trace, blowup, &comb_coeffs);
+    let domain = FriDomain::new_radix2(n0);
+    let params = fri_params_fn(n0, aug_pi_hash);
+    let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+
+    let positions = extract_query_positions(&fri_proof)
+        .expect("FRI/STIR proof has at least one query position");
+    let mut openings_cur = Vec::with_capacity(positions.len());
+    let mut openings_nxt = Vec::with_capacity(positions.len());
+    let width = lde.len();
+    for &pos in &positions {
+        let nxt_pos = (pos + blowup) % n0;
+        let cur_cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
+        let nxt_cells: Vec<F> = (0..width).map(|c| lde[c][nxt_pos]).collect();
+        openings_cur.push(TraceOpening { cells: cur_cells, merkle: tree.open(pos) });
+        openings_nxt.push(TraceOpening { cells: nxt_cells, merkle: tree.open(nxt_pos) });
+    }
+
+    let proof = SubAirProofWithTrace {
+        fri_proof_bytes: serialize_fri(&fri_proof),
+        trace_root,
+        openings_cur,
+        openings_nxt,
+    };
+    (proof, lde, tree)
+}
+
+/// Open the trace at raw row `raw_row` (LDE position `raw_row * blowup`).
+/// Returns a `TraceOpening` the verifier can authenticate against
+/// `trace_root` via `verify_trace_row_at_raw_position`.
+///
+/// Used for F2b cross-region bindings — opens specific cells in
+/// committed sub-traces so the verifier can check cross-region
+/// equality without re-running the FRI.
+pub fn open_trace_row_at_raw_position(
+    lde: &[Vec<F>],
+    tree: &MerkleTreeChannel,
+    raw_row: usize,
+    blowup: usize,
+) -> TraceOpening {
+    let pos = raw_row * blowup;
+    let width = lde.len();
+    let cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
+    TraceOpening {
+        cells,
+        merkle: tree.open(pos),
+    }
+}
+
+/// Verify a `TraceOpening` produced by `open_trace_row_at_raw_position`.
+///
+/// Checks: (a) opening's Merkle index equals `raw_row * blowup`,
+/// (b) the cells hash to the committed leaf, and (c) the Merkle
+/// path authenticates against `trace_root` (using the same cfg/tag
+/// the prover used).  Returns the cells on success.
+pub fn verify_trace_row_at_raw_position<'a>(
+    opening: &'a TraceOpening,
+    trace_root: &[u8; HASH_BYTES],
+    raw_row: usize,
+    blowup: usize,
+    n_lde: usize,
+    width: usize,
+    domain_sep: &[u8],
+) -> Result<&'a [F], String> {
+    let pos = raw_row * blowup;
+    if opening.merkle.index != pos {
+        return Err(format!(
+            "cross-binding opening: Merkle index {} ≠ expected raw_row·blowup = {pos}",
+            opening.merkle.index
+        ));
+    }
+    if opening.cells.len() != width {
+        return Err(format!(
+            "cross-binding opening: cells len {} ≠ expected width {width}",
+            opening.cells.len()
+        ));
+    }
+    let cfg = trace_tree_cfg(n_lde);
+    let tag = trace_tree_tag(n_lde, width, domain_sep);
+    let leaf = compute_leaf_hash(&cfg, pos, &opening.cells);
+    if leaf != opening.merkle.leaf {
+        return Err("cross-binding opening: cells hash ≠ committed leaf".into());
+    }
+    if !MerkleTreeChannel::verify_opening(&cfg, *trace_root, &opening.merkle, &tag) {
+        return Err("cross-binding opening: Merkle path failed".into());
+    }
+    Ok(&opening.cells)
 }
 
 // ─── Verify ───────────────────────────────────────────────────────
@@ -312,6 +492,18 @@ pub fn verify_one_sub_air_with_trace(
         return Err("FRI verify rejected".into());
     }
 
+    // 1b. Extract query positions from FRI or STIR proof.  Returns
+    // `Err` if both `queries` and `stir_proximity_queries` are empty
+    // — defense-in-depth against a malformed proof that would
+    // silently skip ALL per-query trace-cell soundness checks.
+    //
+    // Both FRI mode (`fri_proof.queries[k].per_layer_refs[0].i`) and
+    // STIR mode (`fri_proof.stir_proximity_queries[k].raw_query_index`)
+    // are now supported transparently.
+    let positions = extract_query_positions(&fri_proof)?;
+    let n_queries = positions.len();
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+
     // 2. Recompute combination coefficients (must match prover's α).
     let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
     if comb_coeffs.len() != num_constraints {
@@ -322,7 +514,6 @@ pub fn verify_one_sub_air_with_trace(
     }
 
     // 3. Per-query: verify trace openings + check c_eval · Z_H = phi.
-    let n_queries = fri_proof.queries.len();
     if proof.openings_cur.len() != n_queries || proof.openings_nxt.len() != n_queries {
         return Err(format!(
             "trace openings count mismatch: cur={} nxt={} expected={n_queries}",
@@ -334,7 +525,10 @@ pub fn verify_one_sub_air_with_trace(
     let tag = trace_tree_tag(n0, width, domain_sep);
 
     for k in 0..n_queries {
-        let pos = fri_proof.queries[k].per_layer_refs[0].i;
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(
+            &fri_proof, k, n0, m0,
+        )?;
+        debug_assert_eq!(pos, positions[k]);
         let nxt_pos = (pos + blowup) % n0;
 
         // 3a. Cell-count + index sanity.
@@ -415,7 +609,8 @@ pub fn verify_one_sub_air_with_trace(
 
         let pos_f = lde_omega_pow(pos, n0);
         let z_h = z_h_at(pos_f, n_trace);
-        let c_eval_at_pos = fri_proof.queries[k].per_layer_payloads[0].f_val;
+        // c_eval_at_pos was extracted at loop top via
+        // `extract_query_position_and_c_eval` (FRI or STIR aware).
         let lhs = c_eval_at_pos * Ext::from_fp(z_h);
         let rhs = Ext::from_fp(phi_at_pos);
 

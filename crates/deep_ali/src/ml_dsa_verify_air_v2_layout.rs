@@ -13,15 +13,13 @@
 //! region (`ml_dsa_transcript`) drives the col count up; the v1.7
 //! polynomial-arithmetic region drives the row count up.
 //!
-//! v2 instead composes **5 separate FRI sub-proofs**, each over a
+//! v2 composes **separate FRI/STIR sub-proofs**, each over a
 //! tightly-fitted trace.  PI-hash binding (Fiat-Shamir feeding the
-//! same public-input digest into every sub-proof) makes them
-//! collectively sound: the verifier accepts iff every sub-proof
-//! passes AND every sub-proof commits to the same `pi_hash`, which
-//! includes all shared values (e.g., `w_approx_ntt[k]` referenced
-//! in both v1.7's poly-arithmetic region AND T-INTT's NTT regions).
+//! same public-input digest into every sub-proof) plus F2b L0-L4
+//! cross-binding Merkle inclusion proofs make them collectively
+//! sound.
 //!
-//! ### Sub-proof inventory
+//! ### Sub-proof inventory (after T_MEM removal, 2026-05-10)
 //!
 //! | Sub-proof | Trace dims    | LDE @ b=32  | What it proves                                        |
 //! |-----------|---------------|-------------|-------------------------------------------------------|
@@ -29,12 +27,10 @@
 //! | INTT      | 4096 × 260    | ~34 M cells | 4× chained NTT proving `w_approx[k]` → `w_approx_ntt[k]` |
 //! | COEFF     | 1024 × ~80    | ~2.6 M      | per-coefficient (Decompose + UseHint + W1Encode) chain |
 //! | TRANSCRIPT| 256 × 11520   | ~94 M       | T-Transcript SHAKE-256(µ ‖ w1bytes) → c̃' |
-//! | T_MEM     | 16384 × 8     | ~4 M        | cross-region equality bindings                        |
 //!
-//! Total LDE: ~218 M cells = ~1.7 GiB working set across the 5
-//! sub-proofs.  Total prove time projected: **~50–70 s** (FFT
-//! dominated; the 5 proofs run sequentially or in parallel
-//! depending on rayon scheduling).
+//! Plus F2b cross-binding Merkle inclusion proofs (L0–L4) at known
+//! row positions in each sub-trace, replacing the vacuous T_MEM
+//! perm-arg that was deleted on 2026-05-10.
 //!
 //! ### PI-hash binding (shared values)
 //!
@@ -123,22 +119,9 @@ pub mod transcript {
     pub const N_COLS:        usize = ROUND_WIDTH;                      // 11520
 }
 
-/// T_MEM: permutation argument trace covering all 4 cross-region
-/// binding sets.  ~9 728 active entries; pad to next pow2.
-pub mod t_mem {
-    use crate::ml_dsa::params::{K, N};
-    use crate::permutation_argument::WIDTH;
-
-    /// Bindings:
-    /// - B1: w_approx[k][i] ↔ Decompose r-input.  K·N = 1024 pairs.
-    /// - B2: (r1, r0_sign) ↔ UseHint inputs.  2·K·N = 2048 pairs.
-    /// - B3: adjusted_r1 ↔ W1Encode input.  K·N = 1024 pairs.
-    /// - B4: w1bytes ↔ Transcript absorb input.  768 pairs (1 byte each).
-    pub const TOTAL_PAIRS: usize = (K * N) + (2 * K * N) + (K * N) + 768; // 4864
-    pub const N_ROWS_ACTIVE: usize = 2 * TOTAL_PAIRS;  // (read + write per pair)
-    pub const N_ROWS_POW2:   usize = N_ROWS_ACTIVE.next_power_of_two();
-    pub const N_COLS:        usize = WIDTH;                            // 8
-}
+// `t_mem` layout module removed 2026-05-10 — T_MEM deleted after
+// F2b L0-L4 cross-binding superseded its (vacuous) role.  See
+// project_mmiyc_v2_soundness_gap.md.
 
 // ─── Aggregate v2 layout ──────────────────────────────────────────
 
@@ -158,15 +141,14 @@ impl V2Layout {
     pub const fn n_lde_intt(&self)       -> usize { intt::N_ROWS_POW2 * self.blowup }
     pub const fn n_lde_coeff(&self)      -> usize { coeff_chain::N_ROWS_POW2 * self.blowup }
     pub const fn n_lde_transcript(&self) -> usize { transcript::N_ROWS_POW2 * self.blowup }
-    pub const fn n_lde_t_mem(&self)      -> usize { t_mem::N_ROWS_POW2     * self.blowup }
+    // n_lde_t_mem removed 2026-05-10 — T_MEM deleted from v2.
 
-    /// Total LDE cells across all 5 sub-proofs.
+    /// Total LDE cells across all v2 sub-proofs (post T_MEM removal).
     pub const fn total_lde_cells(&self) -> usize {
           self.n_lde_v17()        * v17::N_COLS
         + self.n_lde_intt()       * intt::N_COLS
         + self.n_lde_coeff()      * coeff_chain::N_COLS
         + self.n_lde_transcript() * transcript::N_COLS
-        + self.n_lde_t_mem()      * t_mem::N_COLS
     }
 }
 
@@ -206,7 +188,7 @@ mod tests {
         assert!(intt::N_ROWS_ACTIVE <= intt::N_ROWS_POW2);
         assert!(coeff_chain::N_ROWS_ACTIVE <= coeff_chain::N_ROWS_POW2);
         assert!(transcript::N_ROWS_ACTIVE <= transcript::N_ROWS_POW2);
-        assert!(t_mem::N_ROWS_ACTIVE <= t_mem::N_ROWS_POW2);
+        // t_mem dimensions assert removed 2026-05-10 — T_MEM deleted from v2.
 
         // Total LDE cells across the 5 sub-proofs at blowup=32.
         // L1 (mldsa-44): ~253 M cells = ~2 GiB working set.
@@ -235,9 +217,6 @@ mod tests {
         eprintln!("  TRANSCRIPT : {:>10} cells ({:.1} MiB)",
             l.n_lde_transcript() * transcript::N_COLS,
             (l.n_lde_transcript() * transcript::N_COLS * 8) as f64 / 1024.0 / 1024.0);
-        eprintln!("  T_MEM      : {:>10} cells ({:.1} MiB)",
-            l.n_lde_t_mem() * t_mem::N_COLS,
-            (l.n_lde_t_mem() * t_mem::N_COLS * 8) as f64 / 1024.0 / 1024.0);
         eprintln!("  TOTAL      : {:>10} cells ({:.1} MiB)",
             total, (total * 8) as f64 / 1024.0 / 1024.0);
     }
@@ -252,21 +231,6 @@ mod tests {
         assert_ne!(PI_HASH_DOMAIN_V2, b"mmiyc/v1/ml-dsa-pok/public-inputs");
     }
 
-    #[test]
-    fn t_mem_total_pairs_matches_v2_bindings() {
-        // 4 binding sets × specified counts:
-        //   B1: K·N      (w_approx[k][i] ↔ Decompose input)
-        //   B2: 2·K·N    ((r1, r0_sign) ↔ UseHint inputs)
-        //   B3: K·N      (adjusted_r1 ↔ W1Encode input)
-        //   B4: 768      (w1bytes ↔ Transcript bytes)
-        let expected = (K * N) + (2 * K * N) + (K * N) + 768;
-        assert_eq!(t_mem::TOTAL_PAIRS, expected);
-        // 4·K·N + 768: 4864 (L1) / 6912 (L3) / 8960 (L5).
-        #[cfg(feature = "mldsa-44")]
-        assert_eq!(t_mem::TOTAL_PAIRS, 4864);
-        #[cfg(feature = "mldsa-65")]
-        assert_eq!(t_mem::TOTAL_PAIRS, 6912);
-        #[cfg(feature = "mldsa-87")]
-        assert_eq!(t_mem::TOTAL_PAIRS, 8960);
-    }
+    // t_mem_total_pairs_matches_v2_bindings test removed 2026-05-10 —
+    // T_MEM no longer exists in v2 after F2b L0-L4 superseded it.
 }

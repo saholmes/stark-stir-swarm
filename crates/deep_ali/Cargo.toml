@@ -64,6 +64,13 @@ sha2 = "0.10"
 # end-to-end, the consumers will move to in-circuit hashing and
 # this dep can be relegated to dev only.
 sha3 = "0.10"
+# Wire-format compression for V2ProofReal — exploits the ~4×
+# structural redundancy in F2b row openings (Merkle path sibling
+# hashes are widely shared across K·N contiguous-stride openings
+# per binding leg).  Empirically zstd -19 gives 4.0× compression on
+# v2 proofs at L3, blowup=4 (48 MB → 12 MB).  Adds ~10-15 ms verify
+# decompress time.  No structural changes to the proof.
+zstd = "0.13"
 
 
 
