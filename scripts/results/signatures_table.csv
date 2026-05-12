@@ -1,0 +1,13 @@
+scheme,nist_level,hash,ext_field,ldt,prove_ms,verify_ms,proof_kib,note
+RSA-2048,L1,sha3-256,Fp6,stir,157808,0.54,151.1,ok
+RSA-2048,L1,sha3-256,Fp6,fri,158658,2.75,789.0,ok
+Ed25519,L1,sha3-256,Fp6,stir,75000,NA,135,REFERENCE — full per-sig harness not-in-tree; see memory project_crossalg_bench.md (Apple M4, 2026-05-01)
+Ed25519,L1,sha3-256,Fp6,fri,75000,NA,135,REFERENCE — full per-sig harness not-in-tree; see memory project_crossalg_bench.md (Apple M4, 2026-05-01)
+ECDSA-p256,L1,sha3-256,Fp6,stir,167240,NA,138,REFERENCE — not-in-tree; see memory project_ecdsa_status.md (Apple M4, K=256)
+ECDSA-p256,L1,sha3-256,Fp6,fri,167240,NA,138,REFERENCE — not-in-tree; see memory project_ecdsa_status.md (Apple M4, K=256)
+ML-DSA-44,L1,sha3-256,Fp6,stir,23727,83.42,10333.1,ok
+ML-DSA-44,L1,sha3-256,Fp6,fri,32310,182.31,15266.1,ok
+ML-DSA-65,L3,sha3-384,Fp6,stir,29344,161.18,18412.0,ok
+ML-DSA-65,L3,sha3-384,Fp6,fri,40059,400.74,27820.8,ok
+ML-DSA-87,L5,sha3-512,Fp8,stir,58219,351.98,29588.7,ok
+ML-DSA-87,L5,sha3-512,Fp8,fri,90796,925.74,49901.7,ok
