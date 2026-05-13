@@ -234,13 +234,7 @@ pub fn verify(
 // ─── Internal modules (skeletons) ────────────────────────────────────
 
 pub mod verifier_air;
-
-/// SHA-3-as-AIR — minimal absorb-sequence AIR for verifying inner-proof
-/// Merkle paths inside the wrapper.  This is the only place SHA-3-in-AIR
-/// is unavoidable; dual-hash limits it to this subcircuit only.
-pub mod sha3_absorb_air {
-    // Module skeleton — implementation lands in subsequent commits.
-}
+pub mod sha3_absorb_air;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
