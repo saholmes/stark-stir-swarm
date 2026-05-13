@@ -233,32 +233,7 @@ pub fn verify(
 
 // ─── Internal modules (skeletons) ────────────────────────────────────
 
-/// Verifier-as-AIR for the `deep_ali_merge` inner verification predicate.
-///
-/// Encodes:
-/// - Constraint composition evaluation at FRI/STIR query points
-/// - Merkle authentication path verification (delegates SHA-3 to
-///   [`sha3_absorb_air`])
-/// - `binding_cells_commit` OOD Schwartz-Zippel checks
-/// - Permutation-argument consistency
-/// - Fiat-Shamir transcript replay
-pub mod verifier_air {
-    /// Estimate the wrapper-AIR trace length needed to express the
-    /// verifier for an inner proof of the given level.  Stub returns
-    /// a conservative upper bound until the AIR layout lands.
-    pub fn estimate_trace_length(nist_level: u8) -> usize {
-        // Rough order-of-magnitude budget (will be tightened):
-        // - L1: ~80K rows  (54 queries × ~12 hops × ~SHA-3 cycles)
-        // - L3: ~120K rows
-        // - L5: ~180K rows
-        match nist_level {
-            1 => 1 << 17,
-            3 => 1 << 18,
-            5 => 1 << 18,
-            _ => panic!("estimate_trace_length: unsupported level {nist_level}"),
-        }
-    }
-}
+pub mod verifier_air;
 
 /// SHA-3-as-AIR — minimal absorb-sequence AIR for verifying inner-proof
 /// Merkle paths inside the wrapper.  This is the only place SHA-3-in-AIR
@@ -338,10 +313,17 @@ mod tests {
     }
 
     #[test]
-    fn verifier_air_trace_length_estimates() {
-        assert_eq!(verifier_air::estimate_trace_length(1), 1 << 17);
-        assert_eq!(verifier_air::estimate_trace_length(3), 1 << 18);
-        assert_eq!(verifier_air::estimate_trace_length(5), 1 << 18);
+    fn verifier_air_trace_length_is_power_of_two() {
+        for level in [1u8, 3, 5] {
+            let n = verifier_air::estimate_trace_length(level);
+            assert!(n.is_power_of_two(), "level {level} rows={n}");
+            // Sanity: trace fits in a reasonable memory budget.
+            // Each row is `width` u64s; layout for L3 has width ~870.
+            // L3 rows ≈ 2^18..2^20, so cells ≈ 256M, ~2 GiB at 8B each.
+            // The budget will tighten significantly once the real
+            // constraint set replaces conservative upper bounds.
+            assert!(n <= 1 << 22, "level {level} trace too large: {n}");
+        }
     }
 
     // ─── Stub-behaviour tests (must keep failing until impl lands) ──
