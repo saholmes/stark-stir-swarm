@@ -326,6 +326,162 @@ pub fn squeeze(state: &KeccakState, variant: Sha3Variant) -> Vec<u8> {
     out
 }
 
+// ─── Bit-level reference (the AIR oracle) ────────────────────────────
+//
+// The AIR encodes Keccak at the bit level (1 600 boolean cells per
+// state) because bitwise operations don't natively express in a prime
+// field.  This layer provides the bit-level reference: same output as
+// `keccak_f1600`, but with explicit per-bit intermediate state.  The
+// AIR's constraint outputs will be compared against this reference
+// at every sub-step.
+
+/// One Keccak lane represented as 64 boolean cells (LSB first).
+/// `lane_bits[i] ∈ {0, 1}` and `Σ lane_bits[i] · 2^i = lane` as u64.
+pub type LaneBits = [u8; 64];
+
+/// One Keccak state at the bit level: 25 lanes × 64 bits.
+/// Indexing matches [`KeccakState`]: `bits[5y + x][bit] ∈ {0, 1}`.
+pub type BitState = [LaneBits; 25];
+
+/// Decompose a u64 lane into its 64 boolean bits (LSB first).
+pub fn lane_to_bits(lane: u64) -> LaneBits {
+    let mut bits = [0u8; 64];
+    for i in 0..64 {
+        bits[i] = ((lane >> i) & 1) as u8;
+    }
+    bits
+}
+
+/// Recompose 64 boolean bits (LSB first) into a u64 lane.  Bits MUST
+/// be in {0, 1}; values outside this range will be silently mis-packed
+/// (the AIR enforces booleanity via `b·(b-1) = 0` constraints, but
+/// this native helper does not double-check).
+pub fn bits_to_lane(bits: &LaneBits) -> u64 {
+    let mut lane = 0u64;
+    for i in 0..64 {
+        lane |= (bits[i] as u64) << i;
+    }
+    lane
+}
+
+/// Convert a u64-lane state into a bit-level state.
+pub fn bit_state_from_lanes(state: &KeccakState) -> BitState {
+    let mut bs = [[0u8; 64]; 25];
+    for (i, &lane) in state.iter().enumerate() {
+        bs[i] = lane_to_bits(lane);
+    }
+    bs
+}
+
+/// Convert a bit-level state back to u64 lanes.
+pub fn lanes_from_bit_state(bs: &BitState) -> KeccakState {
+    let mut state: KeccakState = [0; 25];
+    for i in 0..25 {
+        state[i] = bits_to_lane(&bs[i]);
+    }
+    state
+}
+
+/// Apply one Keccak-f1600 round at the bit level.  Computes θ, ρ, π,
+/// χ, ι using ONLY boolean operations on individual bits, mirroring
+/// what the AIR will enforce.
+///
+/// Each operation maps to its AIR constraint form:
+/// - XOR `c = a ⊕ b`  →  AIR: `c = a + b − 2·a·b`  (boolean inputs)
+/// - AND `c = a & b`  →  AIR: `c = a · b`
+/// - NOT `c = ¬a`     →  AIR: `c = 1 − a`
+/// - rotate-by-n      →  AIR: bit-position re-indexing (no arithmetic)
+///
+/// `round_idx ∈ [0..24)` selects the ι round constant.
+pub fn keccak_round_bit_level(bs: &mut BitState, round_idx: usize) {
+    assert!(round_idx < 24);
+
+    // ─── θ ────────────────────────────────────────────────────────
+    // C[x][bit] = XOR over y ∈ [0..5) of A[5y+x][bit]
+    let mut c = [[0u8; 64]; 5];
+    for x in 0..5 {
+        for bit in 0..64 {
+            // XOR-chain: c[x][bit] = bs[x][bit] ⊕ bs[5+x][bit] ⊕ ... ⊕ bs[20+x][bit]
+            c[x][bit] = bs[x][bit] ^ bs[5 + x][bit] ^ bs[10 + x][bit]
+                      ^ bs[15 + x][bit] ^ bs[20 + x][bit];
+        }
+    }
+    // D[x][bit] = C[(x-1) mod 5][bit] ⊕ C[(x+1) mod 5][rot-1(bit)]
+    // where rot-1 means "bit position rotated by 1": output bit i
+    // comes from input bit (i - 1) mod 64.
+    let mut d = [[0u8; 64]; 5];
+    for x in 0..5 {
+        for bit in 0..64 {
+            let prev_x = (x + 4) % 5;
+            let next_x = (x + 1) % 5;
+            // rotate_left(1) on a u64 maps bit i → bit (i+1) mod 64.
+            // To read the rotated value at output bit `bit`, we read
+            // input at `(bit + 64 - 1) mod 64 = (bit + 63) mod 64`.
+            let src_bit = (bit + 63) % 64;
+            d[x][bit] = c[prev_x][bit] ^ c[next_x][src_bit];
+        }
+    }
+    // A[5y+x][bit] ^= D[x][bit]
+    for y in 0..5 {
+        for x in 0..5 {
+            for bit in 0..64 {
+                bs[5 * y + x][bit] ^= d[x][bit];
+            }
+        }
+    }
+
+    // ─── ρ + π (fused) ────────────────────────────────────────────
+    // B[dst][bit] = A[src][(bit - rho_offset) mod 64]
+    // where π maps (x, y) → (y, 2x + 3y mod 5).
+    let mut b = [[0u8; 64]; 25];
+    for x in 0..5 {
+        for y in 0..5 {
+            let src = 5 * y + x;
+            let dst = 5 * ((2 * x + 3 * y) % 5) + y;
+            let off = RHO_OFFSETS[src] as usize;
+            for bit in 0..64 {
+                // rotate_left(off) on u64: output bit i ← input bit (i + 64 - off) mod 64
+                let src_bit = (bit + 64 - off) % 64;
+                b[dst][bit] = bs[src][src_bit];
+            }
+        }
+    }
+
+    // ─── χ ────────────────────────────────────────────────────────
+    // A[5y+x][bit] = B[5y+x][bit] ⊕ ((¬B[5y+(x+1)%5][bit]) & B[5y+(x+2)%5][bit])
+    for y in 0..5 {
+        // Snapshot one row before overwriting; B is already fresh above
+        // so we can read from it directly.
+        for x in 0..5 {
+            let i0 = 5 * y + x;
+            let i1 = 5 * y + (x + 1) % 5;
+            let i2 = 5 * y + (x + 2) % 5;
+            for bit in 0..64 {
+                let not_b1 = 1u8 - b[i1][bit]; // NOT
+                let and_part = not_b1 & b[i2][bit]; // AND
+                bs[i0][bit] = b[i0][bit] ^ and_part; // XOR
+            }
+        }
+    }
+
+    // ─── ι ────────────────────────────────────────────────────────
+    // A[0][bit] ^= ROUND_CONSTANTS[round_idx][bit]
+    let rc_bits = lane_to_bits(ROUND_CONSTANTS[round_idx]);
+    for bit in 0..64 {
+        bs[0][bit] ^= rc_bits[bit];
+    }
+}
+
+/// Run all 24 rounds of Keccak-f1600 at the bit level.  Equivalent to
+/// `keccak_f1600` but exposes per-bit intermediate state at each
+/// round boundary.  Used to validate the bit-level reference against
+/// the u64 reference.
+pub fn keccak_f1600_bit_level(bs: &mut BitState) {
+    for round in 0..24 {
+        keccak_round_bit_level(bs, round);
+    }
+}
+
 /// End-to-end SHA-3 hash with FIPS 202 §B.2 domain-separated padding
 /// (suffix `01` || pad10*1).  Equivalent to rustcrypto's `Sha3_N` for
 /// the matching variant — verified by the test suite below.
@@ -593,5 +749,174 @@ mod tests {
         // diffusion via χ.  Whatever the exact value, it must differ
         // from zero in at least one lane.
         assert!(s.iter().any(|&l| l != 0));
+    }
+
+    // ─── Bit-level reference validation ─────────────────────────────
+    //
+    // The AIR will encode Keccak at the bit level.  The bit-level
+    // reference MUST produce the same output as the u64 reference at
+    // every round boundary, otherwise the AIR is validating against
+    // a different function than what the inner proof's Merkle paths
+    // were committed with.
+
+    #[test]
+    fn lane_bit_decomposition_roundtrip() {
+        for &lane in &[
+            0u64, 1, 0xFF, 0x8000_0000_0000_0000,
+            0xDEAD_BEEF_CAFE_BABE,
+            ROUND_CONSTANTS[0],
+            ROUND_CONSTANTS[23],
+            u64::MAX,
+        ] {
+            let bits = lane_to_bits(lane);
+            // All cells boolean.
+            assert!(bits.iter().all(|&b| b == 0 || b == 1));
+            // Roundtrip.
+            assert_eq!(bits_to_lane(&bits), lane, "lane=0x{lane:016X}");
+        }
+    }
+
+    #[test]
+    fn state_bit_decomposition_roundtrip() {
+        let state: KeccakState = [
+            0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210,
+            ROUND_CONSTANTS[0], ROUND_CONSTANTS[1], ROUND_CONSTANTS[2],
+            ROUND_CONSTANTS[3], ROUND_CONSTANTS[4], ROUND_CONSTANTS[5],
+            ROUND_CONSTANTS[6], ROUND_CONSTANTS[7], ROUND_CONSTANTS[8],
+            ROUND_CONSTANTS[9], ROUND_CONSTANTS[10], ROUND_CONSTANTS[11],
+            ROUND_CONSTANTS[12], ROUND_CONSTANTS[13], ROUND_CONSTANTS[14],
+            ROUND_CONSTANTS[15], ROUND_CONSTANTS[16], ROUND_CONSTANTS[17],
+            ROUND_CONSTANTS[18], ROUND_CONSTANTS[19], ROUND_CONSTANTS[20],
+            ROUND_CONSTANTS[21], ROUND_CONSTANTS[22],
+        ];
+        let bs = bit_state_from_lanes(&state);
+        let recovered = lanes_from_bit_state(&bs);
+        assert_eq!(state, recovered);
+    }
+
+    #[test]
+    fn bit_level_keccak_matches_u64_keccak_zero_input() {
+        // Run both references on the zero state, compare after each round.
+        let mut s_u64: KeccakState = [0; 25];
+        let mut bs: BitState = [[0u8; 64]; 25];
+        for round in 0..24 {
+            // u64 reference: extract one round by stepping through the
+            // body of `keccak_f1600` manually would be tedious; instead
+            // compare cumulative outputs at the END.  See the test
+            // below for the all-rounds check.
+            let _ = round; // silence unused
+            keccak_round_bit_level(&mut bs, round);
+        }
+        keccak_f1600(&mut s_u64);
+        // After 24 rounds, both must agree.
+        let bs_as_lanes = lanes_from_bit_state(&bs);
+        assert_eq!(bs_as_lanes, s_u64);
+    }
+
+    #[test]
+    fn bit_level_keccak_matches_u64_keccak_nontrivial_input() {
+        // Initialize state with non-trivial pattern, run both
+        // references, compare outputs.
+        let mut s_u64: KeccakState = [0; 25];
+        for i in 0..25 {
+            s_u64[i] = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        let s_u64_initial = s_u64;
+        let mut bs: BitState = bit_state_from_lanes(&s_u64_initial);
+
+        keccak_f1600(&mut s_u64);
+        keccak_f1600_bit_level(&mut bs);
+
+        let bs_as_lanes = lanes_from_bit_state(&bs);
+        assert_eq!(bs_as_lanes, s_u64);
+    }
+
+    #[test]
+    fn bit_level_keccak_per_round_matches_u64() {
+        // Stronger check: ensure bit and u64 references agree after
+        // EACH round, not just at the end.  We reimplement the u64
+        // body inline here so we can break out after each round.
+        let mut s_u64: KeccakState = [
+            0xAA55_AA55_AA55_AA55; 25
+        ];
+        let mut bs = bit_state_from_lanes(&s_u64);
+
+        for round in 0..24 {
+            // u64 path: copy of one round from keccak_f1600.
+            let mut cc = [0u64; 5];
+            for x in 0..5 {
+                cc[x] = s_u64[x] ^ s_u64[x + 5] ^ s_u64[x + 10]
+                      ^ s_u64[x + 15] ^ s_u64[x + 20];
+            }
+            let mut dd = [0u64; 5];
+            for x in 0..5 {
+                dd[x] = cc[(x + 4) % 5] ^ cc[(x + 1) % 5].rotate_left(1);
+            }
+            for x in 0..5 {
+                for y in 0..5 { s_u64[5 * y + x] ^= dd[x]; }
+            }
+            let mut b_lanes = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    let src = 5 * y + x;
+                    let dst = 5 * ((2 * x + 3 * y) % 5) + y;
+                    b_lanes[dst] = s_u64[src].rotate_left(RHO_OFFSETS[src]);
+                }
+            }
+            for y in 0..5 {
+                let row = [
+                    b_lanes[5 * y    ], b_lanes[5 * y + 1], b_lanes[5 * y + 2],
+                    b_lanes[5 * y + 3], b_lanes[5 * y + 4],
+                ];
+                for x in 0..5 {
+                    s_u64[5 * y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
+                }
+            }
+            s_u64[0] ^= ROUND_CONSTANTS[round];
+
+            // bit-level path: one round
+            keccak_round_bit_level(&mut bs, round);
+
+            // Compare after this round.
+            assert_eq!(lanes_from_bit_state(&bs), s_u64,
+                "bit-level and u64 references diverge at round {round}");
+        }
+    }
+
+    #[test]
+    fn bit_level_keccak_validates_against_fips_vector() {
+        // End-to-end: SHA3-256("abc") via bit-level reference must
+        // match the FIPS test vector.  This is the strongest single
+        // test — combines bit decomposition + bit-level rounds +
+        // sponge construction + padding.
+        let block_len = Sha3Variant::Sha3_256.block_bytes();
+        let mut padded = vec![0u8; block_len];
+        padded[..3].copy_from_slice(b"abc");
+        padded[3] = 0x06;
+        padded[block_len - 1] |= 0x80;
+
+        let mut bs: BitState = [[0u8; 64]; 25];
+        let rate_lanes = Sha3Variant::Sha3_256.rate_bits() / 64;
+        // Absorb the padded block via bit-level XOR.
+        for i in 0..rate_lanes {
+            let mut lane = 0u64;
+            for j in 0..8 {
+                lane |= (padded[8 * i + j] as u64) << (8 * j);
+            }
+            let lane_bits = lane_to_bits(lane);
+            for bit in 0..64 {
+                bs[i][bit] ^= lane_bits[bit];
+            }
+        }
+        keccak_f1600_bit_level(&mut bs);
+
+        let lanes = lanes_from_bit_state(&bs);
+        let mut digest = Vec::with_capacity(32);
+        for i in 0..4 { digest.extend_from_slice(&lanes[i].to_le_bytes()); }
+
+        let expected = hex_to_bytes(
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532");
+        assert_eq!(digest, expected,
+            "bit-level Keccak diverges from FIPS SHA3-256(\"abc\") vector");
     }
 }
