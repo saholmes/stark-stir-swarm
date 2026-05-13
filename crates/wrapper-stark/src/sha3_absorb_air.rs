@@ -226,23 +226,132 @@ impl AbsorbAirLayout {
 }
 
 // ─── Native reference (used by tests + future AIR oracle) ────────────
+//
+// Implementation derives directly from FIPS 202 §3.2.  Each sub-step
+// uses ONLY this module's constants tables, so the AIR's behaviour
+// can be compared against this code without any dependency on
+// rustcrypto.  rustcrypto is used in tests as an independent oracle.
 
-/// Native Keccak-f1600 permutation — reference implementation used to
-/// validate the AIR's constraints during testing.  Stub: zeroes the
-/// state and panics on call, so accidental "works because reference"
-/// passes can't sneak through.  Real impl lands in a subsequent commit.
-pub fn keccak_f1600(_state: &mut KeccakState) {
-    panic!("keccak_f1600: reference implementation not yet wired");
+/// Native Keccak-f1600 permutation — reference implementation that the
+/// AIR's constraints will be validated against.  In-place transformation
+/// of the 25-lane state.
+///
+/// Implements FIPS 202 §3.2 directly using [`RHO_OFFSETS`],
+/// [`PI_LANE_INDICES`], and [`ROUND_CONSTANTS`].  No external crypto
+/// dependencies — that's the whole point of having this as a reference.
+pub fn keccak_f1600(state: &mut KeccakState) {
+    for round in 0..24 {
+        // θ: column parities + diffuse
+        let mut c = [0u64; 5];
+        for x in 0..5 {
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        let mut d = [0u64; 5];
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        for x in 0..5 {
+            for y in 0..5 {
+                state[5 * y + x] ^= d[x];
+            }
+        }
+
+        // ρ + π fused (write into a fresh array, then copy back).
+        // π maps lane (x, y) → (y, 2x + 3y mod 5); we precomputed
+        // the destination-source mapping in PI_LANE_INDICES, but
+        // for clarity we recompute here.
+        let mut b = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let src = 5 * y + x;
+                let dst = 5 * ((2 * x + 3 * y) % 5) + y;
+                b[dst] = state[src].rotate_left(RHO_OFFSETS[src]);
+            }
+        }
+
+        // χ: non-linear A[x,y] = B[x,y] ^ ((¬B[x+1,y]) & B[x+2,y])
+        for y in 0..5 {
+            let row = [
+                b[5 * y    ], b[5 * y + 1], b[5 * y + 2],
+                b[5 * y + 3], b[5 * y + 4],
+            ];
+            for x in 0..5 {
+                state[5 * y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
+            }
+        }
+
+        // ι: XOR round constant into lane (0, 0)
+        state[0] ^= ROUND_CONSTANTS[round];
+    }
 }
 
-/// Absorb a single block into the sponge state.  Stub.
-pub fn absorb_block(_state: &mut KeccakState, _block: &[u8], _variant: Sha3Variant) {
-    panic!("absorb_block: not yet wired");
+/// Absorb a single rate-sized block into the sponge state.  XORs the
+/// first `variant.block_bytes()` bytes of `block` into the rate region
+/// of `state` (lane 0 = bytes 0..8 little-endian, etc.), then applies
+/// the permutation.
+///
+/// Caller must ensure `block.len() == variant.block_bytes()`.
+pub fn absorb_block(state: &mut KeccakState, block: &[u8], variant: Sha3Variant) {
+    assert_eq!(block.len(), variant.block_bytes(),
+        "absorb_block: block size must equal variant.block_bytes()");
+    // Number of lanes in the rate region.
+    let rate_lanes = variant.rate_bits() / 64;
+    for i in 0..rate_lanes {
+        let mut lane = 0u64;
+        for j in 0..8 {
+            lane |= (block[8 * i + j] as u64) << (8 * j);
+        }
+        state[i] ^= lane;
+    }
+    keccak_f1600(state);
 }
 
-/// Squeeze the output digest from the sponge state.  Stub.
-pub fn squeeze(_state: &KeccakState, _variant: Sha3Variant) -> Vec<u8> {
-    panic!("squeeze: not yet wired");
+/// Squeeze the fixed-output digest from the sponge state.  Returns
+/// `variant.output_bytes()` bytes.  All SHA-3 variants have
+/// `output_bits ≤ rate_bits`, so no further permutation is needed.
+pub fn squeeze(state: &KeccakState, variant: Sha3Variant) -> Vec<u8> {
+    let out_bytes = variant.output_bytes();
+    debug_assert!(variant.output_bits() <= variant.rate_bits(),
+        "single-squeeze invariant must hold for fixed-output SHA-3");
+    let mut out = Vec::with_capacity(out_bytes);
+    let full_lanes = out_bytes / 8;
+    for i in 0..full_lanes {
+        out.extend_from_slice(&state[i].to_le_bytes());
+    }
+    let tail = out_bytes - 8 * full_lanes;
+    if tail > 0 {
+        let bytes = state[full_lanes].to_le_bytes();
+        out.extend_from_slice(&bytes[..tail]);
+    }
+    out
+}
+
+/// End-to-end SHA-3 hash with FIPS 202 §B.2 domain-separated padding
+/// (suffix `01` || pad10*1).  Equivalent to rustcrypto's `Sha3_N` for
+/// the matching variant — verified by the test suite below.
+pub fn hash(variant: Sha3Variant, input: &[u8]) -> Vec<u8> {
+    let block_len = variant.block_bytes();
+    let mut state: KeccakState = [0; 25];
+
+    // Absorb all full blocks.
+    let mut offset = 0;
+    while offset + block_len <= input.len() {
+        absorb_block(&mut state, &input[offset..offset + block_len], variant);
+        offset += block_len;
+    }
+
+    // Build the final padded block.  SHA-3 domain separator byte is
+    // 0x06 (= `0b00000110`: the `01` suffix in little-endian bit
+    // order followed by the leading `1` of pad10*1).  The trailing
+    // `1` of pad10*1 is the MSB of the last byte of the block.
+    let mut last = vec![0u8; block_len];
+    let tail = &input[offset..];
+    last[..tail.len()].copy_from_slice(tail);
+    last[tail.len()] = 0x06;
+    last[block_len - 1] |= 0x80;
+    absorb_block(&mut state, &last, variant);
+
+    squeeze(&state, variant)
 }
 
 #[cfg(test)]
@@ -348,15 +457,141 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not yet wired")]
-    fn keccak_f1600_stub_panics() {
-        let mut s: KeccakState = [0; 25];
-        keccak_f1600(&mut s);
-    }
-
-    #[test]
     #[should_panic(expected = "unsupported NIST level")]
     fn sha3_variant_rejects_invalid_level() {
         let _ = Sha3Variant::default_for_level(2);
+    }
+
+    // ─── NIST CAVS test vectors (FIPS 202) ──────────────────────────
+    //
+    // These vectors are *external* references — they don't come from
+    // our own SHA-3 code or rustcrypto.  If the native Keccak diverges
+    // from FIPS 202, these tests catch it before the AIR is built on
+    // top.  See `feedback_test_primitive_against_external_ref.md`.
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sha3_256_empty_input_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a");
+        assert_eq!(hash(Sha3Variant::Sha3_256, b""), expected);
+    }
+
+    #[test]
+    fn sha3_256_abc_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532");
+        assert_eq!(hash(Sha3Variant::Sha3_256, b"abc"), expected);
+    }
+
+    #[test]
+    fn sha3_384_empty_input_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004");
+        assert_eq!(hash(Sha3Variant::Sha3_384, b""), expected);
+    }
+
+    #[test]
+    fn sha3_384_abc_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25");
+        assert_eq!(hash(Sha3Variant::Sha3_384, b"abc"), expected);
+    }
+
+    #[test]
+    fn sha3_512_empty_input_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26");
+        assert_eq!(hash(Sha3Variant::Sha3_512, b""), expected);
+    }
+
+    #[test]
+    fn sha3_512_abc_matches_fips_vector() {
+        let expected = hex_to_bytes(
+            "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0");
+        assert_eq!(hash(Sha3Variant::Sha3_512, b"abc"), expected);
+    }
+
+    // ─── Independent cross-check against rustcrypto ─────────────────
+    //
+    // The above FIPS vectors cover empty + "abc" inputs.  These tests
+    // use rustcrypto's `sha3` crate as an independent oracle for
+    // longer / random inputs that span multiple absorb blocks.
+
+    fn rustcrypto_sha3_256(input: &[u8]) -> Vec<u8> {
+        use ::sha3::Digest;
+        let mut h = ::sha3::Sha3_256::new();
+        h.update(input);
+        h.finalize().to_vec()
+    }
+
+    fn rustcrypto_sha3_384(input: &[u8]) -> Vec<u8> {
+        use ::sha3::Digest;
+        let mut h = ::sha3::Sha3_384::new();
+        h.update(input);
+        h.finalize().to_vec()
+    }
+
+    fn rustcrypto_sha3_512(input: &[u8]) -> Vec<u8> {
+        use ::sha3::Digest;
+        let mut h = ::sha3::Sha3_512::new();
+        h.update(input);
+        h.finalize().to_vec()
+    }
+
+    #[test]
+    fn cross_check_sha3_256_multi_block() {
+        // 200 bytes spans multiple absorb blocks for all variants.
+        let input = vec![0xA5u8; 200];
+        assert_eq!(hash(Sha3Variant::Sha3_256, &input), rustcrypto_sha3_256(&input));
+    }
+
+    #[test]
+    fn cross_check_sha3_384_multi_block() {
+        let input = vec![0xA5u8; 200];
+        assert_eq!(hash(Sha3Variant::Sha3_384, &input), rustcrypto_sha3_384(&input));
+    }
+
+    #[test]
+    fn cross_check_sha3_512_multi_block() {
+        // 200 bytes / 72-byte rate = 2.78 blocks → 3 absorb iterations.
+        let input = vec![0xA5u8; 200];
+        assert_eq!(hash(Sha3Variant::Sha3_512, &input), rustcrypto_sha3_512(&input));
+    }
+
+    #[test]
+    fn cross_check_block_size_boundaries() {
+        // Edge cases: input length exactly equal to block size, and
+        // block_size + 1 (forces extra padding block).
+        for variant in [Sha3Variant::Sha3_256, Sha3Variant::Sha3_384, Sha3Variant::Sha3_512] {
+            let bs = variant.block_bytes();
+            for len in [0usize, 1, bs - 1, bs, bs + 1, 2 * bs - 1, 2 * bs, 2 * bs + 1] {
+                let input: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+                let ours = hash(variant, &input);
+                let theirs = match variant {
+                    Sha3Variant::Sha3_256 => rustcrypto_sha3_256(&input),
+                    Sha3Variant::Sha3_384 => rustcrypto_sha3_384(&input),
+                    Sha3Variant::Sha3_512 => rustcrypto_sha3_512(&input),
+                };
+                assert_eq!(ours, theirs,
+                    "variant={variant:?} len={len} disagrees with rustcrypto");
+            }
+        }
+    }
+
+    #[test]
+    fn permutation_changes_state() {
+        // After one Keccak-f1600, the zero state must no longer be zero.
+        let mut s: KeccakState = [0; 25];
+        keccak_f1600(&mut s);
+        // The first ι constant is 0x01, so state[0] = ... after
+        // diffusion via χ.  Whatever the exact value, it must differ
+        // from zero in at least one lane.
+        assert!(s.iter().any(|&l| l != 0));
     }
 }

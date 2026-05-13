@@ -47,3 +47,6 @@ rayon        = { version = "1.10", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+# Independent SHA-3 oracle for cross-checking the native Keccak-f1600
+# in `sha3_absorb_air` against rustcrypto.  Used only in tests.
+sha3 = "0.10"

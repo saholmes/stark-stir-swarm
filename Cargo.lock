@@ -4527,6 +4527,7 @@ dependencies = [
  "hex",
  "merkle",
  "rayon",
+ "sha3 0.10.8",
  "transcript",
 ]
 
