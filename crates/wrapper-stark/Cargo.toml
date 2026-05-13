@@ -1,0 +1,49 @@
+[package]
+name = "wrapper-stark"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Recursive STARK wrapper for deep_ali_merge proofs (paper §8 dual-hash). WIP — feature/recursive-stark branch only."
+
+[features]
+# No defaults — wrapper-stark MUST be built with an explicit
+# (sha3-*, mldsa-*) pair selected by the consumer.  This avoids
+# Cargo workspace feature-unification conflicts: wrapper-stark
+# defaulting to mldsa-65 would unify with cairo-bench's default
+# mldsa-44 under `cargo check --workspace`, producing duplicate
+# symbol errors in `deep_ali`.  Typical invocation:
+#   cargo test -p wrapper-stark --features "sha3-384 mldsa-65 parallel"
+default = []
+# Enables Poseidon-accelerated prover-internal Merkle trees inside the
+# wrapper AIR (paper dual-hash §8).  Verifier-path commitments remain
+# SHA-3 — Theorem 6 hash-upgrade independence preserves unconditional
+# NIST PQ soundness.
+poseidon-accel = ["deep_ali/poseidon-accel", "merkle/poseidon-accel"]
+parallel = ["deep_ali/parallel", "dep:rayon"]
+sha3-256 = ["deep_ali/sha3-256", "merkle/sha3-256", "hash/sha3-256"]
+sha3-384 = ["deep_ali/sha3-384", "merkle/sha3-384", "hash/sha3-384"]
+sha3-512 = ["deep_ali/sha3-512", "merkle/sha3-512", "hash/sha3-512"]
+# ML-DSA parameter set of the *inner* proof the wrapper compresses.
+# Pair with the matching sha3-* feature (L1: sha3-256, L3: sha3-384,
+# L5: sha3-512).
+mldsa-44 = ["deep_ali/mldsa-44"]
+mldsa-65 = ["deep_ali/mldsa-65"]
+mldsa-87 = ["deep_ali/mldsa-87"]
+
+[dependencies]
+# This crate consumes deep_ali types (DeepFriProof, AIR traits, transcript)
+# but MUST NOT modify deep_ali source.  Any breaking change to deep_ali's
+# public API that this crate forces is a soundness-audit-relevant change
+# and should land on main only after re-running the regression check.
+deep_ali     = { path = "../deep_ali", default-features = false }
+merkle       = { path = "../merkle",   default-features = false }
+hash         = { path = "../hash",     default-features = false }
+transcript   = { path = "../transcript", default-features = false }
+ark-ff       = { workspace = true }
+ark-poly     = "0.4.2"
+ark-serialize = { workspace = true }
+ark-goldilocks = { path = "../ark-goldilocks" }
+rayon        = { version = "1.10", optional = true }
+
+[dev-dependencies]
+hex = "0.4"

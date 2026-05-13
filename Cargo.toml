@@ -22,6 +22,11 @@ members = [
     "crates/swarm-worker",
     "crates/swarm-bench",
     "crates/swarm-verify",
+    # Recursive STARK wrapper — work-in-progress on
+    # feature/recursive-stark branch.  Per-signature compression layer
+    # built on top of `deep_ali` (paper §8 dual-hash).  Production
+    # STARK-DNS stays on the stacked-AIR path until the wrapper lands.
+    "crates/wrapper-stark",
     # Swarm-specific crates added in subsequent steps:
     #   "crates/swarm-verify",
     #   "crates/swarm-bench",
