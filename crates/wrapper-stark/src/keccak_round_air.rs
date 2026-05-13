@@ -815,6 +815,100 @@ pub fn write_round_cells(
     write_iota_cells(&cells.iota,     &layout.iota,   trace);
 }
 
+// ─── Full Keccak-f1600 permutation (24 rounds + cross-round threading) ─
+//
+// Chains 24 [`RoundLayout`]s consecutively, with round-to-round
+// state threading via Copy constraints:
+//   ι[r].output_bit(lane, bit)  ≡  θ[r+1].input_bit(lane, bit)
+// for r ∈ [0..23).  23 transitions × 1 600 cells = 36 800 Copy
+// constraints just for round-to-round threading.
+
+/// Layout for one full Keccak-f1600 permutation: 24 rounds × 4 rows
+/// = 96 rows, max row width 6 400.
+#[derive(Clone, Debug)]
+pub struct PermutationLayout {
+    pub row_offset: usize,
+    pub rounds: Vec<RoundLayout>,
+}
+
+impl PermutationLayout {
+    pub fn new(row_offset: usize) -> Self {
+        let mut rounds = Vec::with_capacity(24);
+        for r in 0..24 {
+            rounds.push(RoundLayout::new(r, row_offset + 4 * r));
+        }
+        Self { row_offset, rounds }
+    }
+
+    pub fn rows(&self) -> usize { 24 * 4 }
+    pub fn max_row_width(&self) -> usize { 6400 }
+    pub fn first_round(&self) -> &RoundLayout { &self.rounds[0] }
+    pub fn last_round(&self) -> &RoundLayout { &self.rounds[23] }
+}
+
+/// Emit all constraints for one full Keccak-f1600 permutation.
+/// Total: 24 × 33 600 round constraints + 23 × 1 600 cross-round
+/// Copy constraints = 806 400 + 36 800 = 843 200 constraints.
+pub fn permutation_constraints(layout: &PermutationLayout) -> Vec<BitOp> {
+    let mut out: Vec<BitOp> = Vec::with_capacity(843_200);
+
+    // Per-round constraints (28 800 intra + 4 800 intra-round threading each).
+    for round in &layout.rounds {
+        out.extend(round_constraints(round));
+    }
+
+    // Round-to-round state threading: ι[r].output ≡ θ[r+1].input
+    for r in 0..23 {
+        let cur = &layout.rounds[r];
+        let nxt = &layout.rounds[r + 1];
+        for lane in 0..25 {
+            for bit in 0..64 {
+                out.push(BitOp::Copy {
+                    c: nxt.theta.input_bit(lane, bit),
+                    a: cur.iota.output_bit(lane, bit),
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// All cell values for one full Keccak-f1600 permutation.
+#[derive(Clone, Debug)]
+pub struct PermutationCells {
+    pub rounds: Vec<RoundCells>,
+}
+
+impl PermutationCells {
+    pub fn output_state(&self) -> BitState {
+        self.rounds[23].output_state()
+    }
+}
+
+/// Synthesize cell values for one full Keccak-f1600 permutation.
+pub fn synthesize_permutation(input: &BitState) -> PermutationCells {
+    let mut rounds = Vec::with_capacity(24);
+    let mut state = *input;
+    for r in 0..24 {
+        let cells = synthesize_round(&state, r);
+        state = cells.output_state();
+        rounds.push(cells);
+    }
+    PermutationCells { rounds }
+}
+
+/// Write all permutation cells into a mock trace.
+pub fn write_permutation_cells(
+    cells: &PermutationCells,
+    layout: &PermutationLayout,
+    trace: &mut crate::bit_constraint::MockTrace,
+) {
+    for (round_cells, round_layout) in cells.rounds.iter().zip(layout.rounds.iter()) {
+        write_round_cells(round_cells, round_layout, trace);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1437,5 +1531,123 @@ mod tests {
             assert!(c.satisfied_by(&trace),
                 "constraint {c:?} failed at row_offset=12");
         }
+    }
+
+    // ─── Full Keccak-f1600 permutation tests ────────────────────────
+
+    #[test]
+    fn permutation_layout_has_96_rows() {
+        let layout = PermutationLayout::new(0);
+        assert_eq!(layout.rows(), 96);  // 24 rounds × 4 rows
+        assert_eq!(layout.max_row_width(), 6400);
+        assert_eq!(layout.rounds.len(), 24);
+        // Rounds correctly assigned to consecutive 4-row blocks.
+        for r in 0..24 {
+            assert_eq!(layout.rounds[r].round_idx, r);
+            assert_eq!(layout.rounds[r].row_offset, 4 * r);
+        }
+    }
+
+    #[test]
+    fn permutation_constraint_count_matches_design() {
+        let layout = PermutationLayout::new(0);
+        let cs = permutation_constraints(&layout);
+        // 24 × 33 600 = 806 400 round constraints
+        // 23 × 1 600 = 36 800 cross-round Copy constraints
+        // Total: 843 200
+        assert_eq!(cs.len(), 843_200);
+
+        // Verify the cross-round Copy count specifically.
+        let cross_round_copies = cs.iter().filter(|c| match c {
+            BitOp::Copy { c, a } => {
+                // Cross-round threading: rows differ by exactly 1 AND
+                // the row gap crosses a 4-row round boundary
+                // (i.e. one row is the last of a round, the other
+                // is the first of the next).
+                let cr = c.row;
+                let ar = a.row;
+                // ι rows are 3, 7, 11, ... (4r+3); θ rows are 4r.
+                ar < cr && (ar % 4 == 3) && (cr % 4 == 0) && cr == ar + 1
+            }
+            _ => false,
+        }).count();
+        assert_eq!(cross_round_copies, 23 * 1600,
+            "cross-round threading not wired correctly");
+    }
+
+    #[test]
+    fn synthesized_permutation_matches_native() {
+        // The strongest end-to-end test: synthesize a full 24-round
+        // permutation via the round AIR chain, compare final state
+        // to `keccak_f1600` on the same input.
+        use crate::sha3_absorb_air::{keccak_f1600, lanes_from_bit_state};
+        let input = make_input_state();
+
+        let cells = synthesize_permutation(&input);
+        let synth_state = lanes_from_bit_state(&cells.output_state());
+
+        let mut native_state = crate::sha3_absorb_air::lanes_from_bit_state(&input);
+        keccak_f1600(&mut native_state);
+
+        assert_eq!(synth_state, native_state,
+            "full 24-round permutation AIR diverges from native keccak_f1600");
+    }
+
+    #[test]
+    fn synthesized_permutation_satisfies_all_constraints() {
+        // Build the full 96-row trace, write all permutation cells,
+        // verify every one of the 843 200 constraints passes.
+        // This is the slowest test in the suite — keep an eye on
+        // performance.
+        let layout = PermutationLayout::new(0);
+        let n_rows = layout.rows();
+        let row_width = layout.max_row_width();
+        let mut trace = MockTrace::zeros(n_rows, row_width);
+
+        let input = make_input_state();
+        let cells = synthesize_permutation(&input);
+        write_permutation_cells(&cells, &layout, &mut trace);
+
+        let constraints = permutation_constraints(&layout);
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.satisfied_by(&trace) {
+                panic!("permutation constraint #{i} = {c:?} residue = {}",
+                    c.eval(&trace));
+            }
+        }
+    }
+
+    #[test]
+    fn permutation_cross_round_tampering_breaks_constraint() {
+        // THE soundness test for round-to-round threading: if a
+        // prover writes a different value into θ[r+1]'s input row
+        // than what came out of ι[r]'s output row, the cross-round
+        // Copy constraint MUST catch it.  Tests the round-to-round
+        // splicing attack.
+        let layout = PermutationLayout::new(0);
+        let n_rows = layout.rows();
+        let row_width = layout.max_row_width();
+        let mut trace = MockTrace::zeros(n_rows, row_width);
+
+        let input = make_input_state();
+        let cells = synthesize_permutation(&input);
+        write_permutation_cells(&cells, &layout, &mut trace);
+
+        // Tamper: flip a bit at the θ[5] input (i.e. row 20 in our
+        // layout = 4 * 5 + 0).  Round-to-round threading from
+        // ι[4].output (row 19) to θ[5].input (row 20) must reject.
+        let bad_cell = layout.rounds[5].theta.input_bit(11, 33);
+        let original = trace.get_cell(bad_cell);
+        trace.set(bad_cell, 1 - original);
+
+        let constraints = permutation_constraints(&layout);
+        let n_failing = constraints.iter()
+            .filter(|c| !c.satisfied_by(&trace))
+            .count();
+        // At least the cross-round threading Copy must reject, plus
+        // every downstream constraint that referenced the tampered
+        // cell in round 5.
+        assert!(n_failing >= 1,
+            "cross-round tampering at θ[5] should trip ≥ 1 constraint");
     }
 }
