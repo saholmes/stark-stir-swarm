@@ -687,6 +687,134 @@ pub fn write_iota_cells(
     }
 }
 
+// ─── Full Keccak round (4 sub-step rows + cross-row state threading) ─
+//
+// Layout: rows = [row_offset .. row_offset+4), one row per sub-step.
+//   row_offset + 0  →  θ
+//   row_offset + 1  →  ρπ
+//   row_offset + 2  →  χ
+//   row_offset + 3  →  ι
+//
+// Cross-row state threading is enforced by Copy constraints between
+// the output_state of sub-step N (row r) and the input_state of
+// sub-step N+1 (row r+1).  These are the constraints a malicious
+// prover would have to break to cheat the state evolution — they're
+// the soundness backbone of the multi-row encoding.
+
+/// Layout for one complete Keccak round.
+#[derive(Clone, Debug)]
+pub struct RoundLayout {
+    pub round_idx: usize,
+    pub row_offset: usize,
+    pub theta:  ThetaLayout,
+    pub rho_pi: RhoPiLayout,
+    pub chi:    ChiLayout,
+    pub iota:   IotaLayout,
+}
+
+impl RoundLayout {
+    /// Place the round starting at `row_offset`.  All sub-step
+    /// layouts start at column 0 of their respective row (the trace
+    /// LDE will see different prefixes per row — unification to a
+    /// fixed row width happens in the outer round-sequence layout).
+    pub fn new(round_idx: usize, row_offset: usize) -> Self {
+        assert!(round_idx < 24);
+        Self {
+            round_idx,
+            row_offset,
+            theta:  ThetaLayout::new(row_offset,     0),
+            rho_pi: RhoPiLayout::new(row_offset + 1, 0),
+            chi:    ChiLayout::new(row_offset + 2,   0),
+            iota:   IotaLayout::new(row_offset + 3,  0),
+        }
+    }
+
+    /// Number of trace rows this round occupies.
+    pub fn rows(&self) -> usize { 4 }
+
+    /// Maximum row width across the 4 sub-steps.  When this layout
+    /// is embedded in the outer trace, every row must have at least
+    /// this width allocated.
+    pub fn max_row_width(&self) -> usize {
+        [self.theta.width, self.rho_pi.width, self.chi.width, self.iota.width]
+            .iter().copied().max().unwrap()
+    }
+}
+
+/// Emit all constraints for one full round: 4 sub-step constraint
+/// sets + 3 × 1 600 cross-row Copy constraints for state threading
+/// between consecutive sub-steps.  Total per round: 28 800 + 4 800
+/// = 33 600 constraints.
+pub fn round_constraints(layout: &RoundLayout) -> Vec<BitOp> {
+    let mut out: Vec<BitOp> = Vec::with_capacity(33600);
+    out.extend(theta_constraints(&layout.theta));
+    out.extend(rho_pi_constraints(&layout.rho_pi));
+    out.extend(chi_constraints(&layout.chi));
+    out.extend(iota_constraints(&layout.iota, layout.round_idx));
+
+    // Cross-row state threading:
+    //   θ.output_bit(lane, bit)  ≡  ρπ.input_bit(lane, bit)
+    //   ρπ.output_bit(lane, bit) ≡  χ.input_bit(lane, bit)
+    //   χ.output_bit(lane, bit)  ≡  ι.input_bit(lane, bit)
+    for lane in 0..25 {
+        for bit in 0..64 {
+            out.push(BitOp::Copy {
+                c: layout.rho_pi.input_bit(lane, bit),
+                a: layout.theta.output_bit(lane, bit),
+            });
+            out.push(BitOp::Copy {
+                c: layout.chi.input_bit(lane, bit),
+                a: layout.rho_pi.output_bit(lane, bit),
+            });
+            out.push(BitOp::Copy {
+                c: layout.iota.input_bit(lane, bit),
+                a: layout.chi.output_bit(lane, bit),
+            });
+        }
+    }
+
+    out
+}
+
+/// All cell values for one complete round.
+#[derive(Clone, Debug)]
+pub struct RoundCells {
+    pub theta:  ThetaCells,
+    pub rho_pi: RhoPiCells,
+    pub chi:    ChiCells,
+    pub iota:   IotaCells,
+}
+
+impl RoundCells {
+    /// Final state after this round (= ι output).
+    pub fn output_state(&self) -> BitState {
+        self.iota.output_state
+    }
+}
+
+/// Synthesize cell values for one full Keccak round.  Chains the 4
+/// sub-step synthesisers and produces a consistent cell set that
+/// satisfies every constraint emitted by [`round_constraints`].
+pub fn synthesize_round(input: &BitState, round_idx: usize) -> RoundCells {
+    let theta  = synthesize_theta(input);
+    let rho_pi = synthesize_rho_pi(&theta.output_state);
+    let chi    = synthesize_chi(&rho_pi.output_state);
+    let iota   = synthesize_iota(&chi.output_state, round_idx);
+    RoundCells { theta, rho_pi, chi, iota }
+}
+
+/// Write all 4 sub-step row's cells into a mock trace.
+pub fn write_round_cells(
+    cells: &RoundCells,
+    layout: &RoundLayout,
+    trace: &mut crate::bit_constraint::MockTrace,
+) {
+    write_theta_cells(&cells.theta,   &layout.theta,  trace);
+    write_rho_pi_cells(&cells.rho_pi, &layout.rho_pi, trace);
+    write_chi_cells(&cells.chi,       &layout.chi,    trace);
+    write_iota_cells(&cells.iota,     &layout.iota,   trace);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,6 +1301,141 @@ mod tests {
 
             assert_eq!(iota.output_state, native_state,
                 "full-round composition diverges at round {round}");
+        }
+    }
+
+    // ─── Full round (4-row + cross-row threading) tests ─────────────
+
+    #[test]
+    fn round_layout_has_4_rows() {
+        let layout = RoundLayout::new(0, 0);
+        assert_eq!(layout.rows(), 4);
+        // Rows assigned correctly per sub-step
+        assert_eq!(layout.theta.row,  0);
+        assert_eq!(layout.rho_pi.row, 1);
+        assert_eq!(layout.chi.row,    2);
+        assert_eq!(layout.iota.row,   3);
+    }
+
+    #[test]
+    fn round_layout_max_row_width_is_chi() {
+        let layout = RoundLayout::new(0, 0);
+        // χ is the widest sub-step (6 400); the outer trace must
+        // allocate at least this width per row.
+        assert_eq!(layout.max_row_width(), 6400);
+    }
+
+    #[test]
+    fn round_constraint_count_matches_design() {
+        let layout = RoundLayout::new(0, 0);
+        let cs = round_constraints(&layout);
+        // Per-sub-step: θ=8 000, ρπ=4 800, χ=11 200, ι=4 800 = 28 800
+        // Cross-row threading: 3 × 1 600 = 4 800 Copy constraints
+        // Total: 33 600
+        assert_eq!(cs.len(), 33_600);
+
+        // Cross-row Copy constraints exist (i.e. threading is wired)
+        let cross_row_copies = cs.iter().filter(|c| match c {
+            BitOp::Copy { c, a } => c.row != a.row,
+            _ => false,
+        }).count();
+        assert_eq!(cross_row_copies, 3 * 1600,
+            "must have 3 × 1 600 cross-row Copy constraints for state threading");
+    }
+
+    #[test]
+    fn synthesized_round_matches_native_for_all_rounds() {
+        // For every round 0..24, the round synthesiser must produce
+        // an output state equal to `keccak_round_bit_level` for that
+        // round on the same input.
+        use crate::sha3_absorb_air::keccak_round_bit_level;
+        let input = make_input_state();
+        for round in 0..24 {
+            let cells = synthesize_round(&input, round);
+            let mut native = input;
+            keccak_round_bit_level(&mut native, round);
+            assert_eq!(cells.output_state(), native, "round {round}");
+        }
+    }
+
+    #[test]
+    fn synthesized_round_satisfies_all_constraints() {
+        // Build a multi-row mock trace big enough for the 4-row layout,
+        // synthesise + write cells, verify EVERY constraint passes.
+        let layout = RoundLayout::new(5, 0);  // round 5, row 0
+        let row_width = layout.max_row_width();
+        let n_rows = layout.row_offset + layout.rows();
+        let mut trace = MockTrace::zeros(n_rows, row_width);
+
+        let input = make_input_state();
+        let cells = synthesize_round(&input, 5);
+        write_round_cells(&cells, &layout, &mut trace);
+
+        let constraints = round_constraints(&layout);
+        for (i, c) in constraints.iter().enumerate() {
+            assert!(c.satisfied_by(&trace),
+                "round constraint #{i} = {c:?} residue = {}",
+                c.eval(&trace));
+        }
+    }
+
+    #[test]
+    fn round_threading_tampering_breaks_constraint() {
+        // The critical test for cross-row state threading: if a
+        // prover tries to "skip" a sub-step by writing different
+        // values into the next-row input than what came out of the
+        // previous-row output, the Copy threading constraints MUST
+        // catch it.  Without this property the multi-row encoding
+        // is unsound.
+        let layout = RoundLayout::new(5, 0);
+        let row_width = layout.max_row_width();
+        let n_rows = layout.row_offset + layout.rows();
+        let mut trace = MockTrace::zeros(n_rows, row_width);
+
+        let input = make_input_state();
+        let cells = synthesize_round(&input, 5);
+        write_round_cells(&cells, &layout, &mut trace);
+
+        // Tamper: write a different value into the χ input row that
+        // does NOT match the ρπ output row.  This simulates a prover
+        // trying to splice in a fake state between sub-steps.
+        let bad_cell = layout.chi.input_bit(8, 21);
+        let original = trace.get_cell(bad_cell);
+        trace.set(bad_cell, 1 - original);
+
+        let constraints = round_constraints(&layout);
+        let n_failing = constraints.iter()
+            .filter(|c| !c.satisfied_by(&trace))
+            .count();
+        // At least the threading Copy + at least one χ constraint
+        // must catch this — the χ output now no longer matches the
+        // χ input either.
+        assert!(n_failing >= 2,
+            "tampering with χ input should trip ≥ 2 constraints; got {n_failing}");
+    }
+
+    #[test]
+    fn round_supports_non_zero_row_offset() {
+        // Make sure rounds at non-zero row_offsets work — required
+        // for chaining multiple rounds into a full permutation.
+        let layout = RoundLayout::new(3, 12);  // round 3 at rows 12..16
+        assert_eq!(layout.theta.row,  12);
+        assert_eq!(layout.rho_pi.row, 13);
+        assert_eq!(layout.chi.row,    14);
+        assert_eq!(layout.iota.row,   15);
+
+        let row_width = layout.max_row_width();
+        let n_rows = layout.row_offset + layout.rows();
+        let mut trace = MockTrace::zeros(n_rows, row_width);
+
+        let input = make_input_state();
+        let cells = synthesize_round(&input, 3);
+        write_round_cells(&cells, &layout, &mut trace);
+
+        let constraints = round_constraints(&layout);
+        for c in &constraints {
+            assert!(c.satisfied_by(&trace),
+                "constraint {c:?} failed at row_offset=12");
         }
     }
 }
