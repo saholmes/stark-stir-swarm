@@ -9,6 +9,11 @@ description = "DNS-rollup record helpers, authority signing layer, and the megaz
 default  = ["sha3-256", "parallel"]
 sha3-256 = ["deep_ali/sha3-256"]
 parallel = ["deep_ali/parallel"]
+# Forward the merkle leaf-compression accelerator (paper dual-hash §8):
+# Poseidon-compresses field-element leaves, then SHA-3 the state for the
+# verifier-facing leaf hash.  Internal Merkle nodes remain SHA-3 only —
+# verifier-path soundness is unchanged (SHA-3 CR + FRI IT).
+poseidon-accel = ["deep_ali/poseidon-accel"]
 
 [dependencies]
 ark-ff         = { workspace = true }

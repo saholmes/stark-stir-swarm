@@ -54,6 +54,16 @@ CELLS=(
     "ML-DSA-65   L3 sha3-384 Fp6 parallel,sha3-384,mldsa-65 mldsa_v2"
     "ML-DSA-87   L5 sha3-512 Fp8 parallel,sha3-512,mldsa-87 mldsa_v2"
 )
+# NOTE: `poseidon-accel` (paper dual-hash §8) is plumbed end-to-end
+# (merkle → deep_ali → swarm-dns) but intentionally NOT enabled for these
+# native single-pass benches.  Empirical activation at blowup=4 produced
+# 50–76× regressions in prove + verify on M4 because Poseidon-on-CPU
+# (~22K Goldilocks mults per permutation) is much slower than
+# hardware-accelerated SHA-3.  The dual-hash win is structural: it
+# materialises when expressed inside the wrapper STARK's AIR (where
+# Poseidon ~300 constraints vs SHA-3 ~5000), preserving FIPS-202
+# verifier-path purity at recursive layers.  Re-enable here only when
+# the wrapper-STARK consumer lands, or for accelerator-measurement runs.
 
 # ─── Pre-flight: which bench examples are actually present? ──────────
 # ECDSA-P256 (p256_full_ecdsa_stark_bench, etc.) was implemented in a
