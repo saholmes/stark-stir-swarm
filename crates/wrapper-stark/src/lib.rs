@@ -235,6 +235,7 @@ pub fn verify(
 
 pub mod verifier_air;
 pub mod sha3_absorb_air;
+pub mod bit_constraint;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
