@@ -239,6 +239,7 @@ pub mod bit_constraint;
 pub mod keccak_round_air;
 pub mod sponge_air;
 pub mod composition;
+pub mod fri_bridge;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
