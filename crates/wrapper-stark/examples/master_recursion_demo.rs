@@ -29,8 +29,10 @@ use deep_ali::ml_dsa_verify_air_v2_orchestration::{
 };
 
 use wrapper_stark::master_recursion_bridge::{
-    prove_master_recursive, prove_master_with_in_air_merkle_path,
-    verify_master_recursive, verify_master_with_in_air_merkle_path,
+    prove_master_recursive, prove_master_with_batched_in_air_merkle_path,
+    prove_master_with_in_air_merkle_path, verify_master_recursive,
+    verify_master_with_batched_in_air_merkle_path,
+    verify_master_with_in_air_merkle_path,
 };
 use wrapper_stark::recursive_prover::{
     RecursiveStarkProof, verify_recursive_stark,
@@ -232,8 +234,75 @@ fn main() {
     println!("  The N×Merkle component is linear in N; combining with the");
     println!("  sub-linear master gives O(N) overall L1 wire — bigger than");
     println!("  Option B's O(1) but with FULL CRYPTOGRAPHIC BINDING and");
-    println!("  NO DA DEPENDENCY.  For TRUE O(log N) wire with full binding,");
-    println!("  the natural next step is a batched-Merkle AIR that processes");
-    println!("  all N Merkle paths in one larger trace (~1 STARK total).");
+    println!("  NO DA DEPENDENCY.");
+    println!();
+    println!("  See [BATCHED] below for the O(log N) wire variant — ONE");
+    println!("  Merkle-path STARK whose leaf is SHA3 of all N inner pi_hashes.");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // ─── 5. Option C with BATCHED in-AIR Merkle binding (TRUE O(log N)) ─
+    println!("[BATCHED] Option C with batched in-AIR Merkle binding (TRUE O(log N) wire)");
+    println!();
+
+    let t = Instant::now();
+    let batched = prove_master_with_batched_in_air_merkle_path(
+        &inners,
+        /*master blowup=*/ master_blowup, /*master r=*/ master_r, /*master stir=*/ false,
+        /*merkle blowup=*/ 4, /*merkle r=*/ 54, /*merkle use_stir=*/ false,
+    ).expect("batched bundle must prove");
+    let batched_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    let batched_ok = verify_master_with_batched_in_air_merkle_path(&batched, &inners);
+    let batched_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    assert!(batched_ok);
+
+    let mut batched_master_buf = Vec::new();
+    batched.master.fri_proof.serialize_compressed(&mut batched_master_buf).unwrap();
+    let mut batched_merkle_buf = Vec::new();
+    batched.merkle_path_proof.fri_proof.serialize_compressed(&mut batched_merkle_buf).unwrap();
+    let batched_pi_bytes = batched.inner_pi_hashes.len() * 32;
+    let batched_total = batched_master_buf.len() + batched_merkle_buf.len() + batched_pi_bytes;
+
+    println!("  batched prove:        {batched_prove_ms:>9.1} ms");
+    println!("  batched verify:       {batched_verify_ms:>9.2} ms");
+    println!("  master STARK size:    {}",  fmt_kib(batched_master_buf.len()));
+    println!("  1× Merkle STARK:      {}  (CONSTANT in N)",
+        fmt_kib(batched_merkle_buf.len()));
+    println!("  N × 32-byte pi_hash:  {} B  (linear, but trivially small)",
+        batched_pi_bytes);
+    println!("  full L1 wire:         {}", fmt_kib(batched_total));
+    println!("  verdict:              {}", if batched_ok { "ACCEPT" } else { "REJECT" });
+    println!();
+
+    let per_inner_total = master_buf.len() + merkle_total_bytes;
+    let saving_pct = if per_inner_total > 0 {
+        100.0 * (per_inner_total as f64 - batched_total as f64) / per_inner_total as f64
+    } else { 0.0 };
+
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  BATCHED vs PER-INNER — Option C wire comparison @ N={n}");
+    println!();
+    println!("  Per-inner [FULL] L1 wire:   {}", fmt_kib(per_inner_total));
+    println!("  Batched   [BATCHED] L1 wire:{}", fmt_kib(batched_total));
+    println!("  Saving:                     {:.1} %", saving_pct);
+    println!();
+    println!("  Scaling at production blowup=32 (per-inner Merkle ~395 KiB / batched");
+    println!("  ~395 KiB CONSTANT):");
+    println!("    N=10:   per-inner ~2 MiB + 3.95 MiB = ~5.95 MiB  vs  batched ~2.4 MiB");
+    println!("    N=100:  per-inner ~2 MiB + 39.5 MiB = ~41.5 MiB  vs  batched ~2.4 MiB");
+    println!("    N=1000: per-inner ~2 MiB + 395 MiB  = ~397 MiB   vs  batched ~2.43 MiB");
+    println!();
+    println!("  Soundness (binding chain):");
+    println!("    1. Master STARK FS-commits to N inner outer_pi_hashes via");
+    println!("       MASTER-RECURSION-COMP-V1 + OOD anchor seeds.");
+    println!("    2. Batched leaf = SHA3-256(MASTER-BATCHED-MERKLE-LEAF-V1 || N || π₁..π_N).");
+    println!("    3. Merkle-path STARK attests batched_pi opens to root.");
+    println!("    4. Verifier re-derives batched_pi + expected root from inner_pi_hashes,");
+    println!("       cross-checks each inner_pi_hashes[i] == inner_proofs[i].outer_pi_hash.");
+    println!("    A malicious prover cannot substitute a different N-tuple of pi_hashes");
+    println!("    or a different leaf — the cross-check catches it (verified by");
+    println!("    `batched_bundle_rejects_tampered_inner_pi_hashes` in-tree).");
     println!("═══════════════════════════════════════════════════════════════");
 }

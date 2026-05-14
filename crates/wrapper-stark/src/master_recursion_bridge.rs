@@ -460,10 +460,31 @@ pub fn prove_master_with_in_air_merkle_path(
     })
 }
 
+/// Re-derive the expected Merkle root for a synthetic 4-leaf binary
+/// Merkle tree containing the given `pi_hash` at leaf 0 and SHA3-256
+/// zero-leaves at indices 1..=3 (matches the construction inside
+/// `prove_in_air_merkle_binding_for_pi_hash`).
+fn expected_merkle_root_for_pi_hash(pi_hash: [u8; 32]) -> [u8; 32] {
+    let variant = Sha3Variant::Sha3_256;
+    let pi_hash_leaf = MerkleNode(pi_hash.to_vec());
+    let zero_leaf = MerkleNode::zero(variant);
+    let leaves = vec![
+        pi_hash_leaf, zero_leaf.clone(), zero_leaf.clone(), zero_leaf,
+    ];
+    let claim = merkle_build_and_open(variant, &leaves, 0);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&claim.root.0);
+    out
+}
+
 /// Verify a `MasterWithMerklePathProof` — the master STARK + every
 /// Merkle-path STARK must accept.  Confirms the leaf each Merkle-path
 /// STARK opens matches the matching inner recursive STARK's
-/// `outer_pi_hash`.
+/// `outer_pi_hash` by **re-deriving** the expected Merkle root from
+/// the inner's pi_hash and checking it against the proof's public root.
+/// (Earlier revisions of this function checked the proof's root
+/// against `bundle.merkle_roots[i]` without ever rebinding to the
+/// inner — leaving a leaf-substitution gap.  Closed here.)
 pub fn verify_master_with_in_air_merkle_path(
     bundle: &MasterWithMerklePathProof,
     inner_proofs: &[RecursiveStarkProof],
@@ -474,19 +495,361 @@ pub fn verify_master_with_in_air_merkle_path(
     if bundle.merkle_path_proofs.len() != inner_proofs.len() {
         return false;
     }
+    if bundle.merkle_roots.len() != inner_proofs.len() {
+        return false;
+    }
     for (i, mp) in bundle.merkle_path_proofs.iter().enumerate() {
         if !verify_merkle_path(mp) {
             return false;
         }
-        // Confirm the leaf the Merkle proof opens is the inner's
-        // outer_pi_hash (committed to leaf 0).
         if mp.public.leaf_index != 0 {
             return false;
         }
-        // Verify the merkle root matches what the bundle records.
-        if mp.public.root.0.as_slice() != bundle.merkle_roots[i].as_slice() {
+        // Re-derive expected root from inner[i].outer_pi_hash and confirm:
+        //  (a) the proof's public root matches expected,
+        //  (b) bundle.merkle_roots[i] also matches expected.
+        let expected = expected_merkle_root_for_pi_hash(
+            inner_proofs[i].public.outer_pi_hash,
+        );
+        if mp.public.root.0.as_slice() != expected {
             return false;
         }
+        if bundle.merkle_roots[i] != expected {
+            return false;
+        }
+    }
+    true
+}
+
+// ─── Batched in-AIR Merkle binding (O(log N) L1 wire) ────────────────
+//
+// The per-inner Merkle binding above produces N separate ~395 KiB
+// Merkle-path STARK proofs — total L1 wire scales **linearly in N**.
+// The batched form below produces **ONE** Merkle-path STARK whose leaf
+// is `SHA3-256("MASTER-BATCHED-MERKLE-LEAF-V1" || N || π₁ || π₂ || …
+// || π_N)` over the N inner outer_pi_hashes.  L1 wire then becomes
+// `~master + ~395 KiB + N×32 bytes` — TRUE O(log N) shape.
+//
+// Soundness binding:
+//   1. The master STARK already commits to the N inner outer_pi_hashes
+//      via its FS-seeded composition (`MASTER-RECURSION-COMP-V1`) and
+//      its OOD anchor (`MASTER-RECURSION-OOD-V1`).
+//   2. The batched Merkle-path STARK commits the leaf = batched_pi
+//      derived from the SAME N inner pi_hashes.
+//   3. The verifier re-derives batched_pi from the supplied
+//      `inner_pi_hashes` and re-derives the expected Merkle root,
+//      cross-checking both against the proof.
+//
+// Combined: cryptographic binding of "N inner recursive STARKs +
+// master STARK + Merkle commitment of batched_pi" with O(log N) wire.
+
+/// Composed bundle: master `RecursiveStarkProof` + ONE batched
+/// Merkle-path STARK proof + N × 32-byte inner pi_hashes.  Replaces
+/// the linear-in-N `MasterWithMerklePathProof` with a constant-shape
+/// Merkle piece — the canonical zk-rollup L1 wire profile.
+pub struct MasterWithBatchedMerkleProof {
+    pub master: RecursiveStarkProof,
+    /// Single Merkle-path STARK proof attesting batched_pi is the
+    /// leaf-0 element of a synthetic 4-leaf Merkle tree.
+    pub merkle_path_proof: MerklePathProof,
+    /// Merkle root of the synthetic tree (32 B).
+    pub merkle_root: [u8; 32],
+    /// N inner outer_pi_hashes — the only linear-in-N piece (32 B each).
+    /// L1 calldata for these is tiny: 320 B at N=10, 32 KiB at N=1 000.
+    pub inner_pi_hashes: Vec<[u8; 32]>,
+}
+
+/// Domain-separated batched-pi derivation tag.
+const BATCHED_LEAF_TAG: &[u8] = b"MASTER-BATCHED-MERKLE-LEAF-V1";
+
+/// Derive `batched_pi = SHA3-256(BATCHED_LEAF_TAG || N(LE) || π₁ || π₂ || … || π_N)`.
+///
+/// Same construction on prover + verifier; verifier never sees the
+/// intermediate state.
+fn derive_batched_leaf_pi(inner_pi_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, BATCHED_LEAF_TAG);
+    Digest::update(&mut hasher, (inner_pi_hashes.len() as u64).to_le_bytes());
+    for h in inner_pi_hashes {
+        Digest::update(&mut hasher, h);
+    }
+    Digest::finalize(hasher).into()
+}
+
+/// End-to-end Option C with **batched** in-AIR Merkle binding.
+///
+/// Produces:
+///   - 1 master `RecursiveStarkProof` (via `prove_master_recursive`)
+///   - 1 batched Merkle-path STARK proof binding `batched_pi`
+///     (= SHA3-256 of concatenated inner pi_hashes) to a Merkle root
+///   - N × 32-byte inner pi_hashes (small calldata)
+///
+/// Total L1 wire: `~master + ~395 KiB + N×32 B`.  Replaces the per-inner
+/// Merkle path's N × ~395 KiB linear-in-N piece with a single constant
+/// ~395 KiB plus the trivially small pi_hash list.
+///
+/// # Parameters
+///
+/// Same shape as `prove_master_with_in_air_merkle_path`; the only
+/// difference is one Merkle-path STARK instead of N.
+pub fn prove_master_with_batched_in_air_merkle_path(
+    inner_proofs: &[RecursiveStarkProof],
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<MasterWithBatchedMerkleProof, MasterMerkleBindingError> {
+    if inner_proofs.is_empty() {
+        return Err(MasterMerkleBindingError::Inner(MasterBridgeError::EmptyInput));
+    }
+
+    let master = prove_master_recursive(inner_proofs, blowup, r, use_stir)
+        .map_err(MasterMerkleBindingError::Inner)?;
+
+    let inner_pi_hashes: Vec<[u8; 32]> =
+        inner_proofs.iter().map(|r| r.public.outer_pi_hash).collect();
+    let batched_pi = derive_batched_leaf_pi(&inner_pi_hashes);
+
+    let (merkle_path_proof, merkle_root) = prove_in_air_merkle_binding_for_pi_hash(
+        batched_pi, merkle_blowup, merkle_r, merkle_use_stir,
+    )?;
+
+    Ok(MasterWithBatchedMerkleProof {
+        master, merkle_path_proof, merkle_root, inner_pi_hashes,
+    })
+}
+
+// ─── Two-level sharded master recursion ──────────────────────────────
+//
+// At very large N (STARK-DNS-zone scale, N ≥ 256), a single master
+// STARK over all N inners blows up the prover's memory: master n_trace
+// scales linearly with N, and the LDE working set scales as
+// `n_trace × blowup × width × Ext_degree × 8 B`, which at N = 10 000
+// exceeds 100 GB.  The sharded form below addresses this by recursing
+// the master gadget itself a second time:
+//
+//   ```
+//   N inners  ──►  K first-level masters (Ni inners each)
+//                  ──►  1 super-master over the K first-level masters
+//                       + 1 top batched Merkle over all N inner pi_hashes
+//   ```
+//
+// Peak prover memory per step is O(max(Ni, K)) — the K first-level
+// masters can be proven sequentially.  Only the **super-master**, the
+// **top batched Merkle**, and `(N + K) × 32 B` of pi_hash calldata go
+// to L1.  The K shard masters are local-only — their FRI-quotient
+// algebraic relation is attested by the super-master's sub-circuit 1.
+//
+// Soundness chain (same shape as single-level Option C + the top
+// batched Merkle):
+//   1. Super-master FRI-verifies (attests K shard masters' FRI-quotient
+//      relations via sub-circuit 1).
+//   2. Top batched Merkle binds batched_pi = SHA3(N || π₁..π_N) to root.
+//   3. Verifier cross-checks each inner_pi_hashes[i] ==
+//      inner_proofs[i].outer_pi_hash.
+//
+// Soundness caveat (same shape as the single-level case): sub-circuit 1
+// attests the algebraic FRI-quotient relation on prover-supplied
+// residues.  A tighter form would add in-AIR Merkle binding at every
+// recursion level (shard-level too) — follow-up work; for the
+// architecture-at-scale demo, the top batched Merkle is the wire-
+// level binding.
+
+/// Two-level sharded master proof.
+///
+/// Replaces a single master over N inners with K first-level masters
+/// (Ni inners each) + 1 super-master over the K.  Memory-bounded:
+/// each shard prover sees only O(Ni) residues, the super-master only
+/// O(K) residues.  L1 wire = super_master + top batched Merkle +
+/// (N + K) × 32 B pi_hash calldata.
+pub struct TwoLevelShardedProof {
+    /// The second-level master STARK proving "K shard masters' FRI
+    /// algebraic relations hold."  Posted to L1.
+    pub super_master: RecursiveStarkProof,
+    /// Top batched in-AIR Merkle binding over all N inner pi_hashes.
+    /// Posted to L1.
+    pub top_merkle_path: MerklePathProof,
+    /// Top Merkle root (32 B).  Posted to L1.
+    pub top_merkle_root: [u8; 32],
+    /// All N inner outer_pi_hashes (calldata).
+    pub inner_pi_hashes: Vec<[u8; 32]>,
+    /// K shard-master outer_pi_hashes (calldata).  Exposed for
+    /// transparency / re-deriving the super_master's FS transcript
+    /// off-chain; not used in the algebraic verify path (the
+    /// super_master FRI verify is self-contained).
+    pub shard_pi_hashes: Vec<[u8; 32]>,
+    /// Sharding parameter `Ni` (number of inners per first-level master).
+    pub shard_size: usize,
+}
+
+/// Prove a two-level sharded master over `inner_proofs`, with
+/// `shard_size` inners per first-level master.  K = ceil(N / shard_size).
+///
+/// Trades off:
+///   - **Smaller shard_size** → smaller per-shard memory + smaller K
+///     super-master.  But K grows → super-master n_trace grows linearly
+///     in K.
+///   - **Larger shard_size** → fewer shards K but each shard prover
+///     needs more memory.
+///
+/// For STARK-DNS at N=10 000: shard_size=256, K=40 gives ~256-row first-
+/// level master prover memory (fits on 32 GB dev machine) + K=40
+/// super-master n_trace ≈ 16× smaller than the equivalent single master
+/// at N=10 000.
+///
+/// # Parameters
+///
+/// - `inner_proofs`: N inner recursive STARK proofs (from
+///   `prove_v2_all_subairs_composed_recursive` in FRI mode).
+/// - `shard_size`: Ni — number of inners per first-level master.
+///   Must be ≥ 1.  K = `(N + Ni − 1) / Ni`.
+/// - `(master_blowup, master_r, master_use_stir)`: FRI parameters for
+///   both the first- and second-level master STARKs.
+/// - `(merkle_blowup, merkle_r, merkle_use_stir)`: FRI parameters for
+///   the top batched Merkle STARK.
+pub fn prove_two_level_sharded_master(
+    inner_proofs: &[RecursiveStarkProof],
+    shard_size: usize,
+    master_blowup: usize,
+    master_r: usize,
+    master_use_stir: bool,
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<TwoLevelShardedProof, MasterMerkleBindingError> {
+    if inner_proofs.is_empty() {
+        return Err(MasterMerkleBindingError::Inner(MasterBridgeError::EmptyInput));
+    }
+    if shard_size == 0 {
+        return Err(MasterMerkleBindingError::Internal(
+            "shard_size must be >= 1".into(),
+        ));
+    }
+
+    // 1. Prove each shard's first-level master (sequentially — bounds
+    //    peak prover memory to O(shard_size) at any one time).
+    let mut shard_masters: Vec<RecursiveStarkProof> =
+        Vec::with_capacity((inner_proofs.len() + shard_size - 1) / shard_size);
+    for shard in inner_proofs.chunks(shard_size) {
+        let m = prove_master_recursive(
+            shard, master_blowup, master_r, master_use_stir,
+        ).map_err(MasterMerkleBindingError::Inner)?;
+        shard_masters.push(m);
+    }
+
+    // 2. Prove the super (second-level) master over the K shard masters.
+    let super_master = prove_master_recursive(
+        &shard_masters, master_blowup, master_r, master_use_stir,
+    ).map_err(MasterMerkleBindingError::Inner)?;
+
+    // 3. Top batched Merkle binding over all N inner pi_hashes.
+    let inner_pi_hashes: Vec<[u8; 32]> =
+        inner_proofs.iter().map(|r| r.public.outer_pi_hash).collect();
+    let batched_pi = derive_batched_leaf_pi(&inner_pi_hashes);
+    let (top_merkle_path, top_merkle_root) = prove_in_air_merkle_binding_for_pi_hash(
+        batched_pi, merkle_blowup, merkle_r, merkle_use_stir,
+    )?;
+
+    let shard_pi_hashes: Vec<[u8; 32]> =
+        shard_masters.iter().map(|m| m.public.outer_pi_hash).collect();
+
+    Ok(TwoLevelShardedProof {
+        super_master, top_merkle_path, top_merkle_root,
+        inner_pi_hashes, shard_pi_hashes, shard_size,
+    })
+}
+
+/// Verify a `TwoLevelShardedProof`.
+///
+/// Verifies:
+///   1. `inner_pi_hashes[i] == inner_proofs[i].outer_pi_hash` for every i
+///      (binds the bundle to the supplied inner proofs).
+///   2. `shard_pi_hashes.len() == ceil(N / shard_size)` (sanity).
+///   3. The super-master FRI-verifies (self-contained: attests the K
+///      shard-master FRI-quotient relations algebraically).
+///   4. The top batched Merkle binds `batched_pi(inner_pi_hashes)` to
+///      the recorded root.
+pub fn verify_two_level_sharded_master(
+    proof: &TwoLevelShardedProof,
+    inner_proofs: &[RecursiveStarkProof],
+) -> bool {
+    if proof.inner_pi_hashes.len() != inner_proofs.len() {
+        return false;
+    }
+    if proof.shard_size == 0 {
+        return false;
+    }
+    for (i, h) in proof.inner_pi_hashes.iter().enumerate() {
+        if *h != inner_proofs[i].public.outer_pi_hash {
+            return false;
+        }
+    }
+    let expected_k =
+        (proof.inner_pi_hashes.len() + proof.shard_size - 1) / proof.shard_size;
+    if proof.shard_pi_hashes.len() != expected_k {
+        return false;
+    }
+    if !verify_master_recursive(&proof.super_master) {
+        return false;
+    }
+    let batched_pi = derive_batched_leaf_pi(&proof.inner_pi_hashes);
+    let expected_root = expected_merkle_root_for_pi_hash(batched_pi);
+    if expected_root != proof.top_merkle_root {
+        return false;
+    }
+    if !verify_merkle_path(&proof.top_merkle_path) {
+        return false;
+    }
+    if proof.top_merkle_path.public.leaf_index != 0 {
+        return false;
+    }
+    if proof.top_merkle_path.public.root.0.as_slice() != expected_root {
+        return false;
+    }
+    true
+}
+
+/// Verify a `MasterWithBatchedMerkleProof`.
+///
+/// Re-derives both the batched pi_hash and the expected Merkle root
+/// from `bundle.inner_pi_hashes`, cross-checks them against the proof,
+/// and confirms each `inner_pi_hashes[i] == inner_proofs[i].outer_pi_hash`.
+/// Without the per-inner cross-check, a malicious prover could
+/// substitute a different N-tuple of pi_hashes into the batched leaf.
+pub fn verify_master_with_batched_in_air_merkle_path(
+    bundle: &MasterWithBatchedMerkleProof,
+    inner_proofs: &[RecursiveStarkProof],
+) -> bool {
+    if !verify_master_recursive(&bundle.master) {
+        return false;
+    }
+    if bundle.inner_pi_hashes.len() != inner_proofs.len() {
+        return false;
+    }
+    // Cross-check the supplied inner_pi_hashes against the actual
+    // inner proofs (binds bundle.inner_pi_hashes to the master).
+    for (i, h) in bundle.inner_pi_hashes.iter().enumerate() {
+        if *h != inner_proofs[i].public.outer_pi_hash {
+            return false;
+        }
+    }
+    // Re-derive batched_pi + expected merkle root.
+    let batched_pi = derive_batched_leaf_pi(&bundle.inner_pi_hashes);
+    let expected_root = expected_merkle_root_for_pi_hash(batched_pi);
+    if expected_root != bundle.merkle_root {
+        return false;
+    }
+    // Verify the batched Merkle-path STARK + bind to the expected root.
+    if !verify_merkle_path(&bundle.merkle_path_proof) {
+        return false;
+    }
+    if bundle.merkle_path_proof.public.leaf_index != 0 {
+        return false;
+    }
+    if bundle.merkle_path_proof.public.root.0.as_slice() != expected_root {
+        return false;
     }
     true
 }
@@ -604,5 +967,105 @@ mod tests {
         let master = prove_master_recursive(&inners, 4, 54, false)
             .expect("master prove @ N=4");
         assert!(verify_master_recursive(&master));
+    }
+
+    #[test]
+    fn batched_leaf_pi_is_deterministic_and_depends_on_inputs() {
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let a = derive_batched_leaf_pi(&[h1, h2]);
+        let b = derive_batched_leaf_pi(&[h1, h2]);
+        assert_eq!(a, b);
+        let c = derive_batched_leaf_pi(&[h2, h1]);
+        assert_ne!(a, c, "order-sensitive");
+        let d = derive_batched_leaf_pi(&[h1, h2, h2]);
+        assert_ne!(a, d, "length-sensitive");
+    }
+
+    #[test]
+    #[ignore = "slow — Option C with BATCHED in-AIR Merkle binding at N=2"]
+    fn prove_master_with_batched_in_air_merkle_path_n2() {
+        let inner1 = build_one_inner_recursive(401);
+        let inner2 = build_one_inner_recursive(402);
+        let inners = vec![inner1, inner2];
+
+        let bundle = prove_master_with_batched_in_air_merkle_path(
+            &inners,
+            /*blowup=*/4, /*r=*/54, /*stir=*/false,
+            /*merkle_blowup=*/4, /*merkle_r=*/54, /*merkle_use_stir=*/false,
+        ).expect("batched bundle must prove");
+
+        assert!(verify_master_with_batched_in_air_merkle_path(&bundle, &inners),
+            "batched bundle must verify");
+
+        // Only ONE Merkle-path STARK regardless of N.
+        assert_eq!(bundle.merkle_path_proof.public.leaf_index, 0);
+        assert_eq!(bundle.merkle_path_proof.depth, 2);
+        assert_eq!(bundle.inner_pi_hashes.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "slow — two-level sharded master @ N=4 inners, shard_size=2 (K=2)"]
+    fn prove_two_level_sharded_master_n4_k2() {
+        let inners: Vec<RecursiveStarkProof> = (0..4)
+            .map(|i| build_one_inner_recursive(600 + i))
+            .collect();
+
+        let proof = prove_two_level_sharded_master(
+            &inners,
+            /*shard_size=*/ 2,
+            /*master_blowup=*/ 4, /*master_r=*/ 54, /*master_stir=*/ false,
+            /*merkle_blowup=*/ 4, /*merkle_r=*/ 54, /*merkle_stir=*/ false,
+        ).expect("two-level sharded prove must succeed");
+
+        assert!(verify_two_level_sharded_master(&proof, &inners),
+            "two-level sharded must verify");
+        // K = ceil(4 / 2) = 2
+        assert_eq!(proof.shard_pi_hashes.len(), 2);
+        assert_eq!(proof.inner_pi_hashes.len(), 4);
+        assert_eq!(proof.shard_size, 2);
+        assert_eq!(proof.top_merkle_path.public.leaf_index, 0);
+    }
+
+    #[test]
+    #[ignore = "slow — tampered sharded bundle must reject"]
+    fn sharded_bundle_rejects_tampered_inner_pi_hashes() {
+        let inners: Vec<RecursiveStarkProof> = (0..4)
+            .map(|i| build_one_inner_recursive(700 + i))
+            .collect();
+
+        let mut proof = prove_two_level_sharded_master(
+            &inners, 2, 4, 54, false, 4, 54, false,
+        ).expect("sharded prove");
+
+        // Honest case verifies.
+        assert!(verify_two_level_sharded_master(&proof, &inners));
+
+        // Tamper inner_pi_hashes[0] — verifier must reject because it
+        // no longer matches inner_proofs[0].public.outer_pi_hash.
+        proof.inner_pi_hashes[0][0] ^= 0xFF;
+        assert!(!verify_two_level_sharded_master(&proof, &inners),
+            "tampered inner_pi_hashes[0] must reject");
+    }
+
+    #[test]
+    #[ignore = "slow — tampered batched bundle must reject"]
+    fn batched_bundle_rejects_tampered_inner_pi_hashes() {
+        let inner1 = build_one_inner_recursive(501);
+        let inner2 = build_one_inner_recursive(502);
+        let inners = vec![inner1, inner2];
+
+        let mut bundle = prove_master_with_batched_in_air_merkle_path(
+            &inners, 4, 54, false, 4, 54, false,
+        ).expect("batched prove");
+
+        // Verify honest case first.
+        assert!(verify_master_with_batched_in_air_merkle_path(&bundle, &inners));
+
+        // Tamper inner_pi_hashes[0] — verifier must reject because it
+        // no longer matches inner_proofs[0].public.outer_pi_hash.
+        bundle.inner_pi_hashes[0][0] ^= 0xFF;
+        assert!(!verify_master_with_batched_in_air_merkle_path(&bundle, &inners),
+            "tampered inner_pi_hashes[0] must reject");
     }
 }

@@ -1456,6 +1456,106 @@ pub fn deep_ali_merge_rsa_stacked_streaming(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Streaming P-256 ECDSA verify merge — paper §IV-A Step 2b S_ic path.
+//  Wraps the ported `p256_ecdsa_air::eval_ecdsa_verify_demo` AIR (10 116
+//  LOC across 13 files; commit history `61e6dfd → 6f5e3c4`) into a FRI
+//  c_eval polynomial that `deep_fri_prove` consumes.
+//
+//  The ECDSA AIR is a SINGLE-ROW composition (witness placed in trace
+//  row 0; rows 1..n_trace zero-padded).  All constraints are row-
+//  uniform with no cross-row references, so the merge has no `nxt`
+//  argument unlike the RSA stacked merge.  Padding rows trivially
+//  satisfy the AIR's polynomial constraints (boolean × bit, mul × mul,
+//  group-add × group-add — every constraint is zero when its operand
+//  cells are zero).
+// ═══════════════════════════════════════════════════════════════════
+pub fn deep_ali_merge_p256_ecdsa_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_air::EcdsaVerifyDemoLayout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_air::{
+        ecdsa_verify_demo_constraints, eval_ecdsa_verify_demo,
+    };
+
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_verify_demo_constraints(layout);
+
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    // Per-LDE-point: read the column values into a row buffer, evaluate
+    // the AIR's `k` per-row constraints, then α-combine into one F.
+    // Parallelised over LDE points since the AIR has no cross-row deps.
+    let phi_eval: Vec<F> = {
+        #[cfg(feature = "parallel")]
+        {
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let cur: Vec<F> =
+                        (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+                    let cvals = eval_ecdsa_verify_demo(&cur, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k {
+                        acc += combination_coeffs[j] * cvals[j];
+                    }
+                    acc
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..n)
+                .map(|i| {
+                    let cur: Vec<F> =
+                        (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+                    let cvals = eval_ecdsa_verify_demo(&cur, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k {
+                        acc += combination_coeffs[j] * cvals[j];
+                    }
+                    acc
+                })
+                .collect()
+        }
+    };
+
+    let domain =
+        GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    // ECDSA AIR max constraint degree: group_add gadget uses degree-3
+    // mults (projective coordinate adds); scalar_mul uses degree-2;
+    // scalar_eq is degree-2.  Conservative bound: 3.
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else {
+        0
+    };
+    let info = CompositionInfo {
+        phi_degree_bound,
+        quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k,
+        max_constraint_degree: max_deg,
+        trace_width: w,
+    };
+    (c_eval, info)
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Legacy single-constraint merge (Fibonacci: Φ̃ = a·s + e − t)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1568,6 +1668,26 @@ pub mod rsa2048;
 pub mod rsa2048_field_air;
 pub mod rsa2048_exp_air;
 pub mod rsa2048_stacked_air;
+
+// ECDSA-P256 (FIPS 186-4) verify AIR — ported from the stark-swarm
+// fork's `deep_ali` (commits 61e6dfd → 6f5e3c4 across 4 sprints).
+// Composes F_p, F_n, group, scalar-mul, Fermat-inversion sub-AIRs
+// into a top-level verify gadget.  Phase 5 v0 takes pre-computed
+// (u_1, u_2) — the Fermat-inversion gadget for deriving them lives
+// in `p256_fermat_air` and is wired-ready for the full composition.
+pub mod p256_field;
+pub mod p256_field_air;
+pub mod p256_scalar;
+pub mod p256_scalar_air;
+pub mod p256_group;
+pub mod p256_group_air;
+pub mod p256_scalar_mul_air;
+pub mod p256_scalar_mul_multirow_air;
+pub mod p256_fermat_air;
+pub mod p256_fp_fermat_air;
+pub mod p256_ecdsa_double_multirow_air;
+pub mod p256_ecdsa;
+pub mod p256_ecdsa_air;
 
 // ML-DSA-44 (FIPS 204) verify AIR — phase 1 scaffolding (2026-05-07).
 // Native references + Z_q field AIR + NTT layout + Keccak-f[1600]

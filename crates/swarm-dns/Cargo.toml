@@ -57,3 +57,18 @@ mimalloc      = "0.1"
 # and as a runtime baseline.  Not on the runtime verification path —
 # `verify_zsk_ksk_runtime_fallback` uses only `deep_ali`.
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
+# ─── .se HNPL demo: real DNSSEC capture via Hickory-DNS ──────────────
+# Used only by `examples/se_zone_demo.rs` to fetch real .se zone data
+# (DNSKEY / RRSIG / DS / leaf RRsets) over standard +dnssec DNS
+# queries.  The captured records feed into the existing per-record
+# STARK provers (RSA-2048 / ECDSA-P256 / Ed25519) and the outer
+# rollup, demonstrating the paper's HNPL Phase 1 pipeline on real
+# Internet data without depending on a synthetic megazone.
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dnssec-ring", "system-config"] }
+hickory-proto    = { version = "0.24", default-features = false, features = ["dnssec-ring"] }
+tokio            = { workspace = true }
+# Native verifiers used as the "today's-classical-crypto" ground truth
+# for each captured RRSIG (mirrors the paper's pre-proof check).
+ring             = "0.17"
+p256             = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }

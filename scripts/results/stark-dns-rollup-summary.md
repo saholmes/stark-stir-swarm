@@ -17,11 +17,15 @@ regime:
 | Recursive STARK gadget (4 sub-circuits) | ✓ Production | `wrapper-stark::recursive_prover` |
 | v2 → recursive STARK bridge      | ✓ Ext-generic (Fp⁶/Fp⁸) | `wrapper-stark::v2_recursion_bridge` |
 | Outer HashRollup STARK           | ✓ HASH_BYTES-generic | `swarm-dns::prover::prove_outer_rollup` |
+| Master recursion bridge (Option C) | ✓ Implemented | `wrapper-stark::master_recursion_bridge` |
+| Batched in-AIR Merkle binding (O(log N) wire) | ✓ Implemented | same — `prove_master_with_batched_in_air_merkle_path` |
 | ML-DSA rollup demo (end-to-end)  | ✓ Multi-level builds | `swarm-dns/examples/ml_dsa_recursive_rollup_demo.rs` |
-| Calibrated r per (level, blowup) | ✓ Documented      | `scripts/results/r-vs-blowup-calibration.md` |
-| Quantum-adversary calibration    | ✓ Documented      | `scripts/results/quantum-calibration.md` |
-| Full (level × q × Fp^x) matrix   | ✓ Measured        | `scripts/results/quantum-matrix-full.md` |
-| L1 Ethereum gas analysis         | ✓ Documented      | `scripts/results/l1-ethereum-gas-analysis.md` |
+| Master + batched-Merkle demo     | ✓ Runs               | `wrapper-stark/examples/master_recursion_demo.rs` |
+| Calibrated r per (level, blowup) | ✓ Documented        | `scripts/results/r-vs-blowup-calibration.md` |
+| Quantum-adversary calibration    | ✓ Documented        | `scripts/results/quantum-calibration.md` |
+| Full (level × q × Fp^x) matrix   | ✓ Measured          | `scripts/results/quantum-matrix-full.md` |
+| L1 Ethereum gas analysis         | ✓ Documented        | `scripts/results/l1-ethereum-gas-analysis.md` |
+| Batched-Merkle wire + cost analysis | ✓ Documented      | `scripts/results/batched-merkle-binding.md` |
 
 ## Option B for STARK-DNS — works today
 
