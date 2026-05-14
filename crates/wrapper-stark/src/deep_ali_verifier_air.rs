@@ -185,7 +185,243 @@ pub fn verify_recursive_stark(proof: &RecursiveStarkProof) -> bool {
 /// recursive ML-DSA wrapper, this is the v2_orchestration's row-
 /// uniform constraint set evaluated at a single point.
 pub mod constraint_composition_verifier {
-    // Module skeleton — types and constraints land in subsequent commits.
+    use ark_ff::Field;
+
+    use crate::bit_constraint::{BitOp, CellRef, FieldTraceAccess};
+
+    /// A single constraint composition claim.  The verifier checks
+    /// `Σ_j α_j · Φ_j(values) = expected` for the given constraint
+    /// set + α coefficients + claimed column values + expected
+    /// composed value.
+    ///
+    /// All values are at a single point z — the constraint set is
+    /// the inner AIR's per-row constraints, instantiated at z.
+    #[derive(Clone, Debug)]
+    pub struct CompositionClaim<F: Field> {
+        /// Column values f_1(z), ..., f_n(z) keyed by CellRef.  In
+        /// practice these come from inner FRI query openings.
+        pub column_values: Vec<(CellRef, F)>,
+        /// The inner AIR's per-row constraints (BitOp shape).
+        pub constraints: Vec<BitOp>,
+        /// FS-derived α coefficients, one per constraint.
+        pub alphas: Vec<F>,
+        /// Expected composed value the prover claims.
+        pub expected: F,
+    }
+
+    impl<F: Field> CompositionClaim<F> {
+        pub fn n_constraints(&self) -> usize { self.constraints.len() }
+
+        /// Validate shape: alphas count == constraints count.
+        pub fn check_shape(&self) -> Result<(), String> {
+            if self.alphas.len() != self.constraints.len() {
+                return Err(format!(
+                    "alphas count {} != constraints count {}",
+                    self.alphas.len(), self.constraints.len()
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Trivial trace-access shim that resolves CellRef from a flat
+    /// lookup table.  Used by [`composition_verify_native`] as the
+    /// oracle for cross-validating AIR constraints.
+    pub struct LookupTrace<'a, F: Field> {
+        pub map: &'a [(CellRef, F)],
+    }
+
+    impl<'a, F: Field> FieldTraceAccess<F> for LookupTrace<'a, F> {
+        fn get_cell_f(&self, cell: CellRef) -> F {
+            for (k, v) in self.map {
+                if *k == cell { return *v; }
+            }
+            F::zero()  // unset cells default to zero (consistent with sparse columns)
+        }
+    }
+
+    /// Native reference: compute Σ α_j · Φ_j(values) for the claim.
+    /// Returns the actual composed value (which equals `expected` iff
+    /// the claim is true).
+    pub fn composition_eval_native<F: Field>(claim: &CompositionClaim<F>) -> F {
+        let trace = LookupTrace { map: &claim.column_values };
+        let mut acc = F::zero();
+        for (j, c) in claim.constraints.iter().enumerate() {
+            let phi = c.eval_field(&trace);
+            acc += claim.alphas[j] * phi;
+        }
+        acc
+    }
+
+    /// Check the claim natively: returns `true` iff the actual
+    /// composed value equals `claim.expected`.
+    pub fn composition_verify_native<F: Field>(claim: &CompositionClaim<F>) -> bool {
+        claim.check_shape().is_ok()
+            && composition_eval_native(claim) == claim.expected
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ark_goldilocks::Goldilocks;
+        use ark_ff::Zero;
+
+        fn cell(row: usize, col: usize) -> CellRef { CellRef::new(row, col) }
+
+        #[test]
+        fn shape_validation() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![(cell(0, 0), Goldilocks::from(0u64))],
+                constraints: vec![BitOp::Boolean { b: cell(0, 0) }],
+                alphas: vec![Goldilocks::from(7u64)],
+                expected: Goldilocks::zero(),
+            };
+            assert!(claim.check_shape().is_ok());
+        }
+
+        #[test]
+        fn shape_rejects_alpha_count_mismatch() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![(cell(0, 0), Goldilocks::from(0u64))],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 0) },
+                    BitOp::Boolean { b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(1u64)],  // wrong count
+                expected: Goldilocks::zero(),
+            };
+            assert!(claim.check_shape().is_err());
+        }
+
+        #[test]
+        fn boolean_input_zero_composes_to_zero() {
+            // Single Boolean constraint b·(b-1) at b=0 → 0.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![(cell(0, 0), Goldilocks::from(0u64))],
+                constraints: vec![BitOp::Boolean { b: cell(0, 0) }],
+                alphas: vec![Goldilocks::from(13u64)],
+                expected: Goldilocks::zero(),
+            };
+            assert!(composition_verify_native(&claim));
+        }
+
+        #[test]
+        fn boolean_input_nonzero_composes_correctly() {
+            // b·(b-1) at b=5 → 5·4 = 20.  With α=7, composed = 140.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![(cell(0, 0), Goldilocks::from(5u64))],
+                constraints: vec![BitOp::Boolean { b: cell(0, 0) }],
+                alphas: vec![Goldilocks::from(7u64)],
+                expected: Goldilocks::from(140u64),
+            };
+            assert!(composition_verify_native(&claim));
+        }
+
+        #[test]
+        fn xor_claim_with_correct_composed_value() {
+            // c = a XOR b → c - (a+b-2ab) = 0 on valid inputs.
+            // a=1, b=0 → c=1, residue = 0.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),  // a
+                    (cell(0, 1), Goldilocks::from(0u64)),  // b
+                    (cell(0, 2), Goldilocks::from(1u64)),  // c
+                ],
+                constraints: vec![BitOp::Xor {
+                    c: cell(0, 2), a: cell(0, 0), b: cell(0, 1),
+                }],
+                alphas: vec![Goldilocks::from(99u64)],
+                expected: Goldilocks::zero(),
+            };
+            assert!(composition_verify_native(&claim));
+        }
+
+        #[test]
+        fn xor_claim_rejects_wrong_composed_value() {
+            // Same trace but prover claims wrong expected value.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(1u64)),
+                ],
+                constraints: vec![BitOp::Xor {
+                    c: cell(0, 2), a: cell(0, 0), b: cell(0, 1),
+                }],
+                alphas: vec![Goldilocks::from(99u64)],
+                expected: Goldilocks::from(42u64),  // wrong
+            };
+            assert!(!composition_verify_native(&claim));
+        }
+
+        #[test]
+        fn multi_constraint_composition() {
+            // Two constraints: Boolean(b) + Xor(c=a^b)
+            // Inputs: a=1, b=1, c=0 → Boolean residue = 0, Xor residue = 0
+            // Composed = α1·0 + α2·0 = 0
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),  // a
+                    (cell(0, 1), Goldilocks::from(1u64)),  // b
+                    (cell(0, 2), Goldilocks::from(0u64)),  // c
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(3u64), Goldilocks::from(5u64)],
+                expected: Goldilocks::zero(),
+            };
+            assert!(composition_verify_native(&claim));
+        }
+
+        #[test]
+        fn tampered_column_value_breaks_composition() {
+            // Honest: a=1, b=0, c=1 → Xor residue = 0
+            // Tamper: claim a=1, b=0, c=0 → Xor residue = 0 - (1+0-0) = -1
+            // With α=2, composed = -2 ≠ 0
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(0u64)),  // wrong c
+                ],
+                constraints: vec![BitOp::Xor {
+                    c: cell(0, 2), a: cell(0, 0), b: cell(0, 1),
+                }],
+                alphas: vec![Goldilocks::from(2u64)],
+                expected: Goldilocks::zero(),  // expected for honest trace
+            };
+            assert!(!composition_verify_native(&claim),
+                "tampered c value must break the composition equality");
+        }
+
+        #[test]
+        fn fs_alpha_diversity_pins_each_constraint() {
+            // If one constraint's residue is wrong, the FS-random α
+            // makes the composed value almost-surely non-zero.  Test
+            // with several different α to confirm.  (We use static
+            // α values here; in real FS, they're H(pi_hash || idx).)
+            let bad_trace = vec![
+                (cell(0, 0), Goldilocks::from(1u64)),
+                (cell(0, 1), Goldilocks::from(0u64)),
+                (cell(0, 2), Goldilocks::from(0u64)),  // wrong
+            ];
+            let cons = vec![BitOp::Xor {
+                c: cell(0, 2), a: cell(0, 0), b: cell(0, 1),
+            }];
+            for alpha_val in [2u64, 17, 99, 0x9E37_79B9_7F4A_7C15] {
+                let claim = CompositionClaim::<Goldilocks> {
+                    column_values: bad_trace.clone(),
+                    constraints: cons.clone(),
+                    alphas: vec![Goldilocks::from(alpha_val)],
+                    expected: Goldilocks::zero(),
+                };
+                assert!(!composition_verify_native(&claim),
+                    "alpha={alpha_val} should still reject tampered trace");
+            }
+        }
+    }
 }
 
 /// `binding_cells_commit` OOD verifier sub-circuit.
