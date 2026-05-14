@@ -613,6 +613,300 @@ pub fn verify_perm_arg_accumulator(proof: &PermArgProof) -> bool {
     deep_fri_verify::<Ext>(&params, &proof.fri_proof)
 }
 
+// ─── STEP 6: outer composition — one FRI proof for all three ──────────
+//
+// Collapses the three independent per-sub-circuit FRI proofs into ONE
+// outer DeepFriProof attesting the entire recursive STARK statement:
+//
+//   ∃ witnesses such that:
+//     1. Σ α_j · Φ_j = expected   (constraint composition)
+//   ∧ 2. Σ α_j · (f_j − g_j) = 0  (binding-cells OOD)
+//   ∧ 3. ∏(γ + l_i) = ∏(γ + r_i)  (perm-arg multiset equality)
+//
+// All three sub-circuits' columns are LDE'd on a single shared domain
+// of size `n_trace_max × blowup`, where `n_trace_max` is the next
+// power-of-2 strictly large enough to host each sub-circuit's column-
+// major trace.  Per-sub-circuit c_eval contributions are summed with
+// outer α's FS-derived from `outer_pi_hash`.
+
+/// Pad a column to a target length using a closure that produces the
+/// next value given the current padding row (0-indexed from start of
+/// padding) and the previous row's value at this column.
+fn pad_column<F: Clone>(col: &mut Vec<F>, target: usize, mut next: impl FnMut(usize, &F) -> F) {
+    let mut k = 0usize;
+    while col.len() < target {
+        let prev = col.last().unwrap().clone();
+        col.push(next(k, &prev));
+        k += 1;
+    }
+}
+
+/// Public inputs for the composed recursive STARK proof.  Binds all
+/// three sub-circuit pi_hashes + `n_trace_max` into one outer pi_hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecursiveStarkPublicInputs {
+    pub composition: CompositionAccumulatorPublicInputs,
+    pub ood: OodAccumulatorPublicInputs,
+    pub perm_arg: PermArgPublicInputs,
+    pub n_trace_max: usize,
+    pub outer_pi_hash: [u8; 32],
+}
+
+impl RecursiveStarkPublicInputs {
+    pub fn for_claims(
+        comp_claim: &CompositionClaim<FBase>,
+        ood_claim: &OodAccumulatorClaim,
+        perm_claim: &PermArgClaim<FBase>,
+        n_trace_max: usize,
+    ) -> Self {
+        use ::sha3::Digest;
+        let composition = CompositionAccumulatorPublicInputs::for_claim(comp_claim);
+        let ood = OodAccumulatorPublicInputs::for_claim(ood_claim);
+        let perm_arg = PermArgPublicInputs::for_claim(perm_claim);
+        let mut h = ::sha3::Sha3_256::new();
+        h.update(b"WRAPPER-RECURSIVE-V1");
+        h.update(composition.pi_hash);
+        h.update(ood.pi_hash);
+        h.update(perm_arg.pi_hash);
+        h.update((n_trace_max as u64).to_le_bytes());
+        let digest = h.finalize();
+        let mut outer_pi_hash = [0u8; 32];
+        outer_pi_hash.copy_from_slice(&digest);
+        Self { composition, ood, perm_arg, n_trace_max, outer_pi_hash }
+    }
+}
+
+/// Composed recursive STARK proof.  Single DeepFriProof attesting all
+/// three sub-circuits simultaneously.
+pub struct RecursiveStarkProof {
+    pub public: RecursiveStarkPublicInputs,
+    pub fri_proof: DeepFriProof<Ext>,
+    pub n_trace: usize,
+    pub blowup: usize,
+    pub r: usize,
+    pub use_stir: bool,
+}
+
+/// Prove the recursive STARK statement — all three sub-circuits
+/// composed into ONE outer FRI proof.
+pub fn prove_recursive_stark(
+    comp_claim: &CompositionClaim<FBase>,
+    ood_claim: &OodAccumulatorClaim,
+    perm_claim: &PermArgClaim<FBase>,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<RecursiveStarkProof, RecursiveProverError> {
+    // 0. Shape checks.
+    comp_claim.check_shape().map_err(|e| RecursiveProverError::InvalidClaim(format!("{e:?}")))?;
+    ood_claim.check_shape().map_err(RecursiveProverError::InvalidClaim)?;
+    perm_claim.check_shape().map_err(RecursiveProverError::InvalidClaim)?;
+    if !blowup.is_power_of_two() || blowup < 2 {
+        return Err(RecursiveProverError::Internal(format!(
+            "blowup must be power-of-2 >= 2; got {blowup}"
+        )));
+    }
+    if comp_claim.constraints.is_empty() {
+        return Err(RecursiveProverError::InvalidClaim(
+            "composition constraints must be non-empty".into()
+        ));
+    }
+    if ood_claim.bundle.claims.is_empty() {
+        return Err(RecursiveProverError::InvalidClaim(
+            "OOD bundle must be non-empty".into()
+        ));
+    }
+    if perm_claim.left.is_empty() {
+        return Err(RecursiveProverError::InvalidClaim(
+            "perm-arg multiset must be non-empty".into()
+        ));
+    }
+
+    // 1. Synthesise all three sub-circuits + their initial column-major.
+    let comp_trace = AccumulatorTrace::synthesise(comp_claim);
+    let mut comp_cols = accumulator_trace_to_columns(&comp_trace);
+    if !verify_accumulator_columns(&comp_cols, comp_claim.expected) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+
+    let ood_trace = OodAccumulatorTrace::synthesise(&ood_claim.bundle, &ood_claim.alphas);
+    let mut ood_cols = ood_accumulator_trace_to_columns(&ood_trace);
+    if !verify_ood_accumulator_columns(&ood_cols) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+
+    let perm_trace = PermArgAccumulatorTrace::synthesise(perm_claim);
+    let mut perm_cols = perm_arg_accumulator_trace_to_columns(&perm_trace);
+    if !verify_perm_arg_accumulator_columns(&perm_cols, perm_claim.gamma) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+
+    // 2. Compute n_trace_max = max of (already pow2) padded lengths.
+    let n_trace_max = comp_cols[0].len()
+        .max(ood_cols[0].len())
+        .max(perm_cols[0].len());
+    debug_assert!(n_trace_max.is_power_of_two());
+    let n_lde = n_trace_max * blowup;
+
+    // 3. Pad each sub-circuit's columns to n_trace_max using its rule.
+    //
+    //    Composition padding rule: alpha=phi=0, sum carries (=final).
+    //    OOD padding rule:         f=g=residue=alpha=0, sum carries (=0).
+    //    Perm-arg padding rule:    l=r=0, rl & rr multiply by γ.
+    //
+    //    Each sub-circuit's step-3 trace_to_columns already pads to its
+    //    own next pow2; here we extend further (if needed) to the shared
+    //    n_trace_max while preserving each sub-circuit's invariants.
+    pad_column(&mut comp_cols[0], n_trace_max, |_, _| FBase::zero());        // alpha
+    pad_column(&mut comp_cols[1], n_trace_max, |_, _| FBase::zero());        // phi
+    pad_column(&mut comp_cols[2], n_trace_max, |_, prev| *prev);             // sum
+
+    pad_column(&mut ood_cols[0], n_trace_max, |_, _| FBase::zero());         // f
+    pad_column(&mut ood_cols[1], n_trace_max, |_, _| FBase::zero());         // g
+    pad_column(&mut ood_cols[2], n_trace_max, |_, _| FBase::zero());         // residue
+    pad_column(&mut ood_cols[3], n_trace_max, |_, _| FBase::zero());         // alpha
+    pad_column(&mut ood_cols[4], n_trace_max, |_, prev| *prev);              // sum
+
+    let gamma = perm_claim.gamma;
+    pad_column(&mut perm_cols[0], n_trace_max, |_, _| FBase::zero());        // l
+    pad_column(&mut perm_cols[1], n_trace_max, |_, _| FBase::zero());        // r
+    pad_column(&mut perm_cols[2], n_trace_max, |_, prev| *prev * gamma);     // rl
+    pad_column(&mut perm_cols[3], n_trace_max, |_, prev| *prev * gamma);     // rr
+
+    // Re-verify each sub-circuit's column form at the new shared length.
+    if !verify_accumulator_columns(&comp_cols, comp_claim.expected) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+    if !verify_ood_accumulator_columns(&ood_cols) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+    if !verify_perm_arg_accumulator_columns(&perm_cols, gamma) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+
+    // 4. LDE every column on the shared domain.
+    let comp_lde = lde_trace_columns(&comp_cols, n_trace_max, blowup)
+        .map_err(|e| RecursiveProverError::Internal(format!("comp LDE: {e}")))?;
+    let ood_lde = lde_trace_columns(&ood_cols, n_trace_max, blowup)
+        .map_err(|e| RecursiveProverError::Internal(format!("ood LDE: {e}")))?;
+    let perm_lde = lde_trace_columns(&perm_cols, n_trace_max, blowup)
+        .map_err(|e| RecursiveProverError::Internal(format!("perm LDE: {e}")))?;
+
+    // 5. Derive outer pi_hash + outer alphas.
+    let public = RecursiveStarkPublicInputs::for_claims(
+        comp_claim, ood_claim, perm_claim, n_trace_max,
+    );
+    let mut s_o_c = public.outer_pi_hash;  s_o_c[0] ^= 0xF0;
+    let mut s_o_o = public.outer_pi_hash;  s_o_o[0] ^= 0xF1;
+    let mut s_o_p = public.outer_pi_hash;  s_o_p[0] ^= 0xF2;
+    let outer_a_comp = alphas_from_transcript::<FBase>(&s_o_c, 1)[0];
+    let outer_a_ood  = alphas_from_transcript::<FBase>(&s_o_o, 1)[0];
+    let outer_a_perm = alphas_from_transcript::<FBase>(&s_o_p, 1)[0];
+
+    // 6. Build shared row indicators at n_trace_max.
+    let ind_0    = compute_single_row_indicator_lde(0, n_trace_max, blowup);
+    let ind_last = compute_single_row_indicator_lde(n_trace_max - 1, n_trace_max, blowup);
+
+    // 7. Compute per-sub-circuit inner α's from each sub-circuit's pi_hash.
+    let comp_pi = public.composition.pi_hash;
+    let ood_pi  = public.ood.pi_hash;
+    let perm_pi = public.perm_arg.pi_hash;
+    let mut s; // reused scratch
+    s = comp_pi;  s[0] ^= 0xC1;  let c_a_init = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = comp_pi;  s[0] ^= 0xC2;  let c_a_step = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = comp_pi;  s[0] ^= 0xC3;  let c_a_fin  = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = ood_pi;   s[0] ^= 0xD0;  let o_a_res  = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = ood_pi;   s[0] ^= 0xD1;  let o_a_init = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = ood_pi;   s[0] ^= 0xD2;  let o_a_step = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = ood_pi;   s[0] ^= 0xD3;  let o_a_fin  = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = perm_pi;  s[0] ^= 0xE0;  let p_a_il   = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = perm_pi;  s[0] ^= 0xE1;  let p_a_ir   = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = perm_pi;  s[0] ^= 0xE2;  let p_a_sl   = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = perm_pi;  s[0] ^= 0xE3;  let p_a_sr   = alphas_from_transcript::<FBase>(&s, 1)[0];
+    s = perm_pi;  s[0] ^= 0xE4;  let p_a_fn   = alphas_from_transcript::<FBase>(&s, 1)[0];
+
+    // 8. Compose outer_c_eval per LDE row across all three sub-circuits.
+    let (c_alpha, c_phi, c_sum) = (&comp_lde[0], &comp_lde[1], &comp_lde[2]);
+    let (o_f, o_g, o_res, o_alpha, o_sum) =
+        (&ood_lde[0], &ood_lde[1], &ood_lde[2], &ood_lde[3], &ood_lde[4]);
+    let (p_l, p_r, p_rl, p_rr) =
+        (&perm_lde[0], &perm_lde[1], &perm_lde[2], &perm_lde[3]);
+
+    let shift = blowup;
+    let mut outer_c_eval = vec![FBase::zero(); n_lde];
+    for idx in 0..n_lde {
+        let r_prev = (idx + n_lde - shift) % n_lde;
+        let i0 = ind_0[idx];
+        let il = ind_last[idx];
+        let not_i0 = FBase::from(1u64) - i0;
+
+        // Sub-circuit 1: constraint composition.
+        let comp_init  = c_sum[idx] - c_alpha[idx] * c_phi[idx];
+        let comp_step  = c_sum[idx] - c_sum[r_prev] - c_alpha[idx] * c_phi[idx];
+        let comp_final = c_sum[idx] - comp_claim.expected;
+        let comp_term  =
+              c_a_init * i0     * comp_init
+            + c_a_step * not_i0 * comp_step
+            + c_a_fin  * il     * comp_final;
+
+        // Sub-circuit 2: OOD residue accumulator.
+        let ood_res_def    = o_res[idx] - (o_f[idx] - o_g[idx]);
+        let ood_init       = o_sum[idx] - o_alpha[idx] * o_res[idx];
+        let ood_step       = o_sum[idx] - o_sum[r_prev] - o_alpha[idx] * o_res[idx];
+        let ood_final      = o_sum[idx];
+        let ood_term  =
+              o_a_res  * ood_res_def
+            + o_a_init * i0     * ood_init
+            + o_a_step * not_i0 * ood_step
+            + o_a_fin  * il     * ood_final;
+
+        // Sub-circuit 3: perm-arg Π running-product.
+        let perm_init_l  = p_rl[idx] - (gamma + p_l[idx]);
+        let perm_init_r  = p_rr[idx] - (gamma + p_r[idx]);
+        let perm_step_l  = p_rl[idx] - p_rl[r_prev] * (gamma + p_l[idx]);
+        let perm_step_r  = p_rr[idx] - p_rr[r_prev] * (gamma + p_r[idx]);
+        let perm_final   = p_rl[idx] - p_rr[idx];
+        let perm_term  =
+              p_a_il * i0     * perm_init_l
+            + p_a_ir * i0     * perm_init_r
+            + p_a_sl * not_i0 * perm_step_l
+            + p_a_sr * not_i0 * perm_step_r
+            + p_a_fn * il     * perm_final;
+
+        // Outer α-weighted sum.
+        outer_c_eval[idx] = outer_a_comp * comp_term
+                          + outer_a_ood  * ood_term
+                          + outer_a_perm * perm_term;
+    }
+
+    // 9. Run deep_fri_prove on the outer composed c_eval.
+    let domain = FriDomain::new_radix2(n_lde);
+    let log2_n_lde = n_lde.trailing_zeros() as usize;
+    let schedule: Vec<usize> = (0..log2_n_lde).map(|_| 2).collect();
+    let mut params = DeepFriParams::new(schedule, r, 0xDEEFu64);
+    params.public_inputs_hash = Some(public.outer_pi_hash);
+    if use_stir { params.stir = true; }
+
+    let fri_proof = deep_fri_prove::<Ext>(outer_c_eval, domain, &params);
+
+    Ok(RecursiveStarkProof {
+        public, fri_proof, n_trace: n_trace_max, blowup, r, use_stir,
+    })
+}
+
+/// Verify the composed recursive STARK proof.  Reconstructs the FRI
+/// params from the outer pi_hash + proof bookkeeping and invokes
+/// `deep_fri_verify`.
+pub fn verify_recursive_stark(proof: &RecursiveStarkProof) -> bool {
+    let n_lde = proof.n_trace * proof.blowup;
+    let log2_n_lde = n_lde.trailing_zeros() as usize;
+    let schedule: Vec<usize> = (0..log2_n_lde).map(|_| 2).collect();
+    let mut params = DeepFriParams::new(schedule, proof.r, 0xDEEFu64);
+    params.public_inputs_hash = Some(proof.public.outer_pi_hash);
+    if proof.use_stir { params.stir = true; }
+    deep_fri_verify::<Ext>(&params, &proof.fri_proof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +1211,75 @@ mod tests {
         proof.public.pi_hash[0] ^= 0xFF;
         assert!(!verify_perm_arg_accumulator(&proof),
             "tampered perm-arg pi_hash must be rejected");
+    }
+
+    // ─── STEP 6 (composed outer FRI proof) tests ───────────────────
+
+    #[test]
+    fn recursive_public_inputs_pi_hash_is_deterministic() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let a = RecursiveStarkPublicInputs::for_claims(&c, &o, &p, 8);
+        let b = RecursiveStarkPublicInputs::for_claims(&c, &o, &p, 8);
+        assert_eq!(a.outer_pi_hash, b.outer_pi_hash);
+    }
+
+    #[test]
+    fn recursive_public_inputs_pi_hash_changes_per_subclaim() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let a = RecursiveStarkPublicInputs::for_claims(&c, &o, &p, 8);
+        let mut p2 = perm_arg_honest_claim();
+        p2.gamma = gf(0x99);
+        let b = RecursiveStarkPublicInputs::for_claims(&c, &o, &p2, 8);
+        assert_ne!(a.outer_pi_hash, b.outer_pi_hash);
+    }
+
+    #[test]
+    fn recursive_prove_rejects_bad_blowup() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let result = prove_recursive_stark(&c, &o, &p, 3, 54, false);
+        assert!(matches!(result, Err(RecursiveProverError::Internal(_))));
+    }
+
+    #[test]
+    #[ignore = "slow — exercises full composed recursive FRI prove + verify"]
+    fn round_trip_recursive_stark_smoke() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let proof = prove_recursive_stark(&c, &o, &p, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+            .expect("composed prove must succeed");
+        assert!(verify_recursive_stark(&proof),
+            "composed recursive STARK round-trip must accept");
+    }
+
+    #[test]
+    #[ignore = "slow — exercises STIR variant on composed proof"]
+    fn round_trip_recursive_stark_stir() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let proof = prove_recursive_stark(&c, &o, &p, 4, 54, true)
+            .expect("composed STIR prove must succeed");
+        assert!(verify_recursive_stark(&proof),
+            "composed recursive STIR round-trip must accept");
+    }
+
+    #[test]
+    #[ignore = "slow — composed proof rejects tampered outer pi_hash"]
+    fn round_trip_recursive_rejects_tampered_outer_pi_hash() {
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let mut proof = prove_recursive_stark(&c, &o, &p, 4, 54, false)
+            .expect("composed prove must succeed");
+        proof.public.outer_pi_hash[0] ^= 0xFF;
+        assert!(!verify_recursive_stark(&proof),
+            "tampered outer pi_hash must be rejected");
     }
 }
