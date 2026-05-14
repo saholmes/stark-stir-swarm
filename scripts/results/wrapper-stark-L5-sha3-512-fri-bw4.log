@@ -310,6 +310,7 @@ warning: value assigned to `k_bits` is never read
      = help: maybe it is overwritten before being read?
 
 warning: `deep_ali` (lib) generated 44 warnings (run `cargo fix --lib -p deep_ali` to apply 36 suggestions)
+   Compiling wrapper-stark v0.0.1 (/Volumes/SAHexternal 1/Documents/stark-stir-swarm/crates/wrapper-stark)
 warning: unused import: `PI_LANE_INDICES as _`
    --> crates/wrapper-stark/src/keccak_round_air.rs:308:30
     |
@@ -333,9 +334,9 @@ warning: unused import: `ark_goldilocks::Goldilocks`
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: unused imports: `UniformRowSchema` and `UniformTrace`
-   --> crates/wrapper-stark/src/fri_bridge.rs:445:32
+   --> crates/wrapper-stark/src/fri_bridge.rs:524:32
     |
-445 |         UniformAirConstraints, UniformRowSchema, UniformTrace,
+524 |         UniformAirConstraints, UniformRowSchema, UniformTrace,
     |                                ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
 
 warning: unused imports: `Sha3Variant as _Sha3VariantUnused` and `keccak_round_bit_level`
@@ -353,12 +354,12 @@ warning: unused import: `ark_ff::Field`
    |     ^^^^^^^^^^^^^
 
 warning: `wrapper-stark` (lib test) generated 6 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 6 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.04s
+    Finished `release` profile [optimized] target(s) in 2.20s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-48a283becd11ea89)
 
 running 1 test
-wrapper_sha3 variant=L5 blowup=4 r=105 ldt=fri prove_ms=322 verify_ms=3.91 proof_kib=1184.1 n_trace=128
+wrapper_sha3 variant=L5 blowup=4 r=105 ldt=fri prove_ms=325 verify_ms=3.87 proof_kib=1184.1 n_trace=128
 test wrapper_prover::tests::bench_wrapper_sha3_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.34s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.34s
 

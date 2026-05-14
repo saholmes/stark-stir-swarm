@@ -39,11 +39,13 @@ use deep_ali::fri::{
 use deep_ali::sextic_ext::SexticExt;
 
 use crate::composition::alphas_from_transcript;
-use crate::fri_bridge::{BridgeError, prepare_fri_input_row_uniform};
+use crate::fri_bridge::{
+    BridgeError, DigestBoundary, prepare_fri_input_row_uniform_with_boundary,
+};
 use crate::row_uniform::{
     UniformAirConstraints, UniformRowSchema, synthesize_uniform_trace,
 };
-use crate::sha3_absorb_air::Sha3Variant;
+use crate::sha3_absorb_air::{Sha3Variant, hash as sha3_hash, lane_to_bits};
 
 type FBase = ark_goldilocks::Goldilocks;
 type Ext = SexticExt;
@@ -72,32 +74,51 @@ impl std::fmt::Display for WrapperProverError {
 
 impl std::error::Error for WrapperProverError {}
 
-/// Public inputs the SHA-3 STARK attests to.  Bound into the FS
-/// transcript via `pi_hash`.
+/// Public inputs the SHA-3 STARK attests to.  This is a real
+/// **pre-image proof-of-knowledge** statement: the prover knows
+/// some message `m` such that SHA-3_variant(m) = `digest`.  The
+/// message is NOT included in the public inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sha3StarkPublicInputs {
     pub variant: Sha3Variant,
-    /// 32-byte pi_hash: SHA3-256("WRAPPER-SHA3-V1" || variant_tag || message).
-    /// Binds the proof to a specific (variant, message) pair so a
-    /// malicious prover can't reuse a proof for a different statement.
+    /// The SHA-3 output the prover claims to know a pre-image of.
+    /// Length = variant.output_bytes().
+    pub digest: Vec<u8>,
+    /// 32-byte pi_hash: SHA3-256("WRAPPER-SHA3-V1" || variant_tag || digest).
+    /// Binds (variant, digest) into the FS transcript.  Collision-
+    /// resistance of SHA-3 ensures this commits uniquely.
     pub pi_hash: [u8; 32],
 }
 
 impl Sha3StarkPublicInputs {
-    pub fn for_message(variant: Sha3Variant, message: &[u8]) -> Self {
-        use ::sha3::Digest;
-        let mut h = ::sha3::Sha3_256::new();
-        h.update(b"WRAPPER-SHA3-V1");
-        h.update(&[match variant {
+    /// Construct from a digest (e.g. as received from a verifier
+    /// asking for a pre-image proof).  Uses our own SHA-3 impl
+    /// from `sha3_absorb_air` (validated against FIPS 202 + rustcrypto)
+    /// so we don't depend on the rustcrypto sha3 crate from main lib code.
+    pub fn for_digest(variant: Sha3Variant, digest: &[u8]) -> Self {
+        assert_eq!(digest.len(), variant.output_bytes(),
+            "digest length must match variant.output_bytes()");
+        let mut input = Vec::with_capacity(1 + 14 + 1 + digest.len());
+        input.extend_from_slice(b"WRAPPER-SHA3-V1");
+        input.push(match variant {
             Sha3Variant::Sha3_256 => 1u8,
             Sha3Variant::Sha3_384 => 3,
             Sha3Variant::Sha3_512 => 5,
-        }]);
-        h.update(message);
-        let digest = h.finalize();
+        });
+        input.extend_from_slice(digest);
+        let digest_hash = sha3_hash(Sha3Variant::Sha3_256, &input);
         let mut pi_hash = [0u8; 32];
-        pi_hash.copy_from_slice(&digest);
-        Self { variant, pi_hash }
+        pi_hash.copy_from_slice(&digest_hash);
+        Self { variant, digest: digest.to_vec(), pi_hash }
+    }
+
+    /// Convenience: compute SHA-3(message) and produce the
+    /// corresponding public-input struct.  Used by the prover side
+    /// (which knows the pre-image) to derive what the verifier should
+    /// see.
+    pub fn for_message(variant: Sha3Variant, message: &[u8]) -> Self {
+        let digest = sha3_hash(variant, message);
+        Self::for_digest(variant, &digest)
     }
 }
 
@@ -135,6 +156,34 @@ fn pad_input(input: &[u8], variant: Sha3Variant) -> Vec<Vec<u8>> {
     blocks
 }
 
+/// Construct the digest-boundary specification: for each bit of the
+/// public digest, pin the corresponding `state_out` cell at the last
+/// trace row to that bit value.  The digest occupies the first
+/// `output_bits / 64` lanes of state, LE-packed.
+fn build_digest_boundary(
+    schema: &UniformRowSchema,
+    digest: &[u8],
+    variant: Sha3Variant,
+    alpha: FBase,
+) -> DigestBoundary {
+    assert_eq!(digest.len(), variant.output_bytes());
+    let output_lanes = variant.output_bits() / 64;
+    let mut pinned_bits = Vec::with_capacity(variant.output_bits());
+
+    for lane in 0..output_lanes {
+        let mut lane_u64 = 0u64;
+        for j in 0..8 {
+            lane_u64 |= (digest[8 * lane + j] as u64) << (8 * j);
+        }
+        let lane_bits = lane_to_bits(lane_u64);
+        for bit in 0..64 {
+            pinned_bits.push((schema.state_out_bit(lane, bit), lane_bits[bit]));
+        }
+    }
+
+    DigestBoundary { pinned_bits, alpha }
+}
+
 /// Prove the SHA-3 hashing of `message` under `variant` via the
 /// row-uniform AIR + deep_ali FRI prover.
 ///
@@ -168,9 +217,21 @@ pub fn prove_sha3_air(
     let alphas_sel = alphas_from_transcript::<FBase>(&seed_sel, air.selected.len());
     let alphas_alw = alphas_from_transcript::<FBase>(&seed_alw, air.always.len());
 
-    // 3. Prepare FRI input.
-    let fri_input = prepare_fri_input_row_uniform(
-        &trace, &air, &alphas_sel, &alphas_alw, blowup,
+    // 3. Build digest-boundary constraints — pins state_out at the
+    //    last trace row's first `output_bytes` lanes to the public
+    //    digest bits.  Without this, the prover could compute any
+    //    message and claim any digest; the AIR alone doesn't bind
+    //    state_out[last] to a specific value.
+    let mut seed_bdry = public.pi_hash;
+    seed_bdry[0] ^= 0xA3;
+    let alpha_bdry = alphas_from_transcript::<FBase>(&seed_bdry, 1)[0];
+    let digest_boundary = build_digest_boundary(
+        &trace.schema, &public.digest, variant, alpha_bdry,
+    );
+
+    // 4. Prepare FRI input with the boundary.
+    let fri_input = prepare_fri_input_row_uniform_with_boundary(
+        &trace, &air, &alphas_sel, &alphas_alw, blowup, Some(&digest_boundary),
     )?;
     let n_trace = fri_input.n_trace;
     let n_lde = fri_input.lde_length();
@@ -214,10 +275,11 @@ mod tests {
 
     #[test]
     fn public_inputs_pi_hash_is_deterministic() {
-        // Same (variant, message) → same pi_hash.
+        // Same (variant, message) → same digest → same pi_hash.
         let a = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abc");
         let b = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abc");
         assert_eq!(a.pi_hash, b.pi_hash);
+        assert_eq!(a.digest, b.digest);
     }
 
     #[test]
@@ -225,6 +287,7 @@ mod tests {
         let a = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abc");
         let b = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abcd");
         assert_ne!(a.pi_hash, b.pi_hash);
+        assert_ne!(a.digest, b.digest);
     }
 
     #[test]
@@ -232,6 +295,15 @@ mod tests {
         let a = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abc");
         let b = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_384, b"abc");
         assert_ne!(a.pi_hash, b.pi_hash);
+    }
+
+    #[test]
+    fn public_inputs_digest_matches_native_sha3() {
+        // for_message must compute the actual SHA-3 digest.
+        let pi = Sha3StarkPublicInputs::for_message(Sha3Variant::Sha3_256, b"abc");
+        assert_eq!(pi.digest.len(), 32);
+        let expected = crate::sha3_absorb_air::hash(Sha3Variant::Sha3_256, b"abc");
+        assert_eq!(pi.digest, expected);
     }
 
     #[test]
@@ -246,6 +318,29 @@ mod tests {
             .expect("prove must succeed on valid trace");
         assert!(verify_sha3_air(&proof),
             "round-trip verify must accept on valid proof");
+    }
+
+    #[test]
+    #[ignore = "slow — exercises digest-boundary soundness"]
+    fn round_trip_rejects_tampered_digest_claim() {
+        // The digest-boundary commit lands here: tampering the
+        // CLAIMED digest in the public inputs must make verify fail.
+        // This validates that the AIR enforces state_out[last] = digest
+        // (not just any SHA-3 trace output).
+        let mut proof = prove_sha3_air(b"abc", Sha3Variant::Sha3_256, 4, 54, false)
+            .expect("prove must succeed");
+        // Flip a digest byte AND re-derive the pi_hash so the verifier
+        // would naively accept the pi_hash check — but the AIR's
+        // boundary commitment was built against the ORIGINAL digest,
+        // so the FRI verify will reject on c_eval mismatch at the
+        // last trace row.
+        proof.public.digest[0] ^= 0xFF;
+        proof.public = Sha3StarkPublicInputs::for_digest(
+            proof.public.variant, &proof.public.digest,
+        );
+        assert!(!verify_sha3_air(&proof),
+            "verifier must reject when claimed digest doesn't match \
+             what the trace's state_out[last] actually contains");
     }
 
     #[test]

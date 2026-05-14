@@ -333,9 +333,9 @@ warning: unused import: `ark_goldilocks::Goldilocks`
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: unused imports: `UniformRowSchema` and `UniformTrace`
-   --> crates/wrapper-stark/src/fri_bridge.rs:445:32
+   --> crates/wrapper-stark/src/fri_bridge.rs:524:32
     |
-445 |         UniformAirConstraints, UniformRowSchema, UniformTrace,
+524 |         UniformAirConstraints, UniformRowSchema, UniformTrace,
     |                                ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
 
 warning: unused imports: `Sha3Variant as _Sha3VariantUnused` and `keccak_round_bit_level`
@@ -353,12 +353,12 @@ warning: unused import: `ark_ff::Field`
    |     ^^^^^^^^^^^^^
 
 warning: `wrapper-stark` (lib test) generated 6 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 6 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.05s
+    Finished `release` profile [optimized] target(s) in 0.06s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-c3ef04b937350bdc)
 
 running 1 test
-wrapper_sha3 variant=L1 blowup=4 r=54 ldt=stir prove_ms=345 verify_ms=0.31 proof_kib=81.1 n_trace=128
+wrapper_sha3 variant=L1 blowup=4 r=54 ldt=stir prove_ms=344 verify_ms=0.34 proof_kib=81.1 n_trace=128
 test wrapper_prover::tests::bench_wrapper_sha3_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.35s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.35s
 

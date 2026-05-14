@@ -44,11 +44,12 @@ ark-poly     = "0.4.2"
 ark-serialize = { workspace = true }
 ark-goldilocks = { path = "../ark-goldilocks" }
 rayon        = { version = "1.10", optional = true }
+# SHA-3 (rustcrypto) — used by `composition::alphas_from_transcript`
+# (FS-deriving alpha coefficients) and the cross-check oracle in
+# `sha3_absorb_air` tests.
+sha3 = "0.10"
 
 [dev-dependencies]
 hex = "0.4"
-# Independent SHA-3 oracle for cross-checking the native Keccak-f1600
-# in `sha3_absorb_air` against rustcrypto.  Used only in tests.
-sha3 = "0.10"
 # RNG for non-FS random-α tests in `composition`.
 rand = { version = "0.8", features = ["std", "std_rng"] }

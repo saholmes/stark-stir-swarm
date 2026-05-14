@@ -59,7 +59,7 @@
 //! returns `Err(BridgeError::NotImplemented)` until the row-uniform
 //! refactor lands.
 
-use ark_ff::Field;
+use ark_ff::{Field, Zero};
 
 use crate::bit_constraint::FieldTraceAccess;
 use crate::composition::ConstraintSet;
@@ -185,7 +185,46 @@ pub fn prepare_fri_input<F: Field>(
 
 use ark_goldilocks::Goldilocks;
 use deep_ali::trace_import::lde_trace_columns;
+use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 type FBase = ark_goldilocks::Goldilocks;
+
+/// Digest-boundary specification.  Pins specific (column, expected_bit)
+/// pairs at the trace's last row.  Used to bind a public SHA-3 output
+/// digest into the AIR.
+#[derive(Clone, Debug)]
+pub struct DigestBoundary {
+    /// (state_out column, expected bit value ∈ {0, 1}) pairs.
+    pub pinned_bits: Vec<(usize, u8)>,
+    /// Combination coefficient α applied to the whole boundary sum.
+    /// FS-derived from pi_hash so the verifier reproduces it.
+    pub alpha: FBase,
+}
+
+/// Compute the Lagrange-basis indicator polynomial for the last trace
+/// row, evaluated on the full LDE domain.  `indicator_lde[r] = 1` at
+/// the LDE row corresponding to the last trace row, `0` at all other
+/// trace rows, and interpolated values at intermediate LDE positions.
+///
+/// The indicator vanishes at every trace row except the last, so when
+/// we add `alpha · indicator(r) · (state_out_cell(r) − expected_bit)`
+/// to c_eval, the contribution is zero at all trace rows except the
+/// last, where it pins the cell to the expected bit.
+fn compute_last_row_indicator_lde(n_trace: usize, blowup: usize) -> Vec<FBase> {
+    let n_lde = n_trace * blowup;
+    // Trace-domain values: 1 at index n_trace-1, 0 elsewhere.
+    let mut trace_vals = vec![FBase::from(0u64); n_trace];
+    trace_vals[n_trace - 1] = FBase::from(1u64);
+
+    // FFT to coefficients, then evaluate on the LDE domain.
+    let trace_dom = Radix2EvaluationDomain::<FBase>::new(n_trace)
+        .expect("trace domain radix-2");
+    let coeffs = trace_dom.ifft(&trace_vals);
+    let mut padded = coeffs;
+    padded.resize(n_lde, FBase::from(0u64));
+    let lde_dom = Radix2EvaluationDomain::<FBase>::new(n_lde)
+        .expect("LDE domain radix-2");
+    lde_dom.fft(&padded)
+}
 
 /// Prepare a FRI input from a row-uniform trace + constraints.  This
 /// is the paper-grade path: column-major LDE + per-row constraint
@@ -219,6 +258,27 @@ pub fn prepare_fri_input_row_uniform(
     alphas_selected: &[FBase],
     alphas_always: &[FBase],
     blowup: usize,
+) -> Result<FriInput<FBase>, BridgeError> {
+    prepare_fri_input_row_uniform_with_boundary(
+        trace, air, alphas_selected, alphas_always, blowup, None,
+    )
+}
+
+/// As [`prepare_fri_input_row_uniform`] but optionally adds a
+/// digest-boundary contribution to c_eval.  When `digest_boundary` is
+/// `Some`, the boundary fires only at the last trace row (via the
+/// Lagrange indicator), pinning each named state_out cell to its
+/// expected bit value.  This is what makes the SHA-3 STARK a
+/// **proof-of-knowledge of a pre-image** for the public digest:
+/// without the boundary, the prover can produce a valid trace for
+/// any message and claim any digest.
+pub fn prepare_fri_input_row_uniform_with_boundary(
+    trace: &UniformTrace,
+    air: &UniformAirConstraints,
+    alphas_selected: &[FBase],
+    alphas_always: &[FBase],
+    blowup: usize,
+    digest_boundary: Option<&DigestBoundary>,
 ) -> Result<FriInput<FBase>, BridgeError> {
     if alphas_selected.len() != air.selected.len() {
         return Err(BridgeError::Internal(format!(
@@ -280,6 +340,25 @@ pub fn prepare_fri_input_row_uniform(
             acc += alpha * phi;
         }
         c_eval[r] = acc;
+    }
+
+    // 4. Optional digest-boundary contribution: pins state_out cells
+    //    at the last trace row to public expected bits.  This is the
+    //    soundness mechanism that makes the wrapper STARK a real
+    //    pre-image PoK against a public digest.
+    if let Some(bdry) = digest_boundary {
+        let indicator_lde = compute_last_row_indicator_lde(n_trace, blowup);
+        debug_assert_eq!(indicator_lde.len(), n_lde);
+        for r in 0..n_lde {
+            let ind = indicator_lde[r];
+            if ind.is_zero() { continue; }   // skip when indicator is 0 (most LDE rows)
+            let mut bdry_acc = FBase::from(0u64);
+            for &(col, expected_bit) in &bdry.pinned_bits {
+                let expected = FBase::from(expected_bit as u64);
+                bdry_acc += lde[col][r] - expected;
+            }
+            c_eval[r] += bdry.alpha * ind * bdry_acc;
+        }
     }
 
     Ok(FriInput { lde, n_trace, blowup, c_eval })
