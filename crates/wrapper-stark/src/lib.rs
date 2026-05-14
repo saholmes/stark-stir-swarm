@@ -288,6 +288,7 @@ pub mod wrapper_prover;
 pub mod merkle_path_air;
 pub mod merkle_prover;
 pub mod deep_ali_verifier_air;
+pub mod recursive_prover;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
