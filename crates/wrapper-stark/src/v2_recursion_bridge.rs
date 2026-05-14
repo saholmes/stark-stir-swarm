@@ -66,10 +66,17 @@ use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
 use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof};
 use deep_ali::ml_dsa::params::{K, L, N, W1_BITS_PER_COEF};
 use deep_ali::ml_dsa_decompose;
+use deep_ali::ml_dsa_decompose_air;
+use deep_ali::ml_dsa_ntt_chained_air;
+use deep_ali::ml_dsa_shake_absorb_multi_air;
+use deep_ali::ml_dsa_transcript;
+use deep_ali::ml_dsa_use_hint_air;
 use deep_ali::ml_dsa_verify_air_v17::{
     N_EQ_ROWS, NUM_CONSTRAINTS as V17_NUM_CONSTRAINTS,
     VERIFY_AIR_V17_ACTIVE_ROWS, WIDTH as V17_WIDTH,
 };
+use deep_ali::ml_dsa_verify_air_v2_layout::{coeff_chain, intt as intt_layout, transcript as transcript_layout};
+use deep_ali::ml_dsa_w1_encode_air;
 use deep_ali::sub_air_with_trace::{
     augment_pi_hash, comb_coeffs_aug, deserialize_proof,
     extract_query_position_and_c_eval, extract_query_positions,
@@ -787,6 +794,183 @@ fn extract_sub_air_residues(
     Ok(residues)
 }
 
+/// Per-sub-AIR Ext-typed residues extracted from a v2 inner proof.
+///
+/// One vector per sub-AIR; `intt[k]` for k ∈ 0..K, plus V17, Decompose,
+/// UseHint, W1Encode, TRANSCRIPT = K + 5 entries total.  On an honest
+/// inner proof every residue in every vector is zero.
+#[derive(Clone, Debug)]
+pub struct V2SubAirResidues {
+    pub v17:           Vec<Ext>,
+    pub intt:          Vec<Vec<Ext>>,   // K = 4/6/8 instances at L1/L3/L5
+    pub decompose:     Vec<Ext>,
+    pub use_hint:      Vec<Ext>,
+    pub w1_encode:     Vec<Ext>,
+    pub transcript:    Vec<Ext>,
+}
+
+impl V2SubAirResidues {
+    /// Total number of Ext residues across all sub-AIRs.
+    pub fn total(&self) -> usize {
+        self.v17.len()
+            + self.intt.iter().map(|v| v.len()).sum::<usize>()
+            + self.decompose.len()
+            + self.use_hint.len()
+            + self.w1_encode.len()
+            + self.transcript.len()
+    }
+
+    /// True iff every residue in every sub-AIR is zero.
+    pub fn all_zero(&self) -> bool {
+        use ark_ff::Zero as _;
+        self.v17.iter().all(|r| r.is_zero())
+            && self.intt.iter().all(|v| v.iter().all(|r| r.is_zero()))
+            && self.decompose.iter().all(|r| r.is_zero())
+            && self.use_hint.iter().all(|r| r.is_zero())
+            && self.w1_encode.iter().all(|r| r.is_zero())
+            && self.transcript.iter().all(|r| r.is_zero())
+    }
+}
+
+/// Extract per-query residues for ALL 10 v2 sub-AIRs (V17 + K×INTT +
+/// Decompose + UseHint + W1Encode + TRANSCRIPT).
+///
+/// On an honest v2 inner proof every residue across every sub-AIR is
+/// zero — `result.all_zero()` returns true.  Tampering any sub-AIR's
+/// quotient at any queried position causes its residue vector to
+/// contain at least one non-zero Ext value.
+///
+/// `public` is needed to reconstruct the TRANSCRIPT layout (mu_bytes
+/// + w1bytes).  All other sub-AIRs derive their parameters from
+/// constants in `ml_dsa_verify_air_v2_layout` + `proof.pi_hash`.
+pub fn extract_v2_all_subair_residues(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+) -> Result<V2SubAirResidues, V2BridgeError> {
+    let blowup = 4;  // v2 sub-AIRs all use this blowup
+    let pi_hash = proof.pi_hash;
+
+    // V17.
+    let v17 = extract_sub_air_residues(
+        &proof.fri_v17, VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two(), blowup,
+        pi_hash, b"v17", V17_WIDTH, V17_NUM_CONSTRAINTS,
+        |cur, nxt, row| deep_ali::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
+    )?;
+
+    // INTT × K.  Each instance has its own domain_sep tag b"intt:<k>".
+    if proof.fri_intt.len() != K {
+        return Err(V2BridgeError::OodExtractFailed(format!(
+            "INTT: expected {K} sub-proofs, got {}", proof.fri_intt.len()
+        )));
+    }
+    // Per-instance INTT trace size — matches the prover's
+    // `(BUTTERFLIES_PER_NTT + 16).next_power_of_two()` (= 2048 at L1).
+    // The layout's `intt::N_ROWS_POW2` is the combined multi-instance
+    // size, NOT the per-instance one used by prove_one_sub_air_with_trace.
+    let intt_n_trace = (ml_dsa_ntt_chained_air::BUTTERFLIES_PER_NTT + 16).next_power_of_two();
+    let mut intt = Vec::with_capacity(K);
+    for k in 0..K {
+        let mut tag = b"intt:".to_vec();
+        tag.push(k as u8);
+        let residues = extract_sub_air_residues(
+            &proof.fri_intt[k], intt_n_trace, blowup,
+            pi_hash, &tag,
+            ml_dsa_ntt_chained_air::WIDTH, ml_dsa_ntt_chained_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| ml_dsa_ntt_chained_air::eval_per_row(cur, nxt, row),
+        )?;
+        intt.push(residues);
+    }
+
+    // Decompose, UseHint, W1Encode — all share coeff_chain::N_ROWS_POW2.
+    let coeff_n_trace = coeff_chain::N_ROWS_POW2;
+    let decompose = extract_sub_air_residues(
+        &proof.fri_decompose, coeff_n_trace, blowup,
+        pi_hash, b"decompose",
+        ml_dsa_decompose_air::WIDTH, ml_dsa_decompose_air::NUM_CONSTRAINTS,
+        |cur, nxt, row| ml_dsa_decompose_air::eval_per_row(cur, nxt, row),
+    )?;
+    let use_hint = extract_sub_air_residues(
+        &proof.fri_use_hint, coeff_n_trace, blowup,
+        pi_hash, b"use_hint",
+        ml_dsa_use_hint_air::WIDTH, ml_dsa_use_hint_air::NUM_CONSTRAINTS,
+        |cur, nxt, row| ml_dsa_use_hint_air::eval_per_row(cur, nxt, row),
+    )?;
+    let w1_encode = extract_sub_air_residues(
+        &proof.fri_w1_encode, coeff_n_trace, blowup,
+        pi_hash, b"w1_encode",
+        ml_dsa_w1_encode_air::WIDTH, ml_dsa_w1_encode_air::NUM_CONSTRAINTS,
+        |cur, nxt, row| ml_dsa_w1_encode_air::eval_per_row(cur, nxt, row),
+    )?;
+
+    // TRANSCRIPT — eval_per_row takes a MultiAbsorbLayout extra arg.
+    let layout = ml_dsa_transcript::build_layout(&public.mu_bytes, &public.w1bytes);
+    let transcript_n_trace = transcript_layout::N_ROWS_POW2;
+    let transcript_num_cons = ml_dsa_shake_absorb_multi_air::num_constraints(&layout);
+    let transcript = extract_sub_air_residues(
+        &proof.fri_transcript, transcript_n_trace, blowup,
+        pi_hash, b"transcript",
+        ml_dsa_shake_absorb_multi_air::WIDTH, transcript_num_cons,
+        |cur, nxt, row| ml_dsa_shake_absorb_multi_air::eval_per_row(cur, nxt, row, &layout),
+    )?;
+
+    Ok(V2SubAirResidues {
+        v17, intt, decompose, use_hint, w1_encode, transcript,
+    })
+}
+
+/// Build a sub-circuit 1 CompositionClaim from **all 10** v2 sub-AIRs'
+/// per-query residues (V17 + K×INTT + Decompose + UseHint + W1Encode
+/// + TRANSCRIPT).
+///
+/// Each Ext residue is flattened into EXT_DEGREE Goldilocks coords
+/// and registered as a `BitOp::IsZero` constraint.  Total claim count
+/// at L1: 10 sub-AIRs × ~54 queries × 6 coords ≈ 3240 (varies because
+/// last-row gating sets some residues to Ext::zero()).
+pub fn build_v2_all_subairs_composition(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+) -> Result<CompositionClaim<Goldilocks>, V2BridgeError> {
+    let residues = extract_v2_all_subair_residues(proof, public)?;
+    let total_ext = residues.total();
+    let total_base = total_ext * EXT_DEGREE;
+
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(total_base);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(total_base);
+    let mut next_col = 0usize;
+
+    let push_residue_block = |residues: &[Ext], column_values: &mut Vec<(CellRef, Goldilocks)>,
+                                    constraints: &mut Vec<BitOp>, next_col: &mut usize| {
+        for r in residues {
+            let coords = r.to_fp_components();
+            for c in 0..EXT_DEGREE {
+                let cell = CellRef::new(0, *next_col);
+                column_values.push((cell, coords[c]));
+                constraints.push(BitOp::IsZero { cell });
+                *next_col += 1;
+            }
+        }
+    };
+
+    push_residue_block(&residues.v17, &mut column_values, &mut constraints, &mut next_col);
+    for k in 0..residues.intt.len() {
+        push_residue_block(&residues.intt[k], &mut column_values, &mut constraints, &mut next_col);
+    }
+    push_residue_block(&residues.decompose, &mut column_values, &mut constraints, &mut next_col);
+    push_residue_block(&residues.use_hint,  &mut column_values, &mut constraints, &mut next_col);
+    push_residue_block(&residues.w1_encode, &mut column_values, &mut constraints, &mut next_col);
+    push_residue_block(&residues.transcript, &mut column_values, &mut constraints, &mut next_col);
+
+    // FS alphas from pi_hash ⊕ 0xC6 (distinct from anchor 0xC4 + V17-only 0xC5).
+    let mut seed = proof.pi_hash;
+    seed[0] ^= 0xC6;
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, constraints.len());
+
+    Ok(CompositionClaim {
+        column_values, constraints, alphas,
+        expected: Goldilocks::zero(),
+    })
+}
+
 /// Build a sub-circuit 1 CompositionClaim from real v2 V17 per-query
 /// residues.
 ///
@@ -1008,6 +1192,49 @@ pub fn prove_v2_composed_recursive(
 /// 9 sub-AIRs (4×INTT, Decompose, UseHint, W1Encode, TRANSCRIPT) is
 /// the same pattern: pass each sub-AIR's `eval_per_row` and
 /// constraint count to `extract_sub_air_residues`.
+/// End-to-end with **ALL 10 v2 sub-AIRs** real in sub-circuit 1.
+/// The composed RecursiveStarkProof attests:
+///
+///   1. Sub-circuit 1: every coord of every per-query residue across
+///      V17 + K×INTT + Decompose + UseHint + W1Encode + TRANSCRIPT
+///      is zero.  Tampering ANY sub-AIR's quotient relation at ANY
+///      queried position breaks this leg.
+///   2. Sub-circuit 2: full F2b OOD (BCC-vs-BCC + BCC-vs-public).
+///   3. Sub-circuit 3: vestige perm-arg.
+///
+/// This is the FULL inner-verifier per-query constraint check across
+/// every v2 sub-AIR, expressed as one outer recursive STARK proof.
+pub fn prove_v2_all_subairs_composed_recursive(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
+    // Sub-circuit 1: REAL all-10-sub-AIRs per-query residue composition.
+    let comp_claim = build_v2_all_subairs_composition(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+
+    // Sub-circuit 2: full F2b OOD bundle, flattened.
+    let ext_bundle = extract_v2_full_ood_bundle(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+    let mut ood_seed = proof.pi_hash;
+    ood_seed[0] ^= 0xF6;
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(
+        &ood_seed, base_bundle.claims.len(),
+    );
+    let ood_claim = OodAccumulatorClaim {
+        bundle: base_bundle, alphas: ood_alphas,
+    };
+
+    // Sub-circuit 3: vestige perm-arg.
+    let perm_claim = build_v2_pi_hash_vestige_perm_arg(proof.pi_hash);
+
+    prove_recursive_stark(&comp_claim, &ood_claim, &perm_claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
 pub fn prove_v2_v17_composed_recursive(
     proof: &V2ProofReal,
     public: &V2Witness,
@@ -1247,6 +1474,88 @@ mod tests {
             assert!(v.is_zero(),
                 "honest V17 residue must be zero at every coord; got {v:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "slow — extract residues from ALL 10 v2 sub-AIRs"]
+    fn extract_all_subair_residues_honest() {
+        let w = synthesize_demo_witness(43);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let residues = extract_v2_all_subair_residues(&proof, &w)
+            .expect("all-sub-AIR residue extraction must succeed");
+
+        // Counts: V17 + K INTT + 3 COEFF + 1 TRANSCRIPT.
+        assert!(!residues.v17.is_empty(), "V17 residues must be non-empty");
+        assert_eq!(residues.intt.len(), K, "must have K INTT instances");
+        for k in 0..K {
+            assert!(!residues.intt[k].is_empty(),
+                "INTT[{k}] residues must be non-empty");
+        }
+        assert!(!residues.decompose.is_empty());
+        assert!(!residues.use_hint.is_empty());
+        assert!(!residues.w1_encode.is_empty());
+        assert!(!residues.transcript.is_empty());
+
+        // Diagnostic: which sub-AIR has non-zero residues?
+        use ark_ff::Zero as _;
+        let v17_zero = residues.v17.iter().all(|r| r.is_zero());
+        let intt_zero: Vec<bool> = residues.intt.iter().map(|v| v.iter().all(|r| r.is_zero())).collect();
+        let dec_zero = residues.decompose.iter().all(|r| r.is_zero());
+        let uh_zero = residues.use_hint.iter().all(|r| r.is_zero());
+        let w1_zero = residues.w1_encode.iter().all(|r| r.is_zero());
+        let tr_zero = residues.transcript.iter().all(|r| r.is_zero());
+        eprintln!("per-sub-AIR zero-residue check: V17={v17_zero}, INTT={intt_zero:?}, Decompose={dec_zero}, UseHint={uh_zero}, W1Encode={w1_zero}, TRANSCRIPT={tr_zero}");
+
+        assert!(residues.all_zero(),
+            "honest v2: every residue across all 10 sub-AIRs must be zero");
+
+        let total = residues.total();
+        eprintln!("v2 sub-AIR residue totals @ L1: V17={}, INTT_per_k={}, Decompose={}, UseHint={}, W1Encode={}, TRANSCRIPT={}, total Ext={total}",
+            residues.v17.len(), residues.intt[0].len(),
+            residues.decompose.len(), residues.use_hint.len(),
+            residues.w1_encode.len(), residues.transcript.len());
+    }
+
+    #[test]
+    #[ignore = "slow — build CompositionClaim from all 10 sub-AIRs"]
+    fn build_v2_all_subairs_composition_honest() {
+        let w = synthesize_demo_witness(47);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let claim = build_v2_all_subairs_composition(&proof, &w)
+            .expect("all-sub-AIRs composition must build on honest proof");
+
+        // Multiple of EXT_DEGREE = 6.
+        assert_eq!(claim.constraints.len() % EXT_DEGREE, 0);
+        assert_eq!(claim.column_values.len(), claim.constraints.len());
+
+        // All cell values zero on honest input.
+        for (_cref, v) in &claim.column_values {
+            assert!(v.is_zero(),
+                "all-sub-AIRs honest composition: every coord must be zero; got {v:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "slow — full 10-sub-AIR composed RecursiveStarkProof"]
+    fn prove_v2_all_subairs_composed_recursive_round_trip() {
+        use crate::recursive_prover::verify_recursive_stark;
+
+        let w = synthesize_demo_witness(53);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let rec = prove_v2_all_subairs_composed_recursive(&proof, &w, 4, 54, false)
+            .expect("all-10-sub-AIR composed prove must succeed");
+
+        assert!(verify_recursive_stark(&rec),
+            "10-sub-AIR composed RecursiveStarkProof must verify locally");
     }
 
     #[test]

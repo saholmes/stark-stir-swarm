@@ -29,9 +29,10 @@ use ark_serialize::CanonicalSerialize;
 
 use wrapper_stark::recursive_prover::{verify_ood_accumulator, verify_recursive_stark};
 use wrapper_stark::v2_recursion_bridge::{
-    EXT_DEGREE, build_v2_v17_subair_composition, extract_v2_bcc_pair_ood_bundle,
-    extract_v2_full_ood_bundle, flatten_ext_to_base, prove_v2_composed_recursive,
-    prove_v2_full_ood_recursive, prove_v2_ood_recursive,
+    EXT_DEGREE, build_v2_all_subairs_composition, build_v2_v17_subair_composition,
+    extract_v2_all_subair_residues, extract_v2_bcc_pair_ood_bundle,
+    extract_v2_full_ood_bundle, flatten_ext_to_base, prove_v2_all_subairs_composed_recursive,
+    prove_v2_composed_recursive, prove_v2_full_ood_recursive, prove_v2_ood_recursive,
     prove_v2_v17_composed_recursive,
 };
 
@@ -327,8 +328,88 @@ fn main() {
     println!("  content tied to V17's constraint set, not just bit-booleanity.");
     println!();
     println!("  Remaining sub-AIRs (4×INTT + Decompose + UseHint +");
-    println!("  W1Encode + TRANSCRIPT) follow the same pattern — pass each");
-    println!("  sub-AIR's `eval_per_row` + constraint count to");
-    println!("  `extract_sub_air_residues`.  Drop-in extension.");
+    println!("  W1Encode + TRANSCRIPT) follow the same pattern — see below.");
+    println!();
+
+    // ─── 10. ALL 10 SUB-AIRs: V17 + 4×INTT + COEFF + TRANSCRIPT ───
+    println!("[ALL-10] Sub-circuit 1: ALL v2 sub-AIRs per-query residues");
+    println!("         (V17 + 4×INTT + Decompose + UseHint + W1Encode + TRANSCRIPT)");
+
+    let t = Instant::now();
+    let residues = extract_v2_all_subair_residues(&proof, &w)
+        .expect("all-sub-AIR residue extraction must succeed");
+    let extract_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      residue extraction: {extract_ms:.2} ms");
+    println!("      Ext residues:");
+    println!("        V17        : {:>4}", residues.v17.len());
+    for k in 0..residues.intt.len() {
+        println!("        INTT[{k}]    : {:>4}", residues.intt[k].len());
+    }
+    println!("        Decompose  : {:>4}", residues.decompose.len());
+    println!("        UseHint    : {:>4}", residues.use_hint.len());
+    println!("        W1Encode   : {:>4}", residues.w1_encode.len());
+    println!("        TRANSCRIPT : {:>4}", residues.transcript.len());
+    println!("        TOTAL Ext  : {:>4}  (× {EXT_DEGREE} coords = {} base claims)",
+        residues.total(), residues.total() * EXT_DEGREE);
+    println!("      all residues zero on honest: {}", residues.all_zero());
+    assert!(residues.all_zero());
+
+    let t = Instant::now();
+    let all_comp = build_v2_all_subairs_composition(&proof, &w)
+        .expect("all-sub-AIRs composition build");
+    let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      composition build:  {build_ms:.2} ms  ({} IsZero constraints)",
+        all_comp.constraints.len());
+
+    let t = Instant::now();
+    let all_rec = prove_v2_all_subairs_composed_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+        .expect("all-10 composed prove must succeed");
+    let all_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let mut all_buf = Vec::new();
+    all_rec.fri_proof.serialize_compressed(&mut all_buf).unwrap();
+    let all_kib = all_buf.len() as f64 / 1024.0;
+
+    let t = Instant::now();
+    let all_ok = verify_recursive_stark(&all_rec);
+    let all_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    println!("      n_trace (shared):   {}", all_rec.n_trace);
+    println!("      all-10 prove:       {all_prove_ms:.2} ms");
+    println!("      all-10 verify:      {all_verify_ms:.2} ms");
+    println!("      all-10 proof:       {all_kib:.1} KiB");
+    println!("      verdict:            {}", if all_ok { "ACCEPT" } else { "REJECT" });
+    assert!(all_ok);
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  SUB-CIRCUIT 1 — FULL v2 VERIFIER PER-QUERY CHECK");
+    println!();
+    println!("  Three-stage progression:");
+    println!();
+    println!("    Anchor (pi_hash bits):        24.15 ms / 396 KiB / 256 cons");
+    println!("    V17 only:                    {v17_prove_ms:.2} ms / {v17_kib:.1} KiB / {} cons",
+        v17_comp.constraints.len());
+    println!("    All 10 sub-AIRs:             {all_prove_ms:.2} ms / {all_kib:.1} KiB / {} cons",
+        all_comp.constraints.len());
+    println!();
+    println!("  The composed RecursiveStarkProof now attests the FULL inner-");
+    println!("  verifier per-query quotient check for EVERY v2 sub-AIR:");
+    println!();
+    println!("    Σ β_j · cell_j = 0  for j ∈ 0..({}·{EXT_DEGREE})", residues.total());
+    println!();
+    println!("  where each cell_j is one Goldilocks coord of one v2 sub-AIR");
+    println!("  per-query residue `c_eval(x) · Z_H(x) − Σ α · Φ(trace[x])`,");
+    println!("  drawn from V17 + K×INTT + Decompose + UseHint + W1Encode +");
+    println!("  TRANSCRIPT.  Combined with sub-circuit 2 (F2b OOD), this is");
+    println!("  the wrapper-stark verifier-AIR target: ONE outer recursive");
+    println!("  STARK attesting every constraint check the inner v2 verifier");
+    println!("  performs on the inner proof's queried positions.");
+    println!();
+    println!("  Per-sig recursion shape achieved: real inner v2 proof");
+    println!("  ({:.0} KiB) → one outer recursive STARK proof ({:.0} KiB,",
+        proof_bytes.len() as f64 / 1024.0, all_kib);
+    println!("  {:.1}× compression) attesting the full inner verification.",
+        proof_bytes.len() as f64 / 1024.0 / all_kib);
     println!("═══════════════════════════════════════════════════════════════");
 }
