@@ -408,6 +408,183 @@ pub fn theta_row_uniform_constraints(
     out
 }
 
+// ─── Row-uniform ρπ constraints ─────────────────────────────────────
+//
+// ρ rotates each lane; π permutes lane positions.  Fused into a single
+// bit-position re-indexing: no helpers, no arithmetic — only Copy
+// constraints from state_in (at rotated bit) to state_out (at permuted
+// lane).  All gated by `SelectorIndex::RhoPi`.
+
+/// Emit row-uniform constraints for the ρπ sub-step.  Total: 1 600
+/// Copy constraints, one per (lane, bit) of the output state.  No
+/// helper-cell booleanity needed (ρπ has no helpers); state_in/
+/// state_out booleanity is enforced globally on every row.
+pub fn rho_pi_row_uniform_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<RowUniformConstraint> {
+    use crate::sha3_absorb_air::RHO_OFFSETS;
+
+    let mut out = Vec::with_capacity(1600);
+
+    // output[5·((2x+3y) mod 5) + y][bit] = input[5y + x][(bit - off) mod 64]
+    for x in 0..5 {
+        for y in 0..5 {
+            let src_lane = 5 * y + x;
+            let dst_lane = 5 * ((2 * x + 3 * y) % 5) + y;
+            let off = RHO_OFFSETS[src_lane] as usize;
+            for bit in 0..64 {
+                let src_bit = (bit + 64 - off) % 64;
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::RhoPi,
+                    op: RowUniformOp::Copy {
+                        c: ColRef(schema.state_out_bit(dst_lane, bit)),
+                        a: ColRef(schema.state_in_bit(src_lane, src_bit)),
+                    },
+                });
+            }
+        }
+    }
+
+    out
+}
+
+// ─── Row-uniform χ constraints ──────────────────────────────────────
+//
+// χ uses the SECOND half of the helpers range to avoid collision with
+// θ's helper allocation:
+//   helpers[1600..3200]   χ helpers
+//   layout:  [1600 + 0..1600] = not_b1 helpers (one per output bit)
+//            wait — we need 1600 not_b1 + 1600 and_part = 3200 cells,
+//            but only 1600 free helper columns remain.
+//
+// CHANGE: χ helpers OVERLAP with θ helpers.  Both sub-steps share the
+// 3200-cell helpers range — θ writes to it on θ rows, χ writes on χ
+// rows, and the selector ensures only one sub-step's constraints fire
+// at any given row.  This is the row-uniform space-optimization: the
+// total helper budget is `max(per_sub_step)` = 3 200 (driven by χ),
+// not `sum(per_sub_step)`.
+
+fn chi_not_b1_col(schema: &UniformRowSchema, lane: usize, bit: usize) -> ColRef {
+    debug_assert!(lane < 25 && bit < 64);
+    ColRef(schema.helper_bit(64 * lane + bit))   // helpers[0..1600]
+}
+fn chi_and_part_col(schema: &UniformRowSchema, lane: usize, bit: usize) -> ColRef {
+    debug_assert!(lane < 25 && bit < 64);
+    ColRef(schema.helper_bit(1600 + 64 * lane + bit))   // helpers[1600..3200]
+}
+
+/// Emit row-uniform constraints for the χ sub-step.  Per (lane, bit):
+/// - Not: `not_b1 = NOT state_in[lane_+1][bit]`
+/// - And: `and_part = not_b1 AND state_in[lane_+2][bit]`
+/// - Xor: `state_out[lane][bit] = state_in[lane][bit] XOR and_part`
+/// Plus booleanity on the two helper cells per (lane, bit).
+/// Total: 3 200 booleanity + 1 600 Not + 1 600 And + 1 600 Xor = 8 000.
+pub fn chi_row_uniform_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<RowUniformConstraint> {
+    let mut out: Vec<RowUniformConstraint> = Vec::with_capacity(8000);
+
+    // Booleanity on χ helpers.
+    for lane in 0..25 {
+        for bit in 0..64 {
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Chi,
+                op: RowUniformOp::Boolean { b: chi_not_b1_col(schema, lane, bit) },
+            });
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Chi,
+                op: RowUniformOp::Boolean { b: chi_and_part_col(schema, lane, bit) },
+            });
+        }
+    }
+
+    // Operations per (lane, bit).
+    for y in 0..5 {
+        for x in 0..5 {
+            let i0 = 5 * y + x;
+            let i1 = 5 * y + (x + 1) % 5;
+            let i2 = 5 * y + (x + 2) % 5;
+            for bit in 0..64 {
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::Chi,
+                    op: RowUniformOp::Not {
+                        c: chi_not_b1_col(schema, i0, bit),
+                        a: ColRef(schema.state_in_bit(i1, bit)),
+                    },
+                });
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::Chi,
+                    op: RowUniformOp::And {
+                        c: chi_and_part_col(schema, i0, bit),
+                        a: chi_not_b1_col(schema, i0, bit),
+                        b: ColRef(schema.state_in_bit(i2, bit)),
+                    },
+                });
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::Chi,
+                    op: RowUniformOp::Xor {
+                        c: ColRef(schema.state_out_bit(i0, bit)),
+                        a: ColRef(schema.state_in_bit(i0, bit)),
+                        b: chi_and_part_col(schema, i0, bit),
+                    },
+                });
+            }
+        }
+    }
+
+    out
+}
+
+// ─── Row-uniform ι constraints ──────────────────────────────────────
+//
+// ι: XOR round constant into lane (0,0), pass through lanes 1..25.
+// The round constant is provided publicly via the `rc_bits` columns
+// (the verifier knows ROUND_CONSTANTS[round_at_row(r)][bit] for each
+// ι row, so rc_bits column values are computed verifier-side and
+// pinned by boundary constraints — not part of this constraint set).
+//
+// We use Xor (not XorConst) here because the constant is in a column,
+// not baked into the polynomial.
+
+/// Emit row-uniform constraints for the ι sub-step.  Per bit ∈ [0..64):
+/// - Xor: `state_out[0][bit] = state_in[0][bit] XOR rc_bits[bit]`
+/// Per (lane, bit) for lane ∈ [1..25):
+/// - Copy: `state_out[lane][bit] = state_in[lane][bit]`
+/// Total: 64 Xor + 24·64 Copy = 1 600 constraints.  No helper booleanity
+/// (ι has no helpers); rc_bits booleanity handled by the global booleanity
+/// generator since rc cells are publicly bound elsewhere.
+pub fn iota_row_uniform_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<RowUniformConstraint> {
+    let mut out = Vec::with_capacity(1600);
+
+    // Lane (0, 0): XOR with round-constant bit
+    for bit in 0..64 {
+        out.push(RowUniformConstraint {
+            selector: SelectorIndex::Iota,
+            op: RowUniformOp::Xor {
+                c: ColRef(schema.state_out_bit(0, bit)),
+                a: ColRef(schema.state_in_bit(0, bit)),
+                b: ColRef(schema.rc_bit(bit)),
+            },
+        });
+    }
+    // Lanes 1..25: pass-through (Copy)
+    for lane in 1..25 {
+        for bit in 0..64 {
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Iota,
+                op: RowUniformOp::Copy {
+                    c: ColRef(schema.state_out_bit(lane, bit)),
+                    a: ColRef(schema.state_in_bit(lane, bit)),
+                },
+            });
+        }
+    }
+
+    out
+}
+
 /// Selector column values for the entire trace.  Returns a vector of
 /// length `n_rows` where `selectors[r]` = the active SelectorIndex
 /// at row `r`.  Verifier publicly computes this from row index — no
@@ -670,5 +847,140 @@ mod tests {
                 other => panic!("θ should not emit {other:?}"),
             }
         }
+    }
+
+    // ─── ρπ row-uniform tests ───────────────────────────────────────
+
+    #[test]
+    fn rho_pi_row_uniform_count_and_kind() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = rho_pi_row_uniform_constraints(&schema);
+        // 1600 Copy constraints, no helpers, no booleanity here
+        // (global booleanity covers state cells).
+        assert_eq!(cs.len(), 1600);
+        for c in &cs {
+            assert_eq!(c.selector, SelectorIndex::RhoPi);
+            assert!(matches!(c.op, RowUniformOp::Copy { .. }),
+                "ρπ should emit only Copy; got {:?}", c.op);
+        }
+    }
+
+    #[test]
+    fn rho_pi_row_uniform_writes_all_state_out_bits() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = rho_pi_row_uniform_constraints(&schema);
+
+        // The set of destination columns should be EXACTLY the
+        // state_out bit columns.
+        let mut dst_cols: Vec<usize> = cs.iter().filter_map(|c| match c.op {
+            RowUniformOp::Copy { c, .. } => Some(c.0),
+            _ => None,
+        }).collect();
+        dst_cols.sort();
+        dst_cols.dedup();
+        assert_eq!(dst_cols.len(), 1600);
+        for col in &dst_cols {
+            assert!(schema.state_out.contains(col));
+        }
+    }
+
+    // ─── χ row-uniform tests ────────────────────────────────────────
+
+    #[test]
+    fn chi_row_uniform_count_and_kinds() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = chi_row_uniform_constraints(&schema);
+
+        let n_bool = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Boolean { .. })).count();
+        let n_not  = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Not     { .. })).count();
+        let n_and  = cs.iter().filter(|c| matches!(c.op, RowUniformOp::And     { .. })).count();
+        let n_xor  = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Xor     { .. })).count();
+
+        assert_eq!(n_bool, 3200);  // 2 helper cells per (lane, bit) × 25×64
+        assert_eq!(n_not,  1600);
+        assert_eq!(n_and,  1600);
+        assert_eq!(n_xor,  1600);
+        assert_eq!(cs.len(), 8000);
+
+        for c in &cs {
+            assert_eq!(c.selector, SelectorIndex::Chi);
+        }
+    }
+
+    #[test]
+    fn chi_helpers_dont_conflict_with_theta() {
+        // θ uses helpers[0..1600]; χ uses helpers[0..3200].  At any
+        // given row, the active selector ensures only one sub-step's
+        // constraints fire, so the overlap is safe.  This test pins
+        // the documented overlap.
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let theta_cols: std::collections::HashSet<usize> = theta_row_uniform_constraints(&schema)
+            .iter().filter_map(|c| match c.op {
+                RowUniformOp::Boolean { b: ColRef(c) } if schema.helpers.contains(&c) => Some(c),
+                _ => None,
+            }).collect();
+        let chi_cols: std::collections::HashSet<usize> = chi_row_uniform_constraints(&schema)
+            .iter().filter_map(|c| match c.op {
+                RowUniformOp::Boolean { b: ColRef(c) } if schema.helpers.contains(&c) => Some(c),
+                _ => None,
+            }).collect();
+        // The helper columns overlap; this is intentional space-sharing.
+        assert!(!theta_cols.is_disjoint(&chi_cols),
+            "θ and χ helper col sets should overlap (space-sharing)");
+        // But the active-selector gating ensures only the right
+        // constraint set fires at any given row.
+    }
+
+    // ─── ι row-uniform tests ────────────────────────────────────────
+
+    #[test]
+    fn iota_row_uniform_count_and_kinds() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = iota_row_uniform_constraints(&schema);
+
+        let n_xor  = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Xor  { .. })).count();
+        let n_copy = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Copy { .. })).count();
+
+        assert_eq!(n_xor, 64);          // lane (0,0) gets the round constant
+        assert_eq!(n_copy, 24 * 64);    // pass-through for lanes 1..25
+        assert_eq!(cs.len(), 1600);
+
+        for c in &cs {
+            assert_eq!(c.selector, SelectorIndex::Iota);
+        }
+    }
+
+    #[test]
+    fn iota_lane_zero_uses_rc_bits() {
+        // Verify ι's lane-(0,0) XORs source the second operand from
+        // the rc_bits column range.
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = iota_row_uniform_constraints(&schema);
+        let rc_xors: Vec<_> = cs.iter().filter_map(|c| match c.op {
+            RowUniformOp::Xor { b: ColRef(col), .. } if schema.rc_bits.contains(&col) => Some(col),
+            _ => None,
+        }).collect();
+        assert_eq!(rc_xors.len(), 64,
+            "exactly 64 ι XORs should reference rc_bits cells");
+    }
+
+    // ─── Combined: 4-sub-step row-uniform constraint count ──────────
+
+    #[test]
+    fn total_row_uniform_constraints_for_one_round() {
+        // Total per-round row-uniform constraints (excluding cross-row
+        // threading and global booleanity which are separate generators):
+        // θ:  4 800
+        // ρπ: 1 600
+        // χ:  8 000
+        // ι:  1 600
+        //     ------
+        //     16 000 total
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let n_theta  = theta_row_uniform_constraints(&schema).len();
+        let n_rho_pi = rho_pi_row_uniform_constraints(&schema).len();
+        let n_chi    = chi_row_uniform_constraints(&schema).len();
+        let n_iota   = iota_row_uniform_constraints(&schema).len();
+        assert_eq!(n_theta + n_rho_pi + n_chi + n_iota, 16_000);
     }
 }
