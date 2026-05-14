@@ -63,13 +63,34 @@ fn main() {
     println!();
 
     let n: usize = parse_env_usize("ROLLUP_N", 4);
+    // ROLLUP_BLOWUP controls the OUTER recursive STARK's blowup.  The
+    // inner v2 ML-DSA verify STARK is held at its canonical blowup=4
+    // (the wrapper-stark v2 bridge currently assumes this when
+    // extracting per-sub-AIR residues).  Separating them lets us
+    // sweep the recursive STARK's blowup independently while keeping
+    // the inner proof shape stable.
     let blowup: usize = parse_env_usize("ROLLUP_BLOWUP", 4);
+    let inner_blowup: usize = 4;
+    // Calibrated r per (L1, blowup) from r-vs-blowup-calibration.md.
+    // Maintains the paper's 135-bit total budget at L1 across all
+    // blowups (was previously hard-coded r=54 which only suffices at
+    // blowup=32).
+    let recursive_r: usize = match blowup {
+        4  => 135,
+        8  => 90,
+        16 => 68,
+        32 => 54,
+        _  => 54,
+    };
+    let recursive_r: usize = parse_env_usize("ROLLUP_R", recursive_r);
     let use_stir = std::env::var("ROLLUP_LDT").ok().as_deref() == Some("stir");
     let outer_ldt = if use_stir { LdtMode::Stir } else { LdtMode::Fri };
 
     println!("Configuration:");
     println!("  N (inner signatures):         {n}");
-    println!("  Inner v2 + recursive blowup:  {blowup}");
+    println!("  Inner v2 blowup (fixed):      {inner_blowup}");
+    println!("  Recursive STARK blowup:       {blowup}");
+    println!("  Recursive r (calibrated):     {recursive_r}");
     println!("  Outer rollup LDT:             {}", if use_stir { "STIR" } else { "FRI" });
     println!("  NIST level:                   L1 (sha3-256 + ML-DSA-44)");
     println!();
@@ -94,13 +115,13 @@ fn main() {
 
         // Inner v2 ML-DSA verify STARK.
         let t = Instant::now();
-        let v2_proof = prove_v2_real(&w, &c_tilde, blowup);
+        let v2_proof = prove_v2_real(&w, &c_tilde, inner_blowup);
         let inner_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
         total_inner_prove_ms += inner_prove_ms;
 
         // Verify the inner proof natively (sanity).
         let t = Instant::now();
-        verify_v2_real(&w, &c_tilde, &v2_proof, blowup)
+        verify_v2_real(&w, &c_tilde, &v2_proof, inner_blowup)
             .expect("inner v2 verify must accept");
         let inner_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
         total_inner_verify_ms += inner_verify_ms;
@@ -111,7 +132,7 @@ fn main() {
         // Recursive STARK wrap.
         let t = Instant::now();
         let rec = prove_v2_all_subairs_composed_recursive(
-            &v2_proof, &w, blowup, /*r=*/54, /*stir=*/false,
+            &v2_proof, &w, blowup, recursive_r, /*stir=*/false,
         ).expect("recursive STARK wrap must succeed");
         let rec_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
         total_recursive_prove_ms += rec_prove_ms;
