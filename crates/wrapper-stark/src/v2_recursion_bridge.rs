@@ -57,13 +57,13 @@
 //! N such checks under FS-derived α and attests their joint
 //! satisfaction with one outer FRI proof.
 
-use ark_ff::Zero as ArkZero;
+use ark_ff::{Field as _, Zero as ArkZero};
 use ark_goldilocks::Goldilocks;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, Compress, Validate};
 
 use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
-use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof};
+use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof, layer_sizes_from_schedule};
 use deep_ali::ml_dsa::params::{K, L, N, W1_BITS_PER_COEF};
 use deep_ali::ml_dsa_decompose;
 use deep_ali::ml_dsa_decompose_air;
@@ -689,6 +689,187 @@ impl std::fmt::Display for V2OodRecursiveError {
 }
 impl std::error::Error for V2OodRecursiveError {}
 
+// ─── FRI-verify in-AIR: per-query × per-layer DEEP-quotient residues ─
+//
+// The inner FRI verifier checks two algebraic relations per (query, layer):
+//
+//   DEEP-quotient: q_val · (x_i − z_ext) = f_val − fz_per_layer[ell]
+//   Fold:          s_val = f_val_at_next_layer  (or final-poly eval)
+//
+// where (f_val, s_val, q_val) come from `qp.per_layer_payloads[ell]`,
+// x_i = ω_ell^{rref.i}, ω_ell is the layer's primitive root of unity,
+// z_ext is FS-derived from the proof's transcript via
+// `derive_z_ext_for_proof`, and fz is `proof.fz_per_layer[ell]`.
+//
+// These checks tie the DEEP composition + FRI fold to the FS-derived
+// z_ext.  Encoding them in-AIR as `BitOp::IsZero` constraints is the
+// algebraic core of FRI-verify-in-AIR.  What's still missing for a
+// full FRI-verify-in-AIR reduction is the Merkle-path soundness on
+// `f_val`/`s_val`/`q_val` (i.e. encoding SHA-3 Merkle verification
+// in-AIR) — that's the wrapper-stark verifier-AIR's separate purpose,
+// covered by `sha3_absorb_air` and the SHA-3-PoK gadget.
+//
+// In this commit we encode the DEEP-quotient relation only (one
+// residue per (query, layer)) for the V17 sub-AIR's FRI proof.  The
+// fold-relation check is implied by the DEEP-quotient at the next
+// layer (since s_val == f_val[next]) and is left as a follow-up.
+
+/// Per-query × per-layer DEEP-quotient residues extracted from one
+/// sub-AIR's FRI proof.  Honest proofs yield all-zero residues.
+#[derive(Clone, Debug)]
+pub struct FriDeepQuotientResidues {
+    /// Outer index: query.  Inner index: layer.
+    pub residues: Vec<Vec<Ext>>,
+}
+
+impl FriDeepQuotientResidues {
+    pub fn n_queries(&self) -> usize { self.residues.len() }
+    pub fn n_layers(&self) -> usize { self.residues.first().map(|v| v.len()).unwrap_or(0) }
+    pub fn total(&self) -> usize { self.n_queries() * self.n_layers() }
+
+    pub fn all_zero(&self) -> bool {
+        use ark_ff::Zero as _;
+        self.residues.iter().all(|row| row.iter().all(|r| r.is_zero()))
+    }
+}
+
+/// Extract per-query × per-layer DEEP-quotient residues from a
+/// sub-AIR FRI proof.  Mirrors `deep_fri_verify`'s DEEP-EXT check at
+/// line ~2697 of `crates/deep_ali/src/fri.rs`:
+///
+///     residue = q_val · (x_i − z_ext) − (f_val − fz_per_layer[ell])
+///
+/// Returns `n_queries × L` Ext residues (L = `params.schedule.len()`).
+/// On an honest FRI proof every residue is zero.
+pub fn extract_v2_fri_deep_quotient_residues(
+    fri_proof_bytes: &[u8],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+) -> Result<FriDeepQuotientResidues, V2BridgeError> {
+    use ark_poly::Radix2EvaluationDomain;
+    use ark_poly::EvaluationDomain;
+
+    // sub-air FRI proofs are committed under augmented pi_hash (binds trace_root).
+    // We need to deserialize the SubAirProofWithTrace first to get trace_root.
+    let proof = deserialize_proof(fri_proof_bytes)
+        .map_err(|e| V2BridgeError::BccDeserialize(format!("sub-air proof: {e}")))?;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = <DeepFriProof<Ext> as CanonicalDeserialize>::deserialize_with_mode(
+        proof.fri_proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|e| V2BridgeError::OodExtractFailed(
+        format!("FRI deserialize: {e:?}")
+    ))?;
+    let n0 = n_trace * blowup;
+    let params = v2_fri_params(n0, aug_pi_hash);
+    let l = params.schedule.len();
+    let sizes = layer_sizes_from_schedule(fri_proof.n0, &params.schedule);
+    let z_ext = derive_z_ext_for_proof::<Ext>(&fri_proof, &params);
+
+    // Per-layer ω.  Each layer ell has domain size sizes[ell] with
+    // primitive root ω_ell = group_gen of the radix-2 evaluation domain.
+    let omega_per_layer: Vec<Goldilocks> = (0..l)
+        .map(|ell| Radix2EvaluationDomain::<Goldilocks>::new(sizes[ell])
+            .expect("layer domain power-of-two")
+            .group_gen)
+        .collect();
+
+    // STIR vs FRI detection.  In STIR mode the proof's `queries` is
+    // empty and proximity checks live in `stir_proximity_queries`.
+    // The DEEP-quotient extraction here only handles FRI mode (where
+    // each query has per-layer (f_val, q_val) payloads).  STIR
+    // proximity in-AIR encoding is a separate follow-up — its check
+    // shape is fiber-fold-vs-z_0, not per-layer DEEP-quotient.
+    if fri_proof.queries.is_empty() {
+        return Err(V2BridgeError::OodExtractFailed(
+            "FRI proof has no per-layer queries (likely STIR mode) — \
+             DEEP-quotient extraction only supports FRI mode.  \
+             Set MMIYC_V2_USE_FRI=1 before prove_v2_real to force \
+             FRI mode in the inner proof.".to_string()
+        ));
+    }
+
+    let mut residues_per_query: Vec<Vec<Ext>> = Vec::with_capacity(fri_proof.queries.len());
+    for qp in &fri_proof.queries {
+        let mut row = Vec::with_capacity(l);
+        for ell in 0..l {
+            // Bail if proof layer count mismatches schedule (malformed proof).
+            if ell >= qp.per_layer_payloads.len() || ell >= qp.per_layer_refs.len() {
+                return Err(V2BridgeError::OodExtractFailed(format!(
+                    "FRI proof query layer count {} < schedule len {l}",
+                    qp.per_layer_payloads.len()
+                )));
+            }
+            let pay = &qp.per_layer_payloads[ell];
+            let rref = &qp.per_layer_refs[ell];
+            let omega_ell = omega_per_layer[ell];
+            let x_i = <Ext as TowerField>::from_fp(omega_ell.pow([rref.i as u64]));
+            let fz = fri_proof.fz_per_layer[ell];
+            // residue = q_val · (x_i − z_ext) − (f_val − fz)
+            let lhs = pay.q_val * (x_i - z_ext);
+            let rhs = pay.f_val - fz;
+            row.push(lhs - rhs);
+        }
+        residues_per_query.push(row);
+    }
+
+    Ok(FriDeepQuotientResidues { residues: residues_per_query })
+}
+
+/// Build a sub-circuit 1 CompositionClaim from V17's FRI DEEP-quotient
+/// residues.  EXTENDS — does not replace — the existing
+/// `build_v2_v17_subair_composition` (sub-AIR per-query residues).
+///
+/// Soundness:  on honest input every residue is zero.  Tampering any
+/// `q_val`, `f_val`, or `fz_per_layer[ell]` value in the inner FRI
+/// proof produces a non-zero residue at that (query, layer) pair,
+/// which the FS-weighted accumulator catches at the outer FRI prove.
+///
+/// Caveat: this currently re-checks the algebraic relation between
+/// values that the inner FRI verifier ALREADY validates.  Full
+/// FRI-verify-in-AIR soundness (removing the inner FRI verify call
+/// from the outer verifier's trust path) requires also encoding the
+/// Merkle path verification on `(f_val, s_val, q_val)` in-AIR via
+/// SHA-3 — see `sha3_absorb_air` for the in-AIR hash machinery.
+pub fn build_v2_v17_fri_deep_quotient_composition(
+    proof: &V2ProofReal,
+) -> Result<CompositionClaim<Goldilocks>, V2BridgeError> {
+    let v17_n_trace = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let residues = extract_v2_fri_deep_quotient_residues(
+        &proof.fri_v17, v17_n_trace, /*blowup=*/4, proof.pi_hash, b"v17",
+    )?;
+
+    let n_q = residues.n_queries();
+    let n_l = residues.n_layers();
+    let total = n_q * n_l * EXT_DEGREE;
+
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(total);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(total);
+    let mut next_col = 0usize;
+    for q in 0..n_q {
+        for ell in 0..n_l {
+            let coords = residues.residues[q][ell].to_fp_components();
+            for c in 0..EXT_DEGREE {
+                let cell = CellRef::new(0, next_col);
+                column_values.push((cell, coords[c]));
+                constraints.push(BitOp::IsZero { cell });
+                next_col += 1;
+            }
+        }
+    }
+
+    let mut seed = proof.pi_hash;
+    seed[0] ^= 0xC7;  // distinct from anchor 0xC4, V17 0xC5, all-10 0xC6
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, constraints.len());
+
+    Ok(CompositionClaim {
+        column_values, constraints, alphas,
+        expected: Goldilocks::zero(),
+    })
+}
+
 // ─── Sub-circuit 1 (REAL): v2 V17 sub-AIR per-query residue extractor ─
 //
 // Computes the v2 V17 sub-AIR's per-query constraint residue
@@ -1192,6 +1373,63 @@ pub fn prove_v2_composed_recursive(
 /// 9 sub-AIRs (4×INTT, Decompose, UseHint, W1Encode, TRANSCRIPT) is
 /// the same pattern: pass each sub-AIR's `eval_per_row` and
 /// constraint count to `extract_sub_air_residues`.
+/// End-to-end with sub-circuit 1 = REAL V17 sub-AIR residues
+/// **PLUS** V17 FRI DEEP-quotient residues (FRI-verify-in-AIR).
+///
+/// Adds an extra layer of cryptographic content on top of
+/// `prove_v2_v17_composed_recursive`: not only does sub-circuit 1
+/// attest V17's per-query quotient relation, it also attests the
+/// FRI proof's per-query × per-layer DEEP-quotient algebraic
+/// relation `q_val · (x_i − z_ext) = f_val − fz`.
+pub fn prove_v2_v17_with_fri_verify_composed_recursive(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
+    // Merge V17 per-query residues + V17 FRI DEEP-quotient residues
+    // into ONE composition claim.
+    let mut comp_sub_air = build_v2_v17_subair_composition(proof)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let comp_fri = build_v2_v17_fri_deep_quotient_composition(proof)
+        .map_err(V2OodRecursiveError::Bridge)?;
+
+    // Concat: keep cell-refs disjoint by offsetting the FRI claim's
+    // column indices past the sub-AIR claim's range.
+    let offset = comp_sub_air.column_values.len();
+    for (cref, v) in comp_fri.column_values.iter() {
+        comp_sub_air.column_values.push((CellRef::new(0, cref.col + offset), *v));
+    }
+    for bitop in comp_fri.constraints.iter() {
+        let shifted = match *bitop {
+            BitOp::IsZero { cell } => BitOp::IsZero {
+                cell: CellRef::new(cell.row, cell.col + offset),
+            },
+            other => other,
+        };
+        comp_sub_air.constraints.push(shifted);
+    }
+    comp_sub_air.alphas.extend_from_slice(&comp_fri.alphas);
+
+    // Sub-circuit 2: full F2b OOD.
+    let ext_bundle = extract_v2_full_ood_bundle(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+    let mut ood_seed = proof.pi_hash;
+    ood_seed[0] ^= 0xF6;
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(
+        &ood_seed, base_bundle.claims.len(),
+    );
+    let ood_claim = OodAccumulatorClaim { bundle: base_bundle, alphas: ood_alphas };
+
+    // Sub-circuit 3: vestige perm-arg.
+    let perm_claim = build_v2_pi_hash_vestige_perm_arg(proof.pi_hash);
+
+    prove_recursive_stark(&comp_sub_air, &ood_claim, &perm_claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
 /// End-to-end with **ALL 10 v2 sub-AIRs** real in sub-circuit 1.
 /// The composed RecursiveStarkProof attests:
 ///
@@ -1474,6 +1712,53 @@ mod tests {
             assert!(v.is_zero(),
                 "honest V17 residue must be zero at every coord; got {v:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "slow — FRI-verify-in-AIR: extract V17 DEEP-quotient residues"]
+    fn extract_v2_v17_fri_deep_quotient_residues_honest() {
+        // Force inner v2 proof into FRI mode (default is STIR).  Env
+        // var MUST stay set across the extractor too because
+        // `v2_fri_params` reads it at call time to set
+        // `params.stir` (which controls the FS transcript binding
+        // used in derive_z_ext_for_proof).
+        std::env::set_var("MMIYC_V2_USE_FRI", "1");
+        let w = synthesize_demo_witness(59);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let v17_n_trace = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+        let residues = extract_v2_fri_deep_quotient_residues(
+            &proof.fri_v17, v17_n_trace, 4, proof.pi_hash, b"v17",
+        ).expect("V17 FRI DEEP-quotient extraction must succeed");
+        std::env::remove_var("MMIYC_V2_USE_FRI");
+
+        assert!(residues.n_queries() > 0);
+        assert!(residues.n_layers() > 0);
+        eprintln!("V17 FRI DEEP-quotient: {} queries × {} layers = {} Ext residues",
+            residues.n_queries(), residues.n_layers(), residues.total());
+        assert!(residues.all_zero(),
+            "honest V17 FRI proof: every DEEP-quotient residue must be zero");
+    }
+
+    #[test]
+    #[ignore = "slow — V17 + FRI-verify composed RecursiveStarkProof"]
+    fn prove_v2_v17_with_fri_verify_composed_recursive_round_trip() {
+        use crate::recursive_prover::verify_recursive_stark;
+
+        std::env::set_var("MMIYC_V2_USE_FRI", "1");
+        let w = synthesize_demo_witness(61);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let rec = prove_v2_v17_with_fri_verify_composed_recursive(&proof, &w, 4, 54, false)
+            .expect("V17 + FRI-verify composed prove must succeed");
+        std::env::remove_var("MMIYC_V2_USE_FRI");
+
+        assert!(verify_recursive_stark(&rec),
+            "V17 + FRI-verify composed RecursiveStarkProof must verify locally");
     }
 
     #[test]

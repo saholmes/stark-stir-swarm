@@ -1046,7 +1046,7 @@ pub fn compute_s_layer(f_l: &[F], z_l: F, m: usize) -> Vec<F> {
     s_per_i
 }
 
-fn layer_sizes_from_schedule(n0: usize, schedule: &[usize]) -> Vec<usize> {
+pub fn layer_sizes_from_schedule(n0: usize, schedule: &[usize]) -> Vec<usize> {
     let mut sizes = Vec::with_capacity(schedule.len() + 1);
     let mut n = n0;
     sizes.push(n);

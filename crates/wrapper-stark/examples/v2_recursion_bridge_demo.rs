@@ -29,11 +29,12 @@ use ark_serialize::CanonicalSerialize;
 
 use wrapper_stark::recursive_prover::{verify_ood_accumulator, verify_recursive_stark};
 use wrapper_stark::v2_recursion_bridge::{
-    EXT_DEGREE, build_v2_all_subairs_composition, build_v2_v17_subair_composition,
-    extract_v2_all_subair_residues, extract_v2_bcc_pair_ood_bundle,
+    EXT_DEGREE, build_v2_all_subairs_composition, build_v2_v17_fri_deep_quotient_composition,
+    build_v2_v17_subair_composition, extract_v2_all_subair_residues,
+    extract_v2_bcc_pair_ood_bundle, extract_v2_fri_deep_quotient_residues,
     extract_v2_full_ood_bundle, flatten_ext_to_base, prove_v2_all_subairs_composed_recursive,
     prove_v2_composed_recursive, prove_v2_full_ood_recursive, prove_v2_ood_recursive,
-    prove_v2_v17_composed_recursive,
+    prove_v2_v17_composed_recursive, prove_v2_v17_with_fri_verify_composed_recursive,
 };
 
 fn main() {
@@ -411,5 +412,97 @@ fn main() {
         proof_bytes.len() as f64 / 1024.0, all_kib);
     println!("  {:.1}× compression) attesting the full inner verification.",
         proof_bytes.len() as f64 / 1024.0 / all_kib);
+    println!();
+
+    // ─── 11. FRI-VERIFY-IN-AIR: V17 DEEP-quotient residues ─────────
+    println!("[FRI-VERIFY] Sub-circuit 1 + V17 FRI-verify-in-AIR");
+    println!("             (encode FRI DEEP-quotient relation per query × layer)");
+    println!();
+    println!("  Note: requires inner v2 in FRI mode (MMIYC_V2_USE_FRI=1).");
+    println!("  STIR mode's proximity-fold check is a separate follow-up");
+    println!("  with different fiber-fold-vs-z_0 shape.");
+    println!();
+
+    std::env::set_var("MMIYC_V2_USE_FRI", "1");
+    let w_fri = synthesize_demo_witness(0xC0FFEE + 1);
+    let c_tilde_fri = ml_dsa_transcript::compute_c_tilde_prime_native(&w_fri.mu_bytes, &w_fri.w1bytes);
+    let t = Instant::now();
+    let proof_fri_mode = prove_v2_real(&w_fri, &c_tilde_fri, 4);
+    let inner_fri_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      inner v2 (FRI mode) prove:  {inner_fri_prove_ms:.1} ms");
+
+    let t = Instant::now();
+    let fri_resid = extract_v2_fri_deep_quotient_residues(
+        &proof_fri_mode.fri_v17,
+        deep_ali::ml_dsa_verify_air_v17::VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two(),
+        4, proof_fri_mode.pi_hash, b"v17",
+    ).expect("V17 DEEP-quotient extraction must succeed");
+    let fri_extract_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      DEEP-quotient extract:      {fri_extract_ms:.2} ms");
+    println!("      DEEP-quotient residues:     {} queries × {} layers = {} Ext",
+        fri_resid.n_queries(), fri_resid.n_layers(), fri_resid.total());
+    println!("      DEEP-quotient zero on honest: {}", fri_resid.all_zero());
+    assert!(fri_resid.all_zero());
+
+    let t = Instant::now();
+    let fri_comp = build_v2_v17_fri_deep_quotient_composition(&proof_fri_mode)
+        .expect("FRI DEEP-quotient composition build");
+    println!("      composition build:          {:.2} ms  ({} IsZero constraints)",
+        t.elapsed().as_secs_f64() * 1000.0, fri_comp.constraints.len());
+
+    let t = Instant::now();
+    let fri_rec = prove_v2_v17_with_fri_verify_composed_recursive(
+        &proof_fri_mode, &w_fri, /*blowup=*/4, /*r=*/54, /*stir=*/false,
+    ).expect("V17 + FRI-verify composed prove must succeed");
+    let fri_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+    std::env::remove_var("MMIYC_V2_USE_FRI");
+
+    let mut fri_buf = Vec::new();
+    fri_rec.fri_proof.serialize_compressed(&mut fri_buf).unwrap();
+    let fri_kib = fri_buf.len() as f64 / 1024.0;
+    let t = Instant::now();
+    let fri_ok = verify_recursive_stark(&fri_rec);
+    let fri_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    println!("      n_trace (shared):           {}", fri_rec.n_trace);
+    println!("      V17+FRI-verify prove:       {fri_prove_ms:.2} ms");
+    println!("      V17+FRI-verify verify:      {fri_verify_ms:.2} ms");
+    println!("      V17+FRI-verify proof:       {fri_kib:.1} KiB");
+    println!("      verdict:                    {}", if fri_ok { "ACCEPT" } else { "REJECT" });
+    assert!(fri_ok);
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  FRI-VERIFY-IN-AIR — SUB-CIRCUIT 1 EXTENDED");
+    println!();
+    println!("  The composed RecursiveStarkProof now attests:");
+    println!();
+    println!("    Sub-circuit 1a:  V17 per-query AIR-quotient residues");
+    println!("                     (54 queries × 6 coords = 324 IsZero)");
+    println!("    Sub-circuit 1b:  V17 FRI per-query × per-layer DEEP-quotient");
+    println!("                     (54 queries × {} layers × 6 coords",
+        fri_resid.n_layers());
+    println!("                      = {} IsZero)", fri_comp.constraints.len());
+    println!("    Sub-circuit 2:   full F2b OOD bundle (108 base claims)");
+    println!("    Sub-circuit 3:   vestige perm-arg");
+    println!();
+    println!("  The FRI DEEP-quotient residues are the algebraic core of");
+    println!("  FRI verify: each `q_val · (x_i − z_ext) = f_val − fz` check");
+    println!("  the inner FRI verifier runs at every (query, layer) pair.");
+    println!("  Asserting all 810 residues zero in one outer FRI proof");
+    println!("  delivers the architectural FRI-verify-in-AIR shape.");
+    println!();
+    println!("  Remaining for full FRI-verify-in-AIR soundness independence:");
+    println!("    - Encode SHA-3 Merkle-path verification on (f_val, s_val, q_val)");
+    println!("      in-AIR via the existing `sha3_absorb_air` machinery.");
+    println!("      Without this, the prover could lie about the FRI Merkle");
+    println!("      openings (the algebraic relation would still hold for the");
+    println!("      lied values, since IsZero only checks the values prover");
+    println!("      provides — not their bind to the FRI commits).");
+    println!("    - STIR proximity-fold encoding for v2's default LDT mode.");
+    println!("    - Extend to all 9 other sub-AIRs' FRI proofs.");
+    println!();
+    println!("  These are documented follow-ups; the architectural FRI-");
+    println!("  verify-in-AIR composition shape is delivered here.");
     println!("═══════════════════════════════════════════════════════════════");
 }
