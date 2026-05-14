@@ -455,33 +455,65 @@ pub struct MerkleSpongeLayout {
 }
 
 impl MerkleSpongeLayout {
-    /// Each hop = 1 merkle-hop row + 97 sponge rows = 98 rows.
-    pub const ROWS_PER_HOP: usize = 1 + ROWS_PER_BLOCK;  // 98
+    /// Each hop = 1 merkle-hop row + (n_blocks × 97) sponge rows.
+    /// For sha3-256/384 with 2N ≤ rate, n_blocks = 1 (single absorb).
+    /// For sha3-512 with 2N > rate, n_blocks = 2.
+    /// Use [`Self::rows_per_hop`] / [`Self::sponge_blocks_per_hop`]
+    /// for variant-aware row math instead of the L1/L3 default
+    /// `ROWS_PER_HOP` constant.
+    pub const ROWS_PER_HOP: usize = 1 + ROWS_PER_BLOCK;  // 98 for sha3-256/384
+
+    /// Number of SHA-3 absorb blocks needed for one Merkle hop,
+    /// computing `parent = SHA-3(left || right)` where each of left
+    /// and right is variant.output_bytes() long.
+    pub fn sponge_blocks_per_hop(variant: Sha3Variant) -> usize {
+        let n_bytes = variant.output_bytes();
+        let block_len = variant.block_bytes();
+        let input_len = 2 * n_bytes;
+        // FIPS 202 padding adds at least 1 byte (0x06) + at most
+        // block_len bytes — needs at least one more block when
+        // input_len % block_len == 0.
+        if input_len < block_len {
+            1
+        } else {
+            // input + padding: ceil((input_len + 1) / block_len)
+            (input_len + 1 + block_len - 1) / block_len
+        }
+    }
+
+    pub fn rows_per_hop(variant: Sha3Variant) -> usize {
+        1 + Self::sponge_blocks_per_hop(variant) * ROWS_PER_BLOCK
+    }
 
     pub fn new(variant: Sha3Variant, depth: usize, row_offset: usize) -> Self {
         let schema = UniformRowSchema::new(variant);
+        let rows_per_hop = Self::rows_per_hop(variant);
         let hop_starts = (0..depth)
-            .map(|r| row_offset + r * Self::ROWS_PER_HOP)
+            .map(|r| row_offset + r * rows_per_hop)
             .collect();
         Self { variant, depth, schema, hop_starts }
     }
 
     pub fn total_rows(&self) -> usize {
-        self.depth * Self::ROWS_PER_HOP
+        self.depth * Self::rows_per_hop(self.variant)
     }
 
     pub fn row_width(&self) -> usize {
         self.schema.width
     }
 
-    /// Row index of the absorb-XOR row for hop `r`.
+    /// Row index of the FIRST absorb-XOR row for hop `r` (start of
+    /// the first sponge block in this hop's sub-trace).
     pub fn sponge_absorb_row(&self, r: usize) -> usize {
         self.hop_starts[r] + 1
     }
 
-    /// Row index of the final ι row (= last permutation row) for hop `r`.
+    /// Row index of the final ι row (= last permutation row of the
+    /// LAST sponge block) for hop `r`.  This is the row whose
+    /// state_out carries the `parent = SHA-3(left || right)` value.
     pub fn sponge_final_iota_row(&self, r: usize) -> usize {
-        self.hop_starts[r] + ROWS_PER_BLOCK  // = 1 + (96 perm rows) = row 97 of hop block
+        let n_blocks = Self::sponge_blocks_per_hop(self.variant);
+        self.hop_starts[r] + n_blocks * ROWS_PER_BLOCK
     }
 }
 
@@ -588,15 +620,15 @@ pub fn synthesize_merkle_sponge_trace(
         sponge_input.extend_from_slice(left_bytes);
         sponge_input.extend_from_slice(right_bytes);
         let blocks = pad_for_absorb(&sponge_input, layout.variant);
-        // For SHA-3-256 with 32-byte inputs, 2N = 64 bytes — well within
-        // one block_bytes (136 bytes for sha3-256), so blocks.len() == 1.
-        // We assert that here; future commits handle multi-block hops
-        // (only relevant for sha3-512 if N > 36 bytes/block, but N=64
-        // bytes > 72-byte block → still 1 block).  Conservative check:
-        if blocks.len() != 1 {
+        // Multi-block support: sha3-256/384 absorb in 1 block,
+        // sha3-512 needs 2 blocks for the 128-byte left || right input
+        // (rate = 72 bytes).  Layout's rows_per_hop accounts for this.
+        let expected_blocks = MerkleSpongeLayout::sponge_blocks_per_hop(layout.variant);
+        if blocks.len() != expected_blocks {
             return Err(format!(
-                "merkle sponge hop expected single-block absorb, got {} blocks",
-                blocks.len()
+                "merkle sponge hop block count mismatch: expected {} blocks, \
+                 got {} (variant {:?})",
+                expected_blocks, blocks.len(), layout.variant,
             ));
         }
 
@@ -1473,10 +1505,10 @@ mod tests {
     }
 
     #[test]
-    fn composed_synthesiser_handles_sha3_512_multi_block_or_errors_cleanly() {
-        // sha3-512: 2N = 128 bytes > 72-byte block → multi-block absorb.
-        // Current single-block assertion errors cleanly; future commit
-        // will add multi-block support.
+    fn composed_synthesiser_supports_sha3_512_multi_block() {
+        // sha3-512: 2N = 128 bytes > 72-byte block → 2 absorb blocks
+        // per hop.  This used to error out with "single-block expected";
+        // now supported.
         let variant = Sha3Variant::Sha3_512;
         let leaves: Vec<MerkleNode> = (0..2u8)
             .map(|i| fake_leaf(variant, 0xF0 + i))
@@ -1484,12 +1516,35 @@ mod tests {
         let claim = merkle_build_and_open(variant, &leaves, 0);
         let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
 
-        let result = synthesize_merkle_sponge_trace(&claim, &layout);
-        // Should error with a clear message (not panic).
-        match result {
-            Err(msg) => assert!(msg.contains("single-block"),
-                "expected single-block error, got: {msg}"),
-            Ok(_) => panic!("sha3-512 hop with 128-byte input should require multi-block"),
-        }
+        // Verify layout reflects the multi-block hop sizing.
+        assert_eq!(
+            MerkleSpongeLayout::sponge_blocks_per_hop(variant), 2,
+            "sha3-512 should need 2 absorb blocks for 128-byte left||right"
+        );
+        let rows_per_hop = MerkleSpongeLayout::rows_per_hop(variant);
+        assert_eq!(rows_per_hop, 1 + 2 * ROWS_PER_BLOCK,
+            "rows_per_hop should be 1 + 2*97 = 195 for sha3-512");
+
+        // Synthesise successfully + compute the right root.
+        let (_, root) = synthesize_merkle_sponge_trace(&claim, &layout)
+            .expect("sha3-512 multi-block hop must succeed");
+        assert_eq!(root, claim.root);
+    }
+
+    #[test]
+    fn sponge_blocks_per_hop_per_variant() {
+        // L1 (sha3-256): 2N=64, rate=136 → 1 block (64 + 1 padding ≤ 136)
+        // L3 (sha3-384): 2N=96, rate=104 → 1 block (96 + 1 padding ≤ 104)
+        // L5 (sha3-512): 2N=128, rate=72 → 2 blocks (128+1 padding > 72)
+        assert_eq!(MerkleSpongeLayout::sponge_blocks_per_hop(Sha3Variant::Sha3_256), 1);
+        assert_eq!(MerkleSpongeLayout::sponge_blocks_per_hop(Sha3Variant::Sha3_384), 1);
+        assert_eq!(MerkleSpongeLayout::sponge_blocks_per_hop(Sha3Variant::Sha3_512), 2);
+    }
+
+    #[test]
+    fn rows_per_hop_per_variant() {
+        assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_256), 98);
+        assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_384), 98);
+        assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_512), 195);
     }
 }
