@@ -357,8 +357,8 @@ warning: `wrapper-stark` (lib test) generated 6 warnings (run `cargo fix --lib -
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-48a283becd11ea89)
 
 running 1 test
-wrapper_sha3 variant=L5 blowup=4 r=105 ldt=fri prove_ms=322 verify_ms=3.91 proof_kib=1184.1 n_trace=128
+wrapper_sha3 variant=L5 blowup=4 r=105 ldt=stir prove_ms=308 verify_ms=1.11 proof_kib=287.7 n_trace=128
 test wrapper_prover::tests::bench_wrapper_sha3_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.34s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.31s
 

@@ -310,7 +310,6 @@ warning: value assigned to `k_bits` is never read
      = help: maybe it is overwritten before being read?
 
 warning: `deep_ali` (lib) generated 44 warnings (run `cargo fix --lib -p deep_ali` to apply 36 suggestions)
-   Compiling wrapper-stark v0.0.1 (/Volumes/SAHexternal 1/Documents/stark-stir-swarm/crates/wrapper-stark)
 warning: unused import: `PI_LANE_INDICES as _`
    --> crates/wrapper-stark/src/keccak_round_air.rs:308:30
     |
@@ -354,12 +353,12 @@ warning: unused import: `ark_ff::Field`
    |     ^^^^^^^^^^^^^
 
 warning: `wrapper-stark` (lib test) generated 6 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 6 suggestions)
-    Finished `release` profile [optimized] target(s) in 2.20s
+    Finished `release` profile [optimized] target(s) in 0.06s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-368dfef0c71fe90e)
 
 running 1 test
-wrapper_sha3 variant=L3 blowup=4 r=79 ldt=fri prove_ms=334 verify_ms=2.12 proof_kib=710.8 n_trace=128
+wrapper_sha3 variant=L3 blowup=4 r=79 ldt=fri prove_ms=315 verify_ms=2.14 proof_kib=710.8 n_trace=128
 test wrapper_prover::tests::bench_wrapper_sha3_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.34s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.32s
 

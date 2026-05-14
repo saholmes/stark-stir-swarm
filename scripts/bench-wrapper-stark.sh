@@ -39,16 +39,24 @@ run_cell() {
     local r="$4"        # 54, 79, 105
     local ldt="$5"      # fri, stir
 
-    local stir_env=""
-    if [ "$ldt" = "stir" ]; then stir_env="BENCH_STIR=1"; fi
-
     local log="$RESULTS_DIR/wrapper-stark-${level}-${sha3}-${ldt}-bw${BLOWUP}.log"
     echo "━━━ wrapper-stark ${level} ${sha3} r=${r} ldt=${ldt} blowup=${BLOWUP} ━━━"
 
-    BENCH_BLOWUP=$BLOWUP BENCH_R=$r $stir_env \
-        cargo test --release -p wrapper-stark \
-        --features "$sha3 $mldsa parallel" --no-default-features \
-        --lib bench_wrapper_sha3_stark -- --ignored --nocapture 2>&1 | tee "$log" >/dev/null
+    # Export env vars on separate lines so bash treats them as
+    # environment overrides, not commands.  (Previous version's
+    # `$stir_env=BENCH_STIR=1` inline-prefix syntax tripped a
+    # "command not found" when stir_env was non-empty.)
+    if [ "$ldt" = "stir" ]; then
+        BENCH_BLOWUP=$BLOWUP BENCH_R=$r BENCH_STIR=1 \
+            cargo test --release -p wrapper-stark \
+            --features "$sha3 $mldsa parallel" --no-default-features \
+            --lib bench_wrapper_sha3_stark -- --ignored --nocapture 2>&1 | tee "$log" >/dev/null
+    else
+        BENCH_BLOWUP=$BLOWUP BENCH_R=$r \
+            cargo test --release -p wrapper-stark \
+            --features "$sha3 $mldsa parallel" --no-default-features \
+            --lib bench_wrapper_sha3_stark -- --ignored --nocapture 2>&1 | tee "$log" >/dev/null
+    fi
 
     local csv_line
     csv_line=$(grep "^wrapper_sha3 " "$log" | tail -1)
