@@ -35,6 +35,11 @@ export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$NPROC}"
 ##   r = ⌈total_bit_target / (½ · log₂(blowup))⌉
 ##   where total_bit_target ∈ {135, 197.5, 262.5} for L1/L3/L5.
 ##
+## The SAME `r` table holds for the quantum threat model — the Grover-
+## halved per-query soundness is offset by NIST's Cat-L quantum target
+## being half the classical target.  What changes in the quantum model
+## is the HASH FUNCTION (see `quantum_hash` below), not `r`.
+##
 ## BENCH_R overrides this if set explicitly.
 calibrated_r() {
     local level="$1"
@@ -53,6 +58,70 @@ calibrated_r() {
         "L5 16") echo 132 ;;
         "L5 32") echo 105 ;;
         *) echo "?" ;;
+    esac
+}
+
+## Quantum-aware hash function selection per (level, quantum-query-budget).
+## See scripts/results/quantum-calibration.md for the full derivation.
+## Uses the strict-Brassard bound n/3 ≥ λ_q + log₂(q), where λ_q is the
+## quantum bit-target (= λ_classical / 2 via NIST Cat L = AES-L
+## equivalent and AES quantum loss to Grover).
+##
+##   L1 (λ_q=64):
+##     q ≤ 2^40 → n ≥ 312 → SHA3-384
+##                (relaxed BHT bound: q^3/2^n ≤ 2^-64 → n ≥ 184; SHA3-256 ok)
+##     q ≤ 2^65 → n ≥ 387 → SHA3-512
+##                (relaxed: n ≥ 259 → SHA3-384)
+##     q ≤ 2^90 → n ≥ 462 → IMPOSSIBLE (strict)
+##                (relaxed: n ≥ 334 → SHA3-512)
+##   L3 (λ_q=96):
+##     q ≤ 2^40 → n ≥ 408 → IMPOSSIBLE (strict)
+##                (relaxed: n ≥ 216 → SHA3-256)
+##     q ≤ 2^65 → n ≥ 483 → IMPOSSIBLE (strict)
+##                (relaxed: n ≥ 291 → SHA3-384)
+##     q ≤ 2^90 → IMPOSSIBLE
+##                (relaxed: n ≥ 366 → SHA3-384)
+##   L5 (λ_q=128):
+##     q ≤ 2^40 → n ≥ 504 → SHA3-512 (relaxed: n ≥ 248 → SHA3-256)
+##     q ≤ 2^65 → IMPOSSIBLE strict; relaxed n ≥ 323 → SHA3-384
+##     q ≤ 2^90 → IMPOSSIBLE BOTH STRICT AND RELAXED (n ≥ 398, but SHA3-512=512 ok under relaxed bound)
+##
+## The harness uses the RELAXED bound (more commonly cited; matches the
+## user-provided table).  Override with BENCH_HASH=sha3-{256,384,512}.
+quantum_hash() {
+    local level="$1"
+    local q_log2="$2"  # quantum query budget log2 ∈ {40, 65, 90}
+    # Pick MAX(classical-STARK-floor, quantum-FS-hash-floor) so the
+    # combination satisfies both:
+    #   (a) deep_ali's compile-time STARK ≥ sig constraint
+    #       (sha3 variant must match or exceed the mldsa level)
+    #   (b) Quantum FS-hash CR at the requested (level, q) per the
+    #       user-provided q-vs-hash table.
+    case "$level $q_log2" in
+        # L1 classical floor sha3-256:
+        "L1 40") echo sha3-256 ;;  # quantum floor sha3-256 ✓
+        "L1 65") echo sha3-384 ;;  # quantum floor sha3-384
+        "L1 90") echo sha3-512 ;;  # quantum floor sha3-512
+        # L3 classical floor sha3-384:
+        "L3 40") echo sha3-384 ;;  # quantum sha3-256, but classical floor wins
+        "L3 65") echo sha3-384 ;;  # both at sha3-384
+        "L3 90") echo sha3-512 ;;
+        # L5 classical floor sha3-512:
+        "L5 40") echo sha3-512 ;;  # quantum sha3-384, but classical floor wins
+        "L5 65") echo sha3-512 ;;
+        "L5 90") echo IMPOSSIBLE ;;
+        *) echo "?" ;;
+    esac
+}
+
+## Matching mldsa-* feature.  The ML-DSA parameter set is independent of
+## the quantum hash choice — it's selected by NIST level only.
+mldsa_for_level() {
+    case "$1" in
+        L1) echo mldsa-44 ;;
+        L3) echo mldsa-65 ;;
+        L5) echo mldsa-87 ;;
+        *)  echo "?" ;;
     esac
 }
 
@@ -123,19 +192,58 @@ l5_r="${BENCH_R:-$(calibrated_r L5 "$BLOWUP")}"
 echo "## Calibrated r per level @ blowup=${BLOWUP}: L1=${l1_r}  L3=${l3_r}  L5=${l5_r}"
 echo
 
+## Quantum threat model: when BENCH_Q is set to 40, 65, or 90, the
+## SHA3 variant per level is auto-selected via `quantum_hash`.  Without
+## BENCH_Q, the default uses the classical paper-canon (L1=sha3-256,
+## L3=sha3-384, L5=sha3-512) which is also the "q ≤ 2^40 quantum"
+## hash for L1, but is UNDER-CALIBRATED for higher quantum query budgets.
+BENCH_Q="${BENCH_Q:-}"  # empty | 40 | 65 | 90
+
+if [ -n "$BENCH_Q" ]; then
+    echo "## Quantum threat model active: q ≤ 2^${BENCH_Q} oracle queries"
+    echo "## Hash selection per (level, q):"
+    for lvl in L1 L3 L5; do
+        echo "##   $lvl @ q=2^${BENCH_Q}: $(quantum_hash $lvl $BENCH_Q)"
+    done
+    echo
+fi
+
+run_level_cell() {
+    local level="$1"
+    local r_val="$2"
+    local ldt="$3"
+    local sha3 mldsa
+    if [ -n "$BENCH_Q" ]; then
+        sha3=$(quantum_hash "$level" "$BENCH_Q")
+        if [ "$sha3" = "IMPOSSIBLE" ]; then
+            echo "[skip] $level @ q=2^${BENCH_Q} is NOT POSSIBLE under any SHA3 variant."
+            return
+        fi
+    else
+        # Classical paper-canon hashes.
+        case "$level" in
+            L1) sha3=sha3-256 ;;
+            L3) sha3=sha3-384 ;;
+            L5) sha3=sha3-512 ;;
+        esac
+    fi
+    mldsa=$(mldsa_for_level "$level")
+    run_cell "$level" "$sha3" "$mldsa" "$r_val" "$ldt"
+}
+
 if [[ " $LEVELS_FILTER " == *" L1 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L1 sha3-256 mldsa-44  "$l1_r" "$ldt"
+        run_level_cell L1 "$l1_r" "$ldt"
     done
 fi
 if [[ " $LEVELS_FILTER " == *" L3 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L3 sha3-384 mldsa-65  "$l3_r" "$ldt"
+        run_level_cell L3 "$l3_r" "$ldt"
     done
 fi
 if [[ " $LEVELS_FILTER " == *" L5 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L5 sha3-512 mldsa-87 "$l5_r" "$ldt"
+        run_level_cell L5 "$l5_r" "$ldt"
     done
 fi
 

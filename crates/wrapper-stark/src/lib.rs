@@ -290,12 +290,16 @@ pub mod merkle_prover;
 pub mod deep_ali_verifier_air;
 pub mod recursive_prover;
 
-// v2 recursion bridge is L1/L3-only: it hard-codes `deep_ali::SexticExt`
-// for the extension field used by V2ProofReal, which is correct at L1
-// (mldsa-44) and L3 (mldsa-65) but not at L5 (mldsa-87, which uses
-// OcticExt instead).  Bridging the bridge to be Ext-generic is a
-// larger refactor — see the calibration doc for the open work.
-#[cfg(any(feature = "mldsa-44", feature = "mldsa-65"))]
+// v2 recursion bridge is gated to the SHA-3 variants that select Fp⁶
+// (sha3-256 / sha3-384) in deep_ali.  At sha3-512, deep_ali's `Ext`
+// becomes `OcticExt` (Fp⁸) and the bridge's hardcoded `SexticExt`
+// fails to compile.
+//
+// This also gates out the quantum mode at q=2^90 for L1 (which
+// would require sha3-512 + mldsa-44 for quantum-CR on the FS hash);
+// see scripts/results/quantum-calibration.md for the analysis.
+// Making the bridge Ext-generic is the unblocking refactor.
+#[cfg(any(feature = "sha3-256", feature = "sha3-384"))]
 pub mod v2_recursion_bridge;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
