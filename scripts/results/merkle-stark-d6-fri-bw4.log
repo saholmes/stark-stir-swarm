@@ -406,8 +406,8 @@ warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib 
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-c3ef04b937350bdc)
 
 running 1 test
-merkle_stark variant=L1 depth=4 blowup=4 r=54 ldt=fri prove_ms=1730 verify_ms=1.43 proof_kib=431.0 n_trace=512
+merkle_stark variant=L1 depth=6 blowup=4 r=54 ldt=fri prove_ms=3697 verify_ms=1.61 proof_kib=468.2 n_trace=1024
 test merkle_prover::tests::bench_merkle_path_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 1.74s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 3.70s
 

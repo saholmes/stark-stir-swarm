@@ -310,7 +310,6 @@ warning: value assigned to `k_bits` is never read
      = help: maybe it is overwritten before being read?
 
 warning: `deep_ali` (lib) generated 44 warnings (run `cargo fix --lib -p deep_ali` to apply 36 suggestions)
-   Compiling wrapper-stark v0.0.1 (/Volumes/SAHexternal 1/Documents/stark-stir-swarm/crates/wrapper-stark)
 warning: unused import: `PI_LANE_INDICES as _`
    --> crates/wrapper-stark/src/keccak_round_air.rs:308:30
     |
@@ -373,19 +372,42 @@ warning: unused import: `ark_ff::Field`
 372 |     use ark_ff::Field;
     |         ^^^^^^^^^^^^^
 
+warning: unused import: `Zero`
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:439:25
+    |
+439 |     use ark_ff::{Field, Zero};
+    |                         ^^^^
+
 warning: unused import: `ark_ff::Zero`
    --> crates/wrapper-stark/src/merkle_path_air.rs:902:9
     |
 902 |     use ark_ff::Zero;
     |         ^^^^^^^^^^^^
 
-warning: `wrapper-stark` (lib test) generated 10 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
-    Finished `release` profile [optimized] target(s) in 2.89s
+warning: value assigned to `left` is never read
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:760:22
+    |
+760 |             let _ = (left, right) = (claim.left.clone(), claim.right.clone());
+    |                      ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `right` is never read
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:760:28
+    |
+760 |             let _ = (left, right) = (claim.left.clone(), claim.right.clone());
+    |                            ^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.05s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-c3ef04b937350bdc)
 
 running 1 test
-merkle_stark variant=L1 depth=2 blowup=4 r=54 ldt=fri prove_ms=764 verify_ms=1.25 proof_kib=395.9 n_trace=256
+merkle_stark variant=L1 depth=2 blowup=4 r=54 ldt=fri prove_ms=820 verify_ms=1.23 proof_kib=395.9 n_trace=256
 test merkle_prover::tests::bench_merkle_path_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 216 filtered out; finished in 0.77s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 0.83s
 

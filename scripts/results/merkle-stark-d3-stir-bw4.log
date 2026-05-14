@@ -372,19 +372,42 @@ warning: unused import: `ark_ff::Field`
 372 |     use ark_ff::Field;
     |         ^^^^^^^^^^^^^
 
+warning: unused import: `Zero`
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:439:25
+    |
+439 |     use ark_ff::{Field, Zero};
+    |                         ^^^^
+
 warning: unused import: `ark_ff::Zero`
    --> crates/wrapper-stark/src/merkle_path_air.rs:902:9
     |
 902 |     use ark_ff::Zero;
     |         ^^^^^^^^^^^^
 
-warning: `wrapper-stark` (lib test) generated 10 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.04s
+warning: value assigned to `left` is never read
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:760:22
+    |
+760 |             let _ = (left, right) = (claim.left.clone(), claim.right.clone());
+    |                      ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `right` is never read
+   --> crates/wrapper-stark/src/deep_ali_verifier_air.rs:760:28
+    |
+760 |             let _ = (left, right) = (claim.left.clone(), claim.right.clone());
+    |                            ^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.05s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-c3ef04b937350bdc)
 
 running 1 test
-merkle_stark variant=L1 depth=3 blowup=4 r=54 ldt=stir prove_ms=1644 verify_ms=0.38 proof_kib=111.5 n_trace=512
+merkle_stark variant=L1 depth=3 blowup=4 r=54 ldt=stir prove_ms=1685 verify_ms=0.37 proof_kib=111.5 n_trace=512
 test merkle_prover::tests::bench_merkle_path_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 216 filtered out; finished in 1.65s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 1.69s
 

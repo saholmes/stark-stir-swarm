@@ -402,12 +402,12 @@ warning: value assigned to `right` is never read
     = help: maybe it is overwritten before being read?
 
 warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.05s
+    Finished `release` profile [optimized] target(s) in 0.04s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-c3ef04b937350bdc)
 
 running 1 test
-merkle_stark variant=L1 depth=4 blowup=4 r=54 ldt=fri prove_ms=1730 verify_ms=1.43 proof_kib=431.0 n_trace=512
+merkle_stark variant=L1 depth=5 blowup=4 r=54 ldt=fri prove_ms=1781 verify_ms=1.42 proof_kib=431.0 n_trace=512
 test merkle_prover::tests::bench_merkle_path_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 1.74s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 1.79s
 
