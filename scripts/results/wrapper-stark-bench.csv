@@ -1,0 +1,4 @@
+variant,nist_level,blowup,r,ldt,prove_ms,verify_ms,proof_kib,n_trace
+sha3-256,L1,4,54,fri,339,1.12,362.9,128
+sha3-384,L3,4,79,fri,334,2.12,710.8,128
+sha3-512,L5,4,105,fri,332,4.19,1184.1,128

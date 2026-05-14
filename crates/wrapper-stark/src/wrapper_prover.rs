@@ -262,4 +262,78 @@ mod tests {
         assert!(!verify_sha3_air(&proof),
             "tampered proof must be rejected");
     }
+
+    /// Bench wrapper SHA-3 STARK: prove + verify + proof-size for the
+    /// active SHA-3 variant (selected by cargo features).  Inputs are
+    /// controlled by env vars:
+    ///   BENCH_BLOWUP    — LDE blowup factor (default 4)
+    ///   BENCH_R         — FRI query count (default 54)
+    ///   BENCH_STIR      — "1" for STIR, anything else for FRI
+    ///   BENCH_MESSAGE   — message to hash (default "abc")
+    ///
+    /// Prints a CSV-friendly line:
+    ///   `wrapper_sha3 variant=L1 blowup=4 r=54 ldt=fri prove_ms=X
+    ///    verify_ms=Y proof_kib=Z n_trace=N`
+    ///
+    /// Marked `--ignored` so it doesn't run by default; invoke via
+    /// scripts/bench-wrapper-stark.sh.
+    #[test]
+    #[ignore = "bench — invoke via scripts/bench-wrapper-stark.sh"]
+    fn bench_wrapper_sha3_stark() {
+        use std::time::Instant;
+        use ark_serialize::CanonicalSerialize;
+
+        // Variant is fixed by the build features.
+        #[cfg(feature = "sha3-256")] let variant = Sha3Variant::Sha3_256;
+        #[cfg(all(feature = "sha3-384", not(feature = "sha3-256")))]
+            let variant = Sha3Variant::Sha3_384;
+        #[cfg(all(feature = "sha3-512", not(feature = "sha3-256"), not(feature = "sha3-384")))]
+            let variant = Sha3Variant::Sha3_512;
+
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let r: usize = std::env::var("BENCH_R")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+        let use_stir: bool = std::env::var("BENCH_STIR")
+            .ok().as_deref() == Some("1");
+        let message: String = std::env::var("BENCH_MESSAGE")
+            .unwrap_or_else(|_| "abc".to_string());
+
+        let level_label = match variant {
+            Sha3Variant::Sha3_256 => "L1",
+            Sha3Variant::Sha3_384 => "L3",
+            Sha3Variant::Sha3_512 => "L5",
+        };
+        let ldt_label = if use_stir { "stir" } else { "fri" };
+
+        let msg_bytes = message.as_bytes();
+
+        let t0 = Instant::now();
+        let proof = prove_sha3_air(msg_bytes, variant, blowup, r, use_stir)
+            .expect("prove must succeed");
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 3 verify runs, take median.
+        let mut verify_samples = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let t = Instant::now();
+            let ok = verify_sha3_air(&proof);
+            assert!(ok, "verify must accept");
+            verify_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        verify_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let verify_ms = verify_samples[1];
+
+        let mut buf = Vec::new();
+        proof.fri_proof.serialize_compressed(&mut buf)
+            .expect("serialise proof");
+        let proof_kib = buf.len() as f64 / 1024.0;
+
+        println!(
+            "wrapper_sha3 variant={level_label} blowup={blowup} r={r} ldt={ldt_label} \
+             prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} \
+             proof_kib={proof_kib:.1} n_trace={n_trace}",
+            n_trace = proof.n_trace,
+        );
+    }
 }
