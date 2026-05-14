@@ -38,6 +38,7 @@ merkle      = { path = "../merkle",     default-features = false }
 transcript  = { path = "../transcript", default-features = false }
 
 [dev-dependencies]
+num-bigint    = "0.4"
 sha2          = "0.10"
 # Per-thread heap allocator for the K=256 STARK calibration example.
 # macOS's libsystem_malloc serialises threads on a global lock for
