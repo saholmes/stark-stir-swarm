@@ -24,13 +24,15 @@ use deep_ali::ml_dsa_verify_air_v2_orchestration::{
     prove_v2_real, synthesize_demo_witness, verify_v2_real,
 };
 
+use ark_ff::Zero;
 use ark_serialize::CanonicalSerialize;
 
 use wrapper_stark::recursive_prover::{verify_ood_accumulator, verify_recursive_stark};
 use wrapper_stark::v2_recursion_bridge::{
-    EXT_DEGREE, extract_v2_bcc_pair_ood_bundle, extract_v2_full_ood_bundle,
-    flatten_ext_to_base, prove_v2_composed_recursive,
+    EXT_DEGREE, build_v2_v17_subair_composition, extract_v2_bcc_pair_ood_bundle,
+    extract_v2_full_ood_bundle, flatten_ext_to_base, prove_v2_composed_recursive,
     prove_v2_full_ood_recursive, prove_v2_ood_recursive,
+    prove_v2_v17_composed_recursive,
 };
 
 fn main() {
@@ -266,11 +268,67 @@ fn main() {
     println!("  satisfying input.  Sub-circuit 2 carries the real");
     println!("  cryptographic content (F2b OOD bindings at z_0 ∈ Fp⁶).");
     println!();
-    println!("  Real-world sub-circuit 1 would re-encode each v2 sub-AIR's");
-    println!("  `eval_per_row` as BitOp constraints to attest the quotient");
-    println!("  check `c_eval(x) · Z_H(x) = Σ α_j · Φ_j(trace[x])` at FS-");
-    println!("  derived points.  That's the wrapper-stark verifier-AIR's");
-    println!("  eventual purpose; the architectural composition shape is");
-    println!("  proven here.");
+    println!("  Real-world sub-circuit 1 (anchor → REAL V17 residues) — below.");
+    println!();
+
+    // ─── 9. UPGRADED sub-circuit 1: REAL V17 per-query residues ───
+    println!("[REAL-V17] Sub-circuit 1 upgraded: V17 sub-AIR per-query residues");
+    let t = Instant::now();
+    let v17_comp = build_v2_v17_subair_composition(&proof)
+        .expect("V17 residue extraction must succeed");
+    let v17_extract_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      V17 residue extraction: {v17_extract_ms:.2} ms");
+    println!("      V17 IsZero claims: {}  (= n_queries × {EXT_DEGREE} coords)",
+        v17_comp.constraints.len());
+
+    let all_zero = v17_comp.column_values.iter().all(|(_, v)| v.is_zero());
+    println!("      honest V17: every residue coord is zero = {all_zero}");
+
+    let t = Instant::now();
+    let v17_rec = prove_v2_v17_composed_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+        .expect("V17-real composed prove must succeed");
+    let v17_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let mut v17_buf = Vec::new();
+    v17_rec.fri_proof.serialize_compressed(&mut v17_buf).unwrap();
+    let v17_kib = v17_buf.len() as f64 / 1024.0;
+
+    let t = Instant::now();
+    let v17_ok = verify_recursive_stark(&v17_rec);
+    let v17_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    println!("      n_trace (shared):  {}", v17_rec.n_trace);
+    println!("      V17-real prove:    {v17_prove_ms:.2} ms");
+    println!("      V17-real verify:   {v17_verify_ms:.2} ms");
+    println!("      V17-real proof:    {v17_kib:.1} KiB");
+    println!("      verdict:           {}", if v17_ok { "ACCEPT" } else { "REJECT" });
+    assert!(v17_ok);
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  SUB-CIRCUIT 1 UPGRADE — ANCHOR → REAL V17 RESIDUES");
+    println!();
+    println!("    Anchor (pi_hash bits):    256 BitOp::Boolean constraints");
+    println!("    Real V17 residues:        {} BitOp::IsZero constraints",
+        v17_comp.constraints.len());
+    println!();
+    println!("    Anchor composed prove:    {composed_prove_ms:.2} ms / {composed_kib:.1} KiB");
+    println!("    V17-real composed prove:  {v17_prove_ms:.2} ms / {v17_kib:.1} KiB");
+    println!();
+    println!("  V17-real sub-circuit 1 attests:");
+    println!();
+    println!("      Σ β_j · cell_j = 0  for j ∈ 0..n_queries × 6");
+    println!();
+    println!("  where each cell_j is one Goldilocks coord of a v2 V17");
+    println!("  per-query residue `c_eval(x) · Z_H(x) − Σ α · Φ(trace[x])`.");
+    println!("  Tampering V17's quotient breaks this leg — the residues");
+    println!("  stop being zero and the FS-weighted sum is non-zero with");
+    println!("  probability ≥ 1 − n/|Goldilocks|.  This is REAL cryptographic");
+    println!("  content tied to V17's constraint set, not just bit-booleanity.");
+    println!();
+    println!("  Remaining sub-AIRs (4×INTT + Decompose + UseHint +");
+    println!("  W1Encode + TRANSCRIPT) follow the same pattern — pass each");
+    println!("  sub-AIR's `eval_per_row` + constraint count to");
+    println!("  `extract_sub_air_residues`.  Drop-in extension.");
     println!("═══════════════════════════════════════════════════════════════");
 }

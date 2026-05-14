@@ -137,13 +137,13 @@ pub fn augment_pi_hash(
 }
 
 /// LDE-domain element at index `i`: ω_{n_lde}^i.
-fn lde_omega_pow(i: usize, n_lde: usize) -> F {
+pub fn lde_omega_pow(i: usize, n_lde: usize) -> F {
     let dom = GeneralEvaluationDomain::<F>::new(n_lde).expect("LDE domain power-of-two");
     dom.element(i)
 }
 
 /// Z_H(x) = x^{n_trace} − 1.
-fn z_h_at(x: F, n_trace: usize) -> F {
+pub fn z_h_at(x: F, n_trace: usize) -> F {
     x.pow(&[n_trace as u64]) - F::one()
 }
 
@@ -200,7 +200,7 @@ fn deserialize_fri(bytes: &[u8]) -> Result<DeepFriProof<Ext>, String> {
 /// Returns `Err` if neither source has any queries (catches the
 /// silent-skip soundness gap that the empty-queries guard was added
 /// for — but allows STIR proofs through cleanly).
-fn extract_query_positions(fri_proof: &DeepFriProof<Ext>) -> Result<Vec<usize>, String> {
+pub fn extract_query_positions(fri_proof: &DeepFriProof<Ext>) -> Result<Vec<usize>, String> {
     if !fri_proof.queries.is_empty() {
         Ok(fri_proof.queries.iter().map(|q| q.per_layer_refs[0].i).collect())
     } else if let Some(prox) = &fri_proof.stir_proximity_queries {
@@ -228,7 +228,7 @@ fn extract_query_positions(fri_proof: &DeepFriProof<Ext>) -> Result<Vec<usize>, 
 /// outer `deep_fri_verify` separately checks.  Schwartz-Zippel
 /// soundness for the per-query constraint check is identical in
 /// both modes.
-fn extract_query_position_and_c_eval(
+pub fn extract_query_position_and_c_eval(
     fri_proof: &DeepFriProof<Ext>,
     k: usize,
     n0: usize,

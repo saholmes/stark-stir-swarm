@@ -75,6 +75,14 @@ pub enum BitOp {
     /// cell that participates in a bit-level operation as input or
     /// output.  Degree 2.
     Boolean { b: CellRef },
+    /// Field-element-is-zero: `cell = 0`.  Constraint polynomial is
+    /// just `cell`, degree 1.  Used by the v2 recursion bridge to
+    /// encode per-query residues `c_eval(x) · Z_H(x) − Σ α·Φ(trace[x])`
+    /// as composition claims — each residue must be zero on honest
+    /// inner proofs.  Soundness of the composed sum Σ α_j · cell_j = 0
+    /// at FS-derived α gives SZ binding `∀j cell_j = 0` with
+    /// probability ≥ 1 − n/|F|.
+    IsZero { cell: CellRef },
 }
 
 impl BitOp {
@@ -90,6 +98,7 @@ impl BitOp {
             Self::Copy { .. }      => 1,
             Self::XorConst { .. }  => 1,
             Self::Boolean { .. }   => 2,  // b·(b-1) = b² - b
+            Self::IsZero { .. }    => 1,  // cell - 0 = cell
         }
     }
 }
@@ -205,6 +214,9 @@ impl BitOp {
                 let b = trace.get_cell_f(b);
                 b * (b - F::one())
             }
+            Self::IsZero { cell } => {
+                trace.get_cell_f(cell)
+            }
         }
     }
 
@@ -287,6 +299,9 @@ impl BitOp {
             Self::Boolean { b } => {
                 let b = trace.get_cell(b) as i128;
                 b * (b - 1)
+            }
+            Self::IsZero { cell } => {
+                trace.get_cell(cell) as i128
             }
         }
     }

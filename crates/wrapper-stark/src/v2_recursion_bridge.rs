@@ -66,7 +66,15 @@ use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
 use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof};
 use deep_ali::ml_dsa::params::{K, L, N, W1_BITS_PER_COEF};
 use deep_ali::ml_dsa_decompose;
-use deep_ali::ml_dsa_verify_air_v17::{N_EQ_ROWS, VERIFY_AIR_V17_ACTIVE_ROWS};
+use deep_ali::ml_dsa_verify_air_v17::{
+    N_EQ_ROWS, NUM_CONSTRAINTS as V17_NUM_CONSTRAINTS,
+    VERIFY_AIR_V17_ACTIVE_ROWS, WIDTH as V17_WIDTH,
+};
+use deep_ali::sub_air_with_trace::{
+    augment_pi_hash, comb_coeffs_aug, deserialize_proof,
+    extract_query_position_and_c_eval, extract_query_positions,
+    lde_omega_pow, z_h_at,
+};
 use deep_ali::ml_dsa_verify_air_v2_orchestration::{
     V2ProofReal, V2Witness, derive_w_approx_witness, v2_fri_params,
 };
@@ -674,6 +682,164 @@ impl std::fmt::Display for V2OodRecursiveError {
 }
 impl std::error::Error for V2OodRecursiveError {}
 
+// ─── Sub-circuit 1 (REAL): v2 V17 sub-AIR per-query residue extractor ─
+//
+// Computes the v2 V17 sub-AIR's per-query constraint residue
+//
+//   r_k = c_eval(x_k) · Z_H(x_k) − Σ α_j · Φ_j(trace[x_k], x_k)
+//
+// for each of the V17 FRI proof's queries k.  On an honest v2 inner
+// proof every r_k is zero in Fp⁶.  The recursive STARK's sub-circuit 1
+// (constraint composition) attests Σ β_k · r_k = 0 over FS-derived β,
+// flattening each Ext-typed residue into EXT_DEGREE base-field coords
+// via `TowerField::to_fp_components` (same projection sub-circuit 2
+// uses for OOD claims).
+//
+// Soundness gain vs the pi_hash anchor: each r_k is the SAME residue
+// the inner verifier checks per query.  If the inner V17 proof's
+// quotient relation doesn't hold at any queried position, the
+// corresponding r_k is non-zero and the sub-circuit 1 accumulator
+// catches it.  This is REAL cryptographic content tied to V17's
+// constraint set, not just bit-booleanity over the pi_hash.
+
+/// Compute per-query residues for one v2 sub-AIR FRI proof.
+///
+/// Replicates the per-query `c_eval(x) · Z_H(x) − Σ α_j Φ_j(trace[x])`
+/// check from `deep_ali::sub_air_with_trace::verify_one_sub_air_with_trace`
+/// but returns the Ext-typed residues (one per query) instead of
+/// asserting zero.  On honest inputs all residues are zero.
+fn extract_sub_air_residues(
+    proof_bytes: &[u8],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    width: usize,
+    num_constraints: usize,
+    eval_per_row_fn: impl Fn(&[Goldilocks], &[Goldilocks], usize) -> Vec<Goldilocks>,
+) -> Result<Vec<Ext>, V2BridgeError> {
+    let proof = deserialize_proof(proof_bytes)
+        .map_err(|e| V2BridgeError::BccDeserialize(format!("sub-air proof: {e}")))?;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = <DeepFriProof<Ext> as CanonicalDeserialize>::deserialize_with_mode(
+        proof.fri_proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|e| V2BridgeError::OodExtractFailed(
+        format!("sub-air FRI deserialize: {e:?}")
+    ))?;
+    let n0 = n_trace * blowup;
+    let params = v2_fri_params(n0, aug_pi_hash);
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+
+    let positions = extract_query_positions(&fri_proof)
+        .map_err(|e| V2BridgeError::OodExtractFailed(format!("query positions: {e}")))?;
+    let n_queries = positions.len();
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+
+    if proof.openings_cur.len() != n_queries || proof.openings_nxt.len() != n_queries {
+        return Err(V2BridgeError::OodExtractFailed(format!(
+            "openings count mismatch: cur={} nxt={} expected={n_queries}",
+            proof.openings_cur.len(), proof.openings_nxt.len()
+        )));
+    }
+
+    let mut residues = Vec::with_capacity(n_queries);
+    for k in 0..n_queries {
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(
+            &fri_proof, k, n0, m0,
+        ).map_err(|e| V2BridgeError::OodExtractFailed(format!("query {k}: {e}")))?;
+
+        let cur_op = &proof.openings_cur[k];
+        let nxt_op = &proof.openings_nxt[k];
+        if cur_op.cells.len() != width || nxt_op.cells.len() != width {
+            return Err(V2BridgeError::OodExtractFailed(format!(
+                "query {k}: cells len mismatch (cur={}, nxt={}, expected={width})",
+                cur_op.cells.len(), nxt_op.cells.len()
+            )));
+        }
+
+        let trace_row = pos / blowup;
+        // Match verify_one_sub_air's last-row gate: residue is 0 by
+        // convention on the wrap-around row.
+        if trace_row >= n_trace - 1 {
+            residues.push(Ext::zero());
+            continue;
+        }
+
+        let cvals = eval_per_row_fn(&cur_op.cells, &nxt_op.cells, trace_row);
+        if cvals.len() != num_constraints {
+            return Err(V2BridgeError::OodExtractFailed(format!(
+                "query {k}: eval_per_row returned {} ≠ {num_constraints}",
+                cvals.len()
+            )));
+        }
+        let phi_at_pos: Goldilocks = (0..num_constraints)
+            .map(|j| comb_coeffs[j] * cvals[j])
+            .sum();
+        let pos_f = lde_omega_pow(pos, n0);
+        let z_h = z_h_at(pos_f, n_trace);
+        // residue = c_eval(x) · Z_H(x) − Σ α_j · Φ_j(trace[x], x)
+        let lhs = c_eval_at_pos * <Ext as TowerField>::from_fp(z_h);
+        let rhs = <Ext as TowerField>::from_fp(phi_at_pos);
+        residues.push(lhs - rhs);
+    }
+
+    Ok(residues)
+}
+
+/// Build a sub-circuit 1 CompositionClaim from real v2 V17 per-query
+/// residues.
+///
+/// For each of V17's `n_queries` queries, computes the residue
+/// `c_eval(x) · Z_H(x) − Σ α_j Φ_j(trace[x])` (Ext-typed), flattens it
+/// into EXT_DEGREE = 6 Goldilocks coordinates, and registers each
+/// coordinate as a `BitOp::IsZero` constraint over a CompositionClaim
+/// row-0 cell.
+///
+/// On an honest v2 inner proof every residue is zero (the inner
+/// verifier checks this per-query), so every flattened coord is zero
+/// and every IsZero constraint vanishes.  Composed sum =
+/// Σ β_j · 0 = 0 = expected.
+///
+/// On a tampered inner V17 proof, at least one residue is non-zero
+/// at one coord and (with FS-derived β) the composed sum is non-zero
+/// with probability ≥ 1 − n/|Goldilocks|, catching the tamper.
+pub fn build_v2_v17_subair_composition(
+    proof: &V2ProofReal,
+) -> Result<CompositionClaim<Goldilocks>, V2BridgeError> {
+    let v17_n_trace = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let residues = extract_sub_air_residues(
+        &proof.fri_v17, v17_n_trace, /*blowup=*/4,
+        proof.pi_hash, b"v17",
+        V17_WIDTH, V17_NUM_CONSTRAINTS,
+        |cur, nxt, row| deep_ali::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
+    )?;
+
+    // Each Ext residue → 6 Goldilocks coords → 6 IsZero constraints.
+    let total = residues.len() * EXT_DEGREE;
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(total);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(total);
+    for (k, r) in residues.iter().enumerate() {
+        let coords = r.to_fp_components();
+        for c in 0..EXT_DEGREE {
+            let col = k * EXT_DEGREE + c;
+            let cell = CellRef::new(0, col);
+            column_values.push((cell, coords[c]));
+            constraints.push(BitOp::IsZero { cell });
+        }
+    }
+
+    // FS alphas derived from v2 pi_hash with a new seed-XOR.
+    let mut seed = proof.pi_hash;
+    seed[0] ^= 0xC5;  // distinct from anchor's 0xC4
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, constraints.len());
+
+    Ok(CompositionClaim {
+        column_values, constraints, alphas,
+        expected: Goldilocks::zero(),
+    })
+}
+
 // ─── Sub-circuit 1 wiring (constraint composition over v2 pi_hash) ──
 //
 // The wrapper-stark recursive_prover's sub-circuit 1 expects a
@@ -806,6 +972,54 @@ pub fn prove_v2_composed_recursive(
     let comp_claim = build_v2_pi_hash_anchor_composition(proof.pi_hash);
 
     // Sub-circuit 2: real full F2b OOD bundle, flattened.
+    let ext_bundle = extract_v2_full_ood_bundle(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+    let mut ood_seed = proof.pi_hash;
+    ood_seed[0] ^= 0xF6;
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(
+        &ood_seed, base_bundle.claims.len(),
+    );
+    let ood_claim = OodAccumulatorClaim {
+        bundle: base_bundle, alphas: ood_alphas,
+    };
+
+    // Sub-circuit 3: vestige perm-arg.
+    let perm_claim = build_v2_pi_hash_vestige_perm_arg(proof.pi_hash);
+
+    prove_recursive_stark(&comp_claim, &ood_claim, &perm_claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
+/// End-to-end with **REAL** sub-circuit 1: replaces the pi_hash anchor
+/// with v2 V17 sub-AIR per-query residues.  The composed
+/// RecursiveStarkProof now attests:
+///
+///   1. Sub-circuit 1: every coord of every V17 per-query residue
+///      `c_eval(x) · Z_H(x) − Σ α_j Φ_j(trace[x])` is zero.  This
+///      is the SAME residue the inner v2 verifier checks per query —
+///      tampering V17's quotient breaks this leg.
+///   2. Sub-circuit 2: full F2b OOD (BCC-vs-BCC + BCC-vs-public)
+///      with all coordinates zero (Schwartz-Zippel at z_0 ∈ Fp⁶).
+///   3. Sub-circuit 3: vestige perm-arg (T_MEM removed from v2).
+///
+/// Sub-circuit 1 here covers V17 only — the largest and most
+/// architecturally significant v2 sub-AIR.  Extending to the other
+/// 9 sub-AIRs (4×INTT, Decompose, UseHint, W1Encode, TRANSCRIPT) is
+/// the same pattern: pass each sub-AIR's `eval_per_row` and
+/// constraint count to `extract_sub_air_residues`.
+pub fn prove_v2_v17_composed_recursive(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
+    // Sub-circuit 1: REAL V17 per-query residue composition.
+    let comp_claim = build_v2_v17_subair_composition(proof)
+        .map_err(V2OodRecursiveError::Bridge)?;
+
+    // Sub-circuit 2: full F2b OOD bundle, flattened.
     let ext_bundle = extract_v2_full_ood_bundle(proof, public)
         .map_err(V2OodRecursiveError::Bridge)?;
     let base_bundle = flatten_ext_to_base(&ext_bundle);
@@ -1008,6 +1222,48 @@ mod tests {
         assert_eq!(claim.right.len(), 4);
         assert_eq!(claim.left, claim.right);
         assert_eq!(claim.perm_tag, "v2-pi-hash-vestige");
+    }
+
+    #[test]
+    #[ignore = "slow — extract real V17 sub-AIR per-query residues"]
+    fn build_v2_v17_subair_composition_honest() {
+        let w = synthesize_demo_witness(37);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let claim = build_v2_v17_subair_composition(&proof)
+            .expect("V17 residue extraction must succeed on honest proof");
+
+        // V17 ships V2_NUM_QUERIES queries (L1 = 54) × EXT_DEGREE = 6 coords.
+        assert_eq!(claim.constraints.len() % EXT_DEGREE, 0,
+            "constraint count must be multiple of EXT_DEGREE");
+        assert_eq!(claim.column_values.len(), claim.constraints.len());
+
+        // Every cell value (= Goldilocks coord of an Ext residue) must
+        // be zero on an honest proof.  Each BitOp::IsZero constraint
+        // then evaluates to 0.
+        for (_cref, v) in &claim.column_values {
+            assert!(v.is_zero(),
+                "honest V17 residue must be zero at every coord; got {v:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "slow — V17-real composed RecursiveStarkProof end-to-end"]
+    fn prove_v2_v17_composed_recursive_round_trip() {
+        use crate::recursive_prover::verify_recursive_stark;
+
+        let w = synthesize_demo_witness(41);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let rec = prove_v2_v17_composed_recursive(&proof, &w, 4, 54, false)
+            .expect("V17-real composed recursive prove must succeed");
+
+        assert!(verify_recursive_stark(&rec),
+            "V17-real composed RecursiveStarkProof must verify locally");
     }
 
     #[test]
