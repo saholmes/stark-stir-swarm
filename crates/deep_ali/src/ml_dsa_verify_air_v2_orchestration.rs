@@ -1657,6 +1657,121 @@ pub fn derive_w_approx_witness(w_approx_ntt: &[[u32; N]; K]) -> [[u32; N]; K] {
     w_approx
 }
 
+// ─── Public demo witness synthesiser ─────────────────────────────
+//
+// Builds a deterministic, internally-consistent V2Witness suitable for
+// driving prove_v2_real / verify_v2_real round-trips.  Each `seed`
+// produces a distinct witness (varied via mu_bytes), so callers needing
+// N distinct signatures (e.g. a rollup demo) can iterate `seed = 0..N`.
+//
+// The witness is *synthetic* — it does NOT correspond to a real
+// ML-DSA-{44,65,87} signature on a real message.  It satisfies the
+// FIPS 204 §3 Algorithm 3 verify-equation modulo Q, which is what the
+// STARK actually attests to.  For demo + bench purposes this is
+// sufficient: the STARK is indistinguishable from the real-signature
+// case from the prover's perspective.
+
+/// Synthesise a demo V2Witness varied by `seed`.  Same witness shape
+/// as the in-test `synthesize_witness` used by `v2_bench`; the seed
+/// is XOR'd into `mu_bytes` so each call produces a distinct pi_hash.
+pub fn synthesize_demo_witness(seed: u64) -> V2Witness {
+    use crate::ml_dsa::params::{K, L, N, Q};
+    use crate::ml_dsa_field::{add_q, mul_q, sub_q};
+
+    // Step 1: small centred z, lift to z_cleartext.
+    let mut z_cleartext = Box::new([[0u32; N]; L]);
+    for l in 0..L {
+        for i in 0..N {
+            let signed = ((i as i32 + l as i32 * 7) % 100) - 50;
+            z_cleartext[l][i] = if signed >= 0 {
+                signed as u32
+            } else {
+                (signed + Q as i32) as u32
+            };
+        }
+    }
+    // Step 2: z_ntt[l] = NTT(z_cleartext[l]).
+    let mut z_ntt = Box::new([[0u32; N]; L]);
+    for l in 0..L {
+        let mut tmp = z_cleartext[l];
+        crate::ml_dsa_ntt::ntt(&mut tmp);
+        z_ntt[l] = tmp;
+    }
+    // Step 3: deterministic a_ntt, c_ntt, t1d_ntt; compute w_approx_ntt.
+    let mut a_ntt = Box::new([[[0u32; N]; L]; K]);
+    for k in 0..K {
+        for l in 0..L {
+            for i in 0..N {
+                a_ntt[k][l][i] =
+                    (1000 + i as u32 * 17 + l as u32 * 31 + k as u32 * 41) % Q;
+            }
+        }
+    }
+    let mut c_ntt = Box::new([0u32; N]);
+    for i in 0..N { c_ntt[i] = (1 + i as u32 * 23) % Q; }
+    let mut t1d_ntt = Box::new([[0u32; N]; K]);
+    for k in 0..K {
+        for i in 0..N { t1d_ntt[k][i] = (5 + i as u32 * 11 + k as u32 * 13) % Q; }
+    }
+    let mut w_approx_ntt = Box::new([[0u32; N]; K]);
+    for k in 0..K {
+        for i in 0..N {
+            let mut acc: u32 = 0;
+            for l in 0..L {
+                acc = add_q(acc, mul_q(a_ntt[k][l][i], z_ntt[l][i]));
+            }
+            w_approx_ntt[k][i] = sub_q(acc, mul_q(c_ntt[i], t1d_ntt[k][i]));
+        }
+    }
+    // Step 4: w_approx[k] = INTT(w_approx_ntt[k]).
+    let mut w_approx = Box::new([[0u32; N]; K]);
+    let derived = derive_w_approx_witness(&w_approx_ntt);
+    for k in 0..K { w_approx[k] = derived[k]; }
+
+    // Step 5: synthetic h (all zeros — UseHint becomes a passthrough).
+    let h = Box::new([[0u32; N]; K]);
+
+    // Step 6: adjusted_r1[k][i] via native UseHint.
+    let mut adjusted_r1 = Box::new([[0u32; N]; K]);
+    for k in 0..K {
+        for i in 0..N {
+            let r = w_approx[k][i];
+            let (r1, r0_lifted) = crate::ml_dsa_decompose::decompose(r);
+            let r0_sign = if r0_lifted != 0 && r0_lifted <= Q / 2 { 1 } else { 0 };
+            let (adj, _wp, _wn) = crate::ml_dsa_use_hint_air::use_hint(r1, r0_sign, h[k][i]);
+            adjusted_r1[k][i] = adj;
+        }
+    }
+
+    // Step 7: mu_bytes varied per seed; w1bytes per FIPS 204 §3.5.7.
+    let mut mu_bytes = [0u8; 64];
+    let seed_le = seed.to_le_bytes();
+    for i in 0..64 {
+        mu_bytes[i] = 0x37u8 ^ seed_le[i & 7] ^ (i as u8);
+    }
+    use crate::ml_dsa::params::W1_BITS_PER_COEF;
+    let total_bits = K * N * W1_BITS_PER_COEF;
+    let mut w1bytes = vec![0u8; total_bits / 8];
+    for k in 0..K {
+        for i in 0..N {
+            let bit_offset = (k * N + i) * W1_BITS_PER_COEF;
+            let val = adjusted_r1[k][i] as u64;
+            for b in 0..W1_BITS_PER_COEF {
+                let bit = ((val >> b) & 1) as u8;
+                let byte_idx = (bit_offset + b) / 8;
+                let bit_idx = (bit_offset + b) % 8;
+                w1bytes[byte_idx] |= bit << bit_idx;
+            }
+        }
+    }
+
+    V2Witness {
+        a_ntt, c_ntt, t1d_ntt, w_approx_ntt,
+        mu_bytes, h, w1bytes,
+        z_ntt, z_cleartext, w_approx, adjusted_r1,
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

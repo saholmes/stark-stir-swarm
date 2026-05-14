@@ -6,8 +6,13 @@ license.workspace = true
 description = "DNS-rollup record helpers, authority signing layer, and the megazone demo for the STIR swarm"
 
 [features]
-default  = ["sha3-256", "parallel"]
+default  = ["sha3-256", "mldsa-44", "parallel"]
 sha3-256 = ["deep_ali/sha3-256"]
+sha3-384 = ["deep_ali/sha3-384"]
+sha3-512 = ["deep_ali/sha3-512"]
+mldsa-44 = ["deep_ali/mldsa-44"]
+mldsa-65 = ["deep_ali/mldsa-65"]
+mldsa-87 = ["deep_ali/mldsa-87"]
 parallel = ["deep_ali/parallel"]
 # Forward the merkle leaf-compression accelerator (paper dual-hash §8):
 # Poseidon-compresses field-element leaves, then SHA-3 the state for the
