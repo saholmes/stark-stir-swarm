@@ -31,6 +31,7 @@ use deep_ali::trace_import::lde_trace_columns;
 
 use crate::composition::alphas_from_transcript;
 use crate::fri_bridge::compute_single_row_indicator_lde;
+use crate::sha3_absorb_air::lane_to_bits;
 use crate::merkle_path_air::{
     MerkleCrossRowConstraint, MerkleNode, MerklePathClaim, MerkleSpongeLayout,
     hop_current_col, hop_index_bit_col, hop_left_col, hop_right_col, hop_sibling_col,
@@ -287,6 +288,33 @@ pub fn prove_merkle_path(
         }
     }
 
+    // 6b. Root-binding boundary: at the LAST final-ι row of the LAST
+    //     hop, state_out's first N bits must equal the public root's
+    //     bits.  Without this, the proof only attests to "some chain
+    //     hashed to some root"; this boundary pins it to claim.root
+    //     so the verifier knows it's THEIR root.
+    let last_iota_row = layout.sponge_final_iota_row(claim.depth() - 1);
+    let mut seed_root = public.pi_hash;  seed_root[0] ^= 0xB5;
+    let alpha_root = alphas_from_transcript::<FBase>(&seed_root, 1)[0];
+    let root_indicator = compute_single_row_indicator_lde(last_iota_row, n_trace, blowup);
+    let output_lanes = claim.variant.output_bits() / 64;
+    for lane in 0..output_lanes {
+        let mut lane_u64 = 0u64;
+        for j in 0..8 {
+            lane_u64 |= (claim.root.0[8 * lane + j] as u64) << (8 * j);
+        }
+        let expected_bits = lane_to_bits(lane_u64);
+        for bit in 0..64 {
+            let col = layout.schema.state_out_bit(lane, bit);
+            let expected = FBase::from(expected_bits[bit] as u64);
+            for r_idx in 0..n_lde {
+                let ind = root_indicator[r_idx];
+                if ind.is_zero() { continue; }
+                c_eval[r_idx] += alpha_root * ind * (lde[col][r_idx] - expected);
+            }
+        }
+    }
+
     // 7. Build FRI domain + params + prove.
     let domain = FriDomain::new_radix2(n_lde);
     let log2_n_lde = n_lde.trailing_zeros() as usize;
@@ -426,6 +454,28 @@ mod tests {
             .expect("prove must succeed on valid claim");
         assert!(verify_merkle_path(&proof),
             "honest prove + verify round-trip must accept");
+    }
+
+    #[test]
+    #[ignore = "slow — exercises root-binding soundness"]
+    fn round_trip_rejects_tampered_root_claim() {
+        // Tamper the claimed root in the public inputs.  The
+        // root-binding boundary commits state_out at the last final-ι
+        // row to the original root, so the verifier rejects when
+        // shown a different root with the same proof.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0x20 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 1);
+        let mut proof = prove_merkle_path(&claim, 4, 54, false)
+            .expect("prove must succeed");
+        // Tamper the public root + re-derive pi_hash.
+        proof.public.root.0[0] ^= 0xFF;
+        proof.public = MerklePathPublicInputs::for_root(
+            proof.public.variant, proof.public.root.clone(),
+            proof.public.leaf_index,
+        );
+        assert!(!verify_merkle_path(&proof),
+            "verifier must reject when claimed root doesn't match trace");
     }
 
     #[test]
