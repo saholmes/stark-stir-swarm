@@ -12,6 +12,7 @@ use deep_ali::{
         build_execution_trace, build_hash_rollup_trace, build_nsec3_chain_trace,
         ed25519_zsk_ksk_default_layout, pack_hash_to_leaves, AirType,
     },
+    binding_cells_commit::Ext as DaExt,
     deep_ali_merge_ed25519_verify, deep_ali_merge_general, deep_ali_merge_sha256,
     ed25519_verify_air::{
         fill_verify_air_v16, r_thread_bits_for_kA, verify_air_layout_v16,
@@ -19,15 +20,18 @@ use deep_ali::{
     },
     ed25519_scalar::reduce_mod_l_wide,
     fri::{deep_fri_proof_size_bytes, deep_fri_prove, deep_fri_verify, DeepFriParams, FriDomain},
-    sextic_ext::SexticExt,
     sha256_air, sha512_air,
     trace_import::lde_trace_columns,
 };
+use hash::selected::HASH_BYTES;
 use sha3::Digest;
 
 use crate::dns::{merkle_build, merkle_root, merkle_verify, DnsRecord};
 
-pub type Ext = SexticExt;
+// Feature-conditional Ext (Fp⁶ at sha3-256/sha3-384, Fp⁸ at sha3-512).
+// Picked up from deep_ali::binding_cells_commit::Ext so the workspace
+// stays consistent across all valid (sha3, mldsa) combinations.
+pub type Ext = DaExt;
 pub const BLOWUP: usize = 32;
 pub const NUM_QUERIES: usize = 54;
 pub const SEED_Z: u64 = 0xDEEF_BAAD;
@@ -122,7 +126,7 @@ pub struct InnerShardOutput {
     /// `proof.root_f0` — the FRI/STIR f0 commitment, included so the
     /// `pi_hash` recipe can be reproduced by an external verifier given
     /// the same shard inputs.
-    pub root_f0:      [u8; 32],
+    pub root_f0: [u8; HASH_BYTES],
     /// Encoded inner proof bytes (serialised via `bincode` if needed).
     /// Populated only if `serialise_proof` was true; otherwise empty.
     /// Step-4 leaves this empty pending step-5 proof transport.
@@ -235,7 +239,7 @@ pub struct OuterRollupOutput {
     pub proof_bytes:     usize,
     pub prove_ms:        f64,
     pub local_verify_ms: f64,
-    pub root_f0:         [u8; 32],
+    pub root_f0: [u8; HASH_BYTES],
     /// Compressed ark-serialize encoding of the outer rollup proof.
     pub proof_blob:      Vec<u8>,
     /// `DeepFriParams` mirror needed to verify the outer proof later
@@ -332,7 +336,7 @@ pub struct Nsec3Output {
     pub proof_bytes:     usize,
     pub prove_ms:        f64,
     pub local_verify_ms: f64,
-    pub root_f0:         [u8; 32],
+    pub root_f0: [u8; HASH_BYTES],
     pub proof_blob:      Vec<u8>,
 }
 
@@ -446,7 +450,7 @@ fn ds_ksk_pi_hash(
     dnskey_bytes:    &[u8],
     parent_ds_hash:  &[u8; 32],
     asserted_digest: &[u8; 32],
-    root_f0:         &[u8; 32],
+    root_f0:         &[u8; HASH_BYTES],
     fs_binding_32:   &[u8; 32],
 ) -> [u8; 32] {
     let mut h = sha3::Sha3_256::new();
@@ -484,7 +488,7 @@ pub struct DsKskOutput {
     /// Wall-clock time spent in the worker's local `deep_fri_verify`, ms.
     pub local_verify_ms: f64,
     /// `proof.root_f0` — the FRI/STIR f0 commitment.
-    pub root_f0:         [u8; 32],
+    pub root_f0: [u8; HASH_BYTES],
     /// Encoded inner proof bytes.
     pub proof_blob:      Vec<u8>,
 }
@@ -765,7 +769,7 @@ pub fn zsk_ksk_pi_hash_v2_stark(
     signed_data:   &[u8],
     fs_binding_32: &[u8; 32],
     merkle_root_32: &[u8; 32],
-    root_f0:       &[u8; 32],
+    root_f0:       &[u8; HASH_BYTES],
 ) -> [u8; 32] {
     let mut h = sha3::Sha3_256::new();
     Digest::update(&mut h, b"ZSK-KSK-PIHASH-V2-ST");
@@ -1215,8 +1219,8 @@ pub fn dns_record_chain_pi_hash(
     inclusion:            &DnsLookupInclusion,
     merkle_root_32:       &[u8; 32],
     fs_binding_32:        &[u8; 32],
-    ksk_to_dnskey_root_f0: &[u8; 32],
-    zsk_to_rec_root_f0:    &[u8; 32],
+    ksk_to_dnskey_root_f0: &[u8; HASH_BYTES],
+    zsk_to_rec_root_f0:    &[u8; HASH_BYTES],
 ) -> [u8; 32] {
     let mut h = sha3::Sha3_256::new();
     Digest::update(&mut h, b"DNS-RECORD-CHAIN-V3");
@@ -1259,10 +1263,10 @@ pub struct DnsRecordChainBundle {
     pub fs_binding_32:         [u8; 32],
     /// Empty for the native path; populated for the STARK path.
     pub ksk_to_dnskey_proof:   Vec<u8>,
-    pub ksk_to_dnskey_root_f0: [u8; 32],
+    pub ksk_to_dnskey_root_f0: [u8; HASH_BYTES],
     /// Empty for the native path; populated for the STARK path.
     pub zsk_to_rec_proof:      Vec<u8>,
-    pub zsk_to_rec_root_f0:    [u8; 32],
+    pub zsk_to_rec_root_f0:    [u8; HASH_BYTES],
     /// Whether this bundle carries STARK proofs.
     pub stark_present:         bool,
     /// Aggregate prove + verify timings (only populated for STARK).
@@ -1323,13 +1327,13 @@ pub fn prove_dns_record_chain_native(
         "prove_dns_record_chain_native: Merkle path does not reconstruct \
          the supplied root for (domain, ip)");
 
-    let zero32 = [0u8; 32];
+    let zero_root: [u8; HASH_BYTES] = [0u8; HASH_BYTES];
     let pi_hash = dns_record_chain_pi_hash(
         ksk_pubkey, zsk_pubkey,
         ksk_to_dnskey_sig, dnskey_rrset,
         zsk_to_rec_sig, rec_rrset,
         &inclusion, merkle_root_32, fs_binding_32,
-        &zero32, &zero32,
+        &zero_root, &zero_root,
     );
 
     DnsRecordChainBundle {
@@ -1344,9 +1348,9 @@ pub fn prove_dns_record_chain_native(
         merkle_root_32: *merkle_root_32,
         fs_binding_32: *fs_binding_32,
         ksk_to_dnskey_proof: Vec::new(),
-        ksk_to_dnskey_root_f0: zero32,
+        ksk_to_dnskey_root_f0: zero_root,
         zsk_to_rec_proof: Vec::new(),
-        zsk_to_rec_root_f0: zero32,
+        zsk_to_rec_root_f0: zero_root,
         stark_present: false,
         prove_ms: 0.0,
         local_verify_ms: 0.0,
@@ -1435,7 +1439,7 @@ pub fn prove_dns_record_chain_stark(
 }
 
 /// Pull `root_f0` out of a serialised DEEP-FRI proof blob.
-fn stark_proof_root_f0(blob: &[u8]) -> [u8; 32] {
+fn stark_proof_root_f0(blob: &[u8]) -> [u8; HASH_BYTES] {
     use ark_serialize::{CanonicalDeserialize, Validate};
     let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
         blob, Compress::Yes, Validate::Yes,
@@ -1453,14 +1457,14 @@ pub fn verify_dns_record_chain_runtime(
     bundle: &DnsRecordChainBundle,
 ) -> Result<(), DnsRecordChainError> {
     // pi_hash check: zero-out root_f0 fields for the runtime recipe.
-    let zero32 = [0u8; 32];
+    let zero_root: [u8; HASH_BYTES] = [0u8; HASH_BYTES];
     let recomputed = dns_record_chain_pi_hash(
         &bundle.ksk_pubkey, &bundle.zsk_pubkey,
         &bundle.ksk_to_dnskey_sig, &bundle.dnskey_rrset,
         &bundle.zsk_to_rec_sig,    &bundle.rec_rrset,
         &bundle.inclusion, &bundle.merkle_root_32, &bundle.fs_binding_32,
-        if bundle.stark_present { &bundle.ksk_to_dnskey_root_f0 } else { &zero32 },
-        if bundle.stark_present { &bundle.zsk_to_rec_root_f0    } else { &zero32 },
+        if bundle.stark_present { &bundle.ksk_to_dnskey_root_f0 } else { &zero_root },
+        if bundle.stark_present { &bundle.zsk_to_rec_root_f0    } else { &zero_root },
     );
     if recomputed != bundle.pi_hash {
         return Err(DnsRecordChainError::PiHashMismatch);
@@ -1585,7 +1589,7 @@ pub struct DnsRecordChainSetBundle {
 /// the outer proof's commitment, without re-running the prover.
 pub fn dns_record_chain_set_pi_hash(
     bundle_pi_hashes: &[[u8; 32]],
-    outer_root_f0:    &[u8; 32],
+    outer_root_f0:    &[u8; HASH_BYTES],
     fs_binding_32:    &[u8; 32],
 ) -> [u8; 32] {
     let mut h = sha3::Sha3_256::new();
@@ -1764,7 +1768,7 @@ pub struct DnsRecordChainSetBundleV5 {
 pub fn dns_record_chain_set_pi_hash_v5(
     bundle_pi_hash_root: &[u8; 32],
     bundle_count:        usize,
-    outer_root_f0:       &[u8; 32],
+    outer_root_f0:       &[u8; HASH_BYTES],
     fs_binding_32:       &[u8; 32],
 ) -> [u8; 32] {
     let mut h = sha3::Sha3_256::new();
@@ -2418,13 +2422,13 @@ mod zsk_ksk_native_tests {
         // error specifically.
         let mut tampered = bundle.clone();
         tampered.inclusion.path[0] = [0xFFu8; 32];
-        let zero32 = [0u8; 32];
+        let zero_root: [u8; HASH_BYTES] = [0u8; HASH_BYTES];
         tampered.pi_hash = dns_record_chain_pi_hash(
             &tampered.ksk_pubkey, &tampered.zsk_pubkey,
             &tampered.ksk_to_dnskey_sig, &tampered.dnskey_rrset,
             &tampered.zsk_to_rec_sig, &tampered.rec_rrset,
             &tampered.inclusion, &tampered.merkle_root_32,
-            &tampered.fs_binding_32, &zero32, &zero32,
+            &tampered.fs_binding_32, &zero_root, &zero_root,
         );
         assert_eq!(
             verify_dns_record_chain_runtime(&tampered),
