@@ -50,11 +50,28 @@ fn outer_fri_params(package: &SeEpochPackage, pk_hash: [u8; 32]) -> DeepFriParam
     }
 }
 
+/// Re-construct the FRI params the inner shard prover used.  Mirrors
+/// `prove_inner_shard` in `swarm_dns::prover` so the resolver can
+/// independently FRI-verify the inner STARK proof too.
+fn inner_fri_params(package: &SeEpochPackage, fs_binding: [u8; 32]) -> DeepFriParams {
+    let n0 = package.inner_n_trace * BLOWUP;
+    DeepFriParams {
+        schedule: make_schedule(n0, LdtMode::Stir),
+        r: NUM_QUERIES,
+        seed_z: SEED_Z,
+        coeff_commit_final: true,
+        d_final: 1,
+        stir: true,
+        s0: NUM_QUERIES,
+        public_inputs_hash: Some(fs_binding),
+    }
+}
+
 fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     use fips204::ml_dsa_65;
     use fips204::traits::{SerDes, Verifier};
 
-    // 1. ML-DSA-65 signature verify.
+    // ─── 1. ML-DSA-65 signature verify (Def. 1 binding hash) ─────
     let t_total = Instant::now();
     let pk_bytes: [u8; ml_dsa_65::PK_LEN] = package.authority_pk.as_slice()
         .try_into().map_err(|_|
@@ -73,20 +90,36 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     }
     let mldsa_ms = t_mldsa.elapsed().as_secs_f64() * 1000.0;
 
-    // 2. Outer STARK FRI verify.
-    let t_outer = Instant::now();
-    let outer_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
-        package.outer_stark_proof.as_slice(), Compress::Yes, Validate::Yes,
-    ).map_err(|e| format!("outer STARK proof malformed: {e:?}"))?;
-    // For the FS binding we recompute the same `fs_binding_32` the
-    // prover used.  In `se_zone_demo` that's
-    //   SHA3-256("STARK-DNS-SE-DEMO-SHARD-FS-V1" || merkle_root).
+    // Reconstruct the FS-binding the prover used (deterministic from
+    // `merkle_root`).  Used for BOTH inner and outer FRI verifies.
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
     h.update(b"STARK-DNS-SE-DEMO-SHARD-FS-V1");
     h.update(package.merkle_root);
     let fs_binding: [u8; 32] = h.finalize().into();
 
+    // ─── 2. INNER shard STARK FRI verify (HashRollup over records) ─
+    //
+    // Confirms the prover correctly STARK-hashed all `records` into a
+    // Merkle tree whose root is `merkle_root`.  Without this check,
+    // the resolver would trust the outer rollup to transitively attest
+    // the inner work — closes that trust gap by re-verifying the
+    // inner FRI proof directly.
+    let t_inner = Instant::now();
+    let inner_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        package.inner_stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|e| format!("inner STARK proof malformed: {e:?}"))?;
+    let inner_params = inner_fri_params(package, fs_binding);
+    if !deep_fri_verify::<Ext>(&inner_params, &inner_proof) {
+        return Err("inner STARK FRI verify FAILED".into());
+    }
+    let inner_ms = t_inner.elapsed().as_secs_f64() * 1000.0;
+
+    // ─── 3. OUTER rollup STARK FRI verify (commits inner.pi_hash) ──
+    let t_outer = Instant::now();
+    let outer_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        package.outer_stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|e| format!("outer STARK proof malformed: {e:?}"))?;
     let outer_params = outer_fri_params(package, fs_binding);
     if !deep_fri_verify::<Ext>(&outer_params, &outer_proof) {
         return Err("outer STARK FRI verify FAILED".into());
@@ -94,10 +127,12 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
-    println!("  ✓ ML-DSA-65 signature verify:  {mldsa_ms:>6.3} ms");
-    println!("  ✓ Outer STARK FRI verify:      {outer_ms:>6.3} ms");
-    println!("  ─────────────────────────────");
-    println!("  ✓ One-time epoch acceptance:   {total_ms:>6.3} ms");
+    println!("  ✓ ML-DSA-65 signature verify:    {mldsa_ms:>6.3} ms");
+    println!("  ✓ Inner shard STARK FRI verify:  {inner_ms:>6.3} ms");
+    println!("  ✓ Outer rollup STARK FRI verify: {outer_ms:>6.3} ms");
+    println!("  ─────────────────────────────────");
+    println!("  ✓ One-time epoch acceptance:     {total_ms:>6.3} ms");
+    println!("  (all three independent cryptographic proofs verified)");
     Ok(total_ms)
 }
 
