@@ -170,6 +170,154 @@ pub fn merkle_build_and_open(
     }
 }
 
+// ─── Row-uniform constraints for one Merkle hop ─────────────────────
+//
+// The left/right selection at each hop is:
+//   left  = (1 - bit) * current_node + bit * sibling
+//   right = bit       * current_node + (1 - bit) * sibling
+//
+// Equivalently (the form we encode as polynomial constraints):
+//   left  - current_node - bit · (sibling - current_node) = 0
+//   right - sibling      - bit · (current_node - sibling) = 0
+//
+// Plus booleanity on `bit` and a binding constraint that `parent =
+// SHA-3(left || right)` — the latter delegates to `sponge_air` and
+// lands in a subsequent commit.
+//
+// Each "hop" is encoded one bit-position at a time across the hash
+// output width.  For SHA-3-256 with 256-bit hashes, that's 256
+// (current, sibling, left, right) tuples per hop.
+
+use crate::bit_constraint::{BitOp, CellRef, FieldTraceAccess};
+use ark_ff::Field;
+
+/// Column-layout (within one row) for ONE Merkle hop's left/right
+/// selection cells.  Hash-output bits are packed contiguously per
+/// role (current, sibling, left, right).
+#[derive(Clone, Debug)]
+pub struct MerkleHopLayout {
+    pub row: usize,
+    pub n_hash_bits: usize,
+    pub current_start: usize,
+    pub sibling_start: usize,
+    pub left_start:    usize,
+    pub right_start:   usize,
+    pub bit_col:       usize,   // 1 cell — the index bit for this hop
+    pub width:         usize,
+}
+
+impl MerkleHopLayout {
+    pub fn new(row: usize, col_start: usize, n_hash_bits: usize) -> Self {
+        let current_start = col_start;
+        let sibling_start = current_start + n_hash_bits;
+        let left_start    = sibling_start + n_hash_bits;
+        let right_start   = left_start    + n_hash_bits;
+        let bit_col       = right_start   + n_hash_bits;
+        let width         = bit_col + 1 - col_start;
+        Self {
+            row, n_hash_bits,
+            current_start, sibling_start, left_start, right_start,
+            bit_col, width,
+        }
+    }
+
+    pub fn current_bit(&self, i: usize) -> CellRef {
+        debug_assert!(i < self.n_hash_bits);
+        CellRef::new(self.row, self.current_start + i)
+    }
+    pub fn sibling_bit(&self, i: usize) -> CellRef {
+        debug_assert!(i < self.n_hash_bits);
+        CellRef::new(self.row, self.sibling_start + i)
+    }
+    pub fn left_bit(&self, i: usize) -> CellRef {
+        debug_assert!(i < self.n_hash_bits);
+        CellRef::new(self.row, self.left_start + i)
+    }
+    pub fn right_bit(&self, i: usize) -> CellRef {
+        debug_assert!(i < self.n_hash_bits);
+        CellRef::new(self.row, self.right_start + i)
+    }
+    pub fn bit(&self) -> CellRef {
+        CellRef::new(self.row, self.bit_col)
+    }
+}
+
+/// Polynomial constraint specialised for Merkle left/right selection.
+/// Encodes the degree-2 identity directly (not via primitive BitOp,
+/// because the multiplication includes `bit × (sibling - current)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MerkleSelOp {
+    /// `left - current - bit · (sibling - current) = 0`
+    LeftSelect  { left: CellRef, current: CellRef, sibling: CellRef, bit: CellRef },
+    /// `right - sibling - bit · (current - sibling) = 0`
+    RightSelect { right: CellRef, current: CellRef, sibling: CellRef, bit: CellRef },
+}
+
+impl MerkleSelOp {
+    pub fn degree(&self) -> usize { 2 }   // bit · X term
+
+    pub fn eval_field<F: Field>(&self, trace: &impl FieldTraceAccess<F>) -> F {
+        match *self {
+            Self::LeftSelect { left, current, sibling, bit } => {
+                let left = trace.get_cell_f(left);
+                let cur  = trace.get_cell_f(current);
+                let sib  = trace.get_cell_f(sibling);
+                let b    = trace.get_cell_f(bit);
+                left - cur - b * (sib - cur)
+            }
+            Self::RightSelect { right, current, sibling, bit } => {
+                let right = trace.get_cell_f(right);
+                let cur   = trace.get_cell_f(current);
+                let sib   = trace.get_cell_f(sibling);
+                let b     = trace.get_cell_f(bit);
+                right - sib - b * (cur - sib)
+            }
+        }
+    }
+
+    pub fn satisfied_by_field<F: Field>(
+        &self, trace: &impl FieldTraceAccess<F>,
+    ) -> bool {
+        self.eval_field::<F>(trace).is_zero()
+    }
+}
+
+/// Emit the selection-side constraints for one Merkle hop.  Per bit:
+/// 2 selection constraints + 1 booleanity on the bit (only once per hop,
+/// emitted only at bit 0 to avoid duplication).  Total:
+///   2 · n_hash_bits + 1 = 2N+1 constraints for an N-bit hash hop.
+/// Boundary + parent = SHA-3(left || right) come from other generators.
+pub fn merkle_hop_selection_constraints(
+    layout: &MerkleHopLayout,
+) -> (Vec<MerkleSelOp>, Vec<BitOp>) {
+    let mut sel = Vec::with_capacity(2 * layout.n_hash_bits);
+    let mut bools = Vec::with_capacity(layout.n_hash_bits * 3 + 1);
+
+    for i in 0..layout.n_hash_bits {
+        sel.push(MerkleSelOp::LeftSelect {
+            left:    layout.left_bit(i),
+            current: layout.current_bit(i),
+            sibling: layout.sibling_bit(i),
+            bit:     layout.bit(),
+        });
+        sel.push(MerkleSelOp::RightSelect {
+            right:   layout.right_bit(i),
+            current: layout.current_bit(i),
+            sibling: layout.sibling_bit(i),
+            bit:     layout.bit(),
+        });
+        // Booleanity on bit cells participating in the operations.
+        bools.push(BitOp::Boolean { b: layout.current_bit(i) });
+        bools.push(BitOp::Boolean { b: layout.sibling_bit(i) });
+        bools.push(BitOp::Boolean { b: layout.left_bit(i) });
+        bools.push(BitOp::Boolean { b: layout.right_bit(i) });
+    }
+    // The index bit itself.
+    bools.push(BitOp::Boolean { b: layout.bit() });
+
+    (sel, bools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +436,99 @@ mod tests {
             assert!(merkle_verify_native(&claim),
                 "variant {variant:?} merkle path must verify natively");
         }
+    }
+
+    // ─── Merkle hop selection-constraint tests ──────────────────────
+
+    use crate::bit_constraint::FieldMockTrace;
+    use ark_goldilocks::Goldilocks;
+    use ark_ff::Zero;
+
+    #[test]
+    fn hop_layout_width() {
+        let layout = MerkleHopLayout::new(0, 0, 256);
+        // 4 × 256 + 1 = 1025 cells
+        assert_eq!(layout.width, 4 * 256 + 1);
+    }
+
+    #[test]
+    fn hop_constraint_counts_match_design() {
+        let layout = MerkleHopLayout::new(0, 0, 256);
+        let (sel, bools) = merkle_hop_selection_constraints(&layout);
+        // 2 selection per bit (left+right) + booleanity (4 per bit + 1 indicator)
+        assert_eq!(sel.len(), 2 * 256);
+        assert_eq!(bools.len(), 4 * 256 + 1);
+    }
+
+    #[test]
+    fn left_select_satisfied_when_bit_is_zero() {
+        // bit=0 → left=current, right=sibling
+        let layout = MerkleHopLayout::new(0, 0, 8);  // small hash for test
+        let mut trace = FieldMockTrace::<Goldilocks>::zeros(1, layout.width);
+        // Set the bit to 0
+        trace.set(layout.bit(), Goldilocks::from(0u64));
+        // current = 1, sibling = 0, left should be 1, right should be 0
+        trace.set(layout.current_bit(0), Goldilocks::from(1u64));
+        trace.set(layout.sibling_bit(0), Goldilocks::from(0u64));
+        trace.set(layout.left_bit(0),    Goldilocks::from(1u64));   // = current
+        trace.set(layout.right_bit(0),   Goldilocks::from(0u64));   // = sibling
+
+        let (sel, _) = merkle_hop_selection_constraints(&layout);
+        // Check both constraints at bit 0
+        let l = sel[0]; // LeftSelect at bit 0
+        let r = sel[1]; // RightSelect at bit 0
+        assert!(l.satisfied_by_field::<Goldilocks>(&trace));
+        assert!(r.satisfied_by_field::<Goldilocks>(&trace));
+    }
+
+    #[test]
+    fn left_select_satisfied_when_bit_is_one() {
+        // bit=1 → left=sibling, right=current
+        let layout = MerkleHopLayout::new(0, 0, 8);
+        let mut trace = FieldMockTrace::<Goldilocks>::zeros(1, layout.width);
+        trace.set(layout.bit(), Goldilocks::from(1u64));
+        trace.set(layout.current_bit(0), Goldilocks::from(1u64));
+        trace.set(layout.sibling_bit(0), Goldilocks::from(0u64));
+        trace.set(layout.left_bit(0),    Goldilocks::from(0u64));   // = sibling
+        trace.set(layout.right_bit(0),   Goldilocks::from(1u64));   // = current
+
+        let (sel, _) = merkle_hop_selection_constraints(&layout);
+        assert!(sel[0].satisfied_by_field::<Goldilocks>(&trace));
+        assert!(sel[1].satisfied_by_field::<Goldilocks>(&trace));
+    }
+
+    #[test]
+    fn selection_constraints_reject_swapped_assignment() {
+        // bit=0 but prover claims left=sibling, right=current (the
+        // bit=1 selection).  Constraints must reject.
+        let layout = MerkleHopLayout::new(0, 0, 8);
+        let mut trace = FieldMockTrace::<Goldilocks>::zeros(1, layout.width);
+        trace.set(layout.bit(), Goldilocks::from(0u64));
+        trace.set(layout.current_bit(0), Goldilocks::from(1u64));
+        trace.set(layout.sibling_bit(0), Goldilocks::from(0u64));
+        // SWAP: left=0 (sibling), right=1 (current) — wrong for bit=0
+        trace.set(layout.left_bit(0),    Goldilocks::from(0u64));
+        trace.set(layout.right_bit(0),   Goldilocks::from(1u64));
+
+        let (sel, _) = merkle_hop_selection_constraints(&layout);
+        assert!(!sel[0].satisfied_by_field::<Goldilocks>(&trace));
+        assert!(!sel[1].satisfied_by_field::<Goldilocks>(&trace));
+    }
+
+    #[test]
+    fn merkle_sel_op_degree_is_two() {
+        let r = CellRef::new(0, 0);
+        let op = MerkleSelOp::LeftSelect {
+            left: r, current: r, sibling: r, bit: r,
+        };
+        assert_eq!(op.degree(), 2);
+    }
+
+    #[test]
+    fn hop_layout_at_arbitrary_col_offset() {
+        let layout = MerkleHopLayout::new(5, 100, 256);
+        assert_eq!(layout.current_bit(0), CellRef::new(5, 100));
+        assert_eq!(layout.bit(),
+            CellRef::new(5, 100 + 4 * 256));
     }
 }
