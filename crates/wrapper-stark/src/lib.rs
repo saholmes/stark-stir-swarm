@@ -241,6 +241,7 @@ pub mod sponge_air;
 pub mod composition;
 pub mod fri_bridge;
 pub mod sha3_stark;
+pub mod row_uniform;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
