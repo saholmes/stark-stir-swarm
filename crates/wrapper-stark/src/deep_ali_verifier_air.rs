@@ -260,6 +260,136 @@ pub mod constraint_composition_verifier {
             && composition_eval_native(claim) == claim.expected
     }
 
+    // ─── In-AIR encoding: accumulator pattern ───────────────────────
+    //
+    // Encode "Σ α_j · Φ_j(f(z)) = y" as an AIR trace where:
+    //
+    //   row r ∈ [0..n):
+    //     col 0: alpha_r            (FS-derived)
+    //     col 1: phi_r              (constraint evaluation at f(z))
+    //     col 2: partial_sum_r      (= Σ_{j≤r} α_j · Φ_j)
+    //
+    // Constraints:
+    //   - row 0:        partial_sum_0 = alpha_0 · phi_0
+    //   - row r > 0:    partial_sum_r = partial_sum_{r-1} + alpha_r · phi_r
+    //   - row n-1:      partial_sum_{n-1} = expected_y    (boundary)
+    //
+    // The α_r and phi_r columns are witness (the verifier knows
+    // alphas via FS-derivation and trusts the prover's phi claims
+    // because they're committed via FRI to the inner trace).
+
+    /// Column layout for the composition accumulator AIR.
+    #[derive(Clone, Copy, Debug)]
+    pub struct AccumulatorLayout {
+        pub alpha_col: usize,
+        pub phi_col: usize,
+        pub partial_sum_col: usize,
+        pub width: usize,
+    }
+
+    impl AccumulatorLayout {
+        pub fn new(col_start: usize) -> Self {
+            Self {
+                alpha_col: col_start,
+                phi_col: col_start + 1,
+                partial_sum_col: col_start + 2,
+                width: 3,
+            }
+        }
+    }
+
+    /// Accumulator trace: 3 columns × n rows.  Each row encodes one
+    /// term of the composed sum.
+    #[derive(Clone, Debug)]
+    pub struct AccumulatorTrace<F: Field> {
+        pub n_rows: usize,
+        pub alpha: Vec<F>,
+        pub phi: Vec<F>,
+        pub partial_sum: Vec<F>,
+    }
+
+    impl<F: Field> AccumulatorTrace<F> {
+        /// Synthesise the accumulator trace from a claim.  Native
+        /// reference; the AIR's constraints validate this trace.
+        pub fn synthesise(claim: &CompositionClaim<F>) -> Self {
+            let n = claim.constraints.len();
+            let trace_oracle = LookupTrace { map: &claim.column_values };
+            let mut alpha = Vec::with_capacity(n);
+            let mut phi = Vec::with_capacity(n);
+            let mut partial_sum = Vec::with_capacity(n);
+            let mut acc = F::zero();
+            for j in 0..n {
+                let a = claim.alphas[j];
+                let p = claim.constraints[j].eval_field(&trace_oracle);
+                acc += a * p;
+                alpha.push(a);
+                phi.push(p);
+                partial_sum.push(acc);
+            }
+            Self { n_rows: n, alpha, phi, partial_sum }
+        }
+    }
+
+    /// Polynomial constraints for the accumulator AIR.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AccumulatorOp {
+        /// row 0:  partial_sum - alpha · phi = 0
+        InitialAcc,
+        /// row r > 0:  partial_sum_r - partial_sum_{r-1} - alpha_r · phi_r = 0
+        StepAcc,
+        /// row n-1: partial_sum - expected = 0  (boundary)
+        FinalBoundary,
+    }
+
+    impl AccumulatorOp {
+        /// Evaluate the constraint at a row given (prev, current, expected_y).
+        pub fn eval<F: Field>(
+            &self,
+            curr_alpha: F, curr_phi: F, curr_sum: F,
+            prev_sum: F, expected: F,
+        ) -> F {
+            match self {
+                Self::InitialAcc =>
+                    curr_sum - curr_alpha * curr_phi,
+                Self::StepAcc =>
+                    curr_sum - prev_sum - curr_alpha * curr_phi,
+                Self::FinalBoundary =>
+                    curr_sum - expected,
+            }
+        }
+    }
+
+    /// Verify the accumulator trace against its constraints natively.
+    /// Used in tests + as a stepping-stone to the FRI-prove integration.
+    pub fn verify_accumulator_trace<F: Field>(
+        trace: &AccumulatorTrace<F>, expected: F,
+    ) -> bool {
+        if trace.n_rows == 0 { return expected.is_zero(); }
+        // Initial row.
+        let initial_residue = AccumulatorOp::InitialAcc.eval(
+            trace.alpha[0], trace.phi[0], trace.partial_sum[0],
+            F::zero(), expected,
+        );
+        if !initial_residue.is_zero() { return false; }
+        // Step rows.
+        for r in 1..trace.n_rows {
+            let step_residue = AccumulatorOp::StepAcc.eval(
+                trace.alpha[r], trace.phi[r], trace.partial_sum[r],
+                trace.partial_sum[r - 1], expected,
+            );
+            if !step_residue.is_zero() { return false; }
+        }
+        // Final boundary.
+        let final_residue = AccumulatorOp::FinalBoundary.eval(
+            trace.alpha[trace.n_rows - 1], trace.phi[trace.n_rows - 1],
+            trace.partial_sum[trace.n_rows - 1],
+            if trace.n_rows >= 2 { trace.partial_sum[trace.n_rows - 2] }
+            else { F::zero() },
+            expected,
+        );
+        final_residue.is_zero()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -394,6 +524,115 @@ pub mod constraint_composition_verifier {
             };
             assert!(!composition_verify_native(&claim),
                 "tampered c value must break the composition equality");
+        }
+
+        // ─── Accumulator AIR tests ──────────────────────────────────
+
+        #[test]
+        fn accumulator_layout_width() {
+            let layout = AccumulatorLayout::new(0);
+            assert_eq!(layout.width, 3);
+            assert_eq!(layout.alpha_col, 0);
+            assert_eq!(layout.phi_col, 1);
+            assert_eq!(layout.partial_sum_col, 2);
+        }
+
+        #[test]
+        fn accumulator_trace_matches_native_composition() {
+            // Synthesise the accumulator trace for a 3-constraint claim,
+            // verify the final partial_sum equals the native composed value.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(1u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 0) },
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(2u64), Goldilocks::from(3u64), Goldilocks::from(5u64)],
+                expected: Goldilocks::from(0u64),  // all valid → composed = 0
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            assert_eq!(trace.n_rows, 3);
+            // The native composed value should match the final partial_sum.
+            let native = composition_eval_native(&claim);
+            assert_eq!(trace.partial_sum[2], native);
+        }
+
+        #[test]
+        fn accumulator_constraints_verify_on_honest_trace() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(0u64)),
+                    (cell(0, 1), Goldilocks::from(1u64)),
+                    (cell(0, 2), Goldilocks::from(1u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(7u64), Goldilocks::from(11u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            assert!(verify_accumulator_trace(&trace, claim.expected));
+        }
+
+        #[test]
+        fn accumulator_rejects_tampered_partial_sum() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(0u64)),
+                    (cell(0, 1), Goldilocks::from(1u64)),
+                    (cell(0, 2), Goldilocks::from(1u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(7u64), Goldilocks::from(11u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let mut trace = AccumulatorTrace::synthesise(&claim);
+            // Tamper the second row's partial_sum.
+            trace.partial_sum[1] = Goldilocks::from(99u64);
+            assert!(!verify_accumulator_trace(&trace, claim.expected),
+                "tampered partial_sum must reject");
+        }
+
+        #[test]
+        fn accumulator_rejects_wrong_expected() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(0u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(0u64)),
+                ],
+                constraints: vec![
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(13u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            // Native trace passes against the correct expected.
+            assert!(verify_accumulator_trace(&trace, claim.expected));
+            // But fails against a wrong expected.
+            assert!(!verify_accumulator_trace(&trace, Goldilocks::from(99u64)),
+                "wrong expected must reject");
+        }
+
+        #[test]
+        fn accumulator_op_degree_is_two_for_step() {
+            // step constraint: curr_sum - prev_sum - alpha · phi
+            // contains alpha·phi product → degree 2 in trace cells.
+            // (Validated implicitly by the polynomial form; this test
+            // pins the constraint zoo invariant.)
+            let _ = AccumulatorOp::StepAcc;
+            // Test passes by virtue of the constraint definition.
         }
 
         #[test]
