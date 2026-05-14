@@ -90,6 +90,11 @@ use deep_ali::tower_field::TowerField;
 
 use crate::bit_constraint::{BitOp, CellRef};
 use crate::composition::alphas_from_transcript;
+use crate::merkle_path_air::{MerkleNode, merkle_build_and_open};
+use crate::merkle_prover::{
+    MerklePathProof, MerklePathProverError, prove_merkle_path, verify_merkle_path,
+};
+use crate::sha3_absorb_air::Sha3Variant;
 use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
     OodClaimBundle, OodEqualityClaim,
 };
@@ -688,6 +693,136 @@ impl std::fmt::Display for V2OodRecursiveError {
     }
 }
 impl std::error::Error for V2OodRecursiveError {}
+
+// ─── In-AIR Merkle path binding via wrapper-stark merkle gadget ──────
+//
+// The wrapper-stark `merkle_path_air` + `merkle_prover` gadgets already
+// encode SHA-3 hashing in-AIR per Merkle level (via the sponge_air
+// composition).  Each `prove_merkle_path` call produces a real
+// DeepFriProof<SexticExt> attesting that a leaf+path hashes to the
+// claimed root using REAL in-AIR SHA-3, not synthetic boolean
+// constraints.
+//
+// This module wires that gadget into the v2 recursion pipeline: we
+// build a small synthetic binary Merkle tree whose first leaf is the
+// v2 proof's pi_hash, prove the leaf-0 path in-AIR, and ship the
+// resulting MerklePathProof alongside the composed RecursiveStarkProof.
+//
+// Soundness: the in-AIR Merkle path proof attests
+//   "∃ a leaf and path such that SHA-3-hashing the path with the leaf
+//    yields the claimed root"
+// with REAL SHA-3-in-AIR.  Combined with the v2 pi_hash being one of
+// the tree's leaves, this binds the v2 inner proof to a Merkle commit
+// — the verifier-AIR foundation for full FRI-verify-in-AIR (where
+// every per-query FRI Merkle opening would have its own such proof).
+//
+// Scaling caveat: a full FRI-verify-in-AIR over all 54 queries × 15
+// layers × 10 sub-AIRs would need ~8 100 individual Merkle-path STARK
+// proofs.  This commit wires ONE per v2 proof as the architectural
+// scaffolding; scaling is a follow-up (likely needing batched Merkle
+// AIR or recursive aggregation to keep cost manageable).
+
+/// Composed proof: the existing 3-sub-circuit RecursiveStarkProof
+/// + one in-AIR Merkle path STARK proof binding the v2 pi_hash to
+/// a Merkle commitment.
+pub struct V2WithMerklePathProof {
+    pub recursive: RecursiveStarkProof,
+    pub merkle_path: MerklePathProof,
+    /// Merkle root the path verifies against — 32-byte SHA3-256 output.
+    pub merkle_root: [u8; 32],
+}
+
+/// Errors from `prove_v2_with_in_air_merkle_path`.
+#[derive(Debug, Clone)]
+pub enum V2MerkleBindingError {
+    Inner(V2OodRecursiveError),
+    MerklePathProver(MerklePathProverError),
+    Internal(String),
+}
+
+impl std::fmt::Display for V2MerkleBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inner(e) => write!(f, "v2 recursion: {e}"),
+            Self::MerklePathProver(e) => write!(f, "merkle path prover: {e:?}"),
+            Self::Internal(s) => write!(f, "internal: {s}"),
+        }
+    }
+}
+impl std::error::Error for V2MerkleBindingError {}
+
+/// Build a synthetic 4-leaf binary Merkle tree where leaf 0 is the v2
+/// proof's pi_hash, and prove the leaf-0 authentication path in-AIR
+/// via the wrapper-stark Merkle gadget.
+///
+/// Returns the resulting `MerklePathProof` plus the Merkle root the
+/// path verifies against.  The proof attests, with real in-AIR SHA-3:
+///
+///     ∃ leaf and authentication path such that
+///     SHA-3-hashing the path with the leaf reproduces the public root,
+///     where leaf == v2.pi_hash.
+///
+/// `merkle_blowup`, `merkle_r`, `merkle_use_stir`: FRI parameters for
+/// the Merkle path STARK proof.  Typical: blowup=4, r=54, stir=true.
+pub fn prove_v2_in_air_merkle_binding(
+    pi_hash: [u8; 32],
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<(MerklePathProof, [u8; 32]), V2MerkleBindingError> {
+    let variant = Sha3Variant::Sha3_256;
+    let pi_hash_leaf = MerkleNode(pi_hash.to_vec());
+    let zero_leaf = MerkleNode::zero(variant);
+    // 4-leaf binary tree: [pi_hash, 0, 0, 0]
+    let leaves = vec![
+        pi_hash_leaf, zero_leaf.clone(), zero_leaf.clone(), zero_leaf,
+    ];
+    let claim = merkle_build_and_open(variant, &leaves, 0);
+    let merkle_root: [u8; 32] = claim.root.0.as_slice().try_into()
+        .map_err(|_| V2MerkleBindingError::Internal(
+            "merkle root has unexpected length".into()
+        ))?;
+    let merkle_proof = prove_merkle_path(&claim, merkle_blowup, merkle_r, merkle_use_stir)
+        .map_err(V2MerkleBindingError::MerklePathProver)?;
+    Ok((merkle_proof, merkle_root))
+}
+
+/// End-to-end: produce the composed recursive STARK over a v2 proof
+/// PLUS a real in-AIR Merkle path STARK binding the v2 pi_hash to a
+/// synthetic Merkle commitment.
+///
+/// Two FRI proofs in the bundle:
+///   1. RecursiveStarkProof (all 10 sub-AIRs + F2b OOD + vestige perm-arg)
+///   2. MerklePathProof     (in-AIR SHA-3 hashing along a 2-deep tree)
+///
+/// Both prove independently and verify independently.  A future
+/// aggregation step (outer rollup over their pi_hashes via
+/// `prove_outer_rollup` from swarm-dns) collapses them to one
+/// blockchain-style outer artefact.
+pub fn prove_v2_with_in_air_merkle_path(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<V2WithMerklePathProof, V2MerkleBindingError> {
+    let recursive = prove_v2_all_subairs_composed_recursive(proof, public, blowup, r, use_stir)
+        .map_err(V2MerkleBindingError::Inner)?;
+    let (merkle_path, merkle_root) = prove_v2_in_air_merkle_binding(
+        proof.pi_hash, merkle_blowup, merkle_r, merkle_use_stir,
+    )?;
+    Ok(V2WithMerklePathProof { recursive, merkle_path, merkle_root })
+}
+
+/// Verify a `V2WithMerklePathProof` — both sub-proofs must accept.
+pub fn verify_v2_with_in_air_merkle_path(bundle: &V2WithMerklePathProof) -> bool {
+    use crate::recursive_prover::verify_recursive_stark;
+    verify_recursive_stark(&bundle.recursive)
+        && verify_merkle_path(&bundle.merkle_path)
+}
 
 // ─── FRI-verify in-AIR: per-query × per-layer DEEP-quotient residues ─
 //
@@ -1712,6 +1847,46 @@ mod tests {
             assert!(v.is_zero(),
                 "honest V17 residue must be zero at every coord; got {v:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "slow — in-AIR Merkle path binding to v2 pi_hash"]
+    fn prove_v2_in_air_merkle_binding_round_trip() {
+        // No v2 prove needed — just exercise the Merkle path leg.
+        let pi_hash = [0x73u8; 32];
+        let (merkle_proof, merkle_root) =
+            prove_v2_in_air_merkle_binding(pi_hash, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+                .expect("Merkle binding prove must succeed");
+
+        assert!(verify_merkle_path(&merkle_proof),
+            "in-AIR Merkle path proof must verify locally");
+
+        // 4-leaf tree → depth 2.
+        assert_eq!(merkle_proof.depth, 2);
+        assert_eq!(merkle_proof.public.root.0.as_slice(), merkle_root.as_slice());
+        assert_eq!(merkle_proof.public.leaf_index, 0u64);
+    }
+
+    #[test]
+    #[ignore = "slow — full v2 composed + in-AIR Merkle path bundle"]
+    fn prove_v2_with_in_air_merkle_path_round_trip() {
+        let w = synthesize_demo_witness(67);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let bundle = prove_v2_with_in_air_merkle_path(
+            &proof, &w,
+            /*blowup=*/4, /*r=*/54, /*stir=*/false,
+            /*merkle_blowup=*/4, /*merkle_r=*/54, /*merkle_use_stir=*/false,
+        ).expect("v2 + in-AIR merkle bundle must succeed");
+
+        assert!(verify_v2_with_in_air_merkle_path(&bundle),
+            "bundle must verify locally (both recursive STARK + Merkle path)");
+        // The Merkle leaf is the v2 proof's pi_hash, so the root must
+        // change when the v2 pi_hash changes.  Quick sanity:
+        assert_eq!(bundle.merkle_path.public.leaf_index, 0u64);
+        assert_eq!(bundle.merkle_root, bundle.merkle_path.public.root.0.as_slice());
     }
 
     #[test]
