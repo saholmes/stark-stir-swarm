@@ -318,6 +318,100 @@ pub fn merkle_hop_selection_constraints(
     (sel, bools)
 }
 
+// ─── Multi-hop layout + trace synthesiser ──────────────────────────
+//
+// One Merkle hop occupies one trace row in this gadget's layout.
+// A depth-`d` path has `d` rows.  Cross-hop threading ensures
+// `parent[r] = current[r+1]`, propagating the running hash up the tree.
+
+/// Layout for a depth-`d` Merkle path verification trace.
+#[derive(Clone, Debug)]
+pub struct MerklePathLayout {
+    pub variant: Sha3Variant,
+    pub depth: usize,
+    pub n_hash_bits: usize,
+    /// One column-allocation per row; identical shape across all rows
+    /// (different `row` field).  Inlined as `Vec<MerkleHopLayout>` for
+    /// clarity; the column allocation is uniform.
+    pub hops: Vec<MerkleHopLayout>,
+}
+
+impl MerklePathLayout {
+    pub fn new(variant: Sha3Variant, depth: usize, row_offset: usize) -> Self {
+        let n_hash_bits = variant.output_bits();
+        let mut hops = Vec::with_capacity(depth);
+        for r in 0..depth {
+            hops.push(MerkleHopLayout::new(row_offset + r, 0, n_hash_bits));
+        }
+        Self { variant, depth, n_hash_bits, hops }
+    }
+
+    pub fn row_width(&self) -> usize {
+        if self.hops.is_empty() { 0 } else { self.hops[0].width }
+    }
+}
+
+/// Native trace synthesiser for a Merkle path.  Produces cell values
+/// satisfying the selection + threading constraints; the `parent` cells
+/// are filled by the NATIVE SHA-3 hash (the AIR's SHA-3 sub-circuit
+/// will eventually verify these via composition with sponge_air, but
+/// the synthesiser produces the same values either way).
+pub fn synthesize_merkle_path_trace(
+    claim: &MerklePathClaim,
+    layout: &MerklePathLayout,
+    trace: &mut crate::bit_constraint::MockTrace,
+) -> Result<MerkleNode, String> {
+    use crate::sha3_absorb_air::hash;
+    claim.check_shape()?;
+    if claim.depth() != layout.depth {
+        return Err(format!(
+            "claim depth {} != layout depth {}", claim.depth(), layout.depth
+        ));
+    }
+
+    let n_bits = layout.n_hash_bits;
+    let mut current = claim.leaf.0.clone();
+    let mut idx = claim.leaf_index;
+
+    for (hop_idx, hop) in layout.hops.iter().enumerate() {
+        let bit = (idx & 1) as u8;
+        let sibling_bytes = &claim.path[hop_idx].0;
+
+        // Write current + sibling bit-by-bit (LE within each byte).
+        for i in 0..n_bits {
+            let cur_bit = (current[i / 8] >> (i % 8)) & 1;
+            let sib_bit = (sibling_bytes[i / 8] >> (i % 8)) & 1;
+            trace.set(hop.current_bit(i), cur_bit as u64);
+            trace.set(hop.sibling_bit(i), sib_bit as u64);
+        }
+        trace.set(hop.bit(), bit as u64);
+
+        // Compute left/right per the selection rule + write them.
+        let (left_bytes, right_bytes): (&[u8], &[u8]) = if bit == 0 {
+            (current.as_slice(), sibling_bytes.as_slice())
+        } else {
+            (sibling_bytes.as_slice(), current.as_slice())
+        };
+        for i in 0..n_bits {
+            let l_bit = (left_bytes[i / 8] >> (i % 8)) & 1;
+            let r_bit = (right_bytes[i / 8] >> (i % 8)) & 1;
+            trace.set(hop.left_bit(i), l_bit as u64);
+            trace.set(hop.right_bit(i), r_bit as u64);
+        }
+
+        // Native hash to produce parent.  In the full AIR, this is
+        // delegated to the sponge_air sub-circuit; the synthesiser
+        // produces the same value either way.
+        let mut concat = Vec::with_capacity(left_bytes.len() + right_bytes.len());
+        concat.extend_from_slice(left_bytes);
+        concat.extend_from_slice(right_bytes);
+        current = hash(layout.variant, &concat);
+        idx >>= 1;
+    }
+
+    Ok(MerkleNode(current))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +624,112 @@ mod tests {
         assert_eq!(layout.current_bit(0), CellRef::new(5, 100));
         assert_eq!(layout.bit(),
             CellRef::new(5, 100 + 4 * 256));
+    }
+
+    // ─── Multi-hop trace synthesiser tests ──────────────────────────
+
+    use crate::bit_constraint::{MockTrace, TraceAccess};
+
+    #[test]
+    fn synthesized_trace_root_matches_native() {
+        // Build a 4-leaf tree (depth=2), open leaf index 2, synthesise
+        // the trace, verify the synthesiser's computed root matches
+        // the claim's expected root.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0x40 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 2);
+        let layout = MerklePathLayout::new(variant, claim.depth(), 0);
+
+        let mut trace = MockTrace::zeros(layout.depth, layout.row_width());
+        let computed_root = synthesize_merkle_path_trace(&claim, &layout, &mut trace)
+            .expect("synthesise must succeed on a valid claim");
+        assert_eq!(computed_root, claim.root,
+            "synthesiser's computed root must match the claim's expected root");
+    }
+
+    #[test]
+    fn synthesized_cells_satisfy_selection_constraints() {
+        // Build trace + verify EVERY selection constraint at every hop
+        // is satisfied with i128 arithmetic (matches Goldilocks for
+        // boolean cell values).
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8u8).map(|i| fake_leaf(variant, 0x70 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 5);
+        let layout = MerklePathLayout::new(variant, claim.depth(), 0);
+
+        let mut trace = MockTrace::zeros(layout.depth, layout.row_width());
+        synthesize_merkle_path_trace(&claim, &layout, &mut trace).unwrap();
+
+        let field_trace = crate::bit_constraint::lift_to_field::<Goldilocks>(&trace);
+        for hop in &layout.hops {
+            let (sel, bools) = merkle_hop_selection_constraints(hop);
+            for op in &sel {
+                assert!(op.satisfied_by_field::<Goldilocks>(&field_trace),
+                    "hop row {} selection constraint failed", hop.row);
+            }
+            for b in &bools {
+                assert!(b.satisfied_by_field(&field_trace),
+                    "hop row {} booleanity failed", hop.row);
+            }
+        }
+    }
+
+    #[test]
+    fn synthesized_trace_threading_holds() {
+        // Cross-hop threading: parent[r] = current[r+1] for every
+        // consecutive pair of rows.  Since parent isn't directly a
+        // trace column in the current selection-only layout, we check
+        // an equivalent property: at row r+1, current bits equal the
+        // hash that the trace at row r commits to (the synthesiser's
+        // native hash output between hops).
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8u8).map(|i| fake_leaf(variant, 0x90 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 3);
+        let layout = MerklePathLayout::new(variant, claim.depth(), 0);
+
+        let mut trace = MockTrace::zeros(layout.depth, layout.row_width());
+        synthesize_merkle_path_trace(&claim, &layout, &mut trace).unwrap();
+
+        // The synthesiser computes parent natively and feeds it as
+        // current at the next row.  Verify the chain by walking the
+        // trace bit-by-bit + reading the current_bit pattern.
+        use crate::sha3_absorb_air::hash;
+        for r in 0..(layout.depth - 1) {
+            // Reconstruct left + right bytes from this row's cells.
+            let hop = &layout.hops[r];
+            let mut left_bytes = vec![0u8; variant.output_bytes()];
+            let mut right_bytes = vec![0u8; variant.output_bytes()];
+            for i in 0..layout.n_hash_bits {
+                let l = trace.get_cell(hop.left_bit(i)) as u8;
+                let rv = trace.get_cell(hop.right_bit(i)) as u8;
+                left_bytes[i / 8]  |= l << (i % 8);
+                right_bytes[i / 8] |= rv << (i % 8);
+            }
+            let mut concat = Vec::new();
+            concat.extend_from_slice(&left_bytes);
+            concat.extend_from_slice(&right_bytes);
+            let expected_parent = hash(variant, &concat);
+
+            // Next row's current_bits should equal expected_parent bits.
+            let next_hop = &layout.hops[r + 1];
+            for i in 0..layout.n_hash_bits {
+                let actual = trace.get_cell(next_hop.current_bit(i)) as u8;
+                let expected = (expected_parent[i / 8] >> (i % 8)) & 1;
+                assert_eq!(actual, expected,
+                    "threading violated at hop {r}→{}, bit {i}", r + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn synthesizer_rejects_mismatched_depth() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0xA0 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 1);  // depth 2
+        let layout = MerklePathLayout::new(variant, 3, 0);       // mismatched depth
+
+        let mut trace = MockTrace::zeros(layout.depth, layout.row_width());
+        let result = synthesize_merkle_path_trace(&claim, &layout, &mut trace);
+        assert!(result.is_err());
     }
 }
