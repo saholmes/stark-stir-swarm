@@ -297,6 +297,10 @@ pub mod recursive_prover;
 // (sha3-*, mldsa-*) combinations deep_ali allows.
 pub mod v2_recursion_bridge;
 
+// Master recursion bridge — Option C: wraps N RecursiveStarkProof
+// bundles into ONE master RecursiveStarkProof.  L1 cost O(1) in N.
+pub mod master_recursion_bridge;
+
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
 /// produces the wrapper STARK proof.  Internal Merkle trees use
 /// Poseidon (when `poseidon-accel` is enabled); final commitments and
