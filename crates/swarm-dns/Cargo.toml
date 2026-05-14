@@ -30,6 +30,7 @@ sha3           = { workspace = true }
 hex            = "0.4"
 fips204        = { workspace = true }
 serde          = { workspace = true, features = ["derive"] }
+bincode        = "1.3"
 
 deep_ali    = { path = "../deep_ali", default-features = false }
 cairo-bench = { path = "../cairo-bench", default-features = false }   # for AirType::HashRollup + trace builders
@@ -72,3 +73,4 @@ tokio            = { workspace = true }
 # for each captured RRSIG (mirrors the paper's pre-proof check).
 ring             = "0.17"
 p256             = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
+

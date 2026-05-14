@@ -485,39 +485,166 @@ fn ecdsa_native_verify_captured(
     }
 }
 
+// ─── Per-domain capture worker (for concurrent JoinSet capture) ─────
+//
+// One async task per .se domain.  Fetches:
+//   - DNSKEY + RRSIG(DNSKEY) + DS
+//   - A + RRSIG(A) (non-apex only)
+// Runs the native pre-proof oracle via hickory `Verifier::verify_rrsig`
+// against whichever DNSKEY in the captured set has the matching key_tag.
+// Returns all captured ChainLinks for the domain (0..N where N is up
+// to 2: DNSKEY + A).
+async fn capture_one_domain(
+    resolver: std::sync::Arc<TokioAsyncResolver>,
+    domain: String,
+) -> Vec<ChainLink> {
+    let mut out = Vec::new();
+    let normalized = if domain.ends_with('.') {
+        domain.clone()
+    } else {
+        format!("{domain}.")
+    };
+    let zone_name = Name::from_str(&normalized).unwrap_or_else(|_| Name::root());
+
+    // DNSKEY + RRSIG(DNSKEY)
+    let dnskey_rs = fetch_records(&resolver, &normalized, RecordType::DNSKEY).await;
+    let dnskeys = extract_dnskey(&dnskey_rs);
+    let mut dnskey_rrsigs = extract_rrsig(&dnskey_rs);
+    if dnskey_rrsigs.is_empty() {
+        dnskey_rrsigs = fetch_rrsigs_covering(
+            &resolver, &normalized, RecordType::DNSKEY,
+        ).await;
+    }
+    let alg = dnskeys.first().map(|k| u8::from(k.algorithm())).unwrap_or(0);
+    let dnskey_raw: Vec<Record> = dnskey_rs.iter()
+        .filter(|r| r.record_type() == RecordType::DNSKEY)
+        .cloned().collect();
+
+    // DS from parent
+    let ds_rs = fetch_records(&resolver, &normalized, RecordType::DS).await;
+    let ds_records = extract_ds(&ds_rs);
+
+    if !dnskeys.is_empty() {
+        let mut canonical = Vec::new();
+        for k in &dnskeys {
+            canonical.extend_from_slice(k.public_key());
+        }
+        let verdict = dnskey_rrsigs.first().map(|rrsig| {
+            native_verify_rrsig(&zone_name, &dnskey_raw, rrsig, &dnskeys)
+        }).unwrap_or(NativeVerifyVerdict::Skipped("no RRSIG returned".into()));
+        out.push(ChainLink {
+            domain: domain.clone(),
+            signer_name: domain.clone(),
+            record_type: RecordType::DNSKEY,
+            rrset_canonical: canonical,
+            raw_records: dnskey_raw.clone(),
+            rrsig: dnskey_rrsigs.into_iter().next(),
+            dnskey: dnskeys.first().cloned(),
+            ds_records: ds_records.clone(),
+            algorithm: alg,
+            native_verify: verdict,
+        });
+    }
+
+    // A + RRSIG(A) for non-apex zones
+    if domain != "se" && domain != "se." && domain != "." {
+        let a_rs = fetch_records(&resolver, &normalized, RecordType::A).await;
+        let a_records = extract_a(&a_rs);
+        let mut a_rrsigs = extract_rrsig(&a_rs);
+        if a_rrsigs.is_empty() {
+            a_rrsigs = fetch_rrsigs_covering(
+                &resolver, &normalized, RecordType::A,
+            ).await;
+        }
+        let a_raw: Vec<Record> = a_rs.iter()
+            .filter(|r| r.record_type() == RecordType::A)
+            .cloned().collect();
+        if !a_records.is_empty() && !a_rrsigs.is_empty() {
+            let mut canonical = Vec::new();
+            for a in &a_records {
+                canonical.extend_from_slice(&a.octets());
+            }
+            let rrsig0 = a_rrsigs[0].clone();
+            let leaf_alg = u8::from(rrsig0.algorithm());
+            let verdict = native_verify_rrsig(
+                &zone_name, &a_raw, &rrsig0, &dnskeys,
+            );
+            out.push(ChainLink {
+                domain: domain.clone(),
+                signer_name: domain.clone(),
+                record_type: RecordType::A,
+                rrset_canonical: canonical,
+                raw_records: a_raw,
+                rrsig: Some(rrsig0),
+                dnskey: None,
+                ds_records: Vec::new(),
+                algorithm: leaf_alg,
+                native_verify: verdict,
+            });
+        }
+    }
+
+    out
+}
+
 // ─── Main demo ───────────────────────────────────────────────────────
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     println!("═══════════════════════════════════════════════════════════════");
     println!("STARK-DNS — HNPL Phase 1 demo over real Swedish .se DNSSEC data");
     println!("═══════════════════════════════════════════════════════════════");
     println!();
 
-    let domains_env = std::env::var("SE_DOMAINS").unwrap_or_else(|_| {
-        // Well-known DNSSEC-signed .se zones (curated; all on public
-        // record).  The .se apex itself is included to capture the
-        // TLD-level DNSKEY + DS chain.
-        "se,iis.se,sunet.se,kb.se,regeringen.se,scb.se,polisen.se,\
-         internetstiftelsen.se,skatteverket.se,ica.se".to_string()
-    });
-    let domains: Vec<String> = domains_env.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Domain-list resolution priority:
+    //   1. SE_DOMAIN_FILE=path        — newline-separated file
+    //   2. SE_DOMAINS=d1,d2,…         — comma-separated env override
+    //   3. built-in 10-zone fallback  — curated well-known signed .se zones
+    let domains: Vec<String> = if let Ok(path) = std::env::var("SE_DOMAIN_FILE") {
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("can't read SE_DOMAIN_FILE={path}: {e}"));
+        content.lines().map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .collect()
+    } else {
+        let domains_env = std::env::var("SE_DOMAINS").unwrap_or_else(|_| {
+            // Built-in fallback: well-known DNSSEC-signed .se zones
+            // (curated; all on public record).
+            "se,iis.se,sunet.se,kb.se,regeringen.se,scb.se,polisen.se,\
+             internetstiftelsen.se,skatteverket.se,ica.se".to_string()
+        });
+        domains_env.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let limit: usize = std::env::var("SE_DOMAIN_LIMIT")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let mut domains: Vec<String> = domains.into_iter().take(limit).collect();
+    let concurrency: usize = std::env::var("CAPTURE_CONCURRENCY")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
 
     println!("Configuration:");
     println!("  Resolver:    public anycast (1.1.1.1, 8.8.8.8, 9.9.9.9)");
     println!("  Mode:        capture-raw (validate=false, EDNS0 DO=1)");
-    println!("  .se domains: {}", domains.len());
-    for d in &domains { println!("    - {d}"); }
+    println!("  .se domains: {} (concurrency cap = {concurrency})", domains.len());
+    if domains.len() <= 20 {
+        for d in &domains { println!("    - {d}"); }
+    } else {
+        println!("    (first 5: {})",
+            domains.iter().take(5).cloned().collect::<Vec<_>>().join(", "));
+        println!("    (last 5:  {})",
+            domains.iter().rev().take(5).cloned().collect::<Vec<_>>()
+                .into_iter().rev().collect::<Vec<_>>().join(", "));
+    }
     println!();
 
-    let resolver = build_dnssec_resolver();
+    let resolver = std::sync::Arc::new(build_dnssec_resolver());
     let mut links: Vec<ChainLink> = Vec::new();
 
     // ─── Step 1 — Capture ───────────────────────────────────────────
-    println!("[Step 1] Capture: fetching real DNSSEC chain data …");
+    println!("[Step 1] Concurrent capture: fetching real DNSSEC chain data …");
     println!();
     let t_capture = Instant::now();
 
@@ -562,99 +689,42 @@ async fn main() {
         }
     }
 
-    // 1b. For each captured zone: DNSKEY, RRSIG over DNSKEY, DS from
-    //     parent zone.  For leaf domains: A record + RRSIG.
-    for domain in &domains {
-        let normalized = if domain.ends_with('.') {
-            domain.clone()
-        } else {
-            format!("{domain}.")
-        };
-        let zone_name = Name::from_str(&normalized).unwrap_or_else(|_| Name::root());
+    // 1b. Concurrent per-domain capture via tokio::task::JoinSet
+    //     with a semaphore-based concurrency cap.  Each task fetches
+    //     DNSKEY + RRSIG + DS + A + RRSIG(A) and runs the native
+    //     pre-proof oracle.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut joinset: tokio::task::JoinSet<Vec<ChainLink>> = tokio::task::JoinSet::new();
+    for d in domains.drain(..) {
+        let r = resolver.clone();
+        let sem = semaphore.clone();
+        joinset.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore not closed");
+            capture_one_domain(r, d).await
+        });
+    }
 
-        // DNSKEY for this zone + its RRSIG
-        let dnskey_rs = fetch_records(&resolver, &normalized, RecordType::DNSKEY).await;
-        let dnskeys = extract_dnskey(&dnskey_rs);
-        let mut dnskey_rrsigs = extract_rrsig(&dnskey_rs);
-        if dnskey_rrsigs.is_empty() {
-            dnskey_rrsigs = fetch_rrsigs_covering(&resolver, &normalized, RecordType::DNSKEY).await;
+    let total_tasks = joinset.len();
+    let mut completed = 0usize;
+    let report_step = (total_tasks / 20).max(10);  // ~20 progress lines
+    while let Some(result) = joinset.join_next().await {
+        completed += 1;
+        match result {
+            Ok(domain_links) => {
+                links.extend(domain_links);
+            }
+            Err(e) => {
+                eprintln!("    [warn] capture task panicked: {e}");
+            }
         }
-        let alg = dnskeys.first().map(|k| u8::from(k.algorithm())).unwrap_or(0);
-        let dnskey_raw: Vec<Record> = dnskey_rs.iter()
-            .filter(|r| r.record_type() == RecordType::DNSKEY)
-            .cloned().collect();
-
-        // DS for this zone in parent
-        let ds_rs = fetch_records(&resolver, &normalized, RecordType::DS).await;
-        let ds_records = extract_ds(&ds_rs);
-
-        if !dnskeys.is_empty() {
-            let mut canonical = Vec::new();
-            for k in &dnskeys {
-                canonical.extend_from_slice(k.public_key());
-            }
-            // Native verify: DNSKEY RRset is self-signed by the
-            // zone's own KSK (one of the DNSKEYs in the RRset).
-            let verdict = dnskey_rrsigs.first().map(|rrsig| {
-                native_verify_rrsig(&zone_name, &dnskey_raw, rrsig, &dnskeys)
-            }).unwrap_or(NativeVerifyVerdict::Skipped("no RRSIG returned".into()));
-            links.push(ChainLink {
-                domain: domain.clone(),
-                signer_name: domain.clone(),
-                record_type: RecordType::DNSKEY,
-                rrset_canonical: canonical,
-                raw_records: dnskey_raw.clone(),
-                rrsig: dnskey_rrsigs.into_iter().next(),
-                dnskey: dnskeys.first().cloned(),
-                ds_records: ds_records.clone(),
-                algorithm: alg,
-                native_verify: verdict.clone(),
-            });
-            println!("  {:25}  DNSKEY x{} ({:18}) DS x{}  verify={:?}",
-                domain, dnskeys.len(), algorithm_name(alg),
-                ds_records.len(), summarise(&verdict));
-        } else {
-            println!("  {:25}  (no DNSKEY returned — zone may be unsigned)", domain);
-        }
-
-        // Leaf A record + RRSIG for non-apex zones — verify the A RRset
-        // against the zone's own ZSK (one of the DNSKEYs we just captured).
-        if domain != "se" && domain != "se." {
-            let a_rs = fetch_records(&resolver, &normalized, RecordType::A).await;
-            let a_records = extract_a(&a_rs);
-            let mut a_rrsigs = extract_rrsig(&a_rs);
-            if a_rrsigs.is_empty() {
-                a_rrsigs = fetch_rrsigs_covering(&resolver, &normalized, RecordType::A).await;
-            }
-            let a_raw: Vec<Record> = a_rs.iter()
-                .filter(|r| r.record_type() == RecordType::A)
-                .cloned().collect();
-            if !a_records.is_empty() && !a_rrsigs.is_empty() {
-                let mut canonical = Vec::new();
-                for a in &a_records {
-                    canonical.extend_from_slice(&a.octets());
-                }
-                let rrsig0 = a_rrsigs[0].clone();
-                let leaf_alg = u8::from(rrsig0.algorithm());
-                let verdict = native_verify_rrsig(
-                    &zone_name, &a_raw, &rrsig0, &dnskeys,
-                );
-                links.push(ChainLink {
-                    domain: domain.clone(),
-                    signer_name: domain.clone(),
-                    record_type: RecordType::A,
-                    rrset_canonical: canonical,
-                    raw_records: a_raw,
-                    rrsig: Some(rrsig0),
-                    dnskey: None,
-                    ds_records: Vec::new(),
-                    algorithm: leaf_alg,
-                    native_verify: verdict.clone(),
-                });
-                println!("  {:25}  A      x{} ({:18})        verify={:?}",
-                    domain, a_records.len(), algorithm_name(leaf_alg),
-                    summarise(&verdict));
-            }
+        if completed % report_step == 0 || completed == total_tasks {
+            let elapsed = t_capture.elapsed().as_secs_f64();
+            let rate = completed as f64 / elapsed.max(0.001);
+            println!(
+                "    progress: {completed:>5}/{total_tasks}  chain_links={:>5}  \
+                 rate={:.1} dom/s  elapsed={:.1}s",
+                links.len(), rate, elapsed,
+            );
         }
     }
 
@@ -1003,5 +1073,83 @@ async fn main() {
     println!("      (wrapper-stark::master_recursion_bridge — already in-tree).");
     println!("      For .se TLD scale (~4.5 M RRSIGs): ~3.5 MiB L1 wire, ~14 ms verify.");
     println!("    ◐ Optional Zonemaster cross-check oracle.");
+    println!("═══════════════════════════════════════════════════════════════");
+
+    // ─── Phase 2 — Persist the epoch package to disk ───────────────
+    //
+    // Self-contained binary artefact for OFFLINE DNS resolution.
+    // Edge resolvers read this file, verify once (ML-DSA + outer STARK),
+    // then serve unlimited DNS queries against the committed corpus
+    // via Merkle inclusion proofs — no further network access needed.
+    use swarm_dns::se_epoch_package::{
+        EpochRecord, SeEpochPackage, save_to_file, PACKAGE_VERSION,
+    };
+    let package_path = std::path::PathBuf::from(
+        std::env::var("SE_EPOCH_PACKAGE_PATH")
+            .unwrap_or_else(|_| "target/se-epoch-package.bin".to_string())
+    );
+    println!();
+    println!("[Phase 2] Persisting epoch package → {} …", package_path.display());
+    let epoch_records: Vec<EpochRecord> = records.iter().map(|r| EpochRecord {
+        domain: r.domain.clone(),
+        record_type: r.record_type,
+        algorithm: links.iter()
+            .find(|l| l.domain == r.domain
+                && u16::from(l.record_type) == r.record_type)
+            .map(|l| l.algorithm).unwrap_or(0),
+        rdata: r.rdata.clone(),
+        ttl: r.ttl,
+    }).collect();
+    let authority_pk_bytes: Vec<u8> = {
+        use fips204::traits::SerDes;
+        pk.clone().into_bytes().to_vec()
+    };
+    let authority_sig_bytes: Vec<u8> = sig.to_vec();
+    let package = SeEpochPackage {
+        version:           PACKAGE_VERSION,
+        epoch_t,
+        epoch_seq,
+        epoch_prev,
+        authority_pk:      authority_pk_bytes,
+        authority_sig:     authority_sig_bytes,
+        inner_pi_hash:     inner.pi_hash,
+        inner_merkle_root: inner.merkle_root,
+        inner_n_trace:     inner.n_trace,
+        inner_stark_proof: inner.proof_blob.clone(),
+        inner_root_f0:     inner.root_f0.to_vec(),
+        outer_n_trace:     outer.n_trace,
+        outer_stark_proof: outer.proof_blob.clone(),
+        outer_root_f0:     outer.root_f0.to_vec(),
+        merkle_root:       root,
+        merkle_levels:     tree.clone(),
+        merkle_salt:       salt,
+        records:           epoch_records,
+    };
+    if let Some(parent) = package_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match save_to_file(&package, &package_path) {
+        Ok(written) => {
+            println!("  package serialised:  {} B ({:.1} KiB)",
+                written, written as f64 / 1024.0);
+            println!("  authority_pk:        {} B",     package.authority_pk.len());
+            println!("  authority_sig:       {} B",     package.authority_sig.len());
+            println!("  inner STARK π:       {} B",     package.inner_stark_proof.len());
+            println!("  outer STARK π:       {} B",     package.outer_stark_proof.len());
+            println!("  merkle levels:       {} levels (depth {}), {} entries total",
+                package.merkle_levels.len(),
+                package.merkle_levels.len().saturating_sub(1),
+                package.merkle_levels.iter().map(|l| l.len()).sum::<usize>(),
+            );
+            println!("  records:             {} entries", package.records.len());
+            println!();
+            println!("  Run the offline resolver against this package:");
+            println!("    cargo run --release -p swarm-dns --example se_offline_resolver \\");
+            println!("        --features \"sha3-256 mldsa-44 parallel\" --no-default-features");
+        }
+        Err(e) => {
+            eprintln!("  [warn] package save failed: {e}");
+        }
+    }
     println!("═══════════════════════════════════════════════════════════════");
 }

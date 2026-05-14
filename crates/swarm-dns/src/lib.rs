@@ -6,6 +6,7 @@
 pub mod dns;
 pub mod dns_authority;
 pub mod prover;
+pub mod se_epoch_package;
 
 // Re-export the most common surface so callers don't need to know the
 // internal module split.
