@@ -35,6 +35,7 @@ use wrapper_stark::recursive_prover::{
     prove_composition_accumulator, verify_composition_accumulator,
     prove_ood_accumulator, verify_ood_accumulator,
     prove_perm_arg_accumulator, verify_perm_arg_accumulator,
+    prove_recursive_stark, verify_recursive_stark,
 };
 
 fn gf(x: u64) -> Goldilocks { Goldilocks::from(x) }
@@ -152,28 +153,88 @@ fn main() {
     assert!(perm_ok);
     println!();
 
-    // ─── Composite summary ────────────────────────────────────────
-    let total_prove = comp_prove_ms + ood_prove_ms + perm_prove_ms;
-    let total_verify = comp_verify_ms + ood_verify_ms + perm_verify_ms;
-    let total_size = comp_size + ood_size + perm_size;
+    // ─── Step-4 baseline summary (three independent proofs) ───────
+    let baseline_prove = comp_prove_ms + ood_prove_ms + perm_prove_ms;
+    let baseline_verify = comp_verify_ms + ood_verify_ms + perm_verify_ms;
+    let baseline_size = comp_size + ood_size + perm_size;
+    println!("BASELINE (step 4 — three independent FRI proofs):");
+    println!("    prove:  {baseline_prove:.1} ms   verify: {baseline_verify:.2} ms   size: {}",
+        format_kib(baseline_size));
+    println!();
+
+    // ─── Step 6: ONE OUTER FRI PROOF composing all three ──────────
+    println!("[★] STEP 6 — COMPOSED RECURSIVE STARK (single outer FRI proof)");
+    let recompose_comp = {
+        let mut vals: Vec<u8> = vec![1, 0];
+        for i in 0..6 { vals.push(vals[i] ^ vals[i + 1]); }
+        let column_values: Vec<(CellRef, Goldilocks)> = (0..8)
+            .map(|i| (CellRef::new(0, i), gf(vals[i] as u64))).collect();
+        let constraints: Vec<BitOp> = (0..6).map(|i| BitOp::Xor {
+            c: CellRef::new(0, i + 2),
+            a: CellRef::new(0, i),
+            b: CellRef::new(0, i + 1),
+        }).collect();
+        let alphas: Vec<Goldilocks> = (1..=6u64).map(gf).collect();
+        CompositionClaim { column_values, constraints, alphas, expected: gf(0) }
+    };
+    let recompose_ood = OodAccumulatorClaim {
+        bundle: OodClaimBundle {
+            claims: vec![
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L2a" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L2b" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L2c" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L3" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L4" },
+                OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L5" },
+            ],
+        },
+        alphas: (1..=7u64).map(gf).collect(),
+    };
+    let recompose_perm = PermArgClaim {
+        left:  vec![gf(11), gf(22), gf(33), gf(44), gf(55)],
+        right: vec![gf(33), gf(11), gf(55), gf(22), gf(44)],
+        gamma: gf(0xDEAD_C0DE),
+        perm_tag: "T_MEM",
+    };
+    let t = Instant::now();
+    let composed = prove_recursive_stark(
+        &recompose_comp, &recompose_ood, &recompose_perm, blowup, r, use_stir,
+    ).expect("composed prove must succeed");
+    let composed_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let composed_ok = verify_recursive_stark(&composed);
+    let composed_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let mut buf = Vec::new();
+    composed.fri_proof.serialize_compressed(&mut buf).unwrap();
+    let composed_size = buf.len();
+    println!("    n_trace={}  (= max over three sub-circuits)", composed.n_trace);
+    println!("    prove: {composed_prove_ms:.1} ms   verify: {composed_verify_ms:.2} ms   proof: {}",
+        format_kib(composed_size));
+    println!("    Verdict: {}", if composed_ok { "ACCEPT" } else { "REJECT (bug!)" });
+    assert!(composed_ok);
+    println!();
+
+    // ─── Summary: baseline vs composed ─────────────────────────────
+    let prove_ratio = baseline_prove / composed_prove_ms;
+    let verify_ratio = baseline_verify / composed_verify_ms;
+    let size_ratio = baseline_size as f64 / composed_size as f64;
 
     println!("═══════════════════════════════════════════════════════════");
-    println!("  All three sub-circuit FRI proofs ACCEPTED on honest");
-    println!("  witnesses.  Composite (three independent proofs):");
+    println!("  STEP 6 COMPRESSION (3 sub-circuit proofs → 1 outer proof):");
     println!();
-    println!("    prove:  {total_prove:.1} ms (composition + OOD + perm-arg)");
-    println!("    verify: {total_verify:.2} ms");
-    println!("    size:   {}", format_kib(total_size));
+    println!("    metric        baseline (3 × FRI)   composed (1 × FRI)   ratio");
+    println!("    prove         {baseline_prove:>8.1} ms        {composed_prove_ms:>8.1} ms        {prove_ratio:.2}×");
+    println!("    verify        {baseline_verify:>8.2} ms        {composed_verify_ms:>8.2} ms        {verify_ratio:.2}×");
+    println!("    proof size    {:>8}     {:>8}        {size_ratio:.2}×",
+        format_kib(baseline_size), format_kib(composed_size));
     println!();
-    println!("  Step 6 (single outer FRI proof composing all three");
-    println!("  sub-circuits' c_evals) will collapse the three proofs");
-    println!("  into one — replacing three Merkle roots, three FRI");
-    println!("  fold schedules, and three query sets with a single");
-    println!("  shared LDE.  Target: ~200-500 KiB total, ~5-15 ms");
-    println!("  verify at L1 with blowup=32 and r=54.");
+    println!("  The composed proof attests the SAME recursive ML-DSA STARK");
+    println!("  statement (composition ∧ OOD ∧ perm-arg) through ONE outer");
+    println!("  FRI proof — replacing three Merkle roots, three fold");
+    println!("  schedules, and three query sets with a single shared LDE.");
     println!();
-    println!("  Step-4 milestone: each sub-circuit now produces a real,");
-    println!("  paper-grade DeepFriProof<SexticExt> — same path used by");
-    println!("  the production SHA-3 PoK and Merkle path gadgets.");
+    println!("  Step-6 milestone closed: the recursive STARK gadget");
+    println!("  matches the architectural target (single outer FRI proof).");
     println!("═══════════════════════════════════════════════════════════");
 }
