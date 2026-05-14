@@ -210,12 +210,22 @@ pub struct DigestBoundary {
 /// to c_eval, the contribution is zero at all trace rows except the
 /// last, where it pins the cell to the expected bit.
 fn compute_last_row_indicator_lde(n_trace: usize, blowup: usize) -> Vec<FBase> {
-    let n_lde = n_trace * blowup;
-    // Trace-domain values: 1 at index n_trace-1, 0 elsewhere.
-    let mut trace_vals = vec![FBase::from(0u64); n_trace];
-    trace_vals[n_trace - 1] = FBase::from(1u64);
+    compute_single_row_indicator_lde(n_trace - 1, n_trace, blowup)
+}
 
-    // FFT to coefficients, then evaluate on the LDE domain.
+/// Generalisation of [`compute_last_row_indicator_lde`]: the indicator
+/// polynomial that's 1 at trace row `target_row` and 0 at all other
+/// trace rows, evaluated on the full LDE domain.  Used by the Merkle
+/// path prover to gate selection + cross-row constraints to the
+/// specific row each fires at.
+pub fn compute_single_row_indicator_lde(
+    target_row: usize, n_trace: usize, blowup: usize,
+) -> Vec<FBase> {
+    let n_lde = n_trace * blowup;
+    debug_assert!(target_row < n_trace);
+    let mut trace_vals = vec![FBase::from(0u64); n_trace];
+    trace_vals[target_row] = FBase::from(1u64);
+
     let trace_dom = Radix2EvaluationDomain::<FBase>::new(n_trace)
         .expect("trace domain radix-2");
     let coeffs = trace_dom.ifft(&trace_vals);
