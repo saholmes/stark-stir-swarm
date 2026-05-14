@@ -456,6 +456,59 @@ mod tests {
             "honest prove + verify round-trip must accept");
     }
 
+    /// Bench: measure prove / verify / proof-size for the Merkle path
+    /// gadget at the depth controlled by `BENCH_MERKLE_DEPTH` (default 2).
+    /// Other env vars: BENCH_BLOWUP, BENCH_R, BENCH_STIR.
+    /// Prints a CSV-friendly line for the bench script to scrape.
+    #[test]
+    #[ignore = "bench — invoke via scripts/bench-merkle-stark.sh"]
+    fn bench_merkle_path_stark() {
+        use std::time::Instant;
+        use ark_serialize::CanonicalSerialize;
+
+        let depth_log2: usize = std::env::var("BENCH_MERKLE_DEPTH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+        let n_leaves = 1usize << depth_log2;
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let r: usize = std::env::var("BENCH_R")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+        let use_stir: bool = std::env::var("BENCH_STIR")
+            .ok().as_deref() == Some("1");
+        let ldt_label = if use_stir { "stir" } else { "fri" };
+
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..n_leaves as u8)
+            .map(|i| fake_leaf(variant, 0x30 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, n_leaves / 2);
+
+        let t0 = Instant::now();
+        let proof = prove_merkle_path(&claim, blowup, r, use_stir)
+            .expect("prove must succeed");
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 3 verify runs, take median.
+        let mut samples = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let t = Instant::now();
+            assert!(verify_merkle_path(&proof));
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let verify_ms = samples[1];
+
+        let mut buf = Vec::new();
+        proof.fri_proof.serialize_compressed(&mut buf).unwrap();
+        let proof_kib = buf.len() as f64 / 1024.0;
+
+        println!(
+            "merkle_stark variant=L1 depth={} blowup={blowup} r={r} ldt={ldt_label} \
+             prove_ms={prove_ms:.0} verify_ms={verify_ms:.2} \
+             proof_kib={proof_kib:.1} n_trace={n_trace}",
+            depth_log2, n_trace = proof.n_trace,
+        );
+    }
+
     #[test]
     #[ignore = "slow — exercises root-binding soundness"]
     fn round_trip_rejects_tampered_root_claim() {
