@@ -361,6 +361,67 @@ pub mod constraint_composition_verifier {
 
     /// Verify the accumulator trace against its constraints natively.
     /// Used in tests + as a stepping-stone to the FRI-prove integration.
+    /// Convert an [`AccumulatorTrace`] into column-major form ready
+    /// for FRI/LDE.  Returns `Vec<Vec<F>>` where:
+    ///   - columns[0] = alpha values  (length n_trace, padded to next pow2)
+    ///   - columns[1] = phi values
+    ///   - columns[2] = partial_sum values
+    ///
+    /// Output is padded with zeros to `n_trace.next_power_of_two()`
+    /// rows so it satisfies `deep_ali::trace_import::lde_trace_columns`'s
+    /// power-of-2 trace-length requirement.
+    pub fn accumulator_trace_to_columns<F: Field>(
+        trace: &AccumulatorTrace<F>,
+    ) -> Vec<Vec<F>> {
+        let n_trace = trace.n_rows.next_power_of_two().max(2);
+        let mut alpha_col = Vec::with_capacity(n_trace);
+        let mut phi_col = Vec::with_capacity(n_trace);
+        let mut sum_col = Vec::with_capacity(n_trace);
+        for r in 0..trace.n_rows {
+            alpha_col.push(trace.alpha[r]);
+            phi_col.push(trace.phi[r]);
+            sum_col.push(trace.partial_sum[r]);
+        }
+        // Pad to power-of-2.  For the padding rows, set alpha = phi = 0
+        // and partial_sum = final value (so the StepAcc constraint
+        // continues to hold: padding_sum = prev_sum + 0·0 = prev_sum).
+        let final_sum = trace.partial_sum[trace.n_rows - 1];
+        for _ in trace.n_rows..n_trace {
+            alpha_col.push(F::zero());
+            phi_col.push(F::zero());
+            sum_col.push(final_sum);
+        }
+        vec![alpha_col, phi_col, sum_col]
+    }
+
+    /// Verify the constraint set on the column-major form (mirrors the
+    /// shape `prepare_fri_input_row_uniform` will consume).  Useful as
+    /// a stepping-stone validator before plugging into FRI.
+    pub fn verify_accumulator_columns<F: Field>(
+        columns: &[Vec<F>], expected: F,
+    ) -> bool {
+        if columns.len() != 3 { return false; }
+        let n = columns[0].len();
+        if n < 2 || columns[1].len() != n || columns[2].len() != n {
+            return false;
+        }
+        let (alpha, phi, partial_sum) = (&columns[0], &columns[1], &columns[2]);
+
+        // Initial.
+        if !(partial_sum[0] - alpha[0] * phi[0]).is_zero() {
+            return false;
+        }
+        // Step.
+        for r in 1..n {
+            if !(partial_sum[r] - partial_sum[r - 1] - alpha[r] * phi[r]).is_zero() {
+                return false;
+            }
+        }
+        // Final boundary: the FINAL row (which may be a padding row,
+        // but the synthesiser sets padding_sum = final accumulated value).
+        (partial_sum[n - 1] - expected).is_zero()
+    }
+
     pub fn verify_accumulator_trace<F: Field>(
         trace: &AccumulatorTrace<F>, expected: F,
     ) -> bool {
@@ -623,6 +684,84 @@ pub mod constraint_composition_verifier {
             // But fails against a wrong expected.
             assert!(!verify_accumulator_trace(&trace, Goldilocks::from(99u64)),
                 "wrong expected must reject");
+        }
+
+        #[test]
+        fn accumulator_columns_shape_and_padding() {
+            // Build a 3-row trace, convert to columns, verify padding
+            // up to power-of-2 + final-sum carry.
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(0u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(0u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 0) },
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Boolean { b: cell(0, 2) },
+                ],
+                alphas: vec![Goldilocks::from(2u64), Goldilocks::from(3u64), Goldilocks::from(5u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            let columns = accumulator_trace_to_columns(&trace);
+            assert_eq!(columns.len(), 3);
+
+            let n_lde_rows = columns[0].len();
+            // 3 rows → next pow2 = 4.
+            assert_eq!(n_lde_rows, 4);
+            assert_eq!(columns[1].len(), 4);
+            assert_eq!(columns[2].len(), 4);
+
+            // Padding rows: alpha = phi = 0, partial_sum = final.
+            for r in 3..4 {
+                assert_eq!(columns[0][r], Goldilocks::from(0u64));
+                assert_eq!(columns[1][r], Goldilocks::from(0u64));
+                assert_eq!(columns[2][r], trace.partial_sum[2]);
+            }
+        }
+
+        #[test]
+        fn accumulator_columns_verify_on_honest_trace() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(1u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                    (cell(0, 2), Goldilocks::from(1u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 1) },
+                    BitOp::Xor { c: cell(0, 2), a: cell(0, 0), b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(7u64), Goldilocks::from(11u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            let columns = accumulator_trace_to_columns(&trace);
+            // Verify against the columns form.
+            assert!(verify_accumulator_columns(&columns, claim.expected));
+        }
+
+        #[test]
+        fn accumulator_columns_reject_tampered() {
+            let claim = CompositionClaim::<Goldilocks> {
+                column_values: vec![
+                    (cell(0, 0), Goldilocks::from(0u64)),
+                    (cell(0, 1), Goldilocks::from(0u64)),
+                ],
+                constraints: vec![
+                    BitOp::Boolean { b: cell(0, 0) },
+                    BitOp::Boolean { b: cell(0, 1) },
+                ],
+                alphas: vec![Goldilocks::from(3u64), Goldilocks::from(5u64)],
+                expected: Goldilocks::from(0u64),
+            };
+            let trace = AccumulatorTrace::synthesise(&claim);
+            let mut columns = accumulator_trace_to_columns(&trace);
+            // Tamper the second partial_sum.
+            columns[2][1] = Goldilocks::from(42u64);
+            assert!(!verify_accumulator_columns(&columns, claim.expected));
         }
 
         #[test]
