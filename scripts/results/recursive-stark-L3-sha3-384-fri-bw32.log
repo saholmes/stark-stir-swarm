@@ -402,12 +402,12 @@ warning: value assigned to `right` is never read
      = help: maybe it is overwritten before being read?
 
 warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.05s
+    Finished `release` profile [optimized] target(s) in 0.04s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-368dfef0c71fe90e)
 
 running 1 test
-recursive_stark variant=L3 blowup=4 r=79 ldt=stir prove_ms=0.7 verify_ms=0.36 proof_kib=93.2 n_trace=8 n_constraints=6 n_ood=7 n_perm=5
+recursive_stark variant=L3 blowup=32 r=79 ldt=fri prove_ms=3.2 verify_ms=1.80 proof_kib=541.0 n_trace=8 n_constraints=6 n_ood=7 n_perm=5
 test recursive_prover::tests::bench_recursive_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 301 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 301 filtered out; finished in 0.01s
 

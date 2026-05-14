@@ -1,0 +1,7 @@
+variant,nist_level,blowup,r,ldt,prove_ms,verify_ms,proof_kib,n_trace,n_constraints,n_ood,n_perm
+sha3-256,L1,32,54,fri,2.6,0.91,280.5,8,6,7,5
+sha3-256,L1,32,54,stir,1.7,0.29,78.9,8,6,7,5
+sha3-384,L3,32,79,fri,3.2,1.80,541.0,8,6,7,5
+sha3-384,L3,32,79,stir,1.8,0.53,162.9,8,6,7,5
+sha3-512,L5,32,105,fri,3.3,3.18,892.8,8,6,7,5
+sha3-512,L5,32,105,stir,2.1,1.02,280.1,8,6,7,5

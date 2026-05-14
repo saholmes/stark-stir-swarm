@@ -24,7 +24,7 @@ BLOWUP="${BENCH_BLOWUP:-4}"
 LEVELS_FILTER="${BENCH_LEVELS_ONLY:-L1 L3 L5}"
 LDT_FILTER="${BENCH_LDT_ONLY:-fri stir}"
 
-CSV="$RESULTS_DIR/recursive-stark-bench.csv"
+CSV="$RESULTS_DIR/recursive-stark-bench-bw${BLOWUP}.csv"
 echo "variant,nist_level,blowup,r,ldt,prove_ms,verify_ms,proof_kib,n_trace,n_constraints,n_ood,n_perm" > "$CSV"
 
 NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
@@ -102,7 +102,7 @@ if [[ " $LEVELS_FILTER " == *" L5 "* ]]; then
 fi
 
 # Markdown summary.
-MD="$RESULTS_DIR/recursive-stark-bench.md"
+MD="$RESULTS_DIR/recursive-stark-bench-bw${BLOWUP}.md"
 {
     echo "# Recursive ML-DSA STARK Bench"
     echo
