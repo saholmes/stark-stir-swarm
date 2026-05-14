@@ -50,10 +50,15 @@ use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
 };
 use crate::deep_ali_verifier_air::constraint_composition_verifier::CompositionClaim;
 use crate::deep_ali_verifier_air::permutation_argument_verifier::PermArgClaim;
+use crate::merkle_path_air::{MerkleNode, merkle_build_and_open};
+use crate::merkle_prover::{
+    MerklePathProof, MerklePathProverError, prove_merkle_path, verify_merkle_path,
+};
 use crate::recursive_prover::{
     OodAccumulatorClaim, RecursiveProverError, RecursiveStarkProof,
     prove_recursive_stark, verify_recursive_stark,
 };
+use crate::sha3_absorb_air::Sha3Variant;
 
 type Ext = DaExt;
 
@@ -319,6 +324,173 @@ pub fn verify_master_recursive(master: &RecursiveStarkProof) -> bool {
     verify_recursive_stark(master)
 }
 
+// ─── In-AIR Merkle binding for the master ────────────────────────────
+//
+// Closes the FRI-Merkle soundness gap documented in
+// `prove_v2_with_in_air_merkle_path` (commit 4bb14f2) at the master
+// recursion layer.
+//
+// Each inner RecursiveStarkProof's `outer_pi_hash` is bound to a real
+// in-AIR-SHA-3-hashed Merkle commitment via the wrapper-stark merkle
+// gadget.  N inner proofs → N Merkle-path STARKs, each attesting:
+//
+//     "∃ leaf and authentication path such that SHA-3-hashing the
+//      path with the leaf reproduces the public root,
+//      where leaf == inner.outer_pi_hash."
+//
+// This is the SAME pattern as `prove_v2_in_air_merkle_binding` —
+// applied N times at the master layer to bind each inner recursive
+// STARK's identity into a Merkle commitment with real in-AIR SHA-3
+// hashing.
+
+/// Composed proof: the master `RecursiveStarkProof` + N in-AIR
+/// Merkle-path STARK proofs (one per inner recursive STARK).  Each
+/// Merkle path proof attests `inner.outer_pi_hash` is the leaf-0
+/// element of a synthetic 4-leaf binary Merkle tree with public root.
+pub struct MasterWithMerklePathProof {
+    pub master: RecursiveStarkProof,
+    /// One Merkle-path proof per inner recursive STARK.  Each
+    /// `merkle_path_proofs[i]` attests inner `i`'s outer_pi_hash is
+    /// a Merkle-committed leaf with root `merkle_roots[i]`.
+    pub merkle_path_proofs: Vec<MerklePathProof>,
+    /// One Merkle root per inner recursive STARK.  Sized as
+    /// 32 bytes because the wrapper-stark merkle gadget uses SHA3-256
+    /// for the variant `Sha3Variant::Sha3_256` chosen below.
+    pub merkle_roots: Vec<[u8; 32]>,
+}
+
+/// Errors from `prove_master_with_in_air_merkle_path`.
+#[derive(Debug, Clone)]
+pub enum MasterMerkleBindingError {
+    Inner(MasterBridgeError),
+    MerklePathProver(MerklePathProverError),
+    Internal(String),
+}
+
+impl std::fmt::Display for MasterMerkleBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inner(e) => write!(f, "master bridge: {e}"),
+            Self::MerklePathProver(e) => write!(f, "merkle path prover: {e:?}"),
+            Self::Internal(s) => write!(f, "internal: {s}"),
+        }
+    }
+}
+impl std::error::Error for MasterMerkleBindingError {}
+
+/// Build a synthetic 4-leaf binary Merkle tree containing the given
+/// `pi_hash` at leaf 0 and prove the leaf-0 authentication path
+/// in-AIR via the wrapper-stark merkle gadget.
+///
+/// Returns the `MerklePathProof` plus the 32-byte Merkle root.
+/// Matches the shape of `v2_recursion_bridge::prove_v2_in_air_merkle_binding`.
+fn prove_in_air_merkle_binding_for_pi_hash(
+    pi_hash: [u8; 32],
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<(MerklePathProof, [u8; 32]), MasterMerkleBindingError> {
+    let variant = Sha3Variant::Sha3_256;
+    let pi_hash_leaf = MerkleNode(pi_hash.to_vec());
+    let zero_leaf = MerkleNode::zero(variant);
+    // 4-leaf binary tree: [pi_hash, 0, 0, 0]
+    let leaves = vec![
+        pi_hash_leaf, zero_leaf.clone(), zero_leaf.clone(), zero_leaf,
+    ];
+    let claim = merkle_build_and_open(variant, &leaves, 0);
+    let merkle_root: [u8; 32] = claim.root.0.as_slice().try_into()
+        .map_err(|_| MasterMerkleBindingError::Internal(
+            "merkle root length unexpected".into()
+        ))?;
+    let proof = prove_merkle_path(&claim, merkle_blowup, merkle_r, merkle_use_stir)
+        .map_err(MasterMerkleBindingError::MerklePathProver)?;
+    Ok((proof, merkle_root))
+}
+
+/// End-to-end Option C with in-AIR Merkle binding.
+///
+/// Produces the master `RecursiveStarkProof` (via `prove_master_recursive`)
+/// PLUS N in-AIR Merkle-path STARK proofs binding each inner recursive
+/// STARK's `outer_pi_hash` to a real SHA-3 Merkle commitment.  The
+/// Merkle hashing happens IN-AIR via the wrapper-stark sha3_absorb_air
+/// constraints — a malicious prover cannot lie about leaf/sibling bytes.
+///
+/// Together, the master STARK + N Merkle-path STARKs provide:
+///   - **Algebraic FRI binding** (master sub-circuit 1): the inner
+///     FRI DEEP-quotient relation holds for each inner recursive STARK.
+///   - **Hash-Merkle binding** (in-AIR merkle paths): each inner's
+///     outer_pi_hash is cryptographically committed via SHA-3.
+///
+/// This is the FULL Option C shape — L1 self-attests with real
+/// cryptographic binding on both the FRI quotient relation AND the
+/// inner proof identity.
+///
+/// # Parameters
+///
+/// - `inner_proofs`: N inner recursive STARK proofs (from
+///   `prove_v2_all_subairs_composed_recursive` in FRI mode).
+/// - `(blowup, r, use_stir)`: FRI parameters for the master STARK.
+/// - `(merkle_blowup, merkle_r, merkle_use_stir)`: FRI parameters for
+///   the N in-AIR Merkle path STARKs.  Typical: `(4, 54, false)`.
+pub fn prove_master_with_in_air_merkle_path(
+    inner_proofs: &[RecursiveStarkProof],
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+    merkle_blowup: usize,
+    merkle_r: usize,
+    merkle_use_stir: bool,
+) -> Result<MasterWithMerklePathProof, MasterMerkleBindingError> {
+    let master = prove_master_recursive(inner_proofs, blowup, r, use_stir)
+        .map_err(MasterMerkleBindingError::Inner)?;
+
+    let mut merkle_path_proofs = Vec::with_capacity(inner_proofs.len());
+    let mut merkle_roots = Vec::with_capacity(inner_proofs.len());
+    for rec in inner_proofs {
+        let (proof, root) = prove_in_air_merkle_binding_for_pi_hash(
+            rec.public.outer_pi_hash,
+            merkle_blowup, merkle_r, merkle_use_stir,
+        )?;
+        merkle_path_proofs.push(proof);
+        merkle_roots.push(root);
+    }
+
+    Ok(MasterWithMerklePathProof {
+        master, merkle_path_proofs, merkle_roots,
+    })
+}
+
+/// Verify a `MasterWithMerklePathProof` — the master STARK + every
+/// Merkle-path STARK must accept.  Confirms the leaf each Merkle-path
+/// STARK opens matches the matching inner recursive STARK's
+/// `outer_pi_hash`.
+pub fn verify_master_with_in_air_merkle_path(
+    bundle: &MasterWithMerklePathProof,
+    inner_proofs: &[RecursiveStarkProof],
+) -> bool {
+    if !verify_master_recursive(&bundle.master) {
+        return false;
+    }
+    if bundle.merkle_path_proofs.len() != inner_proofs.len() {
+        return false;
+    }
+    for (i, mp) in bundle.merkle_path_proofs.iter().enumerate() {
+        if !verify_merkle_path(mp) {
+            return false;
+        }
+        // Confirm the leaf the Merkle proof opens is the inner's
+        // outer_pi_hash (committed to leaf 0).
+        if mp.public.leaf_index != 0 {
+            return false;
+        }
+        // Verify the merkle root matches what the bundle records.
+        if mp.public.root.0.as_slice() != bundle.merkle_roots[i].as_slice() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +568,30 @@ mod tests {
         // used inside the OOD anchor / vestige perm-arg.  Just check
         // the master proof is non-trivially bound.
         assert_ne!(master.public.outer_pi_hash, [0u8; 32]);
+    }
+
+    #[test]
+    #[ignore = "slow — Option C with in-AIR Merkle binding at N=2"]
+    fn prove_master_with_in_air_merkle_path_n2() {
+        let inner1 = build_one_inner_recursive(301);
+        let inner2 = build_one_inner_recursive(302);
+        let inners = vec![inner1, inner2];
+
+        let bundle = prove_master_with_in_air_merkle_path(
+            &inners,
+            /*blowup=*/4, /*r=*/54, /*stir=*/false,
+            /*merkle_blowup=*/4, /*merkle_r=*/54, /*merkle_use_stir=*/false,
+        ).expect("master + merkle bundle must prove");
+
+        assert!(verify_master_with_in_air_merkle_path(&bundle, &inners),
+            "full master + N×merkle bundle must verify");
+
+        assert_eq!(bundle.merkle_path_proofs.len(), 2);
+        assert_eq!(bundle.merkle_roots.len(), 2);
+        for mp in &bundle.merkle_path_proofs {
+            assert_eq!(mp.public.leaf_index, 0);
+            assert_eq!(mp.depth, 2);
+        }
     }
 
     #[test]

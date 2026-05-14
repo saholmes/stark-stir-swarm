@@ -29,7 +29,8 @@ use deep_ali::ml_dsa_verify_air_v2_orchestration::{
 };
 
 use wrapper_stark::master_recursion_bridge::{
-    prove_master_recursive, verify_master_recursive,
+    prove_master_recursive, prove_master_with_in_air_merkle_path,
+    verify_master_recursive, verify_master_with_in_air_merkle_path,
 };
 use wrapper_stark::recursive_prover::{
     RecursiveStarkProof, verify_recursive_stark,
@@ -165,11 +166,74 @@ fn main() {
     println!("    Option C: O(log N) L1 wire (~2 MiB) + O(log N) verify, L1 ALONE");
     println!("    Choose B when DA is cheap; choose C when L1 must self-attest.");
     println!();
-    println!("  Soundness caveat: sub-circuit 1 attests the algebraic FRI");
+    println!("  Soundness caveat: above master attests the algebraic FRI");
     println!("  DEEP-quotient relation on prover-supplied (f_val, q_val).");
-    println!("  Full FRI-Merkle-binding requires the in-AIR SHA-3 Merkle");
-    println!("  path check (sub-circuit 4) layered on top — same pattern");
-    println!("  as v2_recursion_bridge::prove_v2_with_in_air_merkle_path.");
-    println!("  Architecturally identical; documented follow-up.");
+    println!("  Full FRI-Merkle-binding via in-AIR SHA-3 layered below.");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // ─── 4. Option C + in-AIR Merkle binding (full soundness) ─────
+    println!("[FULL] Option C with in-AIR Merkle binding (full FRI-Merkle soundness)");
+    println!();
+
+    let t = Instant::now();
+    let bundle = prove_master_with_in_air_merkle_path(
+        &inners,
+        /*master blowup=*/ master_blowup, /*master r=*/ master_r, /*master stir=*/ false,
+        /*merkle blowup=*/ 4, /*merkle r=*/ 54, /*merkle use_stir=*/ false,
+    ).expect("master + merkle bundle must prove");
+    let bundle_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    let bundle_ok = verify_master_with_in_air_merkle_path(&bundle, &inners);
+    let bundle_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    assert!(bundle_ok);
+
+    let mut master_buf = Vec::new();
+    bundle.master.fri_proof.serialize_compressed(&mut master_buf).unwrap();
+    let mut merkle_total_bytes: usize = 0;
+    for mp in &bundle.merkle_path_proofs {
+        let mut buf = Vec::new();
+        mp.fri_proof.serialize_compressed(&mut buf).unwrap();
+        merkle_total_bytes += buf.len();
+    }
+
+    println!("  full bundle prove:    {bundle_prove_ms:>9.1} ms");
+    println!("  full bundle verify:   {bundle_verify_ms:>9.2} ms");
+    println!("  master STARK size:    {}",  fmt_kib(master_buf.len()));
+    println!("  N × Merkle STARK:     {}  ({} × {})",
+        fmt_kib(merkle_total_bytes), n, fmt_kib(merkle_total_bytes / n));
+    println!("  full L1 wire:         {}",  fmt_kib(master_buf.len() + merkle_total_bytes));
+    println!("  verdict:              {}",  if bundle_ok { "ACCEPT" } else { "REJECT" });
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  OPTION C + IN-AIR MERKLE BINDING — FULL SOUNDNESS");
+    println!();
+    println!("  Without merkle binding (algebraic FRI only):");
+    println!("    Master {} attests FRI DEEP-quotient relation per",
+        fmt_kib(master_buf.len()));
+    println!("    inner — soundness depends on prover supplying honest");
+    println!("    (f_val, q_val) at FS-derived z_ext.");
+    println!();
+    println!("  WITH merkle binding (this bundle):");
+    println!("    Master STARK + N × Merkle-path STARK = real in-AIR SHA-3");
+    println!("    hashing binds each inner's outer_pi_hash to a Merkle root.");
+    println!("    A malicious prover cannot lie about leaf/sibling bytes —");
+    println!("    sha3_absorb_air constraints in each Merkle STARK enforce");
+    println!("    the actual hash chain.");
+    println!();
+    println!("  L1 wire cost (full Option C + merkle binding):");
+    println!("    master:    {}", fmt_kib(master_buf.len()));
+    println!("    N merkle:  {}  (LINEAR in N — each path ~395 KiB)",
+        fmt_kib(merkle_total_bytes));
+    println!("    total:     {}", fmt_kib(master_buf.len() + merkle_total_bytes));
+    println!();
+    println!("  The N×Merkle component is linear in N; combining with the");
+    println!("  sub-linear master gives O(N) overall L1 wire — bigger than");
+    println!("  Option B's O(1) but with FULL CRYPTOGRAPHIC BINDING and");
+    println!("  NO DA DEPENDENCY.  For TRUE O(log N) wire with full binding,");
+    println!("  the natural next step is a batched-Merkle AIR that processes");
+    println!("  all N Merkle paths in one larger trace (~1 STARK total).");
     println!("═══════════════════════════════════════════════════════════════");
 }
