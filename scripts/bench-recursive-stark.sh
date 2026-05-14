@@ -30,6 +30,32 @@ echo "variant,nist_level,blowup,r,ldt,prove_ms,verify_ms,proof_kib,n_trace,n_con
 NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$NPROC}"
 
+## Calibrated `r` per (blowup, level) from
+## scripts/results/r-vs-blowup-calibration.md:
+##   r = ⌈total_bit_target / (½ · log₂(blowup))⌉
+##   where total_bit_target ∈ {135, 197.5, 262.5} for L1/L3/L5.
+##
+## BENCH_R overrides this if set explicitly.
+calibrated_r() {
+    local level="$1"
+    local blowup="$2"
+    case "$level $blowup" in
+        "L1 4")  echo 135 ;;
+        "L1 8")  echo  90 ;;
+        "L1 16") echo  68 ;;
+        "L1 32") echo  54 ;;
+        "L3 4")  echo 198 ;;
+        "L3 8")  echo 132 ;;
+        "L3 16") echo  99 ;;
+        "L3 32") echo  79 ;;
+        "L5 4")  echo 263 ;;
+        "L5 8")  echo 175 ;;
+        "L5 16") echo 132 ;;
+        "L5 32") echo 105 ;;
+        *) echo "?" ;;
+    esac
+}
+
 run_cell() {
     local level="$1"    # L1, L3, L5
     local sha3="$2"     # sha3-256, sha3-384, sha3-512
@@ -85,19 +111,31 @@ echo "## Rust: $(rustc --version)"
 echo "## Git HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo
 
+## Per-level r is now auto-derived from blowup via `calibrated_r` to
+## maintain consistent NIST PQ bit-budget across blowups (see
+## scripts/results/r-vs-blowup-calibration.md).  BENCH_R env var
+## still overrides if set explicitly.
+
+l1_r="${BENCH_R:-$(calibrated_r L1 "$BLOWUP")}"
+l3_r="${BENCH_R:-$(calibrated_r L3 "$BLOWUP")}"
+l5_r="${BENCH_R:-$(calibrated_r L5 "$BLOWUP")}"
+
+echo "## Calibrated r per level @ blowup=${BLOWUP}: L1=${l1_r}  L3=${l3_r}  L5=${l5_r}"
+echo
+
 if [[ " $LEVELS_FILTER " == *" L1 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L1 sha3-256 mldsa-44  54 "$ldt"
+        run_cell L1 sha3-256 mldsa-44  "$l1_r" "$ldt"
     done
 fi
 if [[ " $LEVELS_FILTER " == *" L3 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L3 sha3-384 mldsa-65  79 "$ldt"
+        run_cell L3 sha3-384 mldsa-65  "$l3_r" "$ldt"
     done
 fi
 if [[ " $LEVELS_FILTER " == *" L5 "* ]]; then
     for ldt in $LDT_FILTER; do
-        run_cell L5 sha3-512 mldsa-87 105 "$ldt"
+        run_cell L5 sha3-512 mldsa-87 "$l5_r" "$ldt"
     done
 fi
 

@@ -289,6 +289,13 @@ pub mod merkle_path_air;
 pub mod merkle_prover;
 pub mod deep_ali_verifier_air;
 pub mod recursive_prover;
+
+// v2 recursion bridge is L1/L3-only: it hard-codes `deep_ali::SexticExt`
+// for the extension field used by V2ProofReal, which is correct at L1
+// (mldsa-44) and L3 (mldsa-65) but not at L5 (mldsa-87, which uses
+// OcticExt instead).  Bridging the bridge to be Ext-generic is a
+// larger refactor — see the calibration doc for the open work.
+#[cfg(any(feature = "mldsa-44", feature = "mldsa-65"))]
 pub mod v2_recursion_bridge;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and
