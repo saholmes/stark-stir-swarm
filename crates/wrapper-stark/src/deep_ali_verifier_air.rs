@@ -588,7 +588,178 @@ pub mod binding_cells_ood_verifier {
 /// claimed log is consistent with the actual sub-trace cells via
 /// the standard Π_left = Π_right product equality.
 pub mod permutation_argument_verifier {
-    // Module skeleton — types and constraints land in subsequent commits.
+    use ark_ff::Field;
+
+    /// A permutation-argument equality claim.  The verifier checks
+    /// the multiset equality
+    ///
+    ///   `prod_i (γ + left_i) = prod_i (γ + right_i)`
+    ///
+    /// for an FS-derived γ.  By the Schwartz-Zippel lemma applied to
+    /// `Π(X + l_i) − Π(X + r_i)` at X = γ, if the multisets `{l_i}`
+    /// and `{r_i}` differ then the probability that the products are
+    /// equal is ≤ n / |F| (where n = max(|left|, |right|)).  For
+    /// Goldilocks Fp⁶ at n ≈ 2¹⁰, this is ≤ 2⁻³⁷⁴.
+    #[derive(Clone, Debug)]
+    pub struct PermArgClaim<F: Field> {
+        /// Left-side multiset values (as field elements).
+        pub left: Vec<F>,
+        /// Right-side multiset values.
+        pub right: Vec<F>,
+        /// FS-derived challenge γ.
+        pub gamma: F,
+        /// Static tag identifying which perm-arg this is (e.g. "T_MEM").
+        pub perm_tag: &'static str,
+    }
+
+    impl<F: Field> PermArgClaim<F> {
+        /// Compute Π_left = ∏ (γ + l_i).
+        pub fn prod_left(&self) -> F {
+            self.left.iter().fold(F::one(), |acc, l| acc * (self.gamma + *l))
+        }
+
+        /// Compute Π_right = ∏ (γ + r_i).
+        pub fn prod_right(&self) -> F {
+            self.right.iter().fold(F::one(), |acc, r| acc * (self.gamma + *r))
+        }
+
+        /// Residue = Π_left − Π_right.  Zero iff the multisets are
+        /// equal (modulo SZ probability).
+        pub fn residue(&self) -> F {
+            self.prod_left() - self.prod_right()
+        }
+
+        /// Native acceptance check.  Shape validation: |left| = |right|
+        /// (a perm-arg always has equal-size sides).
+        pub fn check_native(&self) -> bool {
+            if self.left.len() != self.right.len() { return false; }
+            self.residue().is_zero()
+        }
+
+        pub fn check_shape(&self) -> Result<(), String> {
+            if self.left.len() != self.right.len() {
+                return Err(format!(
+                    "perm-arg side sizes differ: |left|={}, |right|={}",
+                    self.left.len(), self.right.len()
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ark_goldilocks::Goldilocks;
+        use ark_ff::Zero;
+
+        fn gf(x: u64) -> Goldilocks { Goldilocks::from(x) }
+
+        #[test]
+        fn equal_multisets_pass() {
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(1), gf(2), gf(3)],
+                gamma: gf(0xCAFE),
+                perm_tag: "T_MEM",
+            };
+            assert!(claim.check_native());
+            assert!(claim.residue().is_zero());
+        }
+
+        #[test]
+        fn permuted_multisets_pass() {
+            // Same elements, different order — perm-arg is multiset
+            // equality, not sequence equality.
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(3), gf(1), gf(2)],
+                gamma: gf(0xBEEF),
+                perm_tag: "T_MEM",
+            };
+            assert!(claim.check_native());
+        }
+
+        #[test]
+        fn different_multisets_fail() {
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(1), gf(2), gf(4)],  // 4 instead of 3
+                gamma: gf(0xDEAD),
+                perm_tag: "T_MEM",
+            };
+            assert!(!claim.check_native());
+            assert!(!claim.residue().is_zero());
+        }
+
+        #[test]
+        fn size_mismatch_rejected() {
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(1), gf(2)],
+                gamma: gf(1),
+                perm_tag: "T_MEM",
+            };
+            assert!(!claim.check_native());
+            assert!(claim.check_shape().is_err());
+        }
+
+        #[test]
+        fn multiset_with_duplicates_pass() {
+            // Multisets count multiplicities.
+            let claim = PermArgClaim {
+                left:  vec![gf(7), gf(7), gf(8)],
+                right: vec![gf(7), gf(8), gf(7)],
+                gamma: gf(99),
+                perm_tag: "T_MEM",
+            };
+            assert!(claim.check_native());
+        }
+
+        #[test]
+        fn empty_multisets_pass() {
+            // Vacuous case: both empty ⇒ both products = 1 ⇒ equal.
+            let claim = PermArgClaim::<Goldilocks> {
+                left: vec![], right: vec![],
+                gamma: gf(13),
+                perm_tag: "T_MEM",
+            };
+            assert!(claim.check_native());
+        }
+
+        #[test]
+        fn gamma_diversity_doesnt_create_false_acceptance() {
+            // Different multisets — at every random γ tested, must reject.
+            let left  = vec![gf(1), gf(2), gf(3)];
+            let right = vec![gf(1), gf(2), gf(5)];
+            for gamma_val in [1u64, 7, 999, 0x9E37_79B9_7F4A_7C15] {
+                let claim = PermArgClaim {
+                    left: left.clone(), right: right.clone(),
+                    gamma: gf(gamma_val),
+                    perm_tag: "T_MEM",
+                };
+                assert!(!claim.check_native(),
+                    "γ={gamma_val} should reject different multisets");
+            }
+        }
+
+        #[test]
+        fn tampered_single_element_breaks_argument() {
+            // Honest left + right matching except one element.
+            let mut left  = vec![gf(1), gf(2), gf(3), gf(4), gf(5)];
+            let mut right = left.clone();
+            // Tamper one element of right.
+            right[2] = gf(99);
+            let claim = PermArgClaim {
+                left, right,
+                gamma: gf(0xC0DE),
+                perm_tag: "T_MEM",
+            };
+            assert!(!claim.check_native(),
+                "single-element tamper must break perm-arg");
+            let _ = (left, right) = (claim.left.clone(), claim.right.clone());
+        }
+    }
 }
 
 #[cfg(test)]
