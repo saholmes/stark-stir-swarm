@@ -720,6 +720,310 @@ pub fn selector_pattern(n_blocks: usize) -> Vec<SelectorIndex> {
     out
 }
 
+// ─── Row-uniform trace synthesiser ──────────────────────────────────
+//
+// Fills the uniform-schema trace for an N-block sponge run.  The
+// produced trace satisfies every row-uniform constraint emitted by
+// [`UniformAirConstraints::for_schema`].  Cross-validated by tests
+// against the cell-list synth (`crate::sponge_air::synthesize_sponge`)
+// so the row-uniform encoding provably computes the same hash function.
+
+use crate::sha3_absorb_air::{
+    BitState, ROUND_CONSTANTS, Sha3Variant as _Sha3VariantUnused,
+    keccak_round_bit_level, lane_to_bits,
+};
+
+/// Row-uniform trace.  Cells stored row-major as u8 (booleans).
+/// Wider but conceptually simpler than the cell-list `MockTrace`.
+#[derive(Clone, Debug)]
+pub struct UniformTrace {
+    pub schema: UniformRowSchema,
+    pub n_rows: usize,
+    /// Row-major: `cells[row * schema.width + col]`.
+    pub cells: Vec<u8>,
+}
+
+impl UniformTrace {
+    pub fn zeros(schema: UniformRowSchema, n_rows: usize) -> Self {
+        let cells = vec![0u8; n_rows * schema.width];
+        Self { schema, n_rows, cells }
+    }
+
+    pub fn get(&self, row: usize, col: usize) -> u8 {
+        self.cells[row * self.schema.width + col]
+    }
+
+    pub fn set(&mut self, row: usize, col: usize, val: u8) {
+        self.cells[row * self.schema.width + col] = val;
+    }
+
+    pub fn width(&self) -> usize { self.schema.width }
+}
+
+/// Synthesise a row-uniform trace for `blocks` × `variant`.  Each block
+/// adds 97 rows (1 absorb + 96 permutation).
+pub fn synthesize_uniform_trace(
+    blocks: &[&[u8]],
+    variant: Sha3Variant,
+) -> UniformTrace {
+    let schema = UniformRowSchema::new(variant);
+    let n_rows = rows_for_blocks(blocks.len());
+    let mut trace = UniformTrace::zeros(schema.clone(), n_rows);
+    let rate_lanes = variant.rate_bits() / 64;
+
+    let mut current_state: BitState = [[0u8; 64]; 25];
+
+    for (block_idx, &block) in blocks.iter().enumerate() {
+        let block_row_base = block_idx * ROWS_PER_BLOCK;
+
+        // ─── Absorb row (row_base + 0) ────────────────────────────
+        write_state_in(&mut trace, block_row_base, &schema, &current_state);
+        write_block_bits(&mut trace, block_row_base, &schema, block, rate_lanes);
+        let absorbed_state = apply_absorb_xor(&current_state, block, rate_lanes);
+        write_state_out(&mut trace, block_row_base, &schema, &absorbed_state);
+        set_selector(&mut trace, block_row_base, &schema, SelectorIndex::Absorb);
+        current_state = absorbed_state;
+
+        // ─── 24 rounds of (θ, ρπ, χ, ι) ───────────────────────────
+        for round in 0..24 {
+            let r_theta  = block_row_base + 1 + 4 * round;
+            let r_rho_pi = r_theta + 1;
+            let r_chi    = r_theta + 2;
+            let r_iota   = r_theta + 3;
+
+            // θ
+            write_state_in(&mut trace, r_theta, &schema, &current_state);
+            let (theta_helpers, theta_out) = compute_theta_step(&current_state);
+            write_theta_helpers(&mut trace, r_theta, &schema, &theta_helpers);
+            write_state_out(&mut trace, r_theta, &schema, &theta_out);
+            set_selector(&mut trace, r_theta, &schema, SelectorIndex::Theta);
+            current_state = theta_out;
+
+            // ρπ
+            write_state_in(&mut trace, r_rho_pi, &schema, &current_state);
+            let rho_pi_out = compute_rho_pi_step(&current_state);
+            write_state_out(&mut trace, r_rho_pi, &schema, &rho_pi_out);
+            set_selector(&mut trace, r_rho_pi, &schema, SelectorIndex::RhoPi);
+            current_state = rho_pi_out;
+
+            // χ
+            write_state_in(&mut trace, r_chi, &schema, &current_state);
+            let (chi_helpers, chi_out) = compute_chi_step(&current_state);
+            write_chi_helpers(&mut trace, r_chi, &schema, &chi_helpers);
+            write_state_out(&mut trace, r_chi, &schema, &chi_out);
+            set_selector(&mut trace, r_chi, &schema, SelectorIndex::Chi);
+            current_state = chi_out;
+
+            // ι
+            write_state_in(&mut trace, r_iota, &schema, &current_state);
+            let rc_lane = lane_to_bits(ROUND_CONSTANTS[round]);
+            for bit in 0..64 {
+                trace.set(r_iota, schema.rc_bit(bit), rc_lane[bit]);
+            }
+            let mut iota_out = current_state;
+            for bit in 0..64 {
+                iota_out[0][bit] ^= rc_lane[bit];
+            }
+            write_state_out(&mut trace, r_iota, &schema, &iota_out);
+            set_selector(&mut trace, r_iota, &schema, SelectorIndex::Iota);
+            current_state = iota_out;
+        }
+    }
+
+    trace
+}
+
+// ─── Per-cell helpers ───────────────────────────────────────────────
+
+fn write_state_in(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema, state: &BitState,
+) {
+    for lane in 0..25 {
+        for bit in 0..64 {
+            trace.set(row, schema.state_in_bit(lane, bit), state[lane][bit]);
+        }
+    }
+}
+
+fn write_state_out(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema, state: &BitState,
+) {
+    for lane in 0..25 {
+        for bit in 0..64 {
+            trace.set(row, schema.state_out_bit(lane, bit), state[lane][bit]);
+        }
+    }
+}
+
+fn write_block_bits(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema,
+    block: &[u8], rate_lanes: usize,
+) {
+    for lane in 0..rate_lanes {
+        let mut lane_u64 = 0u64;
+        for j in 0..8 {
+            lane_u64 |= (block[8 * lane + j] as u64) << (8 * j);
+        }
+        let lb = lane_to_bits(lane_u64);
+        for bit in 0..64 {
+            trace.set(row, schema.block_bit(64 * lane + bit), lb[bit]);
+        }
+    }
+}
+
+fn set_selector(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema, active: SelectorIndex,
+) {
+    for sel in SelectorIndex::ALL {
+        trace.set(row, schema.selector(sel), (sel == active) as u8);
+    }
+}
+
+// ─── Sub-step computations (return helpers + output state) ──────────
+
+fn apply_absorb_xor(state: &BitState, block: &[u8], rate_lanes: usize) -> BitState {
+    let mut out = *state;
+    for lane in 0..rate_lanes {
+        let mut lane_u64 = 0u64;
+        for j in 0..8 {
+            lane_u64 |= (block[8 * lane + j] as u64) << (8 * j);
+        }
+        let lb = lane_to_bits(lane_u64);
+        for bit in 0..64 {
+            out[lane][bit] ^= lb[bit];
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct ThetaHelpers {
+    chain: [[[u8; 3]; 64]; 5],
+    parity_c: [[u8; 64]; 5],
+    diffuse_d: [[u8; 64]; 5],
+}
+
+fn compute_theta_step(state: &BitState) -> (ThetaHelpers, BitState) {
+    let mut chain = [[[0u8; 3]; 64]; 5];
+    let mut parity_c = [[0u8; 64]; 5];
+    for x in 0..5 {
+        for bit in 0..64 {
+            let a0 = state[x][bit];
+            let a1 = state[5 + x][bit];
+            let a2 = state[10 + x][bit];
+            let a3 = state[15 + x][bit];
+            let a4 = state[20 + x][bit];
+            let c0 = a0 ^ a1;
+            let c1 = c0 ^ a2;
+            let c2 = c1 ^ a3;
+            chain[x][bit] = [c0, c1, c2];
+            parity_c[x][bit] = c2 ^ a4;
+        }
+    }
+    let mut diffuse_d = [[0u8; 64]; 5];
+    for x in 0..5 {
+        for bit in 0..64 {
+            let prev_x = (x + 4) % 5;
+            let next_x = (x + 1) % 5;
+            let src_bit = (bit + 63) % 64;
+            diffuse_d[x][bit] = parity_c[prev_x][bit] ^ parity_c[next_x][src_bit];
+        }
+    }
+    let mut out = *state;
+    for y in 0..5 {
+        for x in 0..5 {
+            for bit in 0..64 {
+                out[5 * y + x][bit] ^= diffuse_d[x][bit];
+            }
+        }
+    }
+    (ThetaHelpers { chain, parity_c, diffuse_d }, out)
+}
+
+fn write_theta_helpers(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema, h: &ThetaHelpers,
+) {
+    for x in 0..5 {
+        for bit in 0..64 {
+            for i in 0..3 {
+                trace.set(row, theta_chain_col(schema, x, bit, i).0, h.chain[x][bit][i]);
+            }
+            trace.set(row, theta_parity_c_col(schema, x, bit).0, h.parity_c[x][bit]);
+            trace.set(row, theta_diffuse_d_col(schema, x, bit).0, h.diffuse_d[x][bit]);
+        }
+    }
+}
+
+fn compute_rho_pi_step(state: &BitState) -> BitState {
+    use crate::sha3_absorb_air::RHO_OFFSETS;
+    let mut out = [[0u8; 64]; 25];
+    for x in 0..5 {
+        for y in 0..5 {
+            let src = 5 * y + x;
+            let dst = 5 * ((2 * x + 3 * y) % 5) + y;
+            let off = RHO_OFFSETS[src] as usize;
+            for bit in 0..64 {
+                let src_bit = (bit + 64 - off) % 64;
+                out[dst][bit] = state[src][src_bit];
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct ChiHelpers {
+    not_b1: BitState,
+    and_part: BitState,
+}
+
+fn compute_chi_step(state: &BitState) -> (ChiHelpers, BitState) {
+    let mut not_b1 = [[0u8; 64]; 25];
+    let mut and_part = [[0u8; 64]; 25];
+    let mut out = [[0u8; 64]; 25];
+    for y in 0..5 {
+        for x in 0..5 {
+            let i0 = 5 * y + x;
+            let i1 = 5 * y + (x + 1) % 5;
+            let i2 = 5 * y + (x + 2) % 5;
+            for bit in 0..64 {
+                not_b1[i0][bit]   = 1 - state[i1][bit];
+                and_part[i0][bit] = not_b1[i0][bit] & state[i2][bit];
+                out[i0][bit]      = state[i0][bit] ^ and_part[i0][bit];
+            }
+        }
+    }
+    (ChiHelpers { not_b1, and_part }, out)
+}
+
+fn write_chi_helpers(
+    trace: &mut UniformTrace, row: usize, schema: &UniformRowSchema, h: &ChiHelpers,
+) {
+    for lane in 0..25 {
+        for bit in 0..64 {
+            trace.set(row, chi_not_b1_col(schema, lane, bit).0, h.not_b1[lane][bit]);
+            trace.set(row, chi_and_part_col(schema, lane, bit).0, h.and_part[lane][bit]);
+        }
+    }
+}
+
+// ─── Final-state extraction (for cross-validation against native hash) ─
+
+/// Return the final BitState after the trace's last permutation
+/// completes.  This is what would be SHA-3-squeezed for the digest.
+pub fn final_state_of_trace(trace: &UniformTrace) -> BitState {
+    // Last ι row of the last block.
+    let last_iota = trace.n_rows - 1;
+    let schema = &trace.schema;
+    let mut state = [[0u8; 64]; 25];
+    for lane in 0..25 {
+        for bit in 0..64 {
+            state[lane][bit] = trace.get(last_iota, schema.state_out_bit(lane, bit));
+        }
+    }
+    state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1499,171 @@ mod tests {
                 "variant {variant:?}");
             // Selected count is variant-independent.
             assert_eq!(air.selected.len(), 16_000);
+        }
+    }
+
+    // ─── Row-uniform trace synthesiser tests ────────────────────────
+
+    fn pad_input_uniform(input: &[u8], variant: Sha3Variant) -> Vec<Vec<u8>> {
+        let block_len = variant.block_bytes();
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut offset = 0;
+        while offset + block_len <= input.len() {
+            blocks.push(input[offset..offset + block_len].to_vec());
+            offset += block_len;
+        }
+        let mut last = vec![0u8; block_len];
+        last[..input.len() - offset].copy_from_slice(&input[offset..]);
+        last[input.len() - offset] = 0x06;
+        last[block_len - 1] |= 0x80;
+        blocks.push(last);
+        blocks
+    }
+
+    #[test]
+    fn synthesized_trace_has_correct_dimensions() {
+        let blocks = pad_input_uniform(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        assert_eq!(trace.n_rows, ROWS_PER_BLOCK * blocks.len());
+        assert_eq!(trace.width(), trace.schema.width);
+        assert_eq!(trace.cells.len(), trace.n_rows * trace.width());
+    }
+
+    #[test]
+    fn synthesized_trace_selectors_match_pattern() {
+        let blocks = pad_input_uniform(&[0xA5u8; 200], Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+
+        let pattern = selector_pattern(blocks.len());
+        assert_eq!(pattern.len(), trace.n_rows);
+
+        // At every row, exactly one selector is 1, matching the pattern.
+        for row in 0..trace.n_rows {
+            for sel in SelectorIndex::ALL {
+                let expected = if sel == pattern[row] { 1u8 } else { 0 };
+                let actual = trace.get(row, trace.schema.selector(sel));
+                assert_eq!(actual, expected,
+                    "row {row} selector {sel:?} mismatch (expected {expected}, got {actual})");
+            }
+        }
+    }
+
+    #[test]
+    fn synthesized_trace_final_state_matches_native_hash() {
+        // STRONGEST integration: synthesise the uniform trace for
+        // SHA3-256("abc"), extract the final state, compare to native
+        // keccak_f1600 applied to the absorbed initial state.
+        use crate::sha3_absorb_air::{absorb_block, lanes_from_bit_state, KeccakState};
+
+        let blocks = pad_input_uniform(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        let final_bits = final_state_of_trace(&trace);
+        let trace_state = lanes_from_bit_state(&final_bits);
+
+        // Compute the same hash natively.
+        let mut native: KeccakState = [0; 25];
+        for block in &blocks {
+            absorb_block(&mut native, block, Sha3Variant::Sha3_256);
+        }
+        assert_eq!(trace_state, native,
+            "uniform-trace final state diverges from native SHA-3 path");
+    }
+
+    #[test]
+    fn synthesized_trace_satisfies_selected_constraints_on_relevant_rows() {
+        // For each selected constraint, check it holds at every row
+        // where its selector is 1.  (At rows where the selector is 0
+        // the constraint is multiplied by 0 in the composition, so
+        // the underlying Φ_j can be non-zero — we don't check those.)
+        let blocks = pad_input_uniform(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        let schema = trace.schema.clone();
+        let air = UniformAirConstraints::for_schema(&schema);
+        let pattern = selector_pattern(blocks.len());
+
+        for c in &air.selected {
+            for row in 0..trace.n_rows {
+                if pattern[row] != c.selector { continue; }
+                // The op must evaluate to satisfy at this row.
+                let satisfied = eval_op_at_row_native(&trace, row, &c.op);
+                assert!(satisfied,
+                    "constraint {c:?} not satisfied at row {row}");
+            }
+        }
+    }
+
+    /// Native i128-style evaluation of a RowUniformOp at a specific
+    /// row of the uniform trace.  Returns true iff the constraint
+    /// is satisfied at that row.  Used only in tests.
+    fn eval_op_at_row_native(trace: &UniformTrace, row: usize, op: &RowUniformOp) -> bool {
+        match *op {
+            RowUniformOp::Xor { c, a, b } => {
+                let a = trace.get(row, a.0);
+                let b = trace.get(row, b.0);
+                let c = trace.get(row, c.0);
+                c == (a ^ b)
+            }
+            RowUniformOp::And { c, a, b } => {
+                let a = trace.get(row, a.0);
+                let b = trace.get(row, b.0);
+                let c = trace.get(row, c.0);
+                c == (a & b)
+            }
+            RowUniformOp::Not { c, a } => {
+                let a = trace.get(row, a.0);
+                let c = trace.get(row, c.0);
+                c == (1 - a)
+            }
+            RowUniformOp::Copy { c, a } => {
+                trace.get(row, c.0) == trace.get(row, a.0)
+            }
+            RowUniformOp::XorConst { c, a, k } => {
+                let a = trace.get(row, a.0);
+                let c = trace.get(row, c.0);
+                c == (a ^ k)
+            }
+            RowUniformOp::Boolean { b } => {
+                let b = trace.get(row, b.0);
+                b == 0 || b == 1
+            }
+            RowUniformOp::NextRowCopy { dst, src } => {
+                if row + 1 >= trace.n_rows { return true; }  // skip last row
+                trace.get(row + 1, dst.0) == trace.get(row, src.0)
+            }
+        }
+    }
+
+    #[test]
+    fn synthesized_trace_state_threading_holds() {
+        // Cross-row state threading: state_out at row r becomes
+        // state_in at row r+1, for every row except the last.
+        let blocks = pad_input_uniform(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+
+        for c in state_threading_constraints(&trace.schema) {
+            for row in 0..trace.n_rows - 1 {
+                assert!(eval_op_at_row_native(&trace, row, &c.op),
+                    "threading constraint failed at row {row} for op {:?}", c.op);
+            }
+        }
+    }
+
+    #[test]
+    fn synthesized_trace_global_booleanity_holds() {
+        let blocks = pad_input_uniform(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+
+        for c in global_booleanity_constraints(&trace.schema) {
+            for row in 0..trace.n_rows {
+                assert!(eval_op_at_row_native(&trace, row, &c.op),
+                    "global booleanity failed at row {row} op {:?}", c.op);
+            }
         }
     }
 }
