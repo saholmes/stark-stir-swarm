@@ -986,6 +986,62 @@ pub mod binding_cells_ood_verifier {
         }
     }
 
+    /// Convert OodAccumulatorTrace into column-major form for LDE.
+    /// Padding rows carry alpha = 0, so partial_sum stays at its
+    /// final value (which is zero on a valid trace, matching the
+    /// FinalBoundary expectation).
+    pub fn ood_accumulator_trace_to_columns<F: Field>(
+        trace: &OodAccumulatorTrace<F>,
+    ) -> Vec<Vec<F>> {
+        let n = trace.n_rows.next_power_of_two().max(2);
+        let mut f_col = Vec::with_capacity(n);
+        let mut g_col = Vec::with_capacity(n);
+        let mut residue_col = Vec::with_capacity(n);
+        let mut alpha_col = Vec::with_capacity(n);
+        let mut sum_col = Vec::with_capacity(n);
+        for r in 0..trace.n_rows {
+            f_col.push(trace.f_at_z[r]);
+            g_col.push(trace.g_at_z[r]);
+            residue_col.push(trace.residue[r]);
+            alpha_col.push(trace.alpha[r]);
+            sum_col.push(trace.partial_sum[r]);
+        }
+        let final_sum = trace.partial_sum[trace.n_rows - 1];
+        // Padding rows: f = g = residue = 0, alpha = 0, partial_sum
+        // carries forward (= final_sum, which is 0 on a valid bundle).
+        for _ in trace.n_rows..n {
+            f_col.push(F::zero());
+            g_col.push(F::zero());
+            residue_col.push(F::zero());
+            alpha_col.push(F::zero());
+            sum_col.push(final_sum);
+        }
+        vec![f_col, g_col, residue_col, alpha_col, sum_col]
+    }
+
+    pub fn verify_ood_accumulator_columns<F: Field>(
+        columns: &[Vec<F>],
+    ) -> bool {
+        if columns.len() != 5 { return false; }
+        let n = columns[0].len();
+        if n < 2 { return false; }
+        for c in columns { if c.len() != n { return false; } }
+        let (f, g, residue, alpha, sum) =
+            (&columns[0], &columns[1], &columns[2], &columns[3], &columns[4]);
+        // ResidueDef + Initial + Step.
+        for r in 0..n {
+            if !(residue[r] - (f[r] - g[r])).is_zero() { return false; }
+        }
+        if !(sum[0] - alpha[0] * residue[0]).is_zero() { return false; }
+        for r in 1..n {
+            if !(sum[r] - sum[r - 1] - alpha[r] * residue[r]).is_zero() {
+                return false;
+            }
+        }
+        // FinalBoundary: sum[n-1] = 0.
+        sum[n - 1].is_zero()
+    }
+
     pub fn verify_ood_accumulator_trace<F: Field>(
         trace: &OodAccumulatorTrace<F>,
     ) -> bool {
@@ -1173,6 +1229,46 @@ pub mod binding_cells_ood_verifier {
             trace.residue[0] = Goldilocks::from(5u64);
             assert!(!verify_ood_accumulator_trace(&trace),
                 "residue tamper must trip ResidueDef constraint");
+        }
+
+        #[test]
+        fn ood_accumulator_columns_shape_and_padding() {
+            let z = Goldilocks::from(1u64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle::<Goldilocks> {
+                claims: (0..5).map(|_| OodEqualityClaim {
+                    z, f_at_z: v, g_at_z: v, binding_tag: "L1",
+                }).collect(),
+            };
+            let alphas: Vec<Goldilocks> = (1..=5u64).map(Goldilocks::from).collect();
+            let trace = OodAccumulatorTrace::synthesise(&bundle, &alphas);
+            let columns = ood_accumulator_trace_to_columns(&trace);
+            // 5 rows → next pow2 = 8.
+            assert_eq!(columns[0].len(), 8);
+            assert_eq!(columns.len(), 5);
+            // Padding rows have residue = 0, partial_sum = 0 (= final).
+            for r in 5..8 {
+                assert!(columns[2][r].is_zero());
+                assert!(columns[4][r].is_zero());
+            }
+            assert!(verify_ood_accumulator_columns(&columns));
+        }
+
+        #[test]
+        fn ood_accumulator_columns_reject_tampered() {
+            let z = Goldilocks::from(1u64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle::<Goldilocks> {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                ],
+            };
+            let alphas = vec![Goldilocks::from(7u64)];
+            let trace = OodAccumulatorTrace::synthesise(&bundle, &alphas);
+            let mut columns = ood_accumulator_trace_to_columns(&trace);
+            // Tamper residue at row 0.
+            columns[2][0] = Goldilocks::from(99u64);
+            assert!(!verify_ood_accumulator_columns(&columns));
         }
 
         #[test]
@@ -1367,6 +1463,59 @@ pub mod permutation_argument_verifier {
                 Self::FinalBoundary => curr_left - curr_right,
             }
         }
+    }
+
+    /// Convert PermArgAccumulatorTrace into column-major form.
+    /// Padding rows set l = r = 0, so γ + l = γ + r = γ; both
+    /// running products multiply by γ identically, preserving
+    /// running_left = running_right at the boundary.
+    pub fn perm_arg_accumulator_trace_to_columns<F: Field>(
+        trace: &PermArgAccumulatorTrace<F>,
+    ) -> Vec<Vec<F>> {
+        let n = trace.n_rows.next_power_of_two().max(2);
+        let mut l_col = Vec::with_capacity(n);
+        let mut r_col = Vec::with_capacity(n);
+        let mut running_left = Vec::with_capacity(n);
+        let mut running_right = Vec::with_capacity(n);
+        for j in 0..trace.n_rows {
+            l_col.push(trace.l[j]);
+            r_col.push(trace.r[j]);
+            running_left.push(trace.running_left[j]);
+            running_right.push(trace.running_right[j]);
+        }
+        // Padding rows: l = r = 0 means γ + l = γ + r = γ; both
+        // running products grow by × γ each padding row, staying equal.
+        let mut pad_left  = trace.running_left[trace.n_rows - 1];
+        let mut pad_right = trace.running_right[trace.n_rows - 1];
+        for _ in trace.n_rows..n {
+            l_col.push(F::zero());
+            r_col.push(F::zero());
+            pad_left  *= trace.gamma;
+            pad_right *= trace.gamma;
+            running_left.push(pad_left);
+            running_right.push(pad_right);
+        }
+        vec![l_col, r_col, running_left, running_right]
+    }
+
+    pub fn verify_perm_arg_accumulator_columns<F: Field>(
+        columns: &[Vec<F>], gamma: F,
+    ) -> bool {
+        if columns.len() != 4 { return false; }
+        let n = columns[0].len();
+        if n < 2 { return false; }
+        for c in columns { if c.len() != n { return false; } }
+        let (l, r, rl, rr) = (&columns[0], &columns[1], &columns[2], &columns[3]);
+        // Initial.
+        if !(rl[0] - (gamma + l[0])).is_zero() { return false; }
+        if !(rr[0] - (gamma + r[0])).is_zero() { return false; }
+        // Steps.
+        for j in 1..n {
+            if !(rl[j] - rl[j - 1] * (gamma + l[j])).is_zero() { return false; }
+            if !(rr[j] - rr[j - 1] * (gamma + r[j])).is_zero() { return false; }
+        }
+        // FinalBoundary: running_left = running_right at last row.
+        (rl[n - 1] - rr[n - 1]).is_zero()
     }
 
     pub fn verify_perm_arg_accumulator_trace<F: Field>(
@@ -1568,6 +1717,62 @@ pub mod permutation_argument_verifier {
             };
             let trace = PermArgAccumulatorTrace::synthesise(&claim);
             assert!(!verify_perm_arg_accumulator_trace(&trace));
+        }
+
+        #[test]
+        fn perm_arg_accumulator_columns_shape_and_padding() {
+            // 5-element multisets → next pow2 = 8.
+            let claim = PermArgClaim {
+                left:  vec![gf(11), gf(22), gf(33), gf(44), gf(55)],
+                right: vec![gf(33), gf(11), gf(55), gf(22), gf(44)],
+                gamma: gf(0xDEAD),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            let columns = perm_arg_accumulator_trace_to_columns(&trace);
+            assert_eq!(columns.len(), 4);
+            assert_eq!(columns[0].len(), 8);
+            // Padding rows: l = r = 0.
+            for r in 5..8 {
+                assert!(columns[0][r].is_zero());
+                assert!(columns[1][r].is_zero());
+            }
+            // Padding rows: running_left and running_right both multiply
+            // by γ identically, so they stay equal across padding.
+            for r in 5..8 {
+                assert_eq!(columns[2][r], columns[3][r]);
+            }
+            assert!(verify_perm_arg_accumulator_columns(&columns, claim.gamma));
+        }
+
+        #[test]
+        fn perm_arg_accumulator_columns_reject_tampered() {
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(3), gf(1), gf(2)],
+                gamma: gf(7),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            let mut columns = perm_arg_accumulator_trace_to_columns(&trace);
+            // Tamper a running-left value.
+            columns[2][1] = gf(99);
+            assert!(!verify_perm_arg_accumulator_columns(&columns, claim.gamma));
+        }
+
+        #[test]
+        fn perm_arg_accumulator_columns_reject_unequal_multisets() {
+            // Different multisets → final running_left ≠ running_right,
+            // FinalBoundary fails after padding.
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(1), gf(2), gf(5)],
+                gamma: gf(0xC0DE),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            let columns = perm_arg_accumulator_trace_to_columns(&trace);
+            assert!(!verify_perm_arg_accumulator_columns(&columns, claim.gamma));
         }
 
         #[test]
