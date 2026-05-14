@@ -73,13 +73,16 @@ use deep_ali::ml_dsa_verify_air_v2_orchestration::{
 use deep_ali::sextic_ext::SexticExt;
 use deep_ali::tower_field::TowerField;
 
+use crate::bit_constraint::{BitOp, CellRef};
 use crate::composition::alphas_from_transcript;
 use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
     OodClaimBundle, OodEqualityClaim,
 };
+use crate::deep_ali_verifier_air::constraint_composition_verifier::CompositionClaim;
+use crate::deep_ali_verifier_air::permutation_argument_verifier::PermArgClaim;
 use crate::recursive_prover::{
     OodAccumulatorClaim, OodAccumulatorProof, RecursiveProverError,
-    prove_ood_accumulator,
+    RecursiveStarkProof, prove_ood_accumulator, prove_recursive_stark,
 };
 
 type Ext = SexticExt;
@@ -671,6 +674,157 @@ impl std::fmt::Display for V2OodRecursiveError {
 }
 impl std::error::Error for V2OodRecursiveError {}
 
+// ─── Sub-circuit 1 wiring (constraint composition over v2 pi_hash) ──
+//
+// The wrapper-stark recursive_prover's sub-circuit 1 expects a
+// `CompositionClaim<Goldilocks>`: a vector of `BitOp` constraints over
+// trace cells with column values supplied at an FS-derived point z.
+//
+// For v2, the natural sub-circuit-1 statement would be "for each of
+// the 10 v2 sub-AIRs, Σ α_j · Φ_j(trace_at_z) = 0".  But v2's
+// sub-AIRs are field-valued AIRs with `eval_per_row` functions and
+// quotient-polynomial FRI commits — not BitOp-shaped.  Encoding them
+// into BitOp claims would require lifting each `eval_per_row` to a
+// bit-level constraint network (substantial work — the wrapper-stark
+// gadget's eventual verifier-AIR target).
+//
+// Pragmatic intermediate: we attach a v2-bound *anchor* composition
+// that binds the 256 bits of the v2 `pi_hash` into the recursive
+// STARK's composition leg via 256 `BitOp::Boolean` constraints.  Each
+// bit is in {0, 1} (it came from a u8 byte), so every Boolean
+// constraint evaluates to zero on an honest input.  This:
+//
+//   1. Makes sub-circuit 1 NON-VACUOUS — there's a real constraint
+//      check (`b·(b−1) = 0`) per pi_hash bit.
+//   2. Binds the v2 pi_hash into the composed RecursiveStarkProof's
+//      outer_pi_hash via the BitOp constraints' alpha-weighted sum.
+//   3. Doesn't claim to re-prove the inner v2 verifier (that's what
+//      the full verifier-AIR will do, eventually).
+//
+// The anchor's soundness is "the prover knows the bits of the v2
+// pi_hash", which the FS-binding into outer_pi_hash already gives;
+// it's the architectural shape that matters here, not new
+// soundness.
+
+/// Build a `CompositionClaim<Goldilocks>` that binds the v2 pi_hash
+/// bytes' bits via 256 `BitOp::Boolean` constraints.
+///
+/// Layout:
+///   - row 0 has 256 cells, one per pi_hash bit (column = bit index)
+///   - cell value = 0 or 1
+///   - constraint per cell = `BitOp::Boolean { b: cell }`
+///   - alphas FS-derived from `pi_hash` ⊕ `0xC4` (distinct from
+///     recursive_prover's `0xC1/0xC2/0xC3` namespace)
+///   - expected = 0 (every Boolean constraint vanishes on input ∈ {0,1})
+pub fn build_v2_pi_hash_anchor_composition(
+    pi_hash: [u8; 32],
+) -> CompositionClaim<Goldilocks> {
+    use crate::bit_constraint::CellRef;
+
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(256);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(256);
+    for byte_idx in 0..32 {
+        let byte = pi_hash[byte_idx];
+        for bit in 0..8 {
+            let col = byte_idx * 8 + bit;
+            let bit_val = ((byte >> bit) & 1) as u64;
+            let cell = CellRef::new(0, col);
+            column_values.push((cell, Goldilocks::from(bit_val)));
+            constraints.push(BitOp::Boolean { b: cell });
+        }
+    }
+
+    let mut seed = pi_hash;
+    seed[0] ^= 0xC4;
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, constraints.len());
+
+    CompositionClaim {
+        column_values,
+        constraints,
+        alphas,
+        expected: Goldilocks::zero(),
+    }
+}
+
+/// Build a vestige `PermArgClaim<Goldilocks>` whose multisets are
+/// equal by construction — left == right, both derived from the v2
+/// pi_hash bytes packed into Goldilocks field elements.
+///
+/// T_MEM was removed from v2 on 2026-05-10 (superseded by F2b L0-L4),
+/// so there is no real perm-arg leg in the inner proof.  This vestige
+/// keeps the recursive_prover's sub-circuit 3 satisfied; the multiset
+/// equality is trivially true, providing no additional soundness
+/// but completing the 3-sub-circuit composition shape.
+pub fn build_v2_pi_hash_vestige_perm_arg(
+    pi_hash: [u8; 32],
+) -> PermArgClaim<Goldilocks> {
+    // Pack pi_hash into 4 little-endian u64s.
+    let mut elems = Vec::with_capacity(4);
+    for chunk_idx in 0..4 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&pi_hash[8 * chunk_idx..8 * (chunk_idx + 1)]);
+        elems.push(Goldilocks::from(u64::from_le_bytes(bytes)));
+    }
+
+    // Use a FS-derived γ from pi_hash so the perm-arg's z is bound.
+    let mut seed = pi_hash;
+    seed[0] ^= 0xE5;
+    let gamma = alphas_from_transcript::<Goldilocks>(&seed, 1)[0];
+
+    PermArgClaim {
+        left: elems.clone(),
+        right: elems,
+        gamma,
+        perm_tag: "v2-pi-hash-vestige",
+    }
+}
+
+/// End-to-end: take a v2 ML-DSA proof and produce ONE outer
+/// `RecursiveStarkProof` that composes all three sub-circuits:
+///
+///   sub-circuit 1 (constraint composition):
+///     256 `BitOp::Boolean` checks over the v2 pi_hash bits.
+///   sub-circuit 2 (binding-cells OOD):
+///     Full F2b OOD bundle (BCC-vs-BCC + BCC-vs-public), flattened
+///     to Goldilocks via per-coordinate expansion.
+///   sub-circuit 3 (perm-arg multiset equality):
+///     Vestige (left = right = packed v2 pi_hash u64s) — T_MEM was
+///     removed from v2 on 2026-05-10, so this leg is trivially true.
+///
+/// Returns ONE outer `DeepFriProof<SexticExt>` attesting all three
+/// sub-circuit statements simultaneously, with an `outer_pi_hash`
+/// binding the three sub-pi_hashes + n_trace_max into the FS
+/// transcript via SHA3-256.
+pub fn prove_v2_composed_recursive(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
+    // Sub-circuit 1: pi_hash anchor composition.
+    let comp_claim = build_v2_pi_hash_anchor_composition(proof.pi_hash);
+
+    // Sub-circuit 2: real full F2b OOD bundle, flattened.
+    let ext_bundle = extract_v2_full_ood_bundle(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+    let mut ood_seed = proof.pi_hash;
+    ood_seed[0] ^= 0xF6;
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(
+        &ood_seed, base_bundle.claims.len(),
+    );
+    let ood_claim = OodAccumulatorClaim {
+        bundle: base_bundle, alphas: ood_alphas,
+    };
+
+    // Sub-circuit 3: vestige perm-arg.
+    let perm_claim = build_v2_pi_hash_vestige_perm_arg(proof.pi_hash);
+
+    prove_recursive_stark(&comp_claim, &ood_claim, &perm_claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +980,51 @@ mod tests {
         // L2c is at index 2 in the full bundle (after L2a, L3).
         assert_eq!(tampered.first_failing(), Some(2),
             "first failing should be L2c (index 2) after public.h tamper");
+    }
+
+    #[test]
+    fn v2_pi_hash_anchor_composition_shape() {
+        // Fast unit test: anchor has 256 cells + 256 Boolean constraints
+        // + 256 alphas + expected = 0.  Doesn't require running v2.
+        let pi_hash = [0xA5u8; 32];
+        let claim = build_v2_pi_hash_anchor_composition(pi_hash);
+        assert_eq!(claim.column_values.len(), 256);
+        assert_eq!(claim.constraints.len(), 256);
+        assert_eq!(claim.alphas.len(), 256);
+        assert_eq!(claim.expected, Goldilocks::zero());
+
+        // Each cell value is 0 or 1.
+        for (_cref, v) in &claim.column_values {
+            assert!(*v == Goldilocks::zero() || *v == Goldilocks::from(1u64),
+                "cell value {v:?} not in {{0, 1}}");
+        }
+    }
+
+    #[test]
+    fn v2_pi_hash_vestige_perm_arg_is_trivially_equal() {
+        let pi_hash = [0x5Au8; 32];
+        let claim = build_v2_pi_hash_vestige_perm_arg(pi_hash);
+        assert_eq!(claim.left.len(), 4);
+        assert_eq!(claim.right.len(), 4);
+        assert_eq!(claim.left, claim.right);
+        assert_eq!(claim.perm_tag, "v2-pi-hash-vestige");
+    }
+
+    #[test]
+    #[ignore = "slow — full composed RecursiveStarkProof from real v2 proof"]
+    fn prove_v2_composed_recursive_round_trip() {
+        use crate::recursive_prover::verify_recursive_stark;
+
+        let w = synthesize_demo_witness(31);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let rec = prove_v2_composed_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+            .expect("composed recursive prove must succeed");
+
+        assert!(verify_recursive_stark(&rec),
+            "composed RecursiveStarkProof must verify locally");
     }
 
     #[test]
