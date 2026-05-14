@@ -37,6 +37,12 @@ hash        = { path = "../hash",       default-features = false }
 merkle      = { path = "../merkle",     default-features = false }
 transcript  = { path = "../transcript", default-features = false }
 
+# wrapper-stark: pulled in by the ml_dsa_recursive_rollup_demo example
+# to produce recursive STARK proofs.  Pin its features to match
+# swarm-dns's default (sha3-256, mldsa-44, parallel) so the deep_ali
+# transitive feature-unification stays consistent across the workspace.
+wrapper-stark = { path = "../wrapper-stark", default-features = false, features = ["sha3-256", "mldsa-44", "parallel"] }
+
 [dev-dependencies]
 num-bigint    = "0.4"
 sha2          = "0.10"
