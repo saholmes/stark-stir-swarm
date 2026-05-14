@@ -485,6 +485,56 @@ impl MerkleSpongeLayout {
     }
 }
 
+// ─── Merkle hop row cell allocation (within sponge schema) ──────────
+//
+// The merkle hop row repurposes existing sponge_air columns to hold
+// the hop's per-bit cells.  At hop rows:
+//   state_in [0..N]    = current_bits   (running hash from prev hop, or leaf)
+//   block_bits [0..N]  = sibling_bits   (auth path sibling)
+//   state_out [0..N]   = left_bits      (selection result)
+//   state_out [N..2N]  = right_bits
+//   helpers [0]        = index_bit      (this hop's bit of leaf_index)
+//
+// All N = variant.output_bits() (256 / 384 / 512).
+//
+// The next-row binding (cross-row Copy from sponge absorb to merkle
+// hop):
+//   absorb_row.block_bits [0..2N] ≡ merkle_hop_row.state_out [0..2N]
+//
+// will be enforced by the constraint generator in the next commit.
+
+/// Address the merkle hop row's `current_bits` cell.
+pub fn hop_current_col(schema: &UniformRowSchema, bit: usize) -> usize {
+    debug_assert!(bit < schema.state_in.len());
+    schema.state_in_bit(bit / 64, bit % 64)
+}
+
+/// Address the merkle hop row's `sibling_bits` cell.
+pub fn hop_sibling_col(schema: &UniformRowSchema, bit: usize) -> usize {
+    debug_assert!(bit < schema.block_bits.len());
+    schema.block_bit(bit)
+}
+
+/// Address the merkle hop row's `left_bits` cell.
+pub fn hop_left_col(schema: &UniformRowSchema, bit: usize) -> usize {
+    debug_assert!(bit < schema.state_out.len());
+    schema.state_out_bit(bit / 64, bit % 64)
+}
+
+/// Address the merkle hop row's `right_bits` cell.  `bit ∈ [0..N)`.
+pub fn hop_right_col(schema: &UniformRowSchema, n_hash_bits: usize, bit: usize) -> usize {
+    debug_assert!(bit < n_hash_bits);
+    // Pack right_bits AFTER left_bits in state_out: lanes (N/64)..(2N/64).
+    let lane = (n_hash_bits / 64) + bit / 64;
+    let bit_in_lane = bit % 64;
+    schema.state_out_bit(lane, bit_in_lane)
+}
+
+/// Address the merkle hop row's `index_bit` cell.
+pub fn hop_index_bit_col(schema: &UniformRowSchema) -> usize {
+    schema.helper_bit(0)
+}
+
 /// Synthesise the composed Merkle-path + sponge trace.  Fills every row:
 ///
 /// - Merkle hop row (at `hop_starts[r]`): writes current/sibling/left/
@@ -556,10 +606,7 @@ pub fn synthesize_merkle_sponge_trace(
         debug_assert_eq!(sub_trace.n_rows, ROWS_PER_BLOCK);
 
         // 3. Copy the sub-trace into the composed trace, starting at
-        //    `hop_starts[r] + 1`.  The first row of the hop block
-        //    (the merkle-hop row at hop_starts[r]) is left blank for
-        //    now — the future "Merkle selector + bit cells" commit
-        //    will populate it.
+        //    `hop_starts[r] + 1`.
         let dst_offset = layout.hop_starts[r] + 1;
         for sub_row in 0..sub_trace.n_rows {
             for col in 0..sub_trace.schema.width {
@@ -568,7 +615,24 @@ pub fn synthesize_merkle_sponge_trace(
             }
         }
 
-        // 4. Update current ← parent for the next hop.
+        // 4. Populate the merkle hop row at `hop_starts[r]` with
+        //    current / sibling / left / right / bit per the column
+        //    allocation in `hop_*_col` helpers.
+        let hop_row = layout.hop_starts[r];
+        let n_bits = layout.variant.output_bits();
+        for i in 0..n_bits {
+            let cur_bit = (current[i / 8] >> (i % 8)) & 1;
+            let sib_bit = (sibling_bytes[i / 8] >> (i % 8)) & 1;
+            let l_bit   = (left_bytes[i / 8]    >> (i % 8)) & 1;
+            let r_bit   = (right_bytes[i / 8]   >> (i % 8)) & 1;
+            composed.set(hop_row, hop_current_col(&layout.schema, i), cur_bit as u8);
+            composed.set(hop_row, hop_sibling_col(&layout.schema, i), sib_bit as u8);
+            composed.set(hop_row, hop_left_col(&layout.schema, i),    l_bit as u8);
+            composed.set(hop_row, hop_right_col(&layout.schema, n_bits, i), r_bit as u8);
+        }
+        composed.set(hop_row, hop_index_bit_col(&layout.schema), bit);
+
+        // 5. Update current ← parent for the next hop.
         current = hash(layout.variant, &sponge_input);
         debug_assert_eq!(current.len(), n_bytes);
         let _ = block_bytes;
@@ -1034,6 +1098,162 @@ mod tests {
             let (_, root) = synthesize_merkle_sponge_trace(&claim, &layout)
                 .expect("sha3-384 single-block hop must succeed");
             assert_eq!(root, claim.root);
+        }
+    }
+
+    // ─── Merkle hop row + cross-row binding tests ──────────────────
+
+    #[test]
+    fn hop_row_cells_match_native_chain() {
+        // The hop row's current/sibling/left/right cells must match
+        // what the native Merkle chain produces at that hop.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0xA8 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 1);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (trace, _root) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        let schema = &layout.schema;
+        let n_bits = variant.output_bits();
+
+        // Walk the chain natively + compare to hop row cells.
+        let mut current = claim.leaf.0.clone();
+        let mut idx = claim.leaf_index;
+        for r in 0..claim.depth() {
+            let bit = (idx & 1) as u8;
+            let hop_row = layout.hop_starts[r];
+
+            // current_bits must equal `current` byte-by-byte.
+            for i in 0..n_bits {
+                let expected = (current[i / 8] >> (i % 8)) & 1;
+                let actual = trace.get(hop_row, hop_current_col(schema, i));
+                assert_eq!(actual, expected,
+                    "hop {r} bit {i}: hop-row current cell {actual} != native {expected}");
+            }
+
+            // bit cell matches.
+            assert_eq!(trace.get(hop_row, hop_index_bit_col(schema)), bit,
+                "hop {r}: bit cell mismatch");
+
+            // Update for next hop.
+            let sibling = &claim.path[r].0;
+            let mut concat = Vec::with_capacity(current.len() + sibling.len());
+            if bit == 0 {
+                concat.extend_from_slice(&current);
+                concat.extend_from_slice(sibling);
+            } else {
+                concat.extend_from_slice(sibling);
+                concat.extend_from_slice(&current);
+            }
+            current = crate::sha3_absorb_air::hash(variant, &concat);
+            idx >>= 1;
+        }
+    }
+
+    #[test]
+    fn hop_row_left_right_satisfy_selection_constraint() {
+        // At each hop row, the left/right cells must satisfy the
+        // selection constraint we documented in MerkleSelOp.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8u8).map(|i| fake_leaf(variant, 0xB0 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 5);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (trace, _root) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        let schema = &layout.schema;
+        let n_bits = variant.output_bits();
+        let field_trace = crate::bit_constraint::lift_uniform_to_field::<Goldilocks>(&trace);
+
+        for r in 0..claim.depth() {
+            let hop_row = layout.hop_starts[r];
+            // For every bit, verify left - current - bit·(sibling - current) = 0.
+            for i in 0..n_bits {
+                let op = MerkleSelOp::LeftSelect {
+                    left:    CellRef::new(hop_row, hop_left_col(schema, i)),
+                    current: CellRef::new(hop_row, hop_current_col(schema, i)),
+                    sibling: CellRef::new(hop_row, hop_sibling_col(schema, i)),
+                    bit:     CellRef::new(hop_row, hop_index_bit_col(schema)),
+                };
+                assert!(op.satisfied_by_field::<Goldilocks>(&field_trace),
+                    "left-select fails at hop {r} bit {i}");
+
+                let op = MerkleSelOp::RightSelect {
+                    right:   CellRef::new(hop_row, hop_right_col(schema, n_bits, i)),
+                    current: CellRef::new(hop_row, hop_current_col(schema, i)),
+                    sibling: CellRef::new(hop_row, hop_sibling_col(schema, i)),
+                    bit:     CellRef::new(hop_row, hop_index_bit_col(schema)),
+                };
+                assert!(op.satisfied_by_field::<Goldilocks>(&field_trace),
+                    "right-select fails at hop {r} bit {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn cross_row_binding_holds_block_bits_match_left_right() {
+        // The cross-row binding invariant: at the sponge absorb row
+        // (hop_starts[r] + 1), block_bits[0..2N] must equal the
+        // (left || right) bits from the merkle hop row.  This is
+        // what the future polynomial constraint will enforce; this
+        // test confirms the synthesiser produces a trace satisfying
+        // the invariant.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0xC8 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 3);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (trace, _root) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        let schema = &layout.schema;
+        let n_bits = variant.output_bits();
+
+        for r in 0..claim.depth() {
+            let hop_row    = layout.hop_starts[r];
+            let absorb_row = layout.sponge_absorb_row(r);
+
+            // block_bits[0..N] should match left_bits.
+            for i in 0..n_bits {
+                let block_i = trace.get(absorb_row, schema.block_bit(i));
+                let left_i  = trace.get(hop_row, hop_left_col(schema, i));
+                assert_eq!(block_i, left_i,
+                    "hop {r} bit {i}: block_bits[{i}] = {block_i} ≠ left[{i}] = {left_i}");
+            }
+            // block_bits[N..2N] should match right_bits.
+            for i in 0..n_bits {
+                let block_i = trace.get(absorb_row, schema.block_bit(n_bits + i));
+                let right_i = trace.get(hop_row, hop_right_col(schema, n_bits, i));
+                assert_eq!(block_i, right_i,
+                    "hop {r} bit {i}: block_bits[{}] = {block_i} ≠ right[{i}] = {right_i}",
+                    n_bits + i);
+            }
+        }
+    }
+
+    #[test]
+    fn cross_row_binding_sponge_output_equals_next_hop_current() {
+        // Threading: at the sponge's final ι row (hop_starts[r] + 97),
+        // state_out's first N bits must equal the NEXT hop's current_bits.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8u8).map(|i| fake_leaf(variant, 0xD8 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 4);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (trace, _root) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        let schema = &layout.schema;
+        let n_bits = variant.output_bits();
+
+        for r in 0..(claim.depth() - 1) {
+            let sponge_final_row = layout.sponge_final_iota_row(r);
+            let next_hop_row     = layout.hop_starts[r + 1];
+
+            for i in 0..n_bits {
+                let lane = i / 64;
+                let bit_in_lane = i % 64;
+                let state_out_bit = trace.get(sponge_final_row, schema.state_out_bit(lane, bit_in_lane));
+                let next_current  = trace.get(next_hop_row, hop_current_col(schema, i));
+                assert_eq!(state_out_bit, next_current,
+                    "hop {}→{}: state_out[{i}] = {} ≠ next current[{i}] = {}",
+                    r, r + 1, state_out_bit, next_current);
+            }
         }
     }
 

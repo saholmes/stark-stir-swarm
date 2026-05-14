@@ -228,6 +228,24 @@ pub fn lift_to_field<F: Field>(src: &MockTrace) -> FieldMockTrace<F> {
     }
 }
 
+/// Convert a [`crate::row_uniform::UniformTrace`] (u8 cells, row-major
+/// flat storage) into a [`FieldMockTrace`].  Used by gadget tests
+/// that consume the composed row-uniform trace.
+pub fn lift_uniform_to_field<F: Field>(
+    src: &crate::row_uniform::UniformTrace,
+) -> FieldMockTrace<F> {
+    let width = src.schema.width;
+    let mut rows: Vec<Vec<F>> = Vec::with_capacity(src.n_rows);
+    for r in 0..src.n_rows {
+        let mut row = Vec::with_capacity(width);
+        for c in 0..width {
+            row.push(F::from(src.get(r, c) as u64));
+        }
+        rows.push(row);
+    }
+    FieldMockTrace { width, rows }
+}
+
 impl BitOp {
     /// Evaluate this constraint as a polynomial expression in the
     /// trace cell values.  Returns the polynomial's value; ZERO means
