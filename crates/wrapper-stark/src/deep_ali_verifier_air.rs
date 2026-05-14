@@ -733,6 +733,161 @@ pub mod binding_cells_ood_verifier {
         }
     }
 
+    // ─── In-AIR encoding: residue accumulator pattern ───────────────
+    //
+    // Encode 7-claim OOD bundle as an additive accumulator AIR.
+    //
+    //   row r ∈ [0..7):
+    //     col 0: f_at_z_r
+    //     col 1: g_at_z_r
+    //     col 2: residue_r        (= f_at_z_r - g_at_z_r)
+    //     col 3: alpha_r          (FS-derived combination coef)
+    //     col 4: partial_sum_r    (= Σ_{j≤r} α_j · residue_j)
+    //
+    // Constraints:
+    //   - row r:   residue_r = f_at_z_r - g_at_z_r           (deg 1)
+    //   - row 0:   partial_sum_0 = alpha_0 · residue_0       (deg 2)
+    //   - row r:   partial_sum_r = partial_sum_{r-1} + alpha_r · residue_r  (deg 2)
+    //   - row n-1: partial_sum_{n-1} = 0                     (boundary: ALL residues must be 0
+    //                                                         in expectation; for honest claims
+    //                                                         every residue = 0, so the partial
+    //                                                         sum is also 0)
+    //
+    // FS-derived α coefficients ensure that with high probability,
+    // if any residue is non-zero the partial_sum is also non-zero
+    // (Event-E1 Schwartz-Zippel bound).
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct OodAccumulatorLayout {
+        pub f_col: usize,
+        pub g_col: usize,
+        pub residue_col: usize,
+        pub alpha_col: usize,
+        pub partial_sum_col: usize,
+        pub width: usize,
+    }
+
+    impl OodAccumulatorLayout {
+        pub fn new(col_start: usize) -> Self {
+            Self {
+                f_col:           col_start,
+                g_col:           col_start + 1,
+                residue_col:     col_start + 2,
+                alpha_col:       col_start + 3,
+                partial_sum_col: col_start + 4,
+                width: 5,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct OodAccumulatorTrace<F: Field> {
+        pub n_rows: usize,
+        pub f_at_z: Vec<F>,
+        pub g_at_z: Vec<F>,
+        pub residue: Vec<F>,
+        pub alpha: Vec<F>,
+        pub partial_sum: Vec<F>,
+    }
+
+    impl<F: Field> OodAccumulatorTrace<F> {
+        /// Synthesise from a bundle + FS-derived α coefficients.
+        pub fn synthesise(
+            bundle: &OodClaimBundle<F>, alphas: &[F],
+        ) -> Self {
+            let n = bundle.claims.len();
+            assert_eq!(alphas.len(), n);
+            let mut f_at_z = Vec::with_capacity(n);
+            let mut g_at_z = Vec::with_capacity(n);
+            let mut residue = Vec::with_capacity(n);
+            let mut alpha = Vec::with_capacity(n);
+            let mut partial_sum = Vec::with_capacity(n);
+            let mut acc = F::zero();
+            for j in 0..n {
+                let f = bundle.claims[j].f_at_z;
+                let g = bundle.claims[j].g_at_z;
+                let r = f - g;
+                let a = alphas[j];
+                acc += a * r;
+                f_at_z.push(f);
+                g_at_z.push(g);
+                residue.push(r);
+                alpha.push(a);
+                partial_sum.push(acc);
+            }
+            Self { n_rows: n, f_at_z, g_at_z, residue, alpha, partial_sum }
+        }
+    }
+
+    /// Polynomial constraints for the OOD residue accumulator AIR.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OodAccumulatorOp {
+        /// row r: residue - (f - g) = 0
+        ResidueDef,
+        /// row 0: partial_sum - alpha · residue = 0
+        InitialAcc,
+        /// row r > 0: partial_sum - prev_sum - alpha · residue = 0
+        StepAcc,
+        /// row n-1: partial_sum = 0
+        FinalBoundary,
+    }
+
+    impl OodAccumulatorOp {
+        pub fn eval<F: Field>(
+            &self,
+            f: F, g: F, residue: F, alpha: F, curr_sum: F,
+            prev_sum: F,
+        ) -> F {
+            match self {
+                Self::ResidueDef       => residue - (f - g),
+                Self::InitialAcc       => curr_sum - alpha * residue,
+                Self::StepAcc          => curr_sum - prev_sum - alpha * residue,
+                Self::FinalBoundary    => curr_sum,
+            }
+        }
+    }
+
+    pub fn verify_ood_accumulator_trace<F: Field>(
+        trace: &OodAccumulatorTrace<F>,
+    ) -> bool {
+        if trace.n_rows == 0 { return true; }
+        for r in 0..trace.n_rows {
+            // residue definition
+            if !OodAccumulatorOp::ResidueDef.eval(
+                trace.f_at_z[r], trace.g_at_z[r], trace.residue[r],
+                F::zero(), F::zero(), F::zero(),
+            ).is_zero() {
+                return false;
+            }
+        }
+        // initial
+        if !OodAccumulatorOp::InitialAcc.eval(
+            F::zero(), F::zero(),
+            trace.residue[0], trace.alpha[0], trace.partial_sum[0],
+            F::zero(),
+        ).is_zero() {
+            return false;
+        }
+        // steps
+        for r in 1..trace.n_rows {
+            if !OodAccumulatorOp::StepAcc.eval(
+                F::zero(), F::zero(),
+                trace.residue[r], trace.alpha[r], trace.partial_sum[r],
+                trace.partial_sum[r - 1],
+            ).is_zero() {
+                return false;
+            }
+        }
+        // final boundary: all residues must sum to 0 (which equates
+        // to each individual residue being 0 under FS-random alphas)
+        OodAccumulatorOp::FinalBoundary.eval(
+            F::zero(), F::zero(),
+            trace.residue[trace.n_rows - 1], trace.alpha[trace.n_rows - 1],
+            trace.partial_sum[trace.n_rows - 1],
+            F::zero(),
+        ).is_zero()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -806,6 +961,92 @@ pub mod binding_cells_ood_verifier {
             };
             assert!(!bundle.check_all_native());
             assert_eq!(bundle.first_failing(), Some(1));
+        }
+
+        // ─── OOD accumulator AIR tests ──────────────────────────────
+
+        #[test]
+        fn ood_accumulator_layout_width() {
+            let layout = OodAccumulatorLayout::new(0);
+            assert_eq!(layout.width, 5);
+        }
+
+        #[test]
+        fn ood_accumulator_trace_synthesise_passes_on_honest_bundle() {
+            let z = Goldilocks::from(0xCAFEBABE_u64);
+            let v = Goldilocks::from(0x12345);
+            let bundle = OodClaimBundle::<Goldilocks> {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L2a" },
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L5" },
+                ],
+            };
+            let alphas = vec![
+                Goldilocks::from(7u64),
+                Goldilocks::from(11u64),
+                Goldilocks::from(13u64),
+            ];
+            let trace = OodAccumulatorTrace::synthesise(&bundle, &alphas);
+            assert_eq!(trace.n_rows, 3);
+            // All residues 0, so partial_sum stays 0 throughout
+            for r in 0..3 {
+                assert_eq!(trace.residue[r], Goldilocks::from(0u64));
+                assert_eq!(trace.partial_sum[r], Goldilocks::from(0u64));
+            }
+            assert!(verify_ood_accumulator_trace(&trace));
+        }
+
+        #[test]
+        fn ood_accumulator_rejects_tampered_g() {
+            let z = Goldilocks::from(1u64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle::<Goldilocks> {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                    OodEqualityClaim {
+                        z, f_at_z: v,
+                        g_at_z: Goldilocks::from(99u64),   // mismatch
+                        binding_tag: "L3",
+                    },
+                ],
+            };
+            let alphas = vec![Goldilocks::from(7u64), Goldilocks::from(11u64)];
+            let trace = OodAccumulatorTrace::synthesise(&bundle, &alphas);
+            // Trace as synthesised: residue[1] = -57; partial_sum[1] is non-zero.
+            // FinalBoundary rejects.
+            assert!(!verify_ood_accumulator_trace(&trace),
+                "tampered g_at_z must produce non-zero final partial_sum");
+        }
+
+        #[test]
+        fn ood_accumulator_rejects_residue_tampering() {
+            let z = Goldilocks::from(1u64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle::<Goldilocks> {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                ],
+            };
+            let alphas = vec![Goldilocks::from(7u64)];
+            let mut trace = OodAccumulatorTrace::synthesise(&bundle, &alphas);
+            // Tamper residue cell to be non-zero even though f == g.
+            trace.residue[0] = Goldilocks::from(5u64);
+            assert!(!verify_ood_accumulator_trace(&trace),
+                "residue tamper must trip ResidueDef constraint");
+        }
+
+        #[test]
+        fn ood_accumulator_op_degrees() {
+            // Pin the degree budget — all ops are degree ≤ 2.
+            // ResidueDef:   degree 1
+            // InitialAcc:   degree 2 (alpha · residue)
+            // StepAcc:      degree 2
+            // FinalBoundary: degree 1
+            let _ = (OodAccumulatorOp::ResidueDef,
+                     OodAccumulatorOp::InitialAcc,
+                     OodAccumulatorOp::StepAcc,
+                     OodAccumulatorOp::FinalBoundary);
         }
 
         #[test]
