@@ -1,11 +1,53 @@
-//! Recursive STARK wrapper for `deep_ali_merge` proofs.
+//! Library of composable AIR gadgets for paper-grade STARK construction.
 //!
-//! # Purpose
+//! # Pattern
 //!
-//! Take a "fat" inner STARK proof (e.g. our modular ML-DSA-65 v2 proof at
-//! ~18 MiB / 154 ms verify) and produce a "skinny" outer proof
-//! (~200-500 KiB / ~5-15 ms verify) by expressing the inner verifier as
-//! an AIR and proving its acceptance inside a single outer FRI/STIR STARK.
+//! Each module exposes a self-contained AIR gadget — a constraint set
+//! + trace synthesiser + (where applicable) prove/verify entry points.
+//! Larger systems wire several gadgets together inside a single outer
+//! AIR/FRI proof.
+//!
+//! Currently shipped gadgets (runnable, validated):
+//!
+//! - **SHA-3 pre-image PoK** ([`wrapper_prover`]) — proves "I know `m`
+//!   such that SHA-3_variant(m) = D" with full soundness validated by
+//!   tamper-rejection tests.  Sub-millisecond verify at L1 STIR; ~81
+//!   KiB proof.  Runnable via `cargo run --example sha3_preimage_pok`.
+//!
+//! Gadgets in progress (foundations laid, full integration ahead):
+//!
+//! - **Verifier-as-AIR for `deep_ali_merge`** ([`verifier_air`]) — will
+//!   express the inner-proof verification (Merkle paths, constraint
+//!   composition, `binding_cells_commit` OOD) as an AIR.  This is the
+//!   final piece for the recursive ML-DSA wrapper.
+//! - **Keccak-f1600 round AIR** ([`keccak_round_air`] / [`sponge_air`])
+//!   — the SHA-3 sub-circuit, reusable inside any wrapper that needs
+//!   to verify SHA-3-committed Merkle paths.
+//!
+//! # Recursive ML-DSA STARK (target use case)
+//!
+//! Once all gadgets land, the recursive ML-DSA wrapper composes:
+//!
+//! ```text
+//!   wrapper STARK
+//!     │
+//!     ├─► verifier_air                  (deep_ali_merge verifier-as-AIR)
+//!     ├─► sponge_air                    (SHA-3 inside the wrapper)
+//!     ├─► binding_cells_commit verifier (OOD Schwartz-Zippel)
+//!     └─► permutation argument verifier (T_MEM consistency)
+//!   ╲╲╲   ║                       ║   ╱╱╱
+//!         ╲╲   row-uniform encoding   ╱╱
+//!           ╲      composition         ╱
+//!             ╲   FS-derived α       ╱
+//!               ╲   deep_fri_prove ╱
+//!                 ╲              ╱
+//!                  → DeepFriProof<SexticExt>  (KiB-scale, ms-scale verify)
+//! ```
+//!
+//! The SHA-3 PoK gadget shipping in this crate is the FIRST member
+//! of that composition.  Its soundness story (digest boundary + FS
+//! binding + AIR satisfaction) is the template every other gadget
+//! will follow.
 //!
 //! End-to-end soundness story (paper §8 + Theorem 6):
 //!
