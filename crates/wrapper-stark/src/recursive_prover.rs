@@ -67,6 +67,10 @@ use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
     OodAccumulatorTrace, OodClaimBundle, ood_accumulator_trace_to_columns,
     verify_ood_accumulator_columns,
 };
+use crate::deep_ali_verifier_air::permutation_argument_verifier::{
+    PermArgAccumulatorTrace, PermArgClaim, perm_arg_accumulator_trace_to_columns,
+    verify_perm_arg_accumulator_columns,
+};
 use crate::fri_bridge::compute_single_row_indicator_lde;
 
 type FBase = ark_goldilocks::Goldilocks;
@@ -451,6 +455,164 @@ pub fn verify_ood_accumulator(proof: &OodAccumulatorProof) -> bool {
     deep_fri_verify::<Ext>(&params, &proof.fri_proof)
 }
 
+// ─── Sub-circuit 3: Perm-arg Π running-product accumulator ────────────
+
+/// Public inputs for the perm-arg sub-circuit STARK.  Binds the
+/// challenge γ, the perm-tag (domain separator), and the (left, right)
+/// witness multisets into a 32-byte `pi_hash`.  The verifier needs γ
+/// to reconstruct the per-row (γ + l) and (γ + r) factors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermArgPublicInputs {
+    pub gamma: FBase,
+    pub n_elements: usize,
+    pub pi_hash: [u8; 32],
+}
+
+impl PermArgPublicInputs {
+    pub fn for_claim(claim: &PermArgClaim<FBase>) -> Self {
+        use ::sha3::Digest;
+        let n = claim.left.len();
+        let mut h = ::sha3::Sha3_256::new();
+        h.update(b"WRAPPER-PERMARG-V1");
+        h.update(field_to_le_bytes(&claim.gamma));
+        h.update(claim.perm_tag.as_bytes());
+        h.update((claim.perm_tag.len() as u64).to_le_bytes());
+        h.update((n as u64).to_le_bytes());
+        for x in &claim.left  { h.update(field_to_le_bytes(x)); }
+        h.update((claim.right.len() as u64).to_le_bytes());
+        for x in &claim.right { h.update(field_to_le_bytes(x)); }
+        let digest = h.finalize();
+        let mut pi_hash = [0u8; 32];
+        pi_hash.copy_from_slice(&digest);
+        Self { gamma: claim.gamma, n_elements: n, pi_hash }
+    }
+}
+
+/// Recursive STARK proof for the perm-arg sub-circuit.
+pub struct PermArgProof {
+    pub public: PermArgPublicInputs,
+    pub fri_proof: DeepFriProof<Ext>,
+    pub n_trace: usize,
+    pub blowup: usize,
+    pub r: usize,
+    pub use_stir: bool,
+}
+
+/// Prove the perm-arg Π running-product accumulator sub-circuit through
+/// deep_fri_prove.  Five constraint families:
+///
+///   α_il · ind_0    · (rl − (γ + l))                       — row 0
+///   α_ir · ind_0    · (rr − (γ + r))                       — row 0
+///   α_sl · (1−ind_0)·(rl − rl_prev · (γ + l))              — r > 0
+///   α_sr · (1−ind_0)·(rr − rr_prev · (γ + r))              — r > 0
+///   α_fn · ind_last · (rl − rr)                            — last row
+pub fn prove_perm_arg_accumulator(
+    claim: &PermArgClaim<FBase>,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<PermArgProof, RecursiveProverError> {
+    claim.check_shape().map_err(RecursiveProverError::InvalidClaim)?;
+    if !blowup.is_power_of_two() || blowup < 2 {
+        return Err(RecursiveProverError::Internal(format!(
+            "blowup must be power-of-2 >= 2; got {blowup}"
+        )));
+    }
+    if claim.left.is_empty() {
+        return Err(RecursiveProverError::InvalidClaim(
+            "left multiset must be non-empty".into()
+        ));
+    }
+
+    // 1. Synthesise perm-arg accumulator trace + derive public inputs.
+    let trace = PermArgAccumulatorTrace::synthesise(claim);
+    let public = PermArgPublicInputs::for_claim(claim);
+
+    // 2. Column-major + padding (4 cols: l, r, running_left, running_right).
+    let columns = perm_arg_accumulator_trace_to_columns(&trace);
+    if !verify_perm_arg_accumulator_columns(&columns, claim.gamma) {
+        return Err(RecursiveProverError::TraceSelfCheckFailed);
+    }
+    let n_trace = columns[0].len();
+    let n_lde = n_trace * blowup;
+
+    // 3. LDE each column.
+    let lde: Vec<Vec<FBase>> = lde_trace_columns(&columns, n_trace, blowup)
+        .map_err(|e| RecursiveProverError::Internal(format!("LDE: {e}")))?;
+
+    // 4. FS-derive five α's from pi_hash with distinct seeds.
+    let mut s_il = public.pi_hash;  s_il[0] ^= 0xE0;
+    let mut s_ir = public.pi_hash;  s_ir[0] ^= 0xE1;
+    let mut s_sl = public.pi_hash;  s_sl[0] ^= 0xE2;
+    let mut s_sr = public.pi_hash;  s_sr[0] ^= 0xE3;
+    let mut s_fn = public.pi_hash;  s_fn[0] ^= 0xE4;
+    let a_il = alphas_from_transcript::<FBase>(&s_il, 1)[0];
+    let a_ir = alphas_from_transcript::<FBase>(&s_ir, 1)[0];
+    let a_sl = alphas_from_transcript::<FBase>(&s_sl, 1)[0];
+    let a_sr = alphas_from_transcript::<FBase>(&s_sr, 1)[0];
+    let a_fn = alphas_from_transcript::<FBase>(&s_fn, 1)[0];
+
+    // 5. Row indicators.
+    let ind_0    = compute_single_row_indicator_lde(0, n_trace, blowup);
+    let ind_last = compute_single_row_indicator_lde(n_trace - 1, n_trace, blowup);
+
+    // 6. Compose c_eval.
+    let (l_lde, r_lde, rl_lde, rr_lde) = (&lde[0], &lde[1], &lde[2], &lde[3]);
+    let gamma = claim.gamma;
+    let mut c_eval = vec![FBase::zero(); n_lde];
+    let shift = blowup;
+    for idx in 0..n_lde {
+        let r_prev = (idx + n_lde - shift) % n_lde;
+        let l_v   = l_lde[idx];
+        let rt_v  = r_lde[idx];
+        let rl_v  = rl_lde[idx];
+        let rr_v  = rr_lde[idx];
+        let rl_p  = rl_lde[r_prev];
+        let rr_p  = rr_lde[r_prev];
+
+        let init_l = rl_v - (gamma + l_v);
+        let init_r = rr_v - (gamma + rt_v);
+        let step_l = rl_v - rl_p * (gamma + l_v);
+        let step_r = rr_v - rr_p * (gamma + rt_v);
+        let final_t = rl_v - rr_v;
+
+        let i0 = ind_0[idx];
+        let il = ind_last[idx];
+        let not_i0 = FBase::from(1u64) - i0;
+
+        c_eval[idx]  = a_il * i0     * init_l;
+        c_eval[idx] += a_ir * i0     * init_r;
+        c_eval[idx] += a_sl * not_i0 * step_l;
+        c_eval[idx] += a_sr * not_i0 * step_r;
+        c_eval[idx] += a_fn * il     * final_t;
+    }
+
+    // 7. FRI prove.
+    let domain = FriDomain::new_radix2(n_lde);
+    let log2_n_lde = n_lde.trailing_zeros() as usize;
+    let schedule: Vec<usize> = (0..log2_n_lde).map(|_| 2).collect();
+    let mut params = DeepFriParams::new(schedule, r, 0xDEEFu64);
+    params.public_inputs_hash = Some(public.pi_hash);
+    if use_stir { params.stir = true; }
+
+    let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+
+    Ok(PermArgProof {
+        public, fri_proof, n_trace, blowup, r, use_stir,
+    })
+}
+
+/// Verify a perm-arg accumulator STARK proof.
+pub fn verify_perm_arg_accumulator(proof: &PermArgProof) -> bool {
+    let n_lde = proof.n_trace * proof.blowup;
+    let log2_n_lde = n_lde.trailing_zeros() as usize;
+    let schedule: Vec<usize> = (0..log2_n_lde).map(|_| 2).collect();
+    let mut params = DeepFriParams::new(schedule, proof.r, 0xDEEFu64);
+    params.public_inputs_hash = Some(proof.public.pi_hash);
+    if proof.use_stir { params.stir = true; }
+    deep_fri_verify::<Ext>(&params, &proof.fri_proof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +807,115 @@ mod tests {
         proof.public.pi_hash[0] ^= 0xFF;
         assert!(!verify_ood_accumulator(&proof),
             "tampered OOD pi_hash must be rejected");
+    }
+
+    // ─── Sub-circuit 3 (perm-arg Π running-product) tests ──────────
+
+    fn perm_arg_honest_claim() -> PermArgClaim<FBase> {
+        // 5-element multisets, right is a permutation of left.
+        PermArgClaim {
+            left:  vec![gf(11), gf(22), gf(33), gf(44), gf(55)],
+            right: vec![gf(33), gf(11), gf(55), gf(22), gf(44)],
+            gamma: gf(0xDEAD_C0DE),
+            perm_tag: "T_MEM",
+        }
+    }
+
+    #[test]
+    fn perm_arg_public_inputs_pi_hash_is_deterministic() {
+        let claim = perm_arg_honest_claim();
+        let a = PermArgPublicInputs::for_claim(&claim);
+        let b = PermArgPublicInputs::for_claim(&claim);
+        assert_eq!(a.pi_hash, b.pi_hash);
+        assert_eq!(a.gamma, claim.gamma);
+        assert_eq!(a.n_elements, 5);
+    }
+
+    #[test]
+    fn perm_arg_public_inputs_pi_hash_changes_with_gamma() {
+        let mut claim = perm_arg_honest_claim();
+        let a = PermArgPublicInputs::for_claim(&claim);
+        claim.gamma = gf(0x99);
+        let b = PermArgPublicInputs::for_claim(&claim);
+        assert_ne!(a.pi_hash, b.pi_hash);
+    }
+
+    #[test]
+    fn perm_arg_public_inputs_pi_hash_changes_with_tag() {
+        let mut claim = perm_arg_honest_claim();
+        let a = PermArgPublicInputs::for_claim(&claim);
+        claim.perm_tag = "T_OTHER";
+        let b = PermArgPublicInputs::for_claim(&claim);
+        assert_ne!(a.pi_hash, b.pi_hash);
+    }
+
+    #[test]
+    fn perm_arg_prove_rejects_size_mismatch() {
+        let claim = PermArgClaim {
+            left:  vec![gf(1), gf(2), gf(3)],
+            right: vec![gf(1), gf(2)],
+            gamma: gf(1),
+            perm_tag: "T_MEM",
+        };
+        let result = prove_perm_arg_accumulator(&claim, 4, 54, false);
+        assert!(matches!(result, Err(RecursiveProverError::InvalidClaim(_))));
+    }
+
+    #[test]
+    fn perm_arg_prove_rejects_unequal_multisets() {
+        // Trace satisfies its constraints up to the FinalBoundary, which
+        // catches that running_left != running_right.  Should fail the
+        // column-level self-check → TraceSelfCheckFailed.
+        let claim = PermArgClaim {
+            left:  vec![gf(1), gf(2), gf(3)],
+            right: vec![gf(1), gf(2), gf(5)],
+            gamma: gf(7),
+            perm_tag: "T_MEM",
+        };
+        let result = prove_perm_arg_accumulator(&claim, 4, 54, false);
+        assert!(matches!(result,
+            Err(RecursiveProverError::TraceSelfCheckFailed)));
+    }
+
+    #[test]
+    fn perm_arg_prove_rejects_empty() {
+        let claim = PermArgClaim::<FBase> {
+            left: vec![], right: vec![],
+            gamma: gf(1),
+            perm_tag: "T_MEM",
+        };
+        let result = prove_perm_arg_accumulator(&claim, 4, 54, false);
+        assert!(matches!(result, Err(RecursiveProverError::InvalidClaim(_))));
+    }
+
+    #[test]
+    #[ignore = "slow — exercises perm-arg FRI prove + verify round-trip"]
+    fn round_trip_perm_arg_accumulator_smoke() {
+        let claim = perm_arg_honest_claim();
+        let proof = prove_perm_arg_accumulator(&claim, 4, 54, false)
+            .expect("prove must succeed on honest perm-arg");
+        assert!(verify_perm_arg_accumulator(&proof),
+            "perm-arg round-trip verify must accept");
+    }
+
+    #[test]
+    #[ignore = "slow — exercises STIR variant on perm-arg"]
+    fn round_trip_perm_arg_accumulator_stir() {
+        let claim = perm_arg_honest_claim();
+        let proof = prove_perm_arg_accumulator(&claim, 4, 54, true)
+            .expect("STIR prove must succeed");
+        assert!(verify_perm_arg_accumulator(&proof),
+            "perm-arg STIR round-trip verify must accept");
+    }
+
+    #[test]
+    #[ignore = "slow — exercises tamper rejection on perm-arg"]
+    fn round_trip_perm_arg_rejects_tampered_pi_hash() {
+        let claim = perm_arg_honest_claim();
+        let mut proof = prove_perm_arg_accumulator(&claim, 4, 54, false)
+            .expect("prove must succeed");
+        proof.public.pi_hash[0] ^= 0xFF;
+        assert!(!verify_perm_arg_accumulator(&proof),
+            "tampered perm-arg pi_hash must be rejected");
     }
 }
