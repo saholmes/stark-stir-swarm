@@ -62,7 +62,14 @@ use ark_goldilocks::Goldilocks;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, Compress, Validate};
 
-use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
+// `deep_ali::binding_cells_commit::Ext` is feature-conditional:
+//   sha3-256/sha3-384 → SexticExt (Fp⁶)
+//   sha3-512           → OcticExt (Fp⁸)
+// The bridge picks this up automatically so it builds at any
+// (sha3-N, mldsa-M) combination deep_ali allows.
+use deep_ali::binding_cells_commit::{
+    BindingCellsCommit, Ext as DaExt, extract_ood_value,
+};
 use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof, layer_sizes_from_schedule};
 use deep_ali::ml_dsa::params::{K, L, N, W1_BITS_PER_COEF};
 use deep_ali::ml_dsa_decompose;
@@ -85,7 +92,6 @@ use deep_ali::sub_air_with_trace::{
 use deep_ali::ml_dsa_verify_air_v2_orchestration::{
     V2ProofReal, V2Witness, derive_w_approx_witness, v2_fri_params,
 };
-use deep_ali::sextic_ext::SexticExt;
 use deep_ali::tower_field::TowerField;
 
 use crate::bit_constraint::{BitOp, CellRef};
@@ -105,58 +111,66 @@ use crate::recursive_prover::{
     RecursiveStarkProof, prove_ood_accumulator, prove_recursive_stark,
 };
 
-type Ext = SexticExt;
+// Local Ext alias = deep_ali's feature-conditional Ext.
+type Ext = DaExt;
 
-/// Degree of SexticExt over Goldilocks.  Each Ext element decomposes
-/// into this many base-field coordinates via `TowerField::to_fp_components`.
+/// Degree of the active Ext over Goldilocks at compile time.  At
+/// sha3-256/sha3-384 this is 6 (SexticExt); at sha3-512 it is 8
+/// (OcticExt).  `TowerField::to_fp_components` returns exactly this
+/// many base-field coordinates per Ext element.
+#[cfg(any(feature = "sha3-256", feature = "sha3-384"))]
+pub const EXT_DEGREE: usize = 6;
+#[cfg(feature = "sha3-512")]
+pub const EXT_DEGREE: usize = 8;
+#[cfg(not(any(feature = "sha3-256", feature = "sha3-384", feature = "sha3-512")))]
 pub const EXT_DEGREE: usize = 6;
 
-// Per-coordinate static binding-tag tables (one per Ext leg we extract).
-// Used by `flatten_ext_to_base` to give each base-field sub-claim a
-// distinct &'static str discriminator.
-const COORD_TAGS_L2A: [&str; EXT_DEGREE] = [
-    "L2a.c0", "L2a.c1", "L2a.c2", "L2a.c3", "L2a.c4", "L2a.c5",
+// Per-coordinate static binding-tag tables.  Tables are sized for the
+// MAX Ext degree (8 at Fp⁸ / sha3-512) and the flatten function slices
+// to the active EXT_DEGREE.  This keeps the tables compile-time
+// constant regardless of which Ext field is selected.
+const MAX_EXT_DEGREE: usize = 8;
+
+const COORD_TAGS_L2A: [&str; MAX_EXT_DEGREE] = [
+    "L2a.c0", "L2a.c1", "L2a.c2", "L2a.c3", "L2a.c4", "L2a.c5", "L2a.c6", "L2a.c7",
 ];
-const COORD_TAGS_L3: [&str; EXT_DEGREE] = [
-    "L3.c0", "L3.c1", "L3.c2", "L3.c3", "L3.c4", "L3.c5",
+const COORD_TAGS_L3: [&str; MAX_EXT_DEGREE] = [
+    "L3.c0", "L3.c1", "L3.c2", "L3.c3", "L3.c4", "L3.c5", "L3.c6", "L3.c7",
 ];
 
-// Coordinate tags for the BCC-vs-public legs.  Each entry expands into
-// EXT_DEGREE = 6 base-field sub-claims when flattened.
-const COORD_TAGS_L2C: [&str; EXT_DEGREE] = [
-    "L2c.c0", "L2c.c1", "L2c.c2", "L2c.c3", "L2c.c4", "L2c.c5",
+// Coordinate tags for the BCC-vs-public legs.
+const COORD_TAGS_L2C: [&str; MAX_EXT_DEGREE] = [
+    "L2c.c0", "L2c.c1", "L2c.c2", "L2c.c3", "L2c.c4", "L2c.c5", "L2c.c6", "L2c.c7",
 ];
-const COORD_TAGS_L1: [&str; EXT_DEGREE] = [
-    "L1.c0", "L1.c1", "L1.c2", "L1.c3", "L1.c4", "L1.c5",
+const COORD_TAGS_L1: [&str; MAX_EXT_DEGREE] = [
+    "L1.c0", "L1.c1", "L1.c2", "L1.c3", "L1.c4", "L1.c5", "L1.c6", "L1.c7",
 ];
-const COORD_TAGS_L2B: [&str; EXT_DEGREE] = [
-    "L2b.c0", "L2b.c1", "L2b.c2", "L2b.c3", "L2b.c4", "L2b.c5",
+const COORD_TAGS_L2B: [&str; MAX_EXT_DEGREE] = [
+    "L2b.c0", "L2b.c1", "L2b.c2", "L2b.c3", "L2b.c4", "L2b.c5", "L2b.c6", "L2b.c7",
 ];
 
-// L4 bit-column tags, max W1_BITS_PER_COEF = 6 (L1).  Slice to active
-// length at runtime.
-const COORD_TAGS_L4: [[&str; EXT_DEGREE]; 6] = [
-    ["L4.b0.c0", "L4.b0.c1", "L4.b0.c2", "L4.b0.c3", "L4.b0.c4", "L4.b0.c5"],
-    ["L4.b1.c0", "L4.b1.c1", "L4.b1.c2", "L4.b1.c3", "L4.b1.c4", "L4.b1.c5"],
-    ["L4.b2.c0", "L4.b2.c1", "L4.b2.c2", "L4.b2.c3", "L4.b2.c4", "L4.b2.c5"],
-    ["L4.b3.c0", "L4.b3.c1", "L4.b3.c2", "L4.b3.c3", "L4.b3.c4", "L4.b3.c5"],
-    ["L4.b4.c0", "L4.b4.c1", "L4.b4.c2", "L4.b4.c3", "L4.b4.c4", "L4.b4.c5"],
-    ["L4.b5.c0", "L4.b5.c1", "L4.b5.c2", "L4.b5.c3", "L4.b5.c4", "L4.b5.c5"],
+// L4 bit-column tags, max W1_BITS_PER_COEF = 6 (L1).
+const COORD_TAGS_L4: [[&str; MAX_EXT_DEGREE]; 6] = [
+    ["L4.b0.c0", "L4.b0.c1", "L4.b0.c2", "L4.b0.c3", "L4.b0.c4", "L4.b0.c5", "L4.b0.c6", "L4.b0.c7"],
+    ["L4.b1.c0", "L4.b1.c1", "L4.b1.c2", "L4.b1.c3", "L4.b1.c4", "L4.b1.c5", "L4.b1.c6", "L4.b1.c7"],
+    ["L4.b2.c0", "L4.b2.c1", "L4.b2.c2", "L4.b2.c3", "L4.b2.c4", "L4.b2.c5", "L4.b2.c6", "L4.b2.c7"],
+    ["L4.b3.c0", "L4.b3.c1", "L4.b3.c2", "L4.b3.c3", "L4.b3.c4", "L4.b3.c5", "L4.b3.c6", "L4.b3.c7"],
+    ["L4.b4.c0", "L4.b4.c1", "L4.b4.c2", "L4.b4.c3", "L4.b4.c4", "L4.b4.c5", "L4.b4.c6", "L4.b4.c7"],
+    ["L4.b5.c0", "L4.b5.c1", "L4.b5.c2", "L4.b5.c3", "L4.b5.c4", "L4.b5.c5", "L4.b5.c6", "L4.b5.c7"],
 ];
 
 // L5 V17 EQ-region tags, max L = 7 (mldsa-87) a_ntt slots + 3 = 10 total.
-// Slice to active length at runtime.
-const COORD_TAGS_L5: [[&str; EXT_DEGREE]; 10] = [
-    ["L5.a0.c0", "L5.a0.c1", "L5.a0.c2", "L5.a0.c3", "L5.a0.c4", "L5.a0.c5"],
-    ["L5.a1.c0", "L5.a1.c1", "L5.a1.c2", "L5.a1.c3", "L5.a1.c4", "L5.a1.c5"],
-    ["L5.a2.c0", "L5.a2.c1", "L5.a2.c2", "L5.a2.c3", "L5.a2.c4", "L5.a2.c5"],
-    ["L5.a3.c0", "L5.a3.c1", "L5.a3.c2", "L5.a3.c3", "L5.a3.c4", "L5.a3.c5"],
-    ["L5.a4.c0", "L5.a4.c1", "L5.a4.c2", "L5.a4.c3", "L5.a4.c4", "L5.a4.c5"],
-    ["L5.a5.c0", "L5.a5.c1", "L5.a5.c2", "L5.a5.c3", "L5.a5.c4", "L5.a5.c5"],
-    ["L5.a6.c0", "L5.a6.c1", "L5.a6.c2", "L5.a6.c3", "L5.a6.c4", "L5.a6.c5"],
-    ["L5.c_ntt.c0",  "L5.c_ntt.c1",  "L5.c_ntt.c2",  "L5.c_ntt.c3",  "L5.c_ntt.c4",  "L5.c_ntt.c5"],
-    ["L5.t1d_ntt.c0","L5.t1d_ntt.c1","L5.t1d_ntt.c2","L5.t1d_ntt.c3","L5.t1d_ntt.c4","L5.t1d_ntt.c5"],
-    ["L5.w_ntt.c0",  "L5.w_ntt.c1",  "L5.w_ntt.c2",  "L5.w_ntt.c3",  "L5.w_ntt.c4",  "L5.w_ntt.c5"],
+const COORD_TAGS_L5: [[&str; MAX_EXT_DEGREE]; 10] = [
+    ["L5.a0.c0", "L5.a0.c1", "L5.a0.c2", "L5.a0.c3", "L5.a0.c4", "L5.a0.c5", "L5.a0.c6", "L5.a0.c7"],
+    ["L5.a1.c0", "L5.a1.c1", "L5.a1.c2", "L5.a1.c3", "L5.a1.c4", "L5.a1.c5", "L5.a1.c6", "L5.a1.c7"],
+    ["L5.a2.c0", "L5.a2.c1", "L5.a2.c2", "L5.a2.c3", "L5.a2.c4", "L5.a2.c5", "L5.a2.c6", "L5.a2.c7"],
+    ["L5.a3.c0", "L5.a3.c1", "L5.a3.c2", "L5.a3.c3", "L5.a3.c4", "L5.a3.c5", "L5.a3.c6", "L5.a3.c7"],
+    ["L5.a4.c0", "L5.a4.c1", "L5.a4.c2", "L5.a4.c3", "L5.a4.c4", "L5.a4.c5", "L5.a4.c6", "L5.a4.c7"],
+    ["L5.a5.c0", "L5.a5.c1", "L5.a5.c2", "L5.a5.c3", "L5.a5.c4", "L5.a5.c5", "L5.a5.c6", "L5.a5.c7"],
+    ["L5.a6.c0", "L5.a6.c1", "L5.a6.c2", "L5.a6.c3", "L5.a6.c4", "L5.a6.c5", "L5.a6.c6", "L5.a6.c7"],
+    ["L5.c_ntt.c0",  "L5.c_ntt.c1",  "L5.c_ntt.c2",  "L5.c_ntt.c3",  "L5.c_ntt.c4",  "L5.c_ntt.c5",  "L5.c_ntt.c6",  "L5.c_ntt.c7"],
+    ["L5.t1d_ntt.c0","L5.t1d_ntt.c1","L5.t1d_ntt.c2","L5.t1d_ntt.c3","L5.t1d_ntt.c4","L5.t1d_ntt.c5","L5.t1d_ntt.c6","L5.t1d_ntt.c7"],
+    ["L5.w_ntt.c0",  "L5.w_ntt.c1",  "L5.w_ntt.c2",  "L5.w_ntt.c3",  "L5.w_ntt.c4",  "L5.w_ntt.c5",  "L5.w_ntt.c6",  "L5.w_ntt.c7"],
 ];
 
 /// Ext-typed OOD equality claim: an assertion that two polynomials
@@ -584,7 +598,7 @@ pub fn flatten_ext_to_base(ext: &ExtOodClaimBundle) -> OodClaimBundle<Goldilocks
         assert_eq!(f_coords.len(), EXT_DEGREE,
             "TowerField::to_fp_components returned wrong length for SexticExt");
         assert_eq!(g_coords.len(), EXT_DEGREE);
-        let tags: &[&'static str; EXT_DEGREE] = match claim.binding_tag {
+        let tags_max: &[&'static str; MAX_EXT_DEGREE] = match claim.binding_tag {
             "L2a"             => &COORD_TAGS_L2A,
             "L3"              => &COORD_TAGS_L3,
             "L2c"             => &COORD_TAGS_L2C,
@@ -613,6 +627,9 @@ pub fn flatten_ext_to_base(ext: &ExtOodClaimBundle) -> OodClaimBundle<Goldilocks
                  add a COORD_TAGS_* table for the new leg"
             ),
         };
+        // Slice to active EXT_DEGREE (6 at Fp⁶, 8 at Fp⁸).  Tables are
+        // sized for MAX_EXT_DEGREE=8 to be const for both cases.
+        let tags: &[&'static str] = &tags_max[..EXT_DEGREE];
         for i in 0..EXT_DEGREE {
             claims.push(OodEqualityClaim {
                 z: Goldilocks::from(0u64),

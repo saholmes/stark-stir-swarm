@@ -290,16 +290,11 @@ pub mod merkle_prover;
 pub mod deep_ali_verifier_air;
 pub mod recursive_prover;
 
-// v2 recursion bridge is gated to the SHA-3 variants that select Fp⁶
-// (sha3-256 / sha3-384) in deep_ali.  At sha3-512, deep_ali's `Ext`
-// becomes `OcticExt` (Fp⁸) and the bridge's hardcoded `SexticExt`
-// fails to compile.
-//
-// This also gates out the quantum mode at q=2^90 for L1 (which
-// would require sha3-512 + mldsa-44 for quantum-CR on the FS hash);
-// see scripts/results/quantum-calibration.md for the analysis.
-// Making the bridge Ext-generic is the unblocking refactor.
-#[cfg(any(feature = "sha3-256", feature = "sha3-384"))]
+// v2 recursion bridge is now Ext-GENERIC: it uses
+// `deep_ali::binding_cells_commit::Ext` (feature-conditional Fp⁶ at
+// sha3-256/sha3-384, Fp⁸ at sha3-512) and the EXT_DEGREE constant is
+// likewise cfg-selected (6 or 8).  Builds at all
+// (sha3-*, mldsa-*) combinations deep_ali allows.
 pub mod v2_recursion_bridge;
 
 /// Outer prover: runs the inner verifier inside the wrapper AIR and

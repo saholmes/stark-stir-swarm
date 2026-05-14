@@ -185,12 +185,14 @@ The harness logs the active hash per level:
   conservative and produces "L5 q=2^90 NOT POSSIBLE".  The bench
   harness uses the user-provided table which matches conventional
   practice for L1/L3 and the strict bound for L5 q=2^90.
-- The v2 recursion bridge (`wrapper_stark::v2_recursion_bridge`) is
-  Ext-field-gated: it hard-codes `SexticExt` (Fp⁶) which corresponds
-  to `sha3-256` / `sha3-384`.  Quantum modes that require `sha3-512`
-  (L1 q=2^90, L3 q=2^90, all of L5) currently can't run the bridge
-  end-to-end without an Ext-generic refactor.  The synthetic-claim
-  recursive STARK bench is unaffected.
+- The v2 recursion bridge is now **Ext-GENERIC** as of 2026-05-14:
+  it picks up `deep_ali::binding_cells_commit::Ext` (= `SexticExt`
+  at sha3-256/sha3-384, `OcticExt` at sha3-512) and the `EXT_DEGREE`
+  constant is likewise cfg-selected (6 or 8).  All (level, q) cells
+  that are not strictly impossible now run end-to-end through the
+  full F2b OOD + recursive STARK pipeline, including L5
+  (sha3-512+mldsa-87 / Fp⁸) and L1 quantum mode at q=2^90
+  (sha3-512+mldsa-44 over-provisioned / Fp⁸).
 - Bigger quantum budgets monotonically grow proof size and verify
   time as the hash output bytes double per upgrade.  This is the
   fundamental cost of stronger quantum-CR.
