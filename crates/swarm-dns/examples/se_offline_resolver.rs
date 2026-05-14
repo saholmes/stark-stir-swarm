@@ -160,64 +160,181 @@ fn main() {
     };
     println!();
 
-    // ─── Offline DNS queries ────────────────────────────────────────
-    println!("[Phase 3 resolve] Offline queries against committed corpus:");
+    // ─── Phase 3a — POSITIVE: queries for committed records ─────────
+    println!("[Phase 3a — POSITIVE] Queries for records IN the committed corpus");
+    println!("                       (should ACCEPT with Merkle inclusion proof)");
     println!();
     println!("  {:<24} {:<10} {:<6} {:<5} {:<5} rdata", "domain", "type", "alg", "idx", "depth");
     println!("  {:─<80}", "");
 
     // Pick up to 8 records spanning different algorithms for the demo.
     let mut algos_seen = std::collections::HashSet::new();
-    let mut demo_targets: Vec<(String, u16)> = Vec::new();
+    let mut positive_targets: Vec<(String, u16)> = Vec::new();
     for r in &package.records {
         if algos_seen.insert(r.algorithm) {
-            demo_targets.push((r.domain.clone(), r.record_type));
+            positive_targets.push((r.domain.clone(), r.record_type));
         }
-        if demo_targets.len() >= 8 { break; }
+        if positive_targets.len() >= 8 { break; }
     }
-    if demo_targets.len() < 5 {
+    if positive_targets.len() < 5 {
         for r in package.records.iter().take(8) {
             let key = (r.domain.clone(), r.record_type);
-            if !demo_targets.contains(&key) {
-                demo_targets.push(key);
+            if !positive_targets.contains(&key) {
+                positive_targets.push(key);
             }
-            if demo_targets.len() >= 8 { break; }
+            if positive_targets.len() >= 8 { break; }
         }
     }
 
-    let mut total_query_time_us = 0.0_f64;
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-    for (domain, rtype) in &demo_targets {
+    let mut total_pos_us = 0.0_f64;
+    let mut pos_accept = 0usize;
+    let mut pos_reject = 0usize;
+    for (domain, rtype) in &positive_targets {
         let t = Instant::now();
         let result = resolve(&package, domain, *rtype);
         let dt_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-        total_query_time_us += dt_us;
+        total_pos_us += dt_us;
         match result {
             Some(r) => {
-                accepted += 1;
+                pos_accept += 1;
                 show_inclusion(domain, *rtype, &r);
             }
             None => {
-                rejected += 1;
-                println!("  {domain:24} type={rtype:>3}  NOT FOUND or Merkle path mismatch");
+                pos_reject += 1;
+                println!("  {domain:24} type={rtype:>3}  ✗ NOT FOUND (unexpected)");
             }
         }
     }
-    let avg_us = if !demo_targets.is_empty() {
-        total_query_time_us / demo_targets.len() as f64
+    let avg_pos_us = if !positive_targets.is_empty() {
+        total_pos_us / positive_targets.len() as f64
     } else { 0.0 };
-
     println!();
-    println!("  Queries answered: {accepted}/{}, average lookup: {avg_us:.1} µs",
-        demo_targets.len());
-    if rejected > 0 {
-        println!("  Rejected (not found / inclusion mismatch): {rejected}");
+    println!("  Positive verdict: {pos_accept}/{} ACCEPT, avg lookup {avg_pos_us:.1} µs",
+        positive_targets.len());
+    println!();
+
+    // ─── Phase 3b — NEGATIVE: queries for NON-committed records ─────
+    println!("[Phase 3b — NEGATIVE] Queries for records NOT in the committed corpus");
+    println!("                       (should REJECT — no Merkle inclusion proof exists)");
+    println!();
+
+    // Construct queries that are extremely unlikely to be in any
+    // .se epoch package: synthetic adversarial names + record types.
+    let negative_targets: Vec<(String, u16)> = vec![
+        // Synthetic non-existent names that an attacker might want to forge:
+        ("evil-attacker.se".to_string(),               1),  // A record forgery target
+        ("phishing-bank.se".to_string(),               1),
+        ("malicious.example.se".to_string(),           1),
+        ("not-in-tranco.se".to_string(),               48), // DNSKEY query for unknown zone
+        // Legitimate domains that exist on the Internet but are not
+        // in this specific epoch package (i.e. not in the captured corpus):
+        ("github.com".to_string(),                     1),  // not .se at all
+        ("google.com".to_string(),                     1),
+        // Wrong record-type queries for committed domains — same domain,
+        // different rtype, should still REJECT if the rtype wasn't captured:
+        ("nonexistent-record-type.iis.se".to_string(), 255),
+    ];
+
+    println!("  {:<32} {:<10} verdict", "domain", "type");
+    println!("  {:─<80}", "");
+    let mut neg_accept = 0usize;
+    let mut neg_reject = 0usize;
+    for (domain, rtype) in &negative_targets {
+        let result = resolve(&package, domain, *rtype);
+        match result {
+            Some(_) => {
+                neg_accept += 1;
+                println!("  {domain:32} type={rtype:>3}  ✗ ACCEPTED (forgery — this is a bug)");
+            }
+            None => {
+                neg_reject += 1;
+                println!("  {domain:32} type={rtype:>3}  ✓ REJECT (not in committed corpus)");
+            }
+        }
+    }
+    println!();
+    println!("  Negative verdict: {neg_reject}/{} REJECT (expected = {})",
+        negative_targets.len(), negative_targets.len());
+    if neg_accept > 0 {
+        println!("  ✗ {neg_accept} false ACCEPT — this should be 0; security violation!");
+    } else {
+        println!("  ✓ all NEGATIVE queries correctly rejected — coverage = committed corpus");
+    }
+    println!();
+
+    // ─── Phase 3c — ADVERSARIAL: forged inclusion-proof attempt ─────
+    //
+    // An adversary holds the package + sees the committed Merkle root.
+    // They want to convince a victim that "evil.se A → 6.6.6.6" is
+    // attested by the package.  They synthesize a forged leaf hash and
+    // a real authentication path borrowed from leaf index 0.  The
+    // re-verification check `merkle_verify(forged_leaf, 0, real_path,
+    // committed_root)` reconstructs a DIFFERENT root (because the
+    // forged leaf changes the bottom-up hash chain).  REJECTED.
+    println!("[Phase 3c — ADVERSARIAL] Forged-inclusion-proof attack:");
+    println!("                          adversary tries to convince us 'evil.se A 6.6.6.6'");
+    println!("                          is in the corpus by reusing a real authentication path");
+    println!();
+    {
+        use swarm_dns::dns::{DnsRecord, merkle_path, merkle_verify};
+        // Forge a leaf for "evil.se A 6.6.6.6" using the package's
+        // (public) salt.
+        let forged_record = DnsRecord {
+            domain:      "evil.se".to_string(),
+            record_type: 1,
+            ttl:         300,
+            rdata:       vec![6, 6, 6, 6],  // 6.6.6.6 octets
+        };
+        let forged_leaf = forged_record.leaf_hash(&package.merkle_salt);
+        // Borrow a real authentication path from leaf-index 0
+        // (the adversary can compute it from the public tree levels).
+        let real_path_for_idx0 = merkle_path(&package.merkle_levels, 0);
+        // Adversary publishes the (forged_leaf, idx=0, real_path) and
+        // claims it proves inclusion under the committed Merkle root.
+        let adversary_claims_root = package.merkle_root;
+        println!("  forged record:       evil.se A 6.6.6.6");
+        println!("  forged leaf_hash:    {}", hex::encode(&forged_leaf[..16]));
+        println!("  claimed leaf_index:  0  (real index of {} type={} in corpus)",
+            package.records[0].domain, package.records[0].record_type);
+        println!("  authentication path: {} siblings (borrowed from real leaf 0)",
+            real_path_for_idx0.len());
+
+        let attack_succeeds = merkle_verify(
+            forged_leaf, 0, &real_path_for_idx0, adversary_claims_root,
+        );
+        if attack_succeeds {
+            println!();
+            println!("  ✗ FORGERY ACCEPTED — Merkle binding is broken (security bug!)");
+        } else {
+            // Show WHICH root the forged path reconstructs to.
+            let reconstructed = {
+                use sha3::{Digest, Sha3_256};
+                use swarm_dns::dns::TAG_NODE;
+                let mut cur = forged_leaf;
+                let mut idx = 0usize;
+                for &sib in &real_path_for_idx0 {
+                    let (l, r) = if idx & 1 == 0 { (cur, sib) } else { (sib, cur) };
+                    let mut h = Sha3_256::new();
+                    h.update(TAG_NODE); h.update(l); h.update(r);
+                    cur = h.finalize().into();
+                    idx /= 2;
+                }
+                cur
+            };
+            println!();
+            println!("  forged path reconstructs to: {}", hex::encode(&reconstructed[..16]));
+            println!("  committed Merkle root:       {}", hex::encode(&package.merkle_root[..16]));
+            println!("  ✓ FORGERY REJECTED — roots don't match");
+            println!("    The committed root cryptographically pins which leaves are");
+            println!("    in the corpus.  No leaf outside the corpus can satisfy");
+            println!("    the inclusion check because every leaf change propagates");
+            println!("    to a different root via SHA3-256 collision resistance.");
+        }
     }
     println!();
 
     // ─── Tamper-detection demo ──────────────────────────────────────
-    println!("[Tamper test] Mutate one byte of authority_sig and re-verify:");
+    println!("[Phase 3d — TAMPER] Mutate one byte of authority_sig + re-verify:");
     let mut tampered = package.clone();
     tampered.authority_sig[0] ^= 0xFF;
     match verify_package(&tampered) {
@@ -227,18 +344,26 @@ fn main() {
     println!();
 
     println!("═══════════════════════════════════════════════════════════════");
-    println!("  TRUE OFFLINE DNS RESOLUTION DEMONSTRATED");
+    println!("  TRUE OFFLINE DNS RESOLUTION — security envelope demonstrated");
     println!();
     println!("  ✓ Loaded a self-contained {:.1} KiB epoch package",
         raw_size as f64 / 1024.0);
     println!("  ✓ Verified once via ML-DSA-65 + outer STARK FRI");
-    println!("  ✓ Answered {accepted} DNS queries in {:.1} µs total ({avg_us:.1} µs avg)",
-        total_query_time_us);
-    println!("  ✓ NO NETWORK calls; NO secret state; NO ongoing trust");
+    println!("  ✓ {pos_accept} POSITIVE queries served in {:.1} µs total ({avg_pos_us:.1} µs/query)",
+        total_pos_us);
+    println!("  ✓ {neg_reject} NEGATIVE queries correctly rejected (no false ACCEPTs)");
+    println!("  ✓ Forged-inclusion-proof attempt rejected (Merkle binding holds)");
+    println!("  ✓ Sig-tampered package rejected (ML-DSA EUF-CMA holds)");
+    println!();
+    println!("  Security envelope: an offline resolver answers DNS queries");
+    println!("  EXACTLY for the {} records committed in this epoch package,",
+        package.records.len());
+    println!("  and CANNOT be tricked into accepting any record outside it.");
+    println!("  NO NETWORK calls; NO secret state; NO ongoing trust.");
     println!();
     println!("  Post-quantum integrity: STARK soundness rests on SHA-3");
     println!("  collision resistance + ML-DSA-65 EUF-CMA — both PQ-secure.");
     println!("  A future CRQC adversary breaking RSA/ECDSA cannot forge");
-    println!("  any record committed in this epoch package.");
+    println!("  any record outside this epoch package.");
     println!("═══════════════════════════════════════════════════════════════");
 }

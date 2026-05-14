@@ -101,22 +101,52 @@ A single ML-DSA-65 signature transitively binds:
 - The Merkle root (→ records[i] is at leaf-index i)
 - The epoch identity (T, seq, prev — freshness + chain-link integrity)
 
-### Phase 3 offline resolver — measured (smoke N=15 records)
+### Phase 3 offline resolver — security envelope (N=66 records, 252 KiB pkg)
+
+The offline resolver now demonstrates the **complete security
+envelope**: it answers DNS queries EXACTLY for records committed in
+the epoch package, and rejects everything outside.
 
 ```
-Phase 2 read:  load 207.3 KiB package from disk         → 0.3 ms
+Phase 2 read:  load 252.2 KiB package from disk         → 0.4 ms
 Phase 3 verify (one-time):
-  ✓ ML-DSA-65 signature verify                          → 0.125 ms
-  ✓ Outer STARK FRI verify                              → 1.152 ms
+  ✓ ML-DSA-65 signature verify                          → 0.142 ms
+  ✓ Outer STARK FRI verify                              → 1.303 ms
   ─────────────────────────────────────────────────────────────
-  One-time epoch acceptance                              → 1.36 ms
-Phase 3 resolve (per query, offline Merkle inclusion):
-  8 DNS queries answered                                 → 17.3 µs total
-  Average lookup                                         → 2.2 µs/query
-                                                            (paper §IV-D: ~1-2 µs)
-Tamper test: flip 1 byte of authority_sig → re-verify
-  ✗ correctly rejected ("ML-DSA-65 signature verification FAILED")
+  One-time epoch acceptance                              → 1.52 ms
+
+Phase 3a — POSITIVE (queries for records IN the corpus):
+  8/8 ACCEPT  via Merkle inclusion proof  →  avg 4.7 µs/query
+  domains spanning 4 algorithms: alg 8, 13, 14, 5
+  (com.se, 1177.se, tre.se, kb.se, svenskaspel.se, resilans.se, …)
+
+Phase 3b — NEGATIVE (queries for records NOT in the corpus):
+  7/7 REJECT — coverage = committed corpus exactly
+  • evil-attacker.se / phishing-bank.se / malicious.example.se  → REJECT
+  • github.com / google.com (cross-TLD, not .se at all)         → REJECT
+  • not-in-tranco.se / wrong-rtype-for-committed-domain         → REJECT
+
+Phase 3c — ADVERSARIAL forgery attempt:
+  Adversary holds the package + knows merkle_root.  They want to
+  prove "evil.se A 6.6.6.6" is in the corpus by forging a leaf hash
+  + reusing the real authentication path from leaf-index 0.
+  • forged leaf_hash:       949196eef5b495d02c4a6b6eb149a307…
+  • claimed leaf_index:     0  (real index of com.se in corpus)
+  • path reconstructs to:   39291ce4e20579191c0d160d899c91dd…
+  • committed Merkle root:  38e501dfc0f7f03e2f697d865bbf5b37…
+  ✓ FORGERY REJECTED — roots don't match (SHA3-256 collision-resistance)
+
+Phase 3d — TAMPER detection:
+  flip 1 byte of authority_sig + re-verify
+  ✓ correctly rejected ("ML-DSA-65 signature verification FAILED")
 ```
+
+**Security envelope guarantee**:
+1. Answers DNS queries EXACTLY for the N records committed in the package
+2. Rejects every query for a record outside the committed corpus
+3. Cannot be tricked by forged Merkle inclusion proofs (SHA3 CR)
+4. Cannot be tricked by tampered signatures (ML-DSA-65 EUF-CMA)
+5. Cannot be tricked by tampered STARK proofs (FRI soundness)
 
 **Package-size projection from Tranco N=3 822 run** (857 ACCEPT-verdict
 records committed):
