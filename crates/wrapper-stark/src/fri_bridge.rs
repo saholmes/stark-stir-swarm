@@ -63,6 +63,10 @@ use ark_ff::Field;
 
 use crate::bit_constraint::FieldTraceAccess;
 use crate::composition::ConstraintSet;
+use crate::row_uniform::{
+    AlwaysConstraint, ColRef, RowUniformConstraint, RowUniformOp,
+    SelectorIndex, UniformAirConstraints, UniformRowSchema, UniformTrace,
+};
 
 /// Errors that can occur while preparing inputs for the FRI prover.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,10 +176,164 @@ pub fn prepare_fri_input<F: Field>(
         )));
     }
     Err(BridgeError::NotImplemented(
-        "row-uniform restructure pending: cell-list BitOp constraints need \
-         conversion to row-uniform form with selector polynomials before \
-         deep_fri_prove can consume them.  See fri_bridge module docs.",
+        "use prepare_fri_input_row_uniform for the row-uniform path; \
+         this cell-list overload is deprecated.",
     ))
+}
+
+// ─── Row-uniform path: real implementation ─────────────────────────
+
+use ark_goldilocks::Goldilocks;
+use deep_ali::trace_import::lde_trace_columns;
+type FBase = ark_goldilocks::Goldilocks;
+
+/// Prepare a FRI input from a row-uniform trace + constraints.  This
+/// is the paper-grade path: column-major LDE + per-row constraint
+/// composition.
+///
+/// # Arguments
+///
+/// - `trace`: row-uniform trace satisfying the constraints
+/// - `air`: row-uniform AIR constraint set (selected + always)
+/// - `alphas_selected`: one α per selected constraint
+/// - `alphas_always`:   one α per always constraint
+/// - `blowup`: LDE blowup factor (paper §10.1: 32 production, 4 smoke)
+///
+/// # Algorithm
+///
+/// 1. Pad `trace.n_rows` up to next power of two `n_trace` (zero rows)
+/// 2. Convert row-major u8 trace into column-major `Vec<Vec<F>>`
+/// 3. LDE each column to length `n_trace × blowup` via deep_ali's
+///    `lde_trace_columns`
+/// 4. For each LDE row r, compute
+///    `c_eval[r] = Σ α_j_sel · selector_at(r, j) · Φ_j_sel(LDE @ r)
+///               + Σ α_k_always · Φ_k_always(LDE @ r [, LDE @ r+1])`
+/// 5. Return FriInput with the LDE columns + c_eval
+///
+/// Note: NextRowCopy constraints read at LDE rows r and r+1.  At the
+/// last LDE row, they read at row 0 (cyclic), which is correct under
+/// the FRI domain's multiplicative structure.
+pub fn prepare_fri_input_row_uniform(
+    trace: &UniformTrace,
+    air: &UniformAirConstraints,
+    alphas_selected: &[FBase],
+    alphas_always: &[FBase],
+    blowup: usize,
+) -> Result<FriInput<FBase>, BridgeError> {
+    if alphas_selected.len() != air.selected.len() {
+        return Err(BridgeError::Internal(format!(
+            "alphas_selected count {} != air.selected count {}",
+            alphas_selected.len(), air.selected.len()
+        )));
+    }
+    if alphas_always.len() != air.always.len() {
+        return Err(BridgeError::Internal(format!(
+            "alphas_always count {} != air.always count {}",
+            alphas_always.len(), air.always.len()
+        )));
+    }
+    if !blowup.is_power_of_two() || blowup < 2 {
+        return Err(BridgeError::Internal(format!(
+            "blowup must be a power of two ≥ 2; got {blowup}"
+        )));
+    }
+
+    let width = trace.schema.width;
+    let n_trace = trace.n_rows.next_power_of_two();
+    let n_lde = n_trace * blowup;
+
+    // 1. Convert row-major u8 trace into column-major Goldilocks,
+    //    padded with zeros to n_trace rows.
+    let mut columns: Vec<Vec<FBase>> = Vec::with_capacity(width);
+    for col in 0..width {
+        let mut col_vec = Vec::with_capacity(n_trace);
+        for row in 0..trace.n_rows {
+            col_vec.push(FBase::from(trace.get(row, col) as u64));
+        }
+        for _ in trace.n_rows..n_trace {
+            col_vec.push(FBase::from(0u64));
+        }
+        columns.push(col_vec);
+    }
+
+    // 2. LDE each column.
+    let lde: Vec<Vec<FBase>> = lde_trace_columns(&columns, n_trace, blowup)
+        .map_err(|e| BridgeError::Internal(format!("LDE failed: {e}")))?;
+
+    // 3. Compute c_eval per LDE row.  NextRowCopy steps by `blowup`
+    //    LDE rows (one trace-row step), cyclically.
+    let mut c_eval = vec![FBase::from(0u64); n_lde];
+    for r in 0..n_lde {
+        let mut acc = FBase::from(0u64);
+        // Selected: multiplied by selector value at this row.
+        for (j, c) in air.selected.iter().enumerate() {
+            let alpha = alphas_selected[j];
+            let sel_col = trace.schema.selector(c.selector);
+            let sel_val = lde[sel_col][r];
+            let phi = eval_op_at_lde::<FBase>(&c.op, &lde, r, n_lde, blowup);
+            acc += alpha * sel_val * phi;
+        }
+        // Always: no selector multiplication.
+        for (k, c) in air.always.iter().enumerate() {
+            let alpha = alphas_always[k];
+            let phi = eval_op_at_lde::<FBase>(&c.op, &lde, r, n_lde, blowup);
+            acc += alpha * phi;
+        }
+        c_eval[r] = acc;
+    }
+
+    Ok(FriInput { lde, n_trace, blowup, c_eval })
+}
+
+/// Evaluate one RowUniformOp at LDE row `r`.  Returns the polynomial
+/// residue (zero on satisfying trace).  Handles cross-row reads
+/// (NextRowCopy) by reading at row `(r + blowup) mod n_lde` — one
+/// TRACE-row step forward, cyclically.
+fn eval_op_at_lde<F: Field>(
+    op: &RowUniformOp,
+    lde: &[Vec<F>],
+    r: usize,
+    n_lde: usize,
+    blowup: usize,
+) -> F {
+    let two = F::one() + F::one();
+    match *op {
+        RowUniformOp::Xor { c, a, b } => {
+            let a = lde[a.0][r];
+            let b = lde[b.0][r];
+            let c = lde[c.0][r];
+            c - (a + b - two * a * b)
+        }
+        RowUniformOp::And { c, a, b } => {
+            let a = lde[a.0][r];
+            let b = lde[b.0][r];
+            let c = lde[c.0][r];
+            c - a * b
+        }
+        RowUniformOp::Not { c, a } => {
+            let a = lde[a.0][r];
+            let c = lde[c.0][r];
+            c - (F::one() - a)
+        }
+        RowUniformOp::Copy { c, a } => {
+            lde[c.0][r] - lde[a.0][r]
+        }
+        RowUniformOp::XorConst { c, a, k } => {
+            let a = lde[a.0][r];
+            let c = lde[c.0][r];
+            let k = F::from(k as u64);
+            c - (a + k - two * a * k)
+        }
+        RowUniformOp::Boolean { b } => {
+            let b = lde[b.0][r];
+            b * (b - F::one())
+        }
+        RowUniformOp::NextRowCopy { dst, src } => {
+            // One trace-row step in LDE = blowup LDE rows, cyclically.
+            let next_r = (r + blowup) % n_lde;
+            lde[dst.0][next_r] - lde[src.0][r]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +437,113 @@ mod tests {
         let s2 = format!("{e2}");
         assert!(s2.contains("internal error"));
         assert!(s2.contains("foo"));
+    }
+
+    // ─── Row-uniform path integration tests ─────────────────────────
+
+    use crate::row_uniform::{
+        UniformAirConstraints, UniformRowSchema, UniformTrace,
+        synthesize_uniform_trace,
+    };
+    use crate::sha3_absorb_air::Sha3Variant;
+    use crate::composition::alphas_from_transcript;
+    use ark_ff::Zero;
+
+    fn pad_input_for_test(input: &[u8], variant: Sha3Variant) -> Vec<Vec<u8>> {
+        let block_len = variant.block_bytes();
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut offset = 0;
+        while offset + block_len <= input.len() {
+            blocks.push(input[offset..offset + block_len].to_vec());
+            offset += block_len;
+        }
+        let mut last = vec![0u8; block_len];
+        last[..input.len() - offset].copy_from_slice(&input[offset..]);
+        last[input.len() - offset] = 0x06;
+        last[block_len - 1] |= 0x80;
+        blocks.push(last);
+        blocks
+    }
+
+    #[test]
+    fn row_uniform_prepare_fri_input_smoke() {
+        let blocks = pad_input_for_test(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        let schema = trace.schema.clone();
+        let air = UniformAirConstraints::for_schema(&schema);
+
+        let seed = [0xCAu8; 32];
+        let alphas_sel = alphas_from_transcript::<Goldilocks>(&seed, air.selected.len());
+        let mut seed2 = seed; seed2[0] ^= 1;
+        let alphas_alw = alphas_from_transcript::<Goldilocks>(&seed2, air.always.len());
+
+        let result = prepare_fri_input_row_uniform(
+            &trace, &air, &alphas_sel, &alphas_alw, /*blowup=*/4
+        );
+        let fri_input = result.expect("prepare_fri_input must succeed on a valid trace");
+
+        // Shape sanity.
+        assert_eq!(fri_input.lde.len(), schema.width);
+        let expected_lde_len = trace.n_rows.next_power_of_two() * 4;
+        for col in &fri_input.lde {
+            assert_eq!(col.len(), expected_lde_len);
+        }
+        assert_eq!(fri_input.c_eval.len(), expected_lde_len);
+        assert!(fri_input.check_shape().is_ok());
+    }
+
+    #[test]
+    fn row_uniform_c_eval_is_zero_at_trace_rows_for_valid_trace() {
+        // The composed polynomial c_eval must evaluate to ZERO at every
+        // LDE row that corresponds to an ORIGINAL trace row (multiples
+        // of `blowup`).  At intermediate LDE rows, c_eval is generally
+        // non-zero (it interpolates between trace rows) — that's what
+        // FRI's low-degree test checks.
+        let blocks = pad_input_for_test(b"abc", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        let schema = trace.schema.clone();
+        let air = UniformAirConstraints::for_schema(&schema);
+
+        let seed = [0x11u8; 32];
+        let alphas_sel = alphas_from_transcript::<Goldilocks>(&seed, air.selected.len());
+        let mut seed2 = seed; seed2[0] ^= 1;
+        let alphas_alw = alphas_from_transcript::<Goldilocks>(&seed2, air.always.len());
+
+        let blowup = 4;
+        let fri_input = prepare_fri_input_row_uniform(
+            &trace, &air, &alphas_sel, &alphas_alw, blowup,
+        ).expect("prepare must succeed");
+
+        // At trace rows 0..n_rows-1, c_eval must be zero.
+        // (The last row's NextRowCopy wraps cyclically, so it can be
+        // non-zero — we skip it for this check.)
+        for trace_row in 0..(trace.n_rows - 1) {
+            let lde_row = trace_row * blowup;
+            assert!(fri_input.c_eval[lde_row].is_zero(),
+                "c_eval at trace row {trace_row} (LDE row {lde_row}) should be 0; got {:?}",
+                fri_input.c_eval[lde_row]);
+        }
+    }
+
+    #[test]
+    fn row_uniform_prepare_rejects_alpha_count_mismatch() {
+        let blocks = pad_input_for_test(b"x", Sha3Variant::Sha3_256);
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let trace = synthesize_uniform_trace(&refs, Sha3Variant::Sha3_256);
+        let air = UniformAirConstraints::for_schema(&trace.schema);
+
+        // Wrong selected count.
+        let alphas_sel = vec![Goldilocks::from(1u64); 1];
+        let alphas_alw = vec![Goldilocks::from(1u64); air.always.len()];
+        let result = prepare_fri_input_row_uniform(&trace, &air, &alphas_sel, &alphas_alw, 4);
+        assert!(matches!(result, Err(BridgeError::Internal(_))));
+
+        // Wrong always count.
+        let alphas_sel = vec![Goldilocks::from(1u64); air.selected.len()];
+        let alphas_alw = vec![Goldilocks::from(1u64); 1];
+        let result = prepare_fri_input_row_uniform(&trace, &air, &alphas_sel, &alphas_alw, 4);
+        assert!(matches!(result, Err(BridgeError::Internal(_))));
     }
 }
