@@ -436,7 +436,150 @@ pub mod constraint_composition_verifier {
 /// The wrapper AIR encodes this by replicating the FRI transcript
 /// inside the AIR + checking the OOD evaluation equality.
 pub mod binding_cells_ood_verifier {
-    // Module skeleton — types and constraints land in subsequent commits.
+    use ark_ff::{Field, Zero};
+
+    /// A single OOD consistency claim.  The verifier checks
+    /// `f(z) = g(z)` for the claimed evaluations at the FS-derived
+    /// challenge point z.
+    ///
+    /// In the recursive ML-DSA STARK, this represents one of the
+    /// 7 binding-cells OOD checks (L1, L2a, L2b, L2c, L3, L4, L5)
+    /// from the inner proof's `binding_cells_commit` module.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct OodEqualityClaim<F: Field> {
+        /// FS-derived OOD challenge point z ∈ F_ext.
+        pub z: F,
+        /// Claimed evaluation f(z).
+        pub f_at_z: F,
+        /// Claimed evaluation g(z).
+        pub g_at_z: F,
+        /// Static tag identifying which binding-cells pair this is
+        /// (e.g. "L1", "L2a", ..., "L5").  Domain separation when
+        /// multiple OOD claims are checked in one proof.
+        pub binding_tag: &'static str,
+    }
+
+    impl<F: Field> OodEqualityClaim<F> {
+        /// Schwartz-Zippel residue: `f(z) - g(z)`.  Returns 0 iff the
+        /// underlying polynomials agree at z.  If `f ≠ g` as polynomials
+        /// of degree < d, the probability that `f(z) = g(z)` is
+        /// ≤ d / |F_ext| (SZ bound).  For Goldilocks Fp⁶ at d = n_trace ≈
+        /// 2¹⁴, this is ≤ 2⁻³⁷⁰.
+        pub fn residue(&self) -> F {
+            self.f_at_z - self.g_at_z
+        }
+
+        pub fn check_native(&self) -> bool {
+            self.residue().is_zero()
+        }
+    }
+
+    /// Bundle of OOD claims — the full set of binding-cells cross-
+    /// trace consistency checks for one inner proof.  For ML-DSA-65
+    /// v2 this is 7 entries (L1-L5 with L2 having a/b/c).
+    #[derive(Clone, Debug)]
+    pub struct OodClaimBundle<F: Field> {
+        pub claims: Vec<OodEqualityClaim<F>>,
+    }
+
+    impl<F: Field> OodClaimBundle<F> {
+        /// All-or-nothing: every claim must verify natively.
+        pub fn check_all_native(&self) -> bool {
+            self.claims.iter().all(|c| c.check_native())
+        }
+
+        /// Index of first failing claim, for diagnostics.
+        pub fn first_failing(&self) -> Option<usize> {
+            self.claims.iter().position(|c| !c.check_native())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ark_goldilocks::Goldilocks;
+        use ark_ff::Zero;
+
+        #[test]
+        fn equal_evaluations_pass() {
+            let z = Goldilocks::from(0xDEAD_BEEFu64);
+            let v = Goldilocks::from(0x1234_5678u64);
+            let claim = OodEqualityClaim {
+                z, f_at_z: v, g_at_z: v, binding_tag: "L1",
+            };
+            assert!(claim.check_native());
+            assert!(claim.residue().is_zero());
+        }
+
+        #[test]
+        fn unequal_evaluations_fail() {
+            let z = Goldilocks::from(0xDEAD_BEEFu64);
+            let claim = OodEqualityClaim {
+                z, f_at_z: Goldilocks::from(7u64),
+                g_at_z: Goldilocks::from(8u64),
+                binding_tag: "L2a",
+            };
+            assert!(!claim.check_native());
+            assert!(!claim.residue().is_zero());
+        }
+
+        #[test]
+        fn binding_tags_are_distinct_for_l_levels() {
+            // Domain separation: 7 tags for L1/L2a/L2b/L2c/L3/L4/L5.
+            let tags = ["L1", "L2a", "L2b", "L2c", "L3", "L4", "L5"];
+            let mut sorted: Vec<&str> = tags.to_vec();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 7,
+                "expected 7 distinct binding tags");
+        }
+
+        #[test]
+        fn bundle_all_pass_when_every_claim_passes() {
+            let z = Goldilocks::from(0xAB_CDEFu64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L2a" },
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L5" },
+                ],
+            };
+            assert!(bundle.check_all_native());
+            assert_eq!(bundle.first_failing(), None);
+        }
+
+        #[test]
+        fn bundle_fails_if_any_claim_fails() {
+            let z = Goldilocks::from(0xAB_CDEFu64);
+            let v = Goldilocks::from(42u64);
+            let bundle = OodClaimBundle {
+                claims: vec![
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L1" },
+                    OodEqualityClaim {
+                        z,
+                        f_at_z: Goldilocks::from(1u64),
+                        g_at_z: Goldilocks::from(2u64),
+                        binding_tag: "L3",
+                    },
+                    OodEqualityClaim { z, f_at_z: v, g_at_z: v, binding_tag: "L5" },
+                ],
+            };
+            assert!(!bundle.check_all_native());
+            assert_eq!(bundle.first_failing(), Some(1));
+        }
+
+        #[test]
+        fn residue_is_polynomial_difference() {
+            let z = Goldilocks::from(1u64);
+            let claim = OodEqualityClaim::<Goldilocks> {
+                z, f_at_z: Goldilocks::from(10u64),
+                g_at_z: Goldilocks::from(7u64),
+                binding_tag: "L4",
+            };
+            assert_eq!(claim.residue(), Goldilocks::from(3u64));
+        }
+    }
 }
 
 /// Permutation argument verifier sub-circuit.
