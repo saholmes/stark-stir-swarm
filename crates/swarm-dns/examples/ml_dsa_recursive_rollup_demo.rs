@@ -71,28 +71,41 @@ fn main() {
     // the inner proof shape stable.
     let blowup: usize = parse_env_usize("ROLLUP_BLOWUP", 4);
     let inner_blowup: usize = 4;
-    // Calibrated r per (L1, blowup) from r-vs-blowup-calibration.md.
-    // Maintains the paper's 135-bit total budget at L1 across all
-    // blowups (was previously hard-coded r=54 which only suffices at
-    // blowup=32).
-    let recursive_r: usize = match blowup {
-        4  => 135,
-        8  => 90,
-        16 => 68,
-        32 => 54,
-        _  => 54,
+
+    // Auto-detect NIST level from build features.  The (sha3-*,
+    // mldsa-*) feature pair determines both the inner v2 level and
+    // the recursive STARK's bit-budget calibration.
+    #[cfg(feature = "mldsa-44")] let nist_level: &str = "L1";
+    #[cfg(feature = "mldsa-65")] let nist_level: &str = "L3";
+    #[cfg(feature = "mldsa-87")] let nist_level: &str = "L5";
+    #[cfg(feature = "sha3-256")] let sha3_label: &str = "sha3-256";
+    #[cfg(all(feature = "sha3-384", not(feature = "sha3-256")))]
+        let sha3_label: &str = "sha3-384";
+    #[cfg(all(feature = "sha3-512", not(feature = "sha3-256"), not(feature = "sha3-384")))]
+        let sha3_label: &str = "sha3-512";
+
+    // Calibrated r per (level, blowup) from
+    // scripts/results/r-vs-blowup-calibration.md.
+    // Maintains the paper's per-level total bit budget (L1=135,
+    // L3=197.5, L5=262.5) across all blowups.
+    let recursive_r: usize = match (nist_level, blowup) {
+        ("L1", 4)  => 135, ("L1", 8) => 90, ("L1", 16) => 68, ("L1", 32) => 54,
+        ("L3", 4)  => 198, ("L3", 8) => 132, ("L3", 16) => 99, ("L3", 32) => 79,
+        ("L5", 4)  => 263, ("L5", 8) => 175, ("L5", 16) => 132, ("L5", 32) => 105,
+        _ => 54,
     };
     let recursive_r: usize = parse_env_usize("ROLLUP_R", recursive_r);
     let use_stir = std::env::var("ROLLUP_LDT").ok().as_deref() == Some("stir");
     let outer_ldt = if use_stir { LdtMode::Stir } else { LdtMode::Fri };
 
+    // Auto-detect old hardcoded label and replace.
     println!("Configuration:");
     println!("  N (inner signatures):         {n}");
+    println!("  NIST level:                   {nist_level} ({sha3_label})");
     println!("  Inner v2 blowup (fixed):      {inner_blowup}");
     println!("  Recursive STARK blowup:       {blowup}");
     println!("  Recursive r (calibrated):     {recursive_r}");
     println!("  Outer rollup LDT:             {}", if use_stir { "STIR" } else { "FRI" });
-    println!("  NIST level:                   L1 (sha3-256 + ML-DSA-44)");
     println!();
 
     let mut inner_pi_hashes: Vec<[u8; 32]>     = Vec::with_capacity(n);

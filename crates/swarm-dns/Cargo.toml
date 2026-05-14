@@ -7,13 +7,13 @@ description = "DNS-rollup record helpers, authority signing layer, and the megaz
 
 [features]
 default  = ["sha3-256", "mldsa-44", "parallel"]
-sha3-256 = ["deep_ali/sha3-256"]
-sha3-384 = ["deep_ali/sha3-384"]
-sha3-512 = ["deep_ali/sha3-512"]
-mldsa-44 = ["deep_ali/mldsa-44"]
-mldsa-65 = ["deep_ali/mldsa-65"]
-mldsa-87 = ["deep_ali/mldsa-87"]
-parallel = ["deep_ali/parallel"]
+sha3-256 = ["deep_ali/sha3-256", "wrapper-stark/sha3-256", "cairo-bench/sha3-256"]
+sha3-384 = ["deep_ali/sha3-384", "wrapper-stark/sha3-384", "cairo-bench/sha3-384"]
+sha3-512 = ["deep_ali/sha3-512", "wrapper-stark/sha3-512", "cairo-bench/sha3-512"]
+mldsa-44 = ["deep_ali/mldsa-44", "wrapper-stark/mldsa-44", "cairo-bench/mldsa-44"]
+mldsa-65 = ["deep_ali/mldsa-65", "wrapper-stark/mldsa-65", "cairo-bench/mldsa-65"]
+mldsa-87 = ["deep_ali/mldsa-87", "wrapper-stark/mldsa-87", "cairo-bench/mldsa-87"]
+parallel = ["deep_ali/parallel", "wrapper-stark/parallel", "cairo-bench/parallel"]
 # Forward the merkle leaf-compression accelerator (paper dual-hash §8):
 # Poseidon-compresses field-element leaves, then SHA-3 the state for the
 # verifier-facing leaf hash.  Internal Merkle nodes remain SHA-3 only —
@@ -31,17 +31,17 @@ hex            = "0.4"
 fips204        = { workspace = true }
 serde          = { workspace = true, features = ["derive"] }
 
-deep_ali    = { path = "../deep_ali" }
-cairo-bench = { path = "../cairo-bench" }   # for AirType::HashRollup + trace builders
+deep_ali    = { path = "../deep_ali", default-features = false }
+cairo-bench = { path = "../cairo-bench", default-features = false }   # for AirType::HashRollup + trace builders
 hash        = { path = "../hash",       default-features = false }
 merkle      = { path = "../merkle",     default-features = false }
 transcript  = { path = "../transcript", default-features = false }
 
 # wrapper-stark: pulled in by the ml_dsa_recursive_rollup_demo example
-# to produce recursive STARK proofs.  Pin its features to match
-# swarm-dns's default (sha3-256, mldsa-44, parallel) so the deep_ali
-# transitive feature-unification stays consistent across the workspace.
-wrapper-stark = { path = "../wrapper-stark", default-features = false, features = ["sha3-256", "mldsa-44", "parallel"] }
+# to produce recursive STARK proofs.  Features are forwarded from
+# swarm-dns's own (sha3-*, mldsa-*) selection so the workspace builds
+# at any valid (level, quantum-q) combination consistently.
+wrapper-stark = { path = "../wrapper-stark", default-features = false }
 
 [dev-dependencies]
 num-bigint    = "0.4"
