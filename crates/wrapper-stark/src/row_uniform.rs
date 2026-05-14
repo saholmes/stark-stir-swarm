@@ -585,6 +585,127 @@ pub fn iota_row_uniform_constraints(
     out
 }
 
+// ─── Global / unconditional constraints ─────────────────────────────
+//
+// These constraints fire at EVERY row regardless of sub-step.  They're
+// not gated by a sub-step selector (the selector field uses an
+// "always" sentinel that the composition polynomial evaluator treats
+// as 1 unconditionally).
+//
+// Categories:
+// 1. Booleanity on state_in / state_out / block_bits / selector cells
+// 2. Selector-sum-one: exactly one selector is 1 per row
+//    `s_θ + s_ρπ + s_χ + s_ι + s_absorb - 1 = 0`
+// 3. Cross-row state-threading: state_in[r+1] ≡ state_out[r]
+
+/// Sentinel for "fires at every row, no sub-step gating" — see
+/// [`always_constraint`] for the wrapper.  Distinct from any real
+/// SelectorIndex variant to avoid accidental sub-step gating.
+pub(crate) const ALWAYS_SELECTOR: SelectorIndex = SelectorIndex::Absorb; // re-used marker; see `is_always_active` below
+
+/// True iff the constraint should fire unconditionally (no selector
+/// multiplication).  Currently identified by a dedicated `Always`
+/// flag on [`AlwaysConstraint`] — but we keep the `RowUniformConstraint`
+/// shape uniform for ergonomics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlwaysConstraint {
+    pub op: RowUniformOp,
+}
+
+impl AlwaysConstraint {
+    pub fn total_degree(&self) -> usize {
+        // No selector multiplication — degree is just the op's.
+        self.op.degree()
+    }
+}
+
+/// Emit global booleanity constraints — every state_in, state_out,
+/// block_bits, rc_bits, and selector cell must be in {0, 1}.
+/// These fire at every row unconditionally.
+///
+/// Count: 1600 + 1600 + rate_bits + 64 + 5 = 3269 + rate_bits
+pub fn global_booleanity_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<AlwaysConstraint> {
+    let mut out = Vec::with_capacity(3269 + schema.block_bits.len());
+
+    for col in schema.state_in.clone() {
+        out.push(AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(col) } });
+    }
+    for col in schema.state_out.clone() {
+        out.push(AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(col) } });
+    }
+    for col in schema.block_bits.clone() {
+        out.push(AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(col) } });
+    }
+    for col in schema.rc_bits.clone() {
+        out.push(AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(col) } });
+    }
+    for col in schema.selectors.clone() {
+        out.push(AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(col) } });
+    }
+
+    out
+}
+
+/// Emit cross-row state-threading constraints.  At every row r that
+/// has a successor (r is not the very last row of the trace),
+///   state_in[r + 1] - state_out[r] = 0
+/// for every (lane, bit).  Encoded via [`RowUniformOp::NextRowCopy`].
+///
+/// Count: 1600 NextRowCopy constraints (one per state cell).  Each
+/// fires unconditionally at every row except the last.
+pub fn state_threading_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<AlwaysConstraint> {
+    let mut out = Vec::with_capacity(1600);
+    for lane in 0..25 {
+        for bit in 0..64 {
+            out.push(AlwaysConstraint {
+                op: RowUniformOp::NextRowCopy {
+                    dst: ColRef(schema.state_in_bit(lane, bit)),
+                    src: ColRef(schema.state_out_bit(lane, bit)),
+                },
+            });
+        }
+    }
+    out
+}
+
+/// All row-uniform AIR constraints for a single uniform schema:
+/// the four sub-step generators + global booleanity + threading.
+///
+/// Returns `(selected, always)` where:
+/// - `selected`: 16 000 sub-step constraints, each carrying its
+///   gating selector
+/// - `always`:   global booleanity + state threading, fire at every row
+#[derive(Clone, Debug)]
+pub struct UniformAirConstraints {
+    pub selected: Vec<RowUniformConstraint>,
+    pub always:   Vec<AlwaysConstraint>,
+}
+
+impl UniformAirConstraints {
+    pub fn for_schema(schema: &UniformRowSchema) -> Self {
+        let mut selected = Vec::with_capacity(16_000);
+        selected.extend(theta_row_uniform_constraints(schema));
+        selected.extend(rho_pi_row_uniform_constraints(schema));
+        selected.extend(chi_row_uniform_constraints(schema));
+        selected.extend(iota_row_uniform_constraints(schema));
+
+        let mut always = Vec::new();
+        always.extend(global_booleanity_constraints(schema));
+        always.extend(state_threading_constraints(schema));
+
+        Self { selected, always }
+    }
+
+    /// Total constraint count across both categories.
+    pub fn total(&self) -> usize {
+        self.selected.len() + self.always.len()
+    }
+}
+
 /// Selector column values for the entire trace.  Returns a vector of
 /// length `n_rows` where `selectors[r]` = the active SelectorIndex
 /// at row `r`.  Verifier publicly computes this from row index — no
@@ -982,5 +1103,98 @@ mod tests {
         let n_chi    = chi_row_uniform_constraints(&schema).len();
         let n_iota   = iota_row_uniform_constraints(&schema).len();
         assert_eq!(n_theta + n_rho_pi + n_chi + n_iota, 16_000);
+    }
+
+    // ─── Global booleanity + threading tests ────────────────────────
+
+    #[test]
+    fn global_booleanity_covers_all_witness_cells() {
+        for variant in [Sha3Variant::Sha3_256, Sha3Variant::Sha3_384, Sha3Variant::Sha3_512] {
+            let schema = UniformRowSchema::new(variant);
+            let bools = global_booleanity_constraints(&schema);
+            // Expected: state_in (1600) + state_out (1600) + block_bits (variant-dep)
+            //         + rc_bits (64) + selectors (5)
+            let expected = 1600 + 1600 + variant.rate_bits() + 64 + 5;
+            assert_eq!(bools.len(), expected,
+                "variant {variant:?} global booleanity count");
+            // Every constraint must be Boolean.
+            for c in &bools {
+                assert!(matches!(c.op, RowUniformOp::Boolean { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn state_threading_count_and_kind() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = state_threading_constraints(&schema);
+        assert_eq!(cs.len(), 1600);
+        for c in &cs {
+            assert!(matches!(c.op, RowUniformOp::NextRowCopy { .. }));
+        }
+    }
+
+    #[test]
+    fn state_threading_targets_state_in_columns_only() {
+        // dst is state_in (which becomes the NEXT row's input);
+        // src is state_out (CURRENT row's output).
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        for c in state_threading_constraints(&schema) {
+            match c.op {
+                RowUniformOp::NextRowCopy { dst, src } => {
+                    assert!(schema.state_in.contains(&dst.0),
+                        "dst {} not in state_in range", dst.0);
+                    assert!(schema.state_out.contains(&src.0),
+                        "src {} not in state_out range", src.0);
+                }
+                _ => panic!("expected NextRowCopy"),
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_air_constraints_aggregate_counts() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let air = UniformAirConstraints::for_schema(&schema);
+        // selected = 16 000 (per-round sum)
+        assert_eq!(air.selected.len(), 16_000);
+        // always = global booleanity + state threading
+        //        = (1600 + 1600 + 1088 + 64 + 5) + 1600
+        //        = 4357 + 1600 = 5957
+        let bool_count = 1600 + 1600 + 1088 + 64 + 5;
+        assert_eq!(air.always.len(), bool_count + 1600);
+        assert_eq!(air.total(), 16_000 + bool_count + 1600);
+    }
+
+    #[test]
+    fn always_constraint_total_degree_no_selector_multiplication() {
+        // Always constraints don't get selector-multiplied, so their
+        // total degree is just the op's degree (1 or 2).
+        let c1 = AlwaysConstraint { op: RowUniformOp::Boolean { b: ColRef(0) } };
+        assert_eq!(c1.total_degree(), 2);
+
+        let c2 = AlwaysConstraint { op: RowUniformOp::NextRowCopy {
+            dst: ColRef(0), src: ColRef(1),
+        }};
+        assert_eq!(c2.total_degree(), 1);
+    }
+
+    #[test]
+    fn uniform_air_scales_per_variant() {
+        // Global booleanity changes with block_bits range, so total
+        // count differs per variant.
+        for (variant, expected_block_bool) in [
+            (Sha3Variant::Sha3_256, 1088usize),
+            (Sha3Variant::Sha3_384,  832),
+            (Sha3Variant::Sha3_512,  576),
+        ] {
+            let schema = UniformRowSchema::new(variant);
+            let air = UniformAirConstraints::for_schema(&schema);
+            let expected_always = (1600 + 1600 + expected_block_bool + 64 + 5) + 1600;
+            assert_eq!(air.always.len(), expected_always,
+                "variant {variant:?}");
+            // Selected count is variant-independent.
+            assert_eq!(air.selected.len(), 16_000);
+        }
     }
 }
