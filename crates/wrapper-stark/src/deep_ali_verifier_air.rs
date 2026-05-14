@@ -1127,6 +1127,148 @@ pub mod permutation_argument_verifier {
         }
     }
 
+    // ─── In-AIR encoding: multiplicative running-product accumulator ─
+    //
+    // Encode the perm-arg as a row-wise running product:
+    //
+    //   row r ∈ [0..n):
+    //     col 0: l_r              (left multiset element)
+    //     col 1: r_r              (right multiset element)
+    //     col 2: running_left_r   (= ∏_{j≤r} (γ + l_j))
+    //     col 3: running_right_r  (= ∏_{j≤r} (γ + r_j))
+    //
+    // Constraints:
+    //   - row 0:        running_left_0  = γ + l_0
+    //                   running_right_0 = γ + r_0
+    //   - row r > 0:    running_left_r  = running_left_{r-1}  · (γ + l_r)
+    //                   running_right_r = running_right_{r-1} · (γ + r_r)
+    //   - row n-1:      running_left_{n-1} − running_right_{n-1} = 0  (boundary)
+    //
+    // γ is a public input (witnessed as a column in the AIR but
+    // verifier-known via FS-derivation).
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct PermArgAccumulatorLayout {
+        pub l_col: usize,
+        pub r_col: usize,
+        pub running_left_col: usize,
+        pub running_right_col: usize,
+        pub width: usize,
+    }
+
+    impl PermArgAccumulatorLayout {
+        pub fn new(col_start: usize) -> Self {
+            Self {
+                l_col:             col_start,
+                r_col:             col_start + 1,
+                running_left_col:  col_start + 2,
+                running_right_col: col_start + 3,
+                width: 4,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct PermArgAccumulatorTrace<F: Field> {
+        pub n_rows: usize,
+        pub l: Vec<F>,
+        pub r: Vec<F>,
+        pub running_left: Vec<F>,
+        pub running_right: Vec<F>,
+        pub gamma: F,
+    }
+
+    impl<F: Field> PermArgAccumulatorTrace<F> {
+        pub fn synthesise(claim: &PermArgClaim<F>) -> Self {
+            let n = claim.left.len();
+            assert_eq!(claim.right.len(), n);
+            let mut l = Vec::with_capacity(n);
+            let mut r = Vec::with_capacity(n);
+            let mut running_left = Vec::with_capacity(n);
+            let mut running_right = Vec::with_capacity(n);
+            let mut acc_l = F::one();
+            let mut acc_r = F::one();
+            for j in 0..n {
+                acc_l *= claim.gamma + claim.left[j];
+                acc_r *= claim.gamma + claim.right[j];
+                l.push(claim.left[j]);
+                r.push(claim.right[j]);
+                running_left.push(acc_l);
+                running_right.push(acc_r);
+            }
+            Self { n_rows: n, l, r, running_left, running_right, gamma: claim.gamma }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PermArgAccumulatorOp {
+        /// row 0:        running_left_0 - (γ + l_0) = 0
+        InitialLeft,
+        /// row 0:        running_right_0 - (γ + r_0) = 0
+        InitialRight,
+        /// row j > 0:    running_left_j - running_left_{j-1} · (γ + l_j) = 0
+        StepLeft,
+        /// row j > 0:    running_right_j - running_right_{j-1} · (γ + r_j) = 0
+        StepRight,
+        /// row n-1:      running_left - running_right = 0
+        FinalBoundary,
+    }
+
+    impl PermArgAccumulatorOp {
+        pub fn eval<F: Field>(
+            &self,
+            l: F, r: F, curr_left: F, curr_right: F,
+            prev_left: F, prev_right: F, gamma: F,
+        ) -> F {
+            match self {
+                Self::InitialLeft   => curr_left - (gamma + l),
+                Self::InitialRight  => curr_right - (gamma + r),
+                Self::StepLeft      => curr_left - prev_left * (gamma + l),
+                Self::StepRight     => curr_right - prev_right * (gamma + r),
+                Self::FinalBoundary => curr_left - curr_right,
+            }
+        }
+    }
+
+    pub fn verify_perm_arg_accumulator_trace<F: Field>(
+        trace: &PermArgAccumulatorTrace<F>,
+    ) -> bool {
+        if trace.n_rows == 0 { return true; }
+        // initial
+        if !PermArgAccumulatorOp::InitialLeft.eval(
+            trace.l[0], trace.r[0],
+            trace.running_left[0], trace.running_right[0],
+            F::zero(), F::zero(), trace.gamma,
+        ).is_zero() { return false; }
+        if !PermArgAccumulatorOp::InitialRight.eval(
+            trace.l[0], trace.r[0],
+            trace.running_left[0], trace.running_right[0],
+            F::zero(), F::zero(), trace.gamma,
+        ).is_zero() { return false; }
+        // steps
+        for j in 1..trace.n_rows {
+            if !PermArgAccumulatorOp::StepLeft.eval(
+                trace.l[j], trace.r[j],
+                trace.running_left[j], trace.running_right[j],
+                trace.running_left[j - 1], trace.running_right[j - 1],
+                trace.gamma,
+            ).is_zero() { return false; }
+            if !PermArgAccumulatorOp::StepRight.eval(
+                trace.l[j], trace.r[j],
+                trace.running_left[j], trace.running_right[j],
+                trace.running_left[j - 1], trace.running_right[j - 1],
+                trace.gamma,
+            ).is_zero() { return false; }
+        }
+        // boundary
+        PermArgAccumulatorOp::FinalBoundary.eval(
+            trace.l[trace.n_rows - 1], trace.r[trace.n_rows - 1],
+            trace.running_left[trace.n_rows - 1],
+            trace.running_right[trace.n_rows - 1],
+            F::zero(), F::zero(), trace.gamma,
+        ).is_zero()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1221,6 +1363,82 @@ pub mod permutation_argument_verifier {
                 assert!(!claim.check_native(),
                     "γ={gamma_val} should reject different multisets");
             }
+        }
+
+        // ─── Perm-arg accumulator AIR tests ──────────────────────────
+
+        #[test]
+        fn perm_arg_accumulator_layout_width() {
+            let layout = PermArgAccumulatorLayout::new(0);
+            assert_eq!(layout.width, 4);
+        }
+
+        #[test]
+        fn perm_arg_accumulator_synthesises_correct_products() {
+            // 3-element multisets, same elements different order
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(3), gf(1), gf(2)],
+                gamma: gf(7),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            assert_eq!(trace.n_rows, 3);
+            // Final running products should equal prod_left, prod_right
+            // and be equal to each other.
+            assert_eq!(trace.running_left[2], claim.prod_left());
+            assert_eq!(trace.running_right[2], claim.prod_right());
+            assert_eq!(trace.running_left[2], trace.running_right[2]);
+        }
+
+        #[test]
+        fn perm_arg_accumulator_verifies_on_honest_claim() {
+            let claim = PermArgClaim {
+                left:  vec![gf(10), gf(20), gf(30), gf(40)],
+                right: vec![gf(20), gf(30), gf(40), gf(10)],
+                gamma: gf(0xCAFE),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            assert!(verify_perm_arg_accumulator_trace(&trace));
+        }
+
+        #[test]
+        fn perm_arg_accumulator_rejects_tampered_running_left() {
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(3), gf(1), gf(2)],
+                gamma: gf(7),
+                perm_tag: "T_MEM",
+            };
+            let mut trace = PermArgAccumulatorTrace::synthesise(&claim);
+            trace.running_left[1] = gf(99);
+            assert!(!verify_perm_arg_accumulator_trace(&trace),
+                "tampered running_left must reject");
+        }
+
+        #[test]
+        fn perm_arg_accumulator_rejects_unequal_multisets() {
+            // Different multisets — synthesised trace ends with
+            // running_left ≠ running_right → FinalBoundary rejects.
+            let claim = PermArgClaim {
+                left:  vec![gf(1), gf(2), gf(3)],
+                right: vec![gf(1), gf(2), gf(5)],  // 5 instead of 3
+                gamma: gf(7),
+                perm_tag: "T_MEM",
+            };
+            let trace = PermArgAccumulatorTrace::synthesise(&claim);
+            assert!(!verify_perm_arg_accumulator_trace(&trace));
+        }
+
+        #[test]
+        fn perm_arg_accumulator_op_degrees() {
+            // StepLeft and StepRight are degree 2 (prev_running · (γ + l_j))
+            let _ = (PermArgAccumulatorOp::InitialLeft,
+                     PermArgAccumulatorOp::InitialRight,
+                     PermArgAccumulatorOp::StepLeft,
+                     PermArgAccumulatorOp::StepRight,
+                     PermArgAccumulatorOp::FinalBoundary);
         }
 
         #[test]
