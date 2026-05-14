@@ -1282,4 +1282,71 @@ mod tests {
         assert!(!verify_recursive_stark(&proof),
             "tampered outer pi_hash must be rejected");
     }
+
+    /// Bench composed recursive STARK across NIST levels (selected via
+    /// build features) + LDT (BENCH_STIR=1 for STIR else FRI) + blowup
+    /// (BENCH_BLOWUP) + r (BENCH_R).  Emits a CSV-friendly line:
+    ///
+    ///   recursive_stark variant=L1 blowup=4 r=54 ldt=fri \
+    ///     prove_ms=X verify_ms=Y proof_kib=Z n_trace=N \
+    ///     n_constraints=6 n_ood=7 n_perm=5
+    ///
+    /// Marked `--ignored` so it doesn't run by default; invoke via
+    /// scripts/bench-recursive-stark.sh.
+    #[test]
+    #[ignore = "bench — invoke via scripts/bench-recursive-stark.sh"]
+    fn bench_recursive_stark() {
+        use std::time::Instant;
+        use ark_serialize::CanonicalSerialize;
+
+        // Variant selected by build features; only used for the CSV label.
+        #[cfg(feature = "sha3-256")] let level_label = "L1";
+        #[cfg(all(feature = "sha3-384", not(feature = "sha3-256")))]
+            let level_label = "L3";
+        #[cfg(all(feature = "sha3-512", not(feature = "sha3-256"), not(feature = "sha3-384")))]
+            let level_label = "L5";
+
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let r: usize = std::env::var("BENCH_R")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+        let use_stir: bool = std::env::var("BENCH_STIR")
+            .ok().as_deref() == Some("1");
+        let ldt_label = if use_stir { "stir" } else { "fri" };
+
+        let c = xor_chain_claim();
+        let o = ood_honest_claim();
+        let p = perm_arg_honest_claim();
+        let n_constraints = c.constraints.len();
+        let n_ood = o.bundle.claims.len();
+        let n_perm = p.left.len();
+
+        let t0 = Instant::now();
+        let proof = prove_recursive_stark(&c, &o, &p, blowup, r, use_stir)
+            .expect("prove must succeed");
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 3 verify runs, take median.
+        let mut samples = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let t = Instant::now();
+            let ok = verify_recursive_stark(&proof);
+            assert!(ok, "verify must accept on honest proof");
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let verify_ms = samples[1];
+
+        let mut buf = Vec::new();
+        proof.fri_proof.serialize_compressed(&mut buf)
+            .expect("serialise proof");
+        let proof_kib = buf.len() as f64 / 1024.0;
+
+        println!(
+            "recursive_stark variant={level_label} blowup={blowup} r={r} ldt={ldt_label} \
+             prove_ms={prove_ms:.1} verify_ms={verify_ms:.2} proof_kib={proof_kib:.1} \
+             n_trace={n_trace} n_constraints={n_constraints} n_ood={n_ood} n_perm={n_perm}",
+            n_trace = proof.n_trace,
+        );
+    }
 }
