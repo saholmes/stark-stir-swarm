@@ -195,9 +195,217 @@ impl RowType {
 /// Number of rows per absorb block (1 absorb + 24 rounds × 4 sub-steps).
 pub const ROWS_PER_BLOCK: usize = 97;
 
+// ─── Row-uniform constraint generators ──────────────────────────────
+//
+// Constraints reference COLUMNS only (no absolute row).  They're
+// applied at every row of the trace; the selector multiplier gates
+// them to the appropriate sub-step.  Composition polynomial:
+//
+//   Φ(trace, r) = Σ_j α_j · selector_at(r, j) · Φ_j(cells_at_row(r))
+//
+// On rows where the selector is 0 the contribution is 0 — the
+// constraint vanishes vacuously, no booleanity required of the
+// underlying Φ_j.
+
 /// Number of rows for an N-block sponge run.
 pub fn rows_for_blocks(n_blocks: usize) -> usize {
     ROWS_PER_BLOCK * n_blocks
+}
+
+/// Reference to one column of the uniform-schema trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColRef(pub usize);
+
+/// A row-uniform polynomial constraint.  References COLUMNS only —
+/// the row is implicit (the row at which the constraint fires).
+/// All ops also implicitly carry a selector that gates them; the
+/// selector wrapper is [`RowUniformConstraint`] below.
+///
+/// Cross-row reference (`NextRow*`) variants reference cells at the
+/// row after the current one, used for state-threading between
+/// consecutive sub-step rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowUniformOp {
+    /// `c = a XOR b` at the current row, both inputs boolean.
+    Xor { c: ColRef, a: ColRef, b: ColRef },
+    /// `c = a AND b`, boolean inputs.
+    And { c: ColRef, a: ColRef, b: ColRef },
+    /// `c = NOT a`.
+    Not { c: ColRef, a: ColRef },
+    /// `c = a` — used for ρπ bit-permutation between state_in cells
+    /// and state_out cells.
+    Copy { c: ColRef, a: ColRef },
+    /// `c = a XOR k` where `k ∈ {0, 1}` is a public/static bit (ι).
+    XorConst { c: ColRef, a: ColRef, k: u8 },
+    /// `b ∈ {0, 1}` — booleanity constraint.
+    Boolean { b: ColRef },
+    /// `dst(next_row) = src(this_row)` — cross-row threading copy.
+    /// Used between consecutive sub-step rows to propagate state_out
+    /// of row r into state_in of row r+1.
+    NextRowCopy { dst: ColRef, src: ColRef },
+}
+
+impl RowUniformOp {
+    /// Algebraic degree of the constraint polynomial (before selector
+    /// multiplication).  After selector multiplication degree += 1.
+    pub fn degree(&self) -> usize {
+        match self {
+            Self::Xor { .. }            => 2,  // 2ab term
+            Self::And { .. }            => 2,  // a·b term
+            Self::Not { .. }            => 1,
+            Self::Copy { .. }           => 1,
+            Self::XorConst { .. }       => 1,
+            Self::Boolean { .. }        => 2,
+            Self::NextRowCopy { .. }    => 1,
+        }
+    }
+}
+
+/// One row-uniform constraint = a selector + the polynomial it gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowUniformConstraint {
+    /// Selector that gates this constraint.  At a row r:
+    /// - if `selectors[r] == this.selector`, the constraint must hold
+    /// - otherwise, the constraint is multiplied by 0 (vacuous)
+    pub selector: SelectorIndex,
+    pub op: RowUniformOp,
+}
+
+impl RowUniformConstraint {
+    /// Total degree after selector multiplication.  Selector cells
+    /// are degree-1 (linear).
+    pub fn total_degree(&self) -> usize {
+        1 + self.op.degree()
+    }
+}
+
+// ─── Helper-cell column allocation for θ ─────────────────────────────
+//
+// θ uses the first 1600 cells of the [`helpers`] range:
+//   helpers[0..960]      parity-chain intermediates: 3 per (x, bit)
+//                        layout: [3*(64*x + bit) + i for i ∈ 0..3]
+//   helpers[960..1280]   column parities C[x][bit]:
+//                        layout: [960 + 64*x + bit]
+//   helpers[1280..1600]  diffuse vector D[x][bit]:
+//                        layout: [1280 + 64*x + bit]
+
+fn theta_chain_col(schema: &UniformRowSchema, x: usize, bit: usize, i: usize) -> ColRef {
+    debug_assert!(x < 5 && bit < 64 && i < 3);
+    ColRef(schema.helper_bit(3 * (64 * x + bit) + i))
+}
+fn theta_parity_c_col(schema: &UniformRowSchema, x: usize, bit: usize) -> ColRef {
+    debug_assert!(x < 5 && bit < 64);
+    ColRef(schema.helper_bit(960 + 64 * x + bit))
+}
+fn theta_diffuse_d_col(schema: &UniformRowSchema, x: usize, bit: usize) -> ColRef {
+    debug_assert!(x < 5 && bit < 64);
+    ColRef(schema.helper_bit(1280 + 64 * x + bit))
+}
+
+/// Emit row-uniform constraints for the θ sub-step.  All gated by
+/// `SelectorIndex::Theta`.  Total: 1 600 booleanity + 3 200 XOR
+/// = 4 800 constraints (matches the cell-list count).
+pub fn theta_row_uniform_constraints(
+    schema: &UniformRowSchema,
+) -> Vec<RowUniformConstraint> {
+    let mut out: Vec<RowUniformConstraint> = Vec::with_capacity(4800);
+
+    // Booleanity on all θ-helper cells.
+    for x in 0..5 {
+        for bit in 0..64 {
+            for i in 0..3 {
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::Theta,
+                    op: RowUniformOp::Boolean { b: theta_chain_col(schema, x, bit, i) },
+                });
+            }
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Boolean { b: theta_parity_c_col(schema, x, bit) },
+            });
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Boolean { b: theta_diffuse_d_col(schema, x, bit) },
+            });
+        }
+    }
+
+    // XOR-chain: C[x][bit] = ⊕_{y∈[0..5)} state_in[5y+x][bit]
+    for x in 0..5 {
+        for bit in 0..64 {
+            // chain0 = state_in[x][bit] ⊕ state_in[5+x][bit]
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Xor {
+                    c: theta_chain_col(schema, x, bit, 0),
+                    a: ColRef(schema.state_in_bit(x, bit)),
+                    b: ColRef(schema.state_in_bit(5 + x, bit)),
+                },
+            });
+            // chain1 = chain0 ⊕ state_in[10+x][bit]
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Xor {
+                    c: theta_chain_col(schema, x, bit, 1),
+                    a: theta_chain_col(schema, x, bit, 0),
+                    b: ColRef(schema.state_in_bit(10 + x, bit)),
+                },
+            });
+            // chain2 = chain1 ⊕ state_in[15+x][bit]
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Xor {
+                    c: theta_chain_col(schema, x, bit, 2),
+                    a: theta_chain_col(schema, x, bit, 1),
+                    b: ColRef(schema.state_in_bit(15 + x, bit)),
+                },
+            });
+            // C[x][bit] = chain2 ⊕ state_in[20+x][bit]
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Xor {
+                    c: theta_parity_c_col(schema, x, bit),
+                    a: theta_chain_col(schema, x, bit, 2),
+                    b: ColRef(schema.state_in_bit(20 + x, bit)),
+                },
+            });
+        }
+    }
+
+    // D[x][bit] = C[(x-1) mod 5][bit] ⊕ C[(x+1) mod 5][(bit-1) mod 64]
+    for x in 0..5 {
+        for bit in 0..64 {
+            let prev_x = (x + 4) % 5;
+            let next_x = (x + 1) % 5;
+            let rot_src_bit = (bit + 63) % 64;
+            out.push(RowUniformConstraint {
+                selector: SelectorIndex::Theta,
+                op: RowUniformOp::Xor {
+                    c: theta_diffuse_d_col(schema, x, bit),
+                    a: theta_parity_c_col(schema, prev_x, bit),
+                    b: theta_parity_c_col(schema, next_x, rot_src_bit),
+                },
+            });
+        }
+    }
+
+    // state_out[5y+x][bit] = state_in[5y+x][bit] ⊕ D[x][bit]
+    for y in 0..5 {
+        for x in 0..5 {
+            for bit in 0..64 {
+                out.push(RowUniformConstraint {
+                    selector: SelectorIndex::Theta,
+                    op: RowUniformOp::Xor {
+                        c: ColRef(schema.state_out_bit(5 * y + x, bit)),
+                        a: ColRef(schema.state_in_bit(5 * y + x, bit)),
+                        b: theta_diffuse_d_col(schema, x, bit),
+                    },
+                });
+            }
+        }
+    }
+
+    out
 }
 
 /// Selector column values for the entire trace.  Returns a vector of
@@ -343,5 +551,124 @@ mod tests {
 
         let r4 = RowType::at_block_row(4);  // ι of round 0
         assert_eq!(r4.iota_round(), Some(0));
+    }
+
+    // ─── Row-uniform constraint generator tests ─────────────────────
+
+    #[test]
+    fn row_uniform_op_degrees() {
+        let c = ColRef(0);
+        assert_eq!(RowUniformOp::Xor { c, a: c, b: c }.degree(), 2);
+        assert_eq!(RowUniformOp::And { c, a: c, b: c }.degree(), 2);
+        assert_eq!(RowUniformOp::Not { c, a: c }.degree(), 1);
+        assert_eq!(RowUniformOp::Copy { c, a: c }.degree(), 1);
+        assert_eq!(RowUniformOp::XorConst { c, a: c, k: 0 }.degree(), 1);
+        assert_eq!(RowUniformOp::Boolean { b: c }.degree(), 2);
+        assert_eq!(RowUniformOp::NextRowCopy { dst: c, src: c }.degree(), 1);
+    }
+
+    #[test]
+    fn row_uniform_constraint_total_degree() {
+        // After selector multiplication, degree += 1.
+        let c = ColRef(0);
+        let xor = RowUniformConstraint {
+            selector: SelectorIndex::Theta,
+            op: RowUniformOp::Xor { c, a: c, b: c },
+        };
+        assert_eq!(xor.total_degree(), 3);  // selector × XOR = 1 + 2
+
+        let bool_op = RowUniformConstraint {
+            selector: SelectorIndex::Theta,
+            op: RowUniformOp::Boolean { b: c },
+        };
+        assert_eq!(bool_op.total_degree(), 3);  // selector × Boolean = 1 + 2
+    }
+
+    #[test]
+    fn theta_row_uniform_constraint_count() {
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = theta_row_uniform_constraints(&schema);
+        // Same shape as cell-list θ: 4 800 booleanity + 3 200 XOR.
+        // But here all wear the Theta selector.
+        let n_bool = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Boolean { .. })).count();
+        let n_xor  = cs.iter().filter(|c| matches!(c.op, RowUniformOp::Xor { .. })).count();
+        // Helper-only booleanity (state_in/state_out booleanity is
+        // shared across all sub-steps and lives in a separate
+        // generator).
+        assert_eq!(n_bool, 5 * 64 * 5);  // 5 helper bits per (x, bit) × 5×64 (x,bit) pairs
+                                          //         = (3 chain + 1 C + 1 D) × 5 × 64 = 1 600
+        assert_eq!(n_bool, 1600);
+        assert_eq!(n_xor, 3200);   // 4 chain + 1 D + 25×64/5 = 320×4 + 320 + 1600 = 3 200
+        assert_eq!(cs.len(), 4800);
+
+        // All gated by Theta.
+        for c in &cs {
+            assert_eq!(c.selector, SelectorIndex::Theta);
+        }
+    }
+
+    #[test]
+    fn theta_row_uniform_helper_cols_within_helper_range() {
+        // All theta helper col references must land inside the
+        // helpers range (paper-grade column allocation).
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = theta_row_uniform_constraints(&schema);
+
+        for c in &cs {
+            match c.op {
+                RowUniformOp::Boolean { b: ColRef(c) } => {
+                    if schema.state_in.contains(&c) { continue; } // state cells boolean elsewhere
+                    if schema.state_out.contains(&c) { continue; }
+                    assert!(schema.helpers.contains(&c),
+                        "θ booleanity col {c} outside helpers range");
+                }
+                RowUniformOp::Xor { c, a, b } => {
+                    for col in [c.0, a.0, b.0] {
+                        assert!(
+                            schema.state_in.contains(&col)
+                                || schema.state_out.contains(&col)
+                                || schema.helpers.contains(&col),
+                            "θ XOR col {col} outside state/helpers ranges"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn theta_row_uniform_writes_state_out_only_at_end() {
+        // The last 1 600 XOR constraints are the state_out = state_in ⊕ D updates.
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        let cs = theta_row_uniform_constraints(&schema);
+
+        let state_update_count = cs.iter().filter(|c| match c.op {
+            RowUniformOp::Xor { c, .. } => schema.state_out.contains(&c.0),
+            _ => false,
+        }).count();
+        assert_eq!(state_update_count, 25 * 64,
+            "θ should produce exactly 25×64 state_out updates");
+
+        let chain_xor_count = cs.iter().filter(|c| match c.op {
+            RowUniformOp::Xor { c, .. } => schema.helpers.contains(&c.0),
+            _ => false,
+        }).count();
+        // 4 chain steps × 5×64 (x,bit) pairs + 1 D update per (x, bit)
+        // = 4 × 320 + 320 = 1600
+        assert_eq!(chain_xor_count, 1600);
+    }
+
+    #[test]
+    fn theta_row_uniform_no_arithmetic_outside_xor_or_boolean() {
+        // θ uses only Boolean + XOR — no AND, NOT, Copy, XorConst,
+        // NextRowCopy.  Pin this constraint-zoo invariant.
+        let schema = UniformRowSchema::new(Sha3Variant::Sha3_256);
+        for c in theta_row_uniform_constraints(&schema) {
+            match c.op {
+                RowUniformOp::Xor { .. } | RowUniformOp::Boolean { .. } => {},
+                other => panic!("θ should not emit {other:?}"),
+            }
+        }
     }
 }
