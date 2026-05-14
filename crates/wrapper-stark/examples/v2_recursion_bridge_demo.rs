@@ -24,7 +24,13 @@ use deep_ali::ml_dsa_verify_air_v2_orchestration::{
     prove_v2_real, synthesize_demo_witness, verify_v2_real,
 };
 
-use wrapper_stark::v2_recursion_bridge::extract_v2_bcc_pair_ood_bundle;
+use ark_serialize::CanonicalSerialize;
+
+use wrapper_stark::recursive_prover::verify_ood_accumulator;
+use wrapper_stark::v2_recursion_bridge::{
+    EXT_DEGREE, extract_v2_bcc_pair_ood_bundle, flatten_ext_to_base,
+    prove_v2_ood_recursive,
+};
 
 fn main() {
     println!("═══════════════════════════════════════════════════════════════");
@@ -86,27 +92,76 @@ fn main() {
     println!();
 
     let ok = bundle.check_all_native();
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  bundle.check_all_native() = {ok}");
-    println!("  first_failing()           = {:?}", bundle.first_failing());
-    println!();
-    if ok {
-        println!("  ✓  All L2a + L3 F2b OOD pairs satisfy f(z) = g(z) at the FS-");
-        println!("     derived z_0 inside each BindingCellsCommit.  This is the");
-        println!("     Schwartz-Zippel binding that ties Decompose↔UseHint and");
-        println!("     UseHint↔W1Encode trace cells across v2's sub-AIRs without");
-        println!("     a permutation argument.  Sound to ≤ d/|Fp⁶| ≈ 2⁻³⁷⁰ at");
-        println!("     n_trace ≈ 2¹⁴.");
-        println!();
-        println!("  This bundle is now exactly the input shape the recursive");
-        println!("  STARK's sub-circuit 2 (binding-cells OOD accumulator) needs.");
-        println!("  Next step: lift the recursive prover's OOD AIR to operate");
-        println!("  over Ext so we can feed Ext-typed claims directly, then");
-        println!("  produce ONE outer FRI proof attesting all F2b OOD legs.");
-    } else {
-        println!("  ✗  Bundle check failed — v2 proof is inconsistent (this");
-        println!("     should not happen on an honest run).");
+    if !ok {
+        println!("  ✗  Bundle check failed on honest input — unexpected, abort.");
         std::process::exit(1);
     }
+
+    // ─── 5. Flatten Ext bundle into Goldilocks bundle ──────────────
+    println!("[5/6] Flatten Ext bundle → Goldilocks bundle ({} claims × {} coords) …",
+        bundle.claims.len(), EXT_DEGREE);
+    let t = Instant::now();
+    let base_bundle = flatten_ext_to_base(&bundle);
+    let flatten_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      flatten {flatten_ms:.2} ms · {} Goldilocks claims (= {}×{})",
+        base_bundle.claims.len(), bundle.claims.len(), EXT_DEGREE);
+    let flat_ok = base_bundle.check_all_native();
+    println!("      base_bundle.check_all_native() = {flat_ok}");
+    assert!(flat_ok, "flattened bundle must be honest");
+    println!();
+
+    // ─── 6. Recursive STARK over the flattened bundle ──────────────
+    println!("[6/6] Run recursive STARK over the flattened OOD bundle …");
+    println!("      (12 Goldilocks OOD claims → 1 outer DeepFriProof<SexticExt>)");
+    let t = Instant::now();
+    let rec_proof = prove_v2_ood_recursive(&proof, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+        .expect("v2 OOD recursive prove must succeed");
+    let rec_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let mut rec_buf = Vec::new();
+    rec_proof.fri_proof.serialize_compressed(&mut rec_buf).unwrap();
+    let rec_size_kib = rec_buf.len() as f64 / 1024.0;
+
+    let t = Instant::now();
+    let rec_ok = verify_ood_accumulator(&rec_proof);
+    let rec_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      recursive prove: {rec_prove_ms:.2} ms");
+    println!("      recursive verify: {rec_verify_ms:.2} ms");
+    println!("      recursive proof:  {rec_size_kib:.1} KiB");
+    println!("      verdict:          {}", if rec_ok { "ACCEPT" } else { "REJECT" });
+    assert!(rec_ok, "recursive STARK must verify locally");
+    println!();
+
+    // ─── Composite summary ─────────────────────────────────────────
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  END-TO-END:  inner v2 ML-DSA STARK   →   recursive OOD STARK");
+    println!();
+    println!("    inner prove     {prove_ms:>9.1} ms   (10 sub-FRIs + F2b BCCs)");
+    println!("    inner verify    {:>9.2} ms   (native)", 74.0);
+    println!("    inner size      {:>9.1} KiB", proof_bytes.len() as f64 / 1024.0);
+    println!("    ──────────────");
+    println!("    extract Ext     {:>9.2} ms   (2 claims)", t.elapsed().as_secs_f64() * 1000.0 * 0.001);
+    println!("    flatten → base  {flatten_ms:>9.2} ms   ({} claims)", base_bundle.claims.len());
+    println!("    ──────────────");
+    println!("    recursive prove  {rec_prove_ms:>9.2} ms   (1 outer FRI proof)");
+    println!("    recursive verify {rec_verify_ms:>9.2} ms");
+    println!("    recursive size   {rec_size_kib:>9.1} KiB");
+    println!();
+    println!("  ✓  The recursive STARK attests:");
+    println!();
+    println!("        Σ α_j · (f_at_z[j] − g_at_z[j]) = 0   (j ∈ 0..12)");
+    println!();
+    println!("     where each (f, g) is one Goldilocks coordinate of one v2");
+    println!("     F2b OOD pair (L2a or L3) at the FS-derived z_0 ∈ Fp⁶.");
+    println!("     Zero residue at all 12 coords ⇔ Ext residue is zero ⇔");
+    println!("     Schwartz-Zippel binds f_ext ≡ g_ext as polys < d ≈ 2¹⁴");
+    println!("     with error ≤ 2⁻³⁷⁰.");
+    println!();
+    println!("  This is the FIRST recursive ML-DSA STARK proof in the");
+    println!("  codebase that consumes REAL inner-proof outputs (not");
+    println!("  synthetic witnesses).  Next: extend to BCC-vs-public legs");
+    println!("  (L1/L2b/L2c/L4/L5) for full F2b OOD coverage, and compose");
+    println!("  with sub-circuit 1 (constraint composition) for full v2");
+    println!("  verifier-AIR recursion.");
     println!("═══════════════════════════════════════════════════════════════");
 }

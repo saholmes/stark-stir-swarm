@@ -57,11 +57,37 @@
 //! N such checks under FS-derived α and attests their joint
 //! satisfaction with one outer FRI proof.
 
+use ark_goldilocks::Goldilocks;
+
 use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
 use deep_ali::ml_dsa_verify_air_v2_orchestration::V2ProofReal;
 use deep_ali::sextic_ext::SexticExt;
+use deep_ali::tower_field::TowerField;
+
+use crate::composition::alphas_from_transcript;
+use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
+    OodClaimBundle, OodEqualityClaim,
+};
+use crate::recursive_prover::{
+    OodAccumulatorClaim, OodAccumulatorProof, RecursiveProverError,
+    prove_ood_accumulator,
+};
 
 type Ext = SexticExt;
+
+/// Degree of SexticExt over Goldilocks.  Each Ext element decomposes
+/// into this many base-field coordinates via `TowerField::to_fp_components`.
+pub const EXT_DEGREE: usize = 6;
+
+// Per-coordinate static binding-tag tables (one per Ext leg we extract).
+// Used by `flatten_ext_to_base` to give each base-field sub-claim a
+// distinct &'static str discriminator.
+const COORD_TAGS_L2A: [&str; EXT_DEGREE] = [
+    "L2a.c0", "L2a.c1", "L2a.c2", "L2a.c3", "L2a.c4", "L2a.c5",
+];
+const COORD_TAGS_L3: [&str; EXT_DEGREE] = [
+    "L3.c0", "L3.c1", "L3.c2", "L3.c3", "L3.c4", "L3.c5",
+];
 
 /// Ext-typed OOD equality claim: an assertion that two polynomials
 /// agree at the FS-derived OOD challenge point z.
@@ -175,6 +201,125 @@ pub fn extract_v2_bcc_pair_ood_bundle(
     Ok(ExtOodClaimBundle { claims: vec![l2a, l3] })
 }
 
+/// Expand an `ExtOodClaimBundle` into an `OodClaimBundle<Goldilocks>`
+/// by projecting each Ext claim into EXT_DEGREE per-coordinate
+/// Goldilocks sub-claims via `TowerField::to_fp_components`.
+///
+/// Soundness:  for each Ext equality `f_ext(z) − g_ext(z) == 0`, the
+/// equality holds in `Fp⁶` iff every Goldilocks coordinate is zero:
+///
+/// ```text
+///     f_ext − g_ext ∈ Fp⁶          iff    (f_ext − g_ext).c[k] = 0  ∀ k ∈ 0..6
+/// ```
+///
+/// Decomposing yields EXT_DEGREE base-field equality claims per Ext
+/// claim.  The base-field bundle is then consumable by the existing
+/// `prove_ood_accumulator` AIR (which operates over Goldilocks) and
+/// the FRI-side SZ at Fp⁶ is preserved by the BCC commits themselves
+/// — flattening doesn't weaken the SZ bound, it just spreads it
+/// across EXT_DEGREE rows of the OOD accumulator.
+///
+/// Currently supports the two BCC-vs-BCC legs L2a and L3 produced by
+/// `extract_v2_bcc_pair_ood_bundle`.  Other binding tags trigger a
+/// panic (we don't synthesise unknown static tags); add a new
+/// `COORD_TAGS_*` table when extending to more F2b legs.
+pub fn flatten_ext_to_base(ext: &ExtOodClaimBundle) -> OodClaimBundle<Goldilocks> {
+    let mut claims = Vec::with_capacity(ext.claims.len() * EXT_DEGREE);
+    for claim in &ext.claims {
+        let f_coords = claim.f_at_z.to_fp_components();
+        let g_coords = claim.g_at_z.to_fp_components();
+        assert_eq!(f_coords.len(), EXT_DEGREE,
+            "TowerField::to_fp_components returned wrong length for SexticExt");
+        assert_eq!(g_coords.len(), EXT_DEGREE);
+        let tags: &[&'static str; EXT_DEGREE] = match claim.binding_tag {
+            "L2a" => &COORD_TAGS_L2A,
+            "L3"  => &COORD_TAGS_L3,
+            other => panic!(
+                "flatten_ext_to_base: unknown binding_tag '{other}'; \
+                 add a COORD_TAGS_* table for the new leg"
+            ),
+        };
+        for i in 0..EXT_DEGREE {
+            claims.push(OodEqualityClaim {
+                z: Goldilocks::from(0u64),
+                f_at_z: f_coords[i],
+                g_at_z: g_coords[i],
+                binding_tag: tags[i],
+            });
+        }
+    }
+    OodClaimBundle { claims }
+}
+
+/// End-to-end: extract real F2b OOD evaluations from a v2 ML-DSA
+/// proof and produce a recursive STARK proof attesting the bundle.
+///
+/// Pipeline:
+///
+/// ```text
+///   V2ProofReal
+///       │
+///       ▼  extract_v2_bcc_pair_ood_bundle
+///   ExtOodClaimBundle  (2 Ext claims: L2a, L3)
+///       │
+///       ▼  flatten_ext_to_base
+///   OodClaimBundle<Goldilocks>  (12 base claims: L2a.c{0..5}, L3.c{0..5})
+///       │
+///       ▼  FS-derive alphas from v2.pi_hash with seed-XOR 0xF5
+///   OodAccumulatorClaim  (bundle + 12 alphas)
+///       │
+///       ▼  prove_ood_accumulator
+///   OodAccumulatorProof  (DeepFriProof<SexticExt> attesting Σ α·(f−g) = 0)
+/// ```
+///
+/// This is the first end-to-end wiring between an inner v2 proof's
+/// F2b OOD outputs and the recursive STARK gadget's sub-circuit 2.
+/// The returned proof attests:
+///
+///     ∃ witnesses such that every Goldilocks coordinate of every
+///     F2b OOD residue at z_0 is zero — equivalently, that both
+///     L2a's and L3's BCC-vs-BCC equalities hold at z_0 ∈ Fp⁶.
+///
+/// FS alphas are derived from `proof.pi_hash` with seed-XOR `0xF5`,
+/// chosen distinct from the recursive_prover's own namespace
+/// (`0xC1..C3`, `0xD0..D3`, `0xE0..E4`, `0xF0..F2`).
+pub fn prove_v2_ood_recursive(
+    proof: &V2ProofReal,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<OodAccumulatorProof, V2OodRecursiveError> {
+    let ext_bundle = extract_v2_bcc_pair_ood_bundle(proof)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+
+    // FS-derive one alpha per flattened claim.
+    let mut seed = proof.pi_hash;
+    seed[0] ^= 0xF5;
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, base_bundle.claims.len());
+
+    let claim = OodAccumulatorClaim { bundle: base_bundle, alphas };
+    prove_ood_accumulator(&claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
+/// Errors from the end-to-end `prove_v2_ood_recursive` pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2OodRecursiveError {
+    Bridge(V2BridgeError),
+    RecursiveProver(RecursiveProverError),
+}
+
+impl std::fmt::Display for V2OodRecursiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bridge(e) => write!(f, "v2 bridge: {e}"),
+            Self::RecursiveProver(e) => write!(f, "recursive prover: {e}"),
+        }
+    }
+}
+impl std::error::Error for V2OodRecursiveError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +354,61 @@ mod tests {
             assert!(c.residue().is_zero(),
                 "{}: residue must be 0; got {:?}", c.binding_tag, c.residue());
         }
+    }
+
+    #[test]
+    #[ignore = "slow — flatten Ext bundle into Goldilocks bundle"]
+    fn flatten_ext_to_base_produces_12_base_claims() {
+        let w = synthesize_demo_witness(13);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let ext_bundle = extract_v2_bcc_pair_ood_bundle(&proof).unwrap();
+        assert_eq!(ext_bundle.claims.len(), 2);
+
+        let base_bundle = flatten_ext_to_base(&ext_bundle);
+        assert_eq!(base_bundle.claims.len(), 2 * EXT_DEGREE,
+            "2 Ext claims × {EXT_DEGREE} coords = 12 base claims");
+
+        // Every coordinate must be zero on an honest proof.
+        assert!(base_bundle.check_all_native(),
+            "honest v2: all 12 base-coord OOD residues must be zero");
+
+        // Tag layout: claims 0..6 are L2a.c0..c5, 6..12 are L3.c0..c5.
+        for i in 0..EXT_DEGREE {
+            assert_eq!(base_bundle.claims[i].binding_tag, COORD_TAGS_L2A[i]);
+            assert_eq!(base_bundle.claims[EXT_DEGREE + i].binding_tag, COORD_TAGS_L3[i]);
+        }
+    }
+
+    #[test]
+    #[ignore = "slow — full recursive STARK round-trip on real v2 OOD bundle"]
+    fn prove_v2_ood_recursive_round_trip() {
+        use crate::recursive_prover::verify_ood_accumulator;
+
+        let w = synthesize_demo_witness(17);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        // Run the end-to-end pipeline: extract → flatten → FS alphas
+        // → prove_ood_accumulator.
+        let rec_proof = prove_v2_ood_recursive(&proof, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+            .expect("v2 OOD recursive prove must succeed on honest input");
+
+        // Local verify of the recursive STARK proof.
+        assert!(verify_ood_accumulator(&rec_proof),
+            "recursive OOD STARK must verify locally");
+
+        // Reproducibility: re-running on the same v2 proof produces the
+        // same public_inputs (pi_hash inside OodAccumulatorPublicInputs)
+        // and a verifying proof.
+        let rec_proof_2 = prove_v2_ood_recursive(&proof, 4, 54, false)
+            .expect("second run must also succeed");
+        assert_eq!(rec_proof.public.pi_hash, rec_proof_2.public.pi_hash,
+            "v2 → recursive pi_hash must be deterministic in v2 proof");
+        assert!(verify_ood_accumulator(&rec_proof_2));
     }
 
     #[test]
