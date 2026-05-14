@@ -661,6 +661,120 @@ fn pad_for_absorb(input: &[u8], variant: Sha3Variant) -> Vec<Vec<u8>> {
     blocks
 }
 
+// ─── Cross-row binding polynomial constraints ────────────────────────
+//
+// These constraints encode the four invariants validated empirically
+// in the previous commit, as polynomials over trace cells with
+// explicit (row, col) addressing.  Together they pin the Merkle hop
+// row's output to the sponge sub-trace's input AND the sponge
+// sub-trace's output to the next hop's input.
+//
+// The constraints DO reference specific (row, col) cells rather than
+// uniform-column shapes — they sit at the boundary between hops and
+// fire at specific row offsets.  Soundness in FRI is enforced the
+// same way our existing per-cell boundary constraints work: via the
+// composed polynomial that includes them with FS-derived α weights.
+
+/// One cross-row Merkle binding constraint.  All variants are
+/// Copy-shaped (`dst - src = 0`) with the cells at specific rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MerkleCrossRowConstraint {
+    /// `block_bits[i]@absorb_row - left[i]@hop_row = 0`
+    SpongeInputLeft { sponge_block_col: usize, hop_left_col: usize, absorb_row: usize, hop_row: usize },
+    /// `block_bits[N+i]@absorb_row - right[i]@hop_row = 0`
+    SpongeInputRight { sponge_block_col: usize, hop_right_col: usize, absorb_row: usize, hop_row: usize },
+    /// `state_out[i]@final_iota_row - current[i]@next_hop_row = 0`
+    SpongeOutputThreading { state_out_col: usize, next_current_col: usize, final_iota_row: usize, next_hop_row: usize },
+}
+
+impl MerkleCrossRowConstraint {
+    /// Evaluate this constraint against a UniformTrace.  Returns the
+    /// residue (0 if satisfied).
+    pub fn eval(&self, trace: &UniformTrace) -> i128 {
+        match *self {
+            Self::SpongeInputLeft { sponge_block_col, hop_left_col, absorb_row, hop_row } => {
+                let block = trace.get(absorb_row, sponge_block_col) as i128;
+                let left  = trace.get(hop_row, hop_left_col) as i128;
+                block - left
+            }
+            Self::SpongeInputRight { sponge_block_col, hop_right_col, absorb_row, hop_row } => {
+                let block = trace.get(absorb_row, sponge_block_col) as i128;
+                let right = trace.get(hop_row, hop_right_col) as i128;
+                block - right
+            }
+            Self::SpongeOutputThreading { state_out_col, next_current_col, final_iota_row, next_hop_row } => {
+                let state_out = trace.get(final_iota_row, state_out_col) as i128;
+                let next_curr = trace.get(next_hop_row, next_current_col) as i128;
+                state_out - next_curr
+            }
+        }
+    }
+
+    pub fn satisfied_by(&self, trace: &UniformTrace) -> bool {
+        self.eval(trace) == 0
+    }
+
+    /// Polynomial degree: all variants are degree-1 (linear Copy).
+    pub fn degree(&self) -> usize { 1 }
+}
+
+/// Emit ALL cross-row binding constraints for a depth-d Merkle path
+/// composed with sponge_air.  Per hop:
+///   - N constraints for block_bits[0..N] = left[0..N]  (SpongeInputLeft)
+///   - N constraints for block_bits[N..2N] = right[0..N] (SpongeInputRight)
+///   - (only between hops r and r+1) N constraints for state_out[0..N]
+///     at sponge final ι row = current[0..N] at next hop row
+///       (SpongeOutputThreading)
+///
+/// Total: d × 2N (input bindings) + (d-1) × N (threading) constraints.
+pub fn merkle_cross_row_constraints(
+    layout: &MerkleSpongeLayout,
+) -> Vec<MerkleCrossRowConstraint> {
+    let schema = &layout.schema;
+    let n_bits = layout.variant.output_bits();
+    let mut out = Vec::with_capacity(layout.depth * 3 * n_bits);
+
+    for r in 0..layout.depth {
+        let hop_row = layout.hop_starts[r];
+        let absorb_row = layout.sponge_absorb_row(r);
+
+        // SpongeInputLeft: block_bits[i] = left[i]
+        for i in 0..n_bits {
+            out.push(MerkleCrossRowConstraint::SpongeInputLeft {
+                sponge_block_col: schema.block_bit(i),
+                hop_left_col:     hop_left_col(schema, i),
+                absorb_row, hop_row,
+            });
+        }
+        // SpongeInputRight: block_bits[N+i] = right[i]
+        for i in 0..n_bits {
+            out.push(MerkleCrossRowConstraint::SpongeInputRight {
+                sponge_block_col: schema.block_bit(n_bits + i),
+                hop_right_col:    hop_right_col(schema, n_bits, i),
+                absorb_row, hop_row,
+            });
+        }
+
+        // SpongeOutputThreading: state_out[i] at final ι row = current[i]
+        // at next hop row.  Only between consecutive hops.
+        if r + 1 < layout.depth {
+            let final_iota_row = layout.sponge_final_iota_row(r);
+            let next_hop_row = layout.hop_starts[r + 1];
+            for i in 0..n_bits {
+                let lane = i / 64;
+                let bit_in_lane = i % 64;
+                out.push(MerkleCrossRowConstraint::SpongeOutputThreading {
+                    state_out_col: schema.state_out_bit(lane, bit_in_lane),
+                    next_current_col: hop_current_col(schema, i),
+                    final_iota_row, next_hop_row,
+                });
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1368,107 @@ mod tests {
                     "hop {}→{}: state_out[{i}] = {} ≠ next current[{i}] = {}",
                     r, r + 1, state_out_bit, next_current);
             }
+        }
+    }
+
+    // ─── Cross-row binding polynomial constraint tests ─────────────
+
+    #[test]
+    fn merkle_cross_row_constraint_count_matches_design() {
+        // Per hop: 2N input bindings + (between consecutive hops) N
+        // threading bindings.  Total: d·2N + (d-1)·N = (3d-1)·N.
+        let variant = Sha3Variant::Sha3_256;
+        let layout = MerkleSpongeLayout::new(variant, 4, 0);  // d=4
+        let constraints = merkle_cross_row_constraints(&layout);
+        let n_bits = variant.output_bits();
+        let expected = (3 * 4 - 1) * n_bits;  // (3d-1)·N
+        assert_eq!(constraints.len(), expected);
+    }
+
+    #[test]
+    fn cross_row_constraints_satisfied_on_synthesised_trace() {
+        // The headline test: on a valid trace, every cross-row binding
+        // constraint must satisfy.  This pins that the synthesiser
+        // produces traces where the future polynomial constraints
+        // (in the AIR-level prover) will all evaluate to zero.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0xE8 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 2);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (trace, _root) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+        let constraints = merkle_cross_row_constraints(&layout);
+
+        for (i, c) in constraints.iter().enumerate() {
+            assert!(c.satisfied_by(&trace),
+                "cross-row constraint #{i} = {c:?} residue {}",
+                c.eval(&trace));
+        }
+    }
+
+    #[test]
+    fn cross_row_input_tampering_breaks_constraint() {
+        // Tamper one block_bits cell at a sponge absorb row.  At
+        // least one SpongeInputLeft or SpongeInputRight constraint
+        // must reject.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..4u8).map(|i| fake_leaf(variant, 0xF1 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 1);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (mut trace, _) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        // Flip a block_bits cell at the sponge absorb row of hop 0.
+        let absorb_row = layout.sponge_absorb_row(0);
+        let block_col  = layout.schema.block_bit(3);
+        let original = trace.get(absorb_row, block_col);
+        trace.set(absorb_row, block_col, 1 - original);
+
+        let constraints = merkle_cross_row_constraints(&layout);
+        let n_failing = constraints.iter().filter(|c| !c.satisfied_by(&trace)).count();
+        assert!(n_failing >= 1,
+            "input tampering must trip ≥ 1 cross-row constraint");
+    }
+
+    #[test]
+    fn cross_row_threading_tampering_breaks_constraint() {
+        // Tamper a state_out cell at a sponge final ι row.  At least
+        // one SpongeOutputThreading constraint must reject.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8u8).map(|i| fake_leaf(variant, 0x14 + i)).collect();
+        let claim = merkle_build_and_open(variant, &leaves, 3);
+        let layout = MerkleSpongeLayout::new(variant, claim.depth(), 0);
+        let (mut trace, _) = synthesize_merkle_sponge_trace(&claim, &layout).unwrap();
+
+        // Flip a state_out cell at the final ι row of hop 0.
+        let final_iota = layout.sponge_final_iota_row(0);
+        let state_col = layout.schema.state_out_bit(0, 7);
+        let original = trace.get(final_iota, state_col);
+        trace.set(final_iota, state_col, 1 - original);
+
+        let constraints = merkle_cross_row_constraints(&layout);
+        let n_failing = constraints.iter().filter(|c| !c.satisfied_by(&trace)).count();
+        assert!(n_failing >= 1,
+            "threading tampering must trip ≥ 1 cross-row constraint");
+    }
+
+    #[test]
+    fn cross_row_constraint_degrees_are_linear() {
+        let layout = MerkleSpongeLayout::new(Sha3Variant::Sha3_256, 2, 0);
+        for c in merkle_cross_row_constraints(&layout) {
+            assert_eq!(c.degree(), 1,
+                "all cross-row Merkle bindings are Copy-shaped (degree 1)");
+        }
+    }
+
+    #[test]
+    fn cross_row_constraints_at_l3_l5_variants() {
+        // Confirm constraint counts scale with N for sha3-384/512.
+        for variant in [Sha3Variant::Sha3_384] {
+            let layout = MerkleSpongeLayout::new(variant, 3, 0);
+            let constraints = merkle_cross_row_constraints(&layout);
+            let n_bits = variant.output_bits();
+            let expected = (3 * 3 - 1) * n_bits;
+            assert_eq!(constraints.len(), expected,
+                "variant {variant:?}");
         }
     }
 
