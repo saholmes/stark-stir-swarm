@@ -28,8 +28,8 @@ use ark_serialize::CanonicalSerialize;
 
 use wrapper_stark::recursive_prover::verify_ood_accumulator;
 use wrapper_stark::v2_recursion_bridge::{
-    EXT_DEGREE, extract_v2_bcc_pair_ood_bundle, flatten_ext_to_base,
-    prove_v2_ood_recursive,
+    EXT_DEGREE, extract_v2_bcc_pair_ood_bundle, extract_v2_full_ood_bundle,
+    flatten_ext_to_base, prove_v2_full_ood_recursive, prove_v2_ood_recursive,
 };
 
 fn main() {
@@ -159,9 +159,65 @@ fn main() {
     println!();
     println!("  This is the FIRST recursive ML-DSA STARK proof in the");
     println!("  codebase that consumes REAL inner-proof outputs (not");
-    println!("  synthetic witnesses).  Next: extend to BCC-vs-public legs");
-    println!("  (L1/L2b/L2c/L4/L5) for full F2b OOD coverage, and compose");
-    println!("  with sub-circuit 1 (constraint composition) for full v2");
-    println!("  verifier-AIR recursion.");
+    println!("  synthetic witnesses).");
+    println!();
+
+    // ─── 7. FULL F2b coverage (BCC-vs-BCC + BCC-vs-public) ─────────
+    println!("[BONUS] Full F2b OOD coverage: BCC-vs-BCC + BCC-vs-public");
+    let t = Instant::now();
+    let full_bundle = extract_v2_full_ood_bundle(&proof, &w)
+        .expect("full F2b bundle extract");
+    let full_extract_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("      extract full bundle: {full_extract_ms:.2} ms · {} Ext claims",
+        full_bundle.claims.len());
+    println!("        (legs: L2a + L3 + L2c + L1 + L2b + L4×{} + L5×{})",
+        deep_ali::ml_dsa::params::W1_BITS_PER_COEF,
+        deep_ali::ml_dsa::params::L + 3);
+
+    let full_base = flatten_ext_to_base(&full_bundle);
+    println!("      flattened to {} Goldilocks claims (= {} × {EXT_DEGREE})",
+        full_base.claims.len(), full_bundle.claims.len());
+    println!("      bundle.check_all_native() = {}", full_base.check_all_native());
+
+    let t = Instant::now();
+    let full_rec = prove_v2_full_ood_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+        .expect("full v2 OOD recursive prove must succeed");
+    let full_rec_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let mut full_buf = Vec::new();
+    full_rec.fri_proof.serialize_compressed(&mut full_buf).unwrap();
+    let full_size_kib = full_buf.len() as f64 / 1024.0;
+
+    let t = Instant::now();
+    let full_rec_ok = verify_ood_accumulator(&full_rec);
+    let full_rec_verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    println!("      recursive prove:  {full_rec_prove_ms:.2} ms");
+    println!("      recursive verify: {full_rec_verify_ms:.2} ms");
+    println!("      recursive proof:  {full_size_kib:.1} KiB");
+    println!("      verdict:          {}", if full_rec_ok { "ACCEPT" } else { "REJECT" });
+    assert!(full_rec_ok);
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  COVERAGE EXPANSION:");
+    println!();
+    println!("    legs (BCC-vs-BCC only)    : 2 Ext claims  (L2a, L3)");
+    println!("    legs (full F2b)           : {} Ext claims",
+        full_bundle.claims.len());
+    println!("    Goldilocks (BCC-vs-BCC)   : 12 claims     (= 2 × {EXT_DEGREE})");
+    println!("    Goldilocks (full F2b)     : {} claims",
+        full_base.claims.len());
+    println!();
+    println!("  The full-F2b recursive STARK attests ALL seven F2b legs");
+    println!("  (BCC-vs-BCC: L2a, L3; BCC-vs-public: L1, L2b, L2c, L4×bits,");
+    println!("  L5×eq-cols) in ONE outer FRI proof.  Together they");
+    println!("  cross-bind every v2 sub-AIR's region cells to each other");
+    println!("  and to the pi_hash-bound public inputs.");
+    println!();
+    println!("  Next step: compose with sub-circuit 1 (constraint composition)");
+    println!("  for full v2 verifier-AIR recursion — one outer FRI proof");
+    println!("  attesting BOTH the F2b OOD bindings AND each sub-AIR's");
+    println!("  constraint composition.");
     println!("═══════════════════════════════════════════════════════════════");
 }

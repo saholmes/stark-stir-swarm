@@ -57,10 +57,19 @@
 //! N such checks under FS-derived α and attests their joint
 //! satisfaction with one outer FRI proof.
 
+use ark_ff::Zero as ArkZero;
 use ark_goldilocks::Goldilocks;
+use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
+use ark_serialize::{CanonicalDeserialize, Compress, Validate};
 
 use deep_ali::binding_cells_commit::{BindingCellsCommit, extract_ood_value};
-use deep_ali::ml_dsa_verify_air_v2_orchestration::V2ProofReal;
+use deep_ali::fri::{DeepFriProof, derive_z_ext_for_proof};
+use deep_ali::ml_dsa::params::{K, L, N, W1_BITS_PER_COEF};
+use deep_ali::ml_dsa_decompose;
+use deep_ali::ml_dsa_verify_air_v17::{N_EQ_ROWS, VERIFY_AIR_V17_ACTIVE_ROWS};
+use deep_ali::ml_dsa_verify_air_v2_orchestration::{
+    V2ProofReal, V2Witness, derive_w_approx_witness, v2_fri_params,
+};
 use deep_ali::sextic_ext::SexticExt;
 use deep_ali::tower_field::TowerField;
 
@@ -87,6 +96,44 @@ const COORD_TAGS_L2A: [&str; EXT_DEGREE] = [
 ];
 const COORD_TAGS_L3: [&str; EXT_DEGREE] = [
     "L3.c0", "L3.c1", "L3.c2", "L3.c3", "L3.c4", "L3.c5",
+];
+
+// Coordinate tags for the BCC-vs-public legs.  Each entry expands into
+// EXT_DEGREE = 6 base-field sub-claims when flattened.
+const COORD_TAGS_L2C: [&str; EXT_DEGREE] = [
+    "L2c.c0", "L2c.c1", "L2c.c2", "L2c.c3", "L2c.c4", "L2c.c5",
+];
+const COORD_TAGS_L1: [&str; EXT_DEGREE] = [
+    "L1.c0", "L1.c1", "L1.c2", "L1.c3", "L1.c4", "L1.c5",
+];
+const COORD_TAGS_L2B: [&str; EXT_DEGREE] = [
+    "L2b.c0", "L2b.c1", "L2b.c2", "L2b.c3", "L2b.c4", "L2b.c5",
+];
+
+// L4 bit-column tags, max W1_BITS_PER_COEF = 6 (L1).  Slice to active
+// length at runtime.
+const COORD_TAGS_L4: [[&str; EXT_DEGREE]; 6] = [
+    ["L4.b0.c0", "L4.b0.c1", "L4.b0.c2", "L4.b0.c3", "L4.b0.c4", "L4.b0.c5"],
+    ["L4.b1.c0", "L4.b1.c1", "L4.b1.c2", "L4.b1.c3", "L4.b1.c4", "L4.b1.c5"],
+    ["L4.b2.c0", "L4.b2.c1", "L4.b2.c2", "L4.b2.c3", "L4.b2.c4", "L4.b2.c5"],
+    ["L4.b3.c0", "L4.b3.c1", "L4.b3.c2", "L4.b3.c3", "L4.b3.c4", "L4.b3.c5"],
+    ["L4.b4.c0", "L4.b4.c1", "L4.b4.c2", "L4.b4.c3", "L4.b4.c4", "L4.b4.c5"],
+    ["L4.b5.c0", "L4.b5.c1", "L4.b5.c2", "L4.b5.c3", "L4.b5.c4", "L4.b5.c5"],
+];
+
+// L5 V17 EQ-region tags, max L = 7 (mldsa-87) a_ntt slots + 3 = 10 total.
+// Slice to active length at runtime.
+const COORD_TAGS_L5: [[&str; EXT_DEGREE]; 10] = [
+    ["L5.a0.c0", "L5.a0.c1", "L5.a0.c2", "L5.a0.c3", "L5.a0.c4", "L5.a0.c5"],
+    ["L5.a1.c0", "L5.a1.c1", "L5.a1.c2", "L5.a1.c3", "L5.a1.c4", "L5.a1.c5"],
+    ["L5.a2.c0", "L5.a2.c1", "L5.a2.c2", "L5.a2.c3", "L5.a2.c4", "L5.a2.c5"],
+    ["L5.a3.c0", "L5.a3.c1", "L5.a3.c2", "L5.a3.c3", "L5.a3.c4", "L5.a3.c5"],
+    ["L5.a4.c0", "L5.a4.c1", "L5.a4.c2", "L5.a4.c3", "L5.a4.c4", "L5.a4.c5"],
+    ["L5.a5.c0", "L5.a5.c1", "L5.a5.c2", "L5.a5.c3", "L5.a5.c4", "L5.a5.c5"],
+    ["L5.a6.c0", "L5.a6.c1", "L5.a6.c2", "L5.a6.c3", "L5.a6.c4", "L5.a6.c5"],
+    ["L5.c_ntt.c0",  "L5.c_ntt.c1",  "L5.c_ntt.c2",  "L5.c_ntt.c3",  "L5.c_ntt.c4",  "L5.c_ntt.c5"],
+    ["L5.t1d_ntt.c0","L5.t1d_ntt.c1","L5.t1d_ntt.c2","L5.t1d_ntt.c3","L5.t1d_ntt.c4","L5.t1d_ntt.c5"],
+    ["L5.w_ntt.c0",  "L5.w_ntt.c1",  "L5.w_ntt.c2",  "L5.w_ntt.c3",  "L5.w_ntt.c4",  "L5.w_ntt.c5"],
 ];
 
 /// Ext-typed OOD equality claim: an assertion that two polynomials
@@ -201,6 +248,289 @@ pub fn extract_v2_bcc_pair_ood_bundle(
     Ok(ExtOodClaimBundle { claims: vec![l2a, l3] })
 }
 
+// ─── BCC-vs-public leg extraction (L1, L2b, L2c, L4, L5) ─────────────
+
+/// Compute g(z_ext) for a public-input leg, where g is the IFFT of the
+/// canonical public trace column and z_ext is FS-derived from the
+/// BCC's own FRI proof (must match `derive_z_ext_for_proof` on the
+/// reconstructed v2_fri_params).
+fn evaluate_public_col_at_z_ext(
+    bcc: &BindingCellsCommit,
+    public_trace_col: &[Goldilocks],
+    pi_hash: [u8; 32],
+    leg_tag: &'static str,
+) -> Result<(Ext, Ext), V2BridgeError> {
+    let n_trace = bcc.n_trace as usize;
+    if public_trace_col.len() != n_trace {
+        return Err(V2BridgeError::OodExtractFailed(format!(
+            "{leg_tag}: public col len {} ≠ bcc.n_trace {}",
+            public_trace_col.len(), n_trace
+        )));
+    }
+    let packed_n_lde = n_trace * (bcc.blowup as usize) * (bcc.num_cols as usize);
+    let params = v2_fri_params(packed_n_lde, pi_hash);
+    let fri_proof = <DeepFriProof<Ext> as CanonicalDeserialize>::deserialize_with_mode(
+        bcc.fri_proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|e| V2BridgeError::OodExtractFailed(
+        format!("{leg_tag}: FRI deserialize: {e:?}")
+    ))?;
+    if fri_proof.fz_per_layer.is_empty() {
+        return Err(V2BridgeError::OodExtractFailed(format!(
+            "{leg_tag}: fz_per_layer empty"
+        )));
+    }
+    let z_ext = derive_z_ext_for_proof::<Ext>(&fri_proof, &params);
+    let f_at_z = fri_proof.fz_per_layer[0];
+
+    // Public side: IFFT(public_trace_col) + Horner at z_ext.
+    let dom = GeneralEvaluationDomain::<Goldilocks>::new(n_trace)
+        .ok_or_else(|| V2BridgeError::OodExtractFailed(format!(
+            "{leg_tag}: n_trace {n_trace} not radix-2"
+        )))?;
+    let coeffs = dom.ifft(public_trace_col);
+    let mut g_at_z = Ext::zero();
+    for k in (0..coeffs.len()).rev() {
+        g_at_z = g_at_z * z_ext + <Ext as TowerField>::from_fp(coeffs[k]);
+    }
+    Ok((f_at_z, g_at_z))
+}
+
+/// Build one public-leg Ext OOD claim from a BCC blob + canonical
+/// public trace column.
+fn extract_public_leg_claim(
+    bcc_blob: &[u8],
+    public_trace_col: &[Goldilocks],
+    pi_hash: [u8; 32],
+    binding_tag: &'static str,
+) -> Result<ExtOodEqualityClaim, V2BridgeError> {
+    let bcc = deserialize_bcc(bcc_blob, binding_tag)?;
+    let (f_at_z, g_at_z) =
+        evaluate_public_col_at_z_ext(&bcc, public_trace_col, pi_hash, binding_tag)?;
+    Ok(ExtOodEqualityClaim { f_at_z, g_at_z, binding_tag })
+}
+
+// ─── Canonical public-trace-column builders ──────────────────────────
+
+fn build_public_h_col(public: &V2Witness) -> Vec<Goldilocks> {
+    let n = (K * N).next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n];
+    for k in 0..K {
+        for i in 0..N {
+            col[k * N + i] = Goldilocks::from(public.h[k][i] as u64);
+        }
+    }
+    col
+}
+
+fn build_canonical_w_approx_flat_col(public: &V2Witness) -> Vec<Goldilocks> {
+    let n = (K * N).next_power_of_two();
+    let canonical = derive_w_approx_witness(&public.w_approx_ntt);
+    let mut col = vec![Goldilocks::zero(); n];
+    for k in 0..K {
+        for i in 0..N {
+            col[k * N + i] = Goldilocks::from(canonical[k][i] as u64);
+        }
+    }
+    col
+}
+
+fn build_translated_r0_sign_col(public: &V2Witness) -> Vec<Goldilocks> {
+    use deep_ali::ml_dsa::params::Q;
+    let n = (K * N).next_power_of_two();
+    let canonical = derive_w_approx_witness(&public.w_approx_ntt);
+    let mut col = vec![Goldilocks::zero(); n];
+    for k in 0..K {
+        for i in 0..N {
+            let r = canonical[k][i];
+            let (_r1, r0_lifted) = ml_dsa_decompose::decompose(r);
+            let uh: u32 = if r0_lifted != 0 && r0_lifted <= Q / 2 { 1 } else { 0 };
+            col[k * N + i] = Goldilocks::from(uh as u64);
+        }
+    }
+    col
+}
+
+fn build_l4_bit_col(public: &V2Witness, bit: usize) -> Vec<Goldilocks> {
+    let n = (K * N).next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n];
+    for r in 0..(K * N) {
+        let off = r * W1_BITS_PER_COEF + bit;
+        let bit_val = (public.w1bytes[off / 8] >> (off % 8)) & 1;
+        col[r] = Goldilocks::from(bit_val as u64);
+    }
+    col
+}
+
+fn build_l5_a_ntt_col(public: &V2Witness, l: usize) -> Vec<Goldilocks> {
+    let n_pad = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n_pad];
+    for r in 0..N_EQ_ROWS {
+        let k = r / N;
+        let i = r % N;
+        col[r] = Goldilocks::from(public.a_ntt[k][l][i] as u64);
+    }
+    col
+}
+
+fn build_l5_c_ntt_col(public: &V2Witness) -> Vec<Goldilocks> {
+    let n_pad = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n_pad];
+    for r in 0..N_EQ_ROWS {
+        let i = r % N;
+        col[r] = Goldilocks::from(public.c_ntt[i] as u64);
+    }
+    col
+}
+
+fn build_l5_t1d_ntt_col(public: &V2Witness) -> Vec<Goldilocks> {
+    let n_pad = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n_pad];
+    for r in 0..N_EQ_ROWS {
+        let k = r / N;
+        let i = r % N;
+        col[r] = Goldilocks::from(public.t1d_ntt[k][i] as u64);
+    }
+    col
+}
+
+fn build_l5_w_approx_ntt_col(public: &V2Witness) -> Vec<Goldilocks> {
+    let n_pad = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
+    let mut col = vec![Goldilocks::zero(); n_pad];
+    for r in 0..N_EQ_ROWS {
+        let k = r / N;
+        let i = r % N;
+        col[r] = Goldilocks::from(public.w_approx_ntt[k][i] as u64);
+    }
+    col
+}
+
+/// Extract the full BCC-vs-public F2b OOD bundle from a `V2ProofReal`
+/// plus its public witness fields.  Includes L1 + L2b + L2c + L4 (one
+/// per bit) + L5 (L + 3 columns).
+///
+/// On `mldsa-44` (L=4, W1_BITS_PER_COEF=6) the bundle has
+/// 1 + 1 + 1 + 6 + (4 + 3) = 16 Ext claims.
+///
+/// On `mldsa-65` (L=5, W1_BITS_PER_COEF=4): 1+1+1+4+(5+3) = 15 claims.
+/// On `mldsa-87` (L=7, W1_BITS_PER_COEF=4): 1+1+1+4+(7+3) = 17 claims.
+pub fn extract_v2_public_leg_ood_bundle(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+) -> Result<ExtOodClaimBundle, V2BridgeError> {
+    let pi_hash = proof.pi_hash;
+    let mut claims = Vec::new();
+
+    // L2c: public.h ↔ UseHint COL_H
+    let l2c_col = build_public_h_col(public);
+    claims.push(extract_public_leg_claim(
+        &proof.l2c_use_hint_bcc, &l2c_col, pi_hash, "L2c",
+    )?);
+
+    // L1: canonical w_approx ↔ Decompose col_r
+    let l1_col = build_canonical_w_approx_flat_col(public);
+    claims.push(extract_public_leg_claim(
+        &proof.l1_decompose_bcc, &l1_col, pi_hash, "L1",
+    )?);
+
+    // L2b: canonical translated r0_sign ↔ UseHint COL_R0_SIGN
+    let l2b_col = build_translated_r0_sign_col(public);
+    claims.push(extract_public_leg_claim(
+        &proof.l2b_use_hint_bcc, &l2b_col, pi_hash, "L2b",
+    )?);
+
+    // L4: W1Encode bit columns ↔ canonical bit-b columns from w1bytes
+    if proof.l4_w1_encode_bccs.len() != W1_BITS_PER_COEF {
+        return Err(V2BridgeError::BccDeserialize(format!(
+            "L4: expected {W1_BITS_PER_COEF} BCCs, got {}",
+            proof.l4_w1_encode_bccs.len()
+        )));
+    }
+    let l4_bit_tags: [&'static str; 6] = ["L4.b0","L4.b1","L4.b2","L4.b3","L4.b4","L4.b5"];
+    for b in 0..W1_BITS_PER_COEF {
+        let col = build_l4_bit_col(public, b);
+        claims.push(extract_public_leg_claim(
+            &proof.l4_w1_encode_bccs[b], &col, pi_hash, l4_bit_tags[b],
+        )?);
+    }
+
+    // L5: V17 EQ-region columns ↔ public a_ntt[l] (l ∈ 0..L), c_ntt, t1d_ntt, w_approx_ntt
+    let expected_l5_count = L + 3;
+    if proof.l5_v17_eq_bccs.len() != expected_l5_count {
+        return Err(V2BridgeError::BccDeserialize(format!(
+            "L5: expected {expected_l5_count} BCCs, got {}",
+            proof.l5_v17_eq_bccs.len()
+        )));
+    }
+    let l5_a_tags: [&'static str; 7] = ["L5.a0","L5.a1","L5.a2","L5.a3","L5.a4","L5.a5","L5.a6"];
+    let mut idx = 0;
+    for l in 0..L {
+        let col = build_l5_a_ntt_col(public, l);
+        claims.push(extract_public_leg_claim(
+            &proof.l5_v17_eq_bccs[idx], &col, pi_hash, l5_a_tags[l],
+        )?);
+        idx += 1;
+    }
+    {
+        let col = build_l5_c_ntt_col(public);
+        claims.push(extract_public_leg_claim(
+            &proof.l5_v17_eq_bccs[idx], &col, pi_hash, "L5.c_ntt",
+        )?);
+        idx += 1;
+    }
+    {
+        let col = build_l5_t1d_ntt_col(public);
+        claims.push(extract_public_leg_claim(
+            &proof.l5_v17_eq_bccs[idx], &col, pi_hash, "L5.t1d_ntt",
+        )?);
+        idx += 1;
+    }
+    {
+        let col = build_l5_w_approx_ntt_col(public);
+        claims.push(extract_public_leg_claim(
+            &proof.l5_v17_eq_bccs[idx], &col, pi_hash, "L5.w_ntt",
+        )?);
+    }
+
+    Ok(ExtOodClaimBundle { claims })
+}
+
+/// Extract the **full** v2 F2b OOD bundle — both the BCC-vs-BCC legs
+/// (L2a, L3) and all BCC-vs-public legs (L1, L2b, L2c, L4, L5).  This
+/// is the complete F2b cross-binding shape attested by a v2 proof.
+pub fn extract_v2_full_ood_bundle(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+) -> Result<ExtOodClaimBundle, V2BridgeError> {
+    let mut bundle = extract_v2_bcc_pair_ood_bundle(proof)?;
+    let public_bundle = extract_v2_public_leg_ood_bundle(proof, public)?;
+    bundle.claims.extend(public_bundle.claims);
+    Ok(bundle)
+}
+
+/// End-to-end: extract the full F2b OOD bundle (BCC-vs-BCC +
+/// BCC-vs-public) and prove its joint satisfaction with the recursive
+/// OOD accumulator STARK.  Equivalent to `prove_v2_ood_recursive` but
+/// covers all seven F2b legs (vs only L2a + L3).
+pub fn prove_v2_full_ood_recursive(
+    proof: &V2ProofReal,
+    public: &V2Witness,
+    blowup: usize,
+    r: usize,
+    use_stir: bool,
+) -> Result<OodAccumulatorProof, V2OodRecursiveError> {
+    let ext_bundle = extract_v2_full_ood_bundle(proof, public)
+        .map_err(V2OodRecursiveError::Bridge)?;
+    let base_bundle = flatten_ext_to_base(&ext_bundle);
+
+    let mut seed = proof.pi_hash;
+    seed[0] ^= 0xF6;  // distinct from prove_v2_ood_recursive's 0xF5
+    let alphas = alphas_from_transcript::<Goldilocks>(&seed, base_bundle.claims.len());
+
+    let claim = OodAccumulatorClaim { bundle: base_bundle, alphas };
+    prove_ood_accumulator(&claim, blowup, r, use_stir)
+        .map_err(V2OodRecursiveError::RecursiveProver)
+}
+
 /// Expand an `ExtOodClaimBundle` into an `OodClaimBundle<Goldilocks>`
 /// by projecting each Ext claim into EXT_DEGREE per-coordinate
 /// Goldilocks sub-claims via `TowerField::to_fp_components`.
@@ -232,8 +562,29 @@ pub fn flatten_ext_to_base(ext: &ExtOodClaimBundle) -> OodClaimBundle<Goldilocks
             "TowerField::to_fp_components returned wrong length for SexticExt");
         assert_eq!(g_coords.len(), EXT_DEGREE);
         let tags: &[&'static str; EXT_DEGREE] = match claim.binding_tag {
-            "L2a" => &COORD_TAGS_L2A,
-            "L3"  => &COORD_TAGS_L3,
+            "L2a"             => &COORD_TAGS_L2A,
+            "L3"              => &COORD_TAGS_L3,
+            "L2c"             => &COORD_TAGS_L2C,
+            "L1"              => &COORD_TAGS_L1,
+            "L2b"             => &COORD_TAGS_L2B,
+            // L4 bit-position tags ("L4.b0".."L4.b5")
+            "L4.b0"           => &COORD_TAGS_L4[0],
+            "L4.b1"           => &COORD_TAGS_L4[1],
+            "L4.b2"           => &COORD_TAGS_L4[2],
+            "L4.b3"           => &COORD_TAGS_L4[3],
+            "L4.b4"           => &COORD_TAGS_L4[4],
+            "L4.b5"           => &COORD_TAGS_L4[5],
+            // L5 column tags ("L5.a0".."L5.a6", "L5.c_ntt", "L5.t1d_ntt", "L5.w_ntt")
+            "L5.a0"           => &COORD_TAGS_L5[0],
+            "L5.a1"           => &COORD_TAGS_L5[1],
+            "L5.a2"           => &COORD_TAGS_L5[2],
+            "L5.a3"           => &COORD_TAGS_L5[3],
+            "L5.a4"           => &COORD_TAGS_L5[4],
+            "L5.a5"           => &COORD_TAGS_L5[5],
+            "L5.a6"           => &COORD_TAGS_L5[6],
+            "L5.c_ntt"        => &COORD_TAGS_L5[7],
+            "L5.t1d_ntt"      => &COORD_TAGS_L5[8],
+            "L5.w_ntt"        => &COORD_TAGS_L5[9],
             other => panic!(
                 "flatten_ext_to_base: unknown binding_tag '{other}'; \
                  add a COORD_TAGS_* table for the new leg"
@@ -409,6 +760,72 @@ mod tests {
         assert_eq!(rec_proof.public.pi_hash, rec_proof_2.public.pi_hash,
             "v2 → recursive pi_hash must be deterministic in v2 proof");
         assert!(verify_ood_accumulator(&rec_proof_2));
+    }
+
+    #[test]
+    #[ignore = "slow — full F2b OOD bundle (BCC-vs-BCC + BCC-vs-public)"]
+    fn extract_v2_full_ood_bundle_honest() {
+        let w = synthesize_demo_witness(19);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        // Public legs only.
+        let public_bundle = extract_v2_public_leg_ood_bundle(&proof, &w)
+            .expect("public-leg OOD bundle extraction must succeed");
+        // mldsa-44 (L1): L=4, W1_BITS_PER_COEF=6 → 1+1+1+6+(4+3) = 16 claims
+        let expected_public_count = 1 + 1 + 1 + W1_BITS_PER_COEF + (L + 3);
+        assert_eq!(public_bundle.claims.len(), expected_public_count);
+        assert!(public_bundle.check_all_native(),
+            "honest v2 must satisfy all BCC-vs-public OOD legs; \
+             first_failing = {:?}", public_bundle.first_failing());
+
+        // Full bundle: BCC-vs-BCC (2) + BCC-vs-public (16) = 18 at mldsa-44.
+        let full_bundle = extract_v2_full_ood_bundle(&proof, &w)
+            .expect("full F2b OOD bundle extraction must succeed");
+        assert_eq!(full_bundle.claims.len(), 2 + expected_public_count);
+        assert!(full_bundle.check_all_native(),
+            "honest v2 must satisfy ALL F2b OOD legs");
+    }
+
+    #[test]
+    #[ignore = "slow — full F2b OOD bundle → recursive STARK round-trip"]
+    fn prove_v2_full_ood_recursive_round_trip() {
+        use crate::recursive_prover::verify_ood_accumulator;
+
+        let w = synthesize_demo_witness(23);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        let rec_proof = prove_v2_full_ood_recursive(&proof, &w, 4, 54, false)
+            .expect("full v2 OOD recursive prove must succeed");
+        assert!(verify_ood_accumulator(&rec_proof),
+            "full v2 → recursive STARK must verify locally");
+    }
+
+    #[test]
+    #[ignore = "slow — tampered public input breaks the full F2b bundle"]
+    fn tampered_public_breaks_full_bundle() {
+        let mut w = synthesize_demo_witness(29);
+        let c_tilde: [u8; C_TILDE_BYTES] =
+            ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let proof = prove_v2_real(&w, &c_tilde, 4);
+
+        // Honest bundle must accept.
+        let honest = extract_v2_full_ood_bundle(&proof, &w).unwrap();
+        assert!(honest.check_all_native());
+
+        // Tamper a public h value — L2c's canonical column changes,
+        // so g(z_ext) ≠ f(z_ext) at the L2c leg.
+        w.h[0][0] ^= 1;
+        let tampered = extract_v2_full_ood_bundle(&proof, &w).unwrap();
+        assert!(!tampered.check_all_native(),
+            "public.h tamper must break the F2b bundle");
+
+        // L2c is at index 2 in the full bundle (after L2a, L3).
+        assert_eq!(tampered.first_failing(), Some(2),
+            "first failing should be L2c (index 2) after public.h tamper");
     }
 
     #[test]

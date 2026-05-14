@@ -727,8 +727,8 @@ const V2_BLOWUP: usize = 32;
 /// Auto-derived from the active `sha3-N` Cargo feature: 54 / 79 / 105
 /// for NIST PQ Levels 1 / 3 / 5 (Johnson-regime unconditional).
 /// See `crate::stark_level::NUM_QUERIES_LEVEL`.
-const V2_NUM_QUERIES: usize = crate::stark_level::NUM_QUERIES_LEVEL;
-const V2_SEED_Z: u64 = 0xDEEF_BAAD;
+pub const V2_NUM_QUERIES: usize = crate::stark_level::NUM_QUERIES_LEVEL;
+pub const V2_SEED_Z: u64 = 0xDEEF_BAAD;
 
 // derive_t_mem_challenges removed 2026-05-10 — T_MEM deleted after F2b
 // L0-L4 superseded its (vacuous) cross-region binding role.
@@ -768,7 +768,7 @@ pub(crate) fn comb_coeffs(num: usize, pi_hash: &[u8; 32], domain_sep: &[u8]) -> 
     }).collect()
 }
 
-pub(crate) fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+pub fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     // Default: **STIR** mode (since `verify_one_sub_air_with_trace`'s
     // per-query trace-cell soundness check was generalized to handle
     // both FRI and STIR proof structures via
