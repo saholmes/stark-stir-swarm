@@ -151,6 +151,84 @@ ML-DSA-65 signature; any mutation to π_inner, π_outer, merkle_root,
 records, or the signature itself flips the verifier's verdict to
 REJECT.
 
+## Tranco-scale demonstration — N=3 822 (2026-05-15)
+
+The N=500 walkthrough above is the smoke validation; the full
+**Tranco-filtered .se TLD** end-to-end produces a 392.7 KiB epoch
+package over 867 records.  This is the canonical web-scale data point.
+
+| Stage | Operation | Result |
+|---|---|---:|
+| Phase 1 producer wall-clock (3 822 .se zones) | 912 s (~15 min) |
+| Captured DNSSEC chain links                   | 1 593 |
+| Records committed to STARK (ACCEPT-verdict)   | **867** |
+| Pre-proof oracle pass-rate                    | 54 % |
+| DNSSEC algorithms observed in production .se  | **7 distinct** (RSASHA1, RSASHA1-NSEC3-SHA1, RSASHA256, RSASHA512, ECDSAP256SHA256, ECDSAP384SHA384, Ed25519) |
+| Inner shard STARK π                           | 187 562 B (183 KiB) / 230 ms prove / 0.7 ms verify |
+| Outer rollup STARK π                          | 95 858 B (93.6 KiB) / 1 ms prove / 0.4 ms verify |
+| Merkle tree levels                            | 11 levels (depth 10), 1 738 internal entries |
+| ML-DSA-65 pk + sig                            | 5 261 B (5.1 KiB) |
+| **Total epoch package**                       | **402 147 B (392.7 KiB)** |
+| **Package artefact in-repo**                  | `scripts/data/se-epoch-package-tranco.bin` |
+| SHA-256 of the artefact                       | `c39cb1a4d3e37540e4c7a64d4d1d9c09644986c7b7aeb0bd43c418d24808b5a0` |
+
+### Phase 3 offline resolver — Tranco-scale measurement (N=867)
+
+```
+loaded 392.7 KiB package from disk                     0.4 ms
+✓ ML-DSA-65 signature verify                           0.085 ms
+✓ Inner shard STARK FRI verify                         1.267 ms
+✓ Outer rollup STARK FRI verify                        0.823 ms
+─────────────────────────────────────────────────────────────────
+✓ One-time epoch acceptance (all 3 proofs)             2.20 ms
+
+Phase 3a — POSITIVE queries (records IN corpus):
+  6/6 ACCEPT  via Merkle inclusion proof  →  avg 3.4 µs/query
+  domains spanning 5 algorithms: alg 5, 8, 13, 14, 15
+  (tre.se, resilans.se, kb.se, com.se, svenskaspel.se, 1177.se)
+
+Phase 3b — NEGATIVE queries (records NOT in corpus):
+  7/7 REJECT  → coverage = committed corpus exactly
+
+Phase 3c — Forged-inclusion-proof attack:
+  forged "evil.se A 6.6.6.6" leaf + reused real auth path
+  ✓ REJECTED — reconstructs to 81ddc7e6…, committed root 0b7b36e5…
+
+Phase 3d — Comprehensive component-level tamper sweep (9 cases):
+  ✓ authority_sig[0] ^= 0xFF        → ML-DSA verify catches
+  ✓ authority_pk[0]  ^= 0xFF        → ML-DSA verify catches
+  ✓ merkle_root[0]   ^= 0xFF        → ML-DSA verify (binding hash)
+  ✓ inner_pi_hash[0] ^= 0xFF        → ML-DSA verify (binding hash)
+  ✓ outer_root_f0[0] ^= 0xFF        → ML-DSA verify (binding hash)
+  ✓ epoch_t  = 0  (replay)          → ML-DSA verify (binding hash)
+  ✓ epoch_seq = u64::MAX (replay)   → ML-DSA verify (binding hash)
+  ✓ outer_stark_proof[100] ^= 0xFF  → Outer rollup STARK FRI catches
+  ✓ inner_stark_proof[100] ^= 0xFF  → Inner shard STARK FRI catches
+  Tamper caught: 9/9 (all rejected — security envelope intact)
+
+Phase 3e — Record-level tamper (rdata flip):
+  records[0].rdata[0] ^= 0xFF → resolve() re-derives leaf_hash →
+  Merkle inclusion fails → ✓ correctly rejected
+```
+
+**Security envelope at Tranco scale**: an offline resolver answers
+DNS queries EXACTLY for the **867 records** committed in the 392.7 KiB
+package, and cannot be tricked into accepting any record outside it,
+nor any tampered version of a record inside it.
+
+### Reproduce the Tranco-scale demo
+
+```bash
+# Verify the artefact's identity (committed to git)
+shasum -a 256 scripts/data/se-epoch-package-tranco.bin
+# → c39cb1a4d3e37540e4c7a64d4d1d9c09644986c7b7aeb0bd43c418d24808b5a0
+
+# Run the comprehensive offline resolver
+SE_EPOCH_PACKAGE_PATH=scripts/data/se-epoch-package-tranco.bin \
+    cargo run --release -p swarm-dns --example se_offline_resolver \
+    --features "sha3-256 mldsa-44 parallel" --no-default-features
+```
+
 ## Reproduce on your machine
 
 Self-contained reproducer using the ship-on-disk Tranco list and the
@@ -172,25 +250,31 @@ CAPTURE_CONCURRENCY=64 \
     --features "sha3-256 mldsa-44 parallel" --no-default-features
 ```
 
-## Headline numbers (this demo at N=500 captured / 199 committed)
+## Headline numbers — N=500 smoke + N=3 822 Tranco-scale
 
-| Metric | Measurement |
-|---|---:|
-| Phase 1 producer wall-clock (500 zones)            | **126 s** |
-| Captured DNSSEC chain links                         | 276 |
-| Records committed to STARK                          | **199** (ACCEPT-verdict only) |
-| Pre-proof oracle REJECTs (expired/rotated RRSIGs)  | 1 |
-| DNSSEC algorithms observed                          | 5 distinct |
-| Inner shard STARK π                                 | 135.0 KiB |
-| Outer rollup STARK π                                | 84.9 KiB |
-| ML-DSA-65 pk + sig                                  | 5.3 KiB |
-| **Total epoch package (Phase 2)**                  | **269.4 KiB** |
-| Phase 3 load                                        | 0.2 ms |
-| Phase 3 one-time verify (ML-DSA + outer STARK)      | **1.48 ms** |
-| Phase 3 POSITIVE query avg                          | **3.8 µs / query** |
-| Phase 3 NEGATIVE query reject rate                  | 7/7 = 100 % |
-| Forged-inclusion-proof attempt                      | REJECTED |
-| Signature-tamper attempt                            | REJECTED |
+| Metric | N=500 smoke (199 committed) | **N=3 822 Tranco (867 committed)** |
+|---|---:|---:|
+
+| Phase 1 producer wall-clock                         | 126 s    | **912 s (~15 min)** |
+| Captured DNSSEC chain links                         | 276      | **1 593** |
+| Records committed to STARK                          | 199      | **867** |
+| Pre-proof oracle ACCEPT-rate                        | 72 %     | 54 % |
+| DNSSEC algorithms observed                          | 5        | **7 distinct** |
+| Inner shard STARK π                                 | 135.0 KiB | **183 KiB** |
+| Outer rollup STARK π                                | 84.9 KiB | 93.6 KiB |
+| ML-DSA-65 pk + sig                                  | 5.3 KiB  | 5.1 KiB |
+| **Total epoch package (Phase 2)**                   | **269.4 KiB** | **392.7 KiB** |
+| Merkle tree depth                                   | 8 levels | **10 levels** |
+| Phase 3 load                                        | 0.4 ms   | 0.4 ms |
+| Phase 3 ML-DSA-65 verify                            | 0.143 ms | 0.085 ms |
+| Phase 3 inner STARK FRI verify                      | 1.589 ms | 1.267 ms |
+| Phase 3 outer STARK FRI verify                      | 1.073 ms | 0.823 ms |
+| **Phase 3 one-time verify (all 3 proofs)**          | **2.86 ms** | **2.20 ms** |
+| Phase 3 POSITIVE query avg                          | 3.8 µs   | **3.4 µs** |
+| Phase 3 NEGATIVE query reject rate                  | 7/7 = 100 % | 7/7 = 100 % |
+| Forged-inclusion-proof attempt                      | REJECTED | REJECTED |
+| **Comprehensive 9-case tamper sweep**               | 9/9 REJECT | **9/9 REJECT** |
+| Record-level rdata tamper                           | REJECT   | REJECT |
 
 ## Security guarantees (paper §V Theorems 1–4)
 
