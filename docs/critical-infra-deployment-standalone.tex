@@ -1,0 +1,48 @@
+%% critical-infra-deployment-standalone.tex
+%%
+%% Standalone wrapper that compiles `critical-infra-deployment.tex` on
+%% its own (e.g. for review / quick PDF rendering) without needing the
+%% surrounding thesis or paper preamble.  For thesis inclusion, just
+%% \input{critical-infra-deployment.tex} from within an existing
+%% document instead.
+%%
+%% Compile via:    pdflatex critical-infra-deployment-standalone.tex
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+% siunitx fallbacks in case the preamble doesn't define mebi-/kibi-byte:
+\DeclareSIUnit{\byte}{B}
+
+\title{STARK-DNS for Sub-TLD Critical Infrastructure:\\
+       Empirical Practicality}
+\author{Anonymous (NDSS double-blind submission)}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note demonstrates that the offline STARK-DNS epoch-package
+architecture is empirically practical for sub-TLD critical-infrastructure
+DNS deployment.  At realistic deployment scopes (\texttt{.gov},
+\texttt{.mil}, allied government TLDs, NATO/ICS-CERT critical-sector
+endpoint lists), the epoch package is \SI{3}{\mebi\byte}--\SI{30}{\mebi\byte},
+boot cost is \SI{10}{\milli\second}--\SI{16}{\milli\second}, and
+per-query cost is \SI{6}{\micro\second}--\SI{9}{\micro\second}.  Every
+projection is anchored by measured data points on real Swedish
+\texttt{.se} DNSSEC captures committed to the implementation repository.
+The architecture is post-quantum secure and requires no network
+connectivity after the one-time epoch acceptance.
+\end{abstract}
+
+\input{critical-infra-deployment.tex}
+
+\end{document}
