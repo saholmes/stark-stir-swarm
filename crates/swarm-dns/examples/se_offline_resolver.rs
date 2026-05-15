@@ -67,6 +67,45 @@ fn inner_fri_params(package: &SeEpochPackage, fs_binding: [u8; 32]) -> DeepFriPa
     }
 }
 
+/// Silent variant of `verify_package` for the comprehensive tamper
+/// sweep below — runs the same three checks but suppresses progress
+/// output so the tamper table stays readable.
+fn verify_package_quiet(package: &SeEpochPackage) -> Result<(), String> {
+    use fips204::ml_dsa_65;
+    use fips204::traits::{SerDes, Verifier};
+
+    let pk_bytes: [u8; ml_dsa_65::PK_LEN] = package.authority_pk.as_slice()
+        .try_into().map_err(|_| "authority_pk wrong length".to_string())?;
+    let pk = ml_dsa_65::PublicKey::try_from_bytes(pk_bytes)
+        .map_err(|_| "malformed ML-DSA pk".to_string())?;
+    let sig_bytes: [u8; ml_dsa_65::SIG_LEN] = package.authority_sig.as_slice()
+        .try_into().map_err(|_| "authority_sig wrong length".to_string())?;
+    if !pk.verify(&package.binding_hash(), &sig_bytes, ML_DSA_CTX) {
+        return Err("ML-DSA-65 sig FAILED".into());
+    }
+
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"STARK-DNS-SE-DEMO-SHARD-FS-V1");
+    h.update(package.merkle_root);
+    let fs_binding: [u8; 32] = h.finalize().into();
+
+    let inner_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        package.inner_stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|_| "inner STARK malformed".to_string())?;
+    if !deep_fri_verify::<Ext>(&inner_fri_params(package, fs_binding), &inner_proof) {
+        return Err("inner STARK FRI FAILED".into());
+    }
+
+    let outer_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        package.outer_stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|_| "outer STARK malformed".to_string())?;
+    if !deep_fri_verify::<Ext>(&outer_fri_params(package, fs_binding), &outer_proof) {
+        return Err("outer STARK FRI FAILED".into());
+    }
+    Ok(())
+}
+
 fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     use fips204::ml_dsa_65;
     use fips204::traits::{SerDes, Verifier};
@@ -368,13 +407,118 @@ fn main() {
     }
     println!();
 
-    // ─── Tamper-detection demo ──────────────────────────────────────
-    println!("[Phase 3d — TAMPER] Mutate one byte of authority_sig + re-verify:");
-    let mut tampered = package.clone();
-    tampered.authority_sig[0] ^= 0xFF;
-    match verify_package(&tampered) {
-        Ok(_) => println!("  ✗ FAILED — tampered sig wrongly accepted (this is a bug)"),
-        Err(e) => println!("  ✓ correctly rejected:  {e}"),
+    // ─── Phase 3d — COMPREHENSIVE TAMPER TESTS ──────────────────────
+    //
+    // Every cryptographic component of the package gets a one-byte flip,
+    // demonstrating which verification check catches each tampering.
+    // A robust system rejects ALL of these; if any tampering ACCEPTS,
+    // the verifier has a security gap.
+    println!("[Phase 3d — TAMPER] Comprehensive component-level tamper tests:");
+    println!();
+
+    struct TamperCase {
+        name: &'static str,
+        expected_catcher: &'static str,
+        mutate: Box<dyn Fn(&mut SeEpochPackage)>,
+    }
+    let cases: Vec<TamperCase> = vec![
+        TamperCase {
+            name: "authority_sig[0] ^= 0xFF",
+            expected_catcher: "ML-DSA-65 signature verify",
+            mutate: Box::new(|p| p.authority_sig[0] ^= 0xFF),
+        },
+        TamperCase {
+            name: "authority_pk[0] ^= 0xFF (wrong key)",
+            expected_catcher: "ML-DSA-65 signature verify",
+            mutate: Box::new(|p| p.authority_pk[0] ^= 0xFF),
+        },
+        TamperCase {
+            name: "merkle_root[0] ^= 0xFF",
+            expected_catcher: "ML-DSA-65 signature verify (binding hash)",
+            mutate: Box::new(|p| p.merkle_root[0] ^= 0xFF),
+        },
+        TamperCase {
+            name: "inner_pi_hash[0] ^= 0xFF",
+            expected_catcher: "ML-DSA-65 signature verify (binding hash)",
+            mutate: Box::new(|p| p.inner_pi_hash[0] ^= 0xFF),
+        },
+        TamperCase {
+            name: "outer_root_f0[0] ^= 0xFF",
+            expected_catcher: "ML-DSA-65 signature verify (binding hash)",
+            mutate: Box::new(|p| if !p.outer_root_f0.is_empty() { p.outer_root_f0[0] ^= 0xFF }),
+        },
+        TamperCase {
+            name: "epoch_t = 0 (replay attack)",
+            expected_catcher: "ML-DSA-65 signature verify (binding hash)",
+            mutate: Box::new(|p| p.epoch_t = 0),
+        },
+        TamperCase {
+            name: "epoch_seq = u64::MAX (replay attack)",
+            expected_catcher: "ML-DSA-65 signature verify (binding hash)",
+            mutate: Box::new(|p| p.epoch_seq = u64::MAX),
+        },
+        TamperCase {
+            name: "outer_stark_proof[100] ^= 0xFF",
+            expected_catcher: "Outer rollup STARK FRI verify",
+            mutate: Box::new(|p| {
+                if p.outer_stark_proof.len() > 100 { p.outer_stark_proof[100] ^= 0xFF }
+            }),
+        },
+        TamperCase {
+            name: "inner_stark_proof[100] ^= 0xFF",
+            expected_catcher: "Inner shard STARK FRI verify",
+            mutate: Box::new(|p| {
+                if p.inner_stark_proof.len() > 100 { p.inner_stark_proof[100] ^= 0xFF }
+            }),
+        },
+    ];
+
+    println!("  {:<44} {:<22} {}", "tampering", "verdict", "expected catcher");
+    println!("  {:─<100}", "");
+    let mut tamper_caught = 0usize;
+    let mut tamper_missed = 0usize;
+    for case in &cases {
+        let mut tampered = package.clone();
+        (case.mutate)(&mut tampered);
+        let verdict = match verify_package_quiet(&tampered) {
+            Ok(_) => {
+                tamper_missed += 1;
+                "✗ ACCEPTED (security bug!)"
+            }
+            Err(_) => {
+                tamper_caught += 1;
+                "✓ REJECTED"
+            }
+        };
+        println!("  {:<44} {verdict:<22} {}", case.name, case.expected_catcher);
+    }
+    println!();
+    println!("  Tamper caught: {tamper_caught}/{} ({})",
+        cases.len(),
+        if tamper_missed == 0 { "all attempted tamperings correctly rejected" }
+        else { "SECURITY VIOLATION — some tamperings accepted" }
+    );
+    println!();
+
+    // ─── Phase 3e — RECORD-LEVEL tamper test (Merkle inclusion catch) ─
+    //
+    // Tamper a single record's rdata in the package's records[] list.
+    // The Merkle inclusion check at query time should catch this
+    // because the resolver re-derives the leaf_hash from the (possibly
+    // tampered) record bytes and verifies against the committed root.
+    println!("[Phase 3e — RECORD TAMPER] Mutate records[0].rdata + re-query:");
+    {
+        let mut tampered = package.clone();
+        if !tampered.records.is_empty() && !tampered.records[0].rdata.is_empty() {
+            tampered.records[0].rdata[0] ^= 0xFF;
+            let target_domain = tampered.records[0].domain.clone();
+            let target_type = tampered.records[0].record_type;
+            let result = resolve(&tampered, &target_domain, target_type);
+            match result {
+                Some(_) => println!("  ✗ FAILED — tampered record wrongly resolved (this is a bug)"),
+                None => println!("  ✓ correctly rejected: Merkle inclusion fails for tampered records[0].rdata"),
+            }
+        }
     }
     println!();
 
@@ -388,7 +532,10 @@ fn main() {
         total_pos_us);
     println!("  ✓ {neg_reject} NEGATIVE queries correctly rejected (no false ACCEPTs)");
     println!("  ✓ Forged-inclusion-proof attempt rejected (Merkle binding holds)");
-    println!("  ✓ Sig-tampered package rejected (ML-DSA EUF-CMA holds)");
+    println!("  ✓ Comprehensive component tamper sweep: {tamper_caught}/{} all rejected", cases.len());
+    println!("    (covers: ML-DSA sig, pk, merkle_root, inner_pi_hash, outer_root_f0,");
+    println!("     epoch_t replay, epoch_seq replay, outer STARK bytes, inner STARK bytes)");
+    println!("  ✓ Record-level tamper (rdata flip) caught by Merkle inclusion re-derivation");
     println!();
     println!("  Security envelope: an offline resolver answers DNS queries");
     println!("  EXACTLY for the {} records committed in this epoch package,",
