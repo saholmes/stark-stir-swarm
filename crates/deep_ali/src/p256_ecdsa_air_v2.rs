@@ -21,15 +21,17 @@
 // coordinate (matching FIPS 186-4 §6.4.2), so a STARK proof over a
 // REAL ECDSA signature actually verifies that signature in-circuit.
 //
-// Soundness note: the (p−2) bit cells are filled by the fill helper
-// and are NOT individually pinned to specific constant values by the
-// AIR's row-uniform constraint set.  A malicious prover that wrote
-// different bits would compute base^k for some other k; the chain's
-// chained square-and-multiply still verifies in-circuit, but the
-// downstream equality check (X_aff mod n == r) is overwhelmingly
-// unlikely to hold for random `r` extracted from a captured RRSIG
-// (DL-hardness in F_n).  The same "trust by construction" pattern as
-// the existing v0 layout's u_1 / u_2 bit cells.
+// Soundness: the (p−2) bit cells are pinned by ROW-0 BOUNDARY
+// CONSTRAINTS (the 256 entries at the end of the constraint list
+// returned by `ecdsa_verify_v2_constraints`).  Each bit cell's
+// value at trace row 0 is constrained to equal the corresponding
+// constant bit of (p−2); the FRI merge applies the row-0 Lagrange
+// indicator polynomial so the constraint vanishes on padded rows
+// (rows ≥ 1) regardless of cell contents.  A malicious prover that
+// writes different bits produces a non-zero boundary constraint at
+// row 0 → c_eval doesn't divide cleanly by Z_H → FRI proximity
+// tests reject the proof.  Verified by the
+// `row0_boundary_catches_flipped_bit` test below.
 
 #![allow(non_snake_case, non_upper_case_globals, dead_code)]
 
@@ -246,8 +248,11 @@ pub fn build_ecdsa_verify_v2_layout(
     )
 }
 
-/// Total constraint count for the v2 composition.
-pub fn ecdsa_verify_v2_constraints(layout: &EcdsaVerifyV2Layout) -> usize {
+/// Count of ROW-UNIFORM constraints in the v2 composition (the kind
+/// the existing FRI merge applies on every LDE row).  The boundary
+/// constraints are reported separately by
+/// `ecdsa_verify_v2_row0_boundary_constraints`.
+pub fn ecdsa_verify_v2_row_uniform_constraints(layout: &EcdsaVerifyV2Layout) -> usize {
     scalar_mul_chain_gadget_constraints(&layout.u1_g_chain)
         + scalar_mul_chain_gadget_constraints(&layout.u2_q_chain)
         + group_add_gadget_constraints(&layout.final_add)
@@ -255,6 +260,23 @@ pub fn ecdsa_verify_v2_constraints(layout: &EcdsaVerifyV2Layout) -> usize {
         + MUL_GADGET_CONSTRAINTS
         + SCALAR_MUL_GADGET_CONSTRAINTS
         + SCALAR_EQ_GADGET_CONSTRAINTS
+}
+
+/// Number of row-0 boundary constraints: one per (p-2) bit cell,
+/// pinning each bit cell to the corresponding constant bit of (p-2).
+/// Closes the soundness gap that the row-uniform AIR alone leaves the
+/// bit cells unconstrained — a malicious prover with different bits
+/// would otherwise compute `base^k` for arbitrary `k ≠ p-2`.
+pub const ECDSA_V2_ROW0_BOUNDARY_CONSTRAINTS: usize = 256;
+
+pub fn ecdsa_verify_v2_row0_boundary_constraints() -> usize {
+    ECDSA_V2_ROW0_BOUNDARY_CONSTRAINTS
+}
+
+/// Total constraint count = row-uniform + row-0 boundary.
+pub fn ecdsa_verify_v2_constraints(layout: &EcdsaVerifyV2Layout) -> usize {
+    ecdsa_verify_v2_row_uniform_constraints(layout)
+        + ecdsa_verify_v2_row0_boundary_constraints()
 }
 
 /// Read a `FieldElement` from `NUM_LIMBS` adjacent trace cells.
@@ -389,12 +411,13 @@ pub fn fill_ecdsa_verify_v2(
     }
 }
 
-/// Emit all constraints for the v2 layout.
-pub fn eval_ecdsa_verify_v2(
+/// Emit ROW-UNIFORM constraints (the gadget composition).  These hold
+/// at EVERY trace row; the FRI merge applies them on every LDE point.
+pub fn eval_ecdsa_verify_v2_row_uniform(
     cur: &[F],
     layout: &EcdsaVerifyV2Layout,
 ) -> Vec<F> {
-    let mut out = Vec::with_capacity(ecdsa_verify_v2_constraints(layout));
+    let mut out = Vec::with_capacity(ecdsa_verify_v2_row_uniform_constraints(layout));
     out.extend(eval_scalar_mul_chain_gadget(cur, &layout.u1_g_chain));
     out.extend(eval_scalar_mul_chain_gadget(cur, &layout.u2_q_chain));
     out.extend(eval_group_add_gadget(cur, &layout.final_add));
@@ -402,6 +425,39 @@ pub fn eval_ecdsa_verify_v2(
     out.extend(eval_mul_gadget(cur, &layout.x_affine_mul));
     out.extend(eval_scalar_mul_gadget(cur, &layout.r_x_mod_n_layout));
     out.extend(eval_scalar_eq_gadget(cur, &layout.r_eq_layout));
+    out
+}
+
+/// Emit ROW-0 BOUNDARY constraints.  These pin each (p-2) bit cell
+/// to its constant value at trace row 0; they're gated by a row-0
+/// Lagrange indicator in the FRI merge layer, so they vanish on
+/// padded (rows ≥ 1) trace rows regardless of the cell contents.
+pub fn eval_ecdsa_verify_v2_row0_boundary(
+    cur: &[F],
+    layout: &EcdsaVerifyV2Layout,
+) -> Vec<F> {
+    let pm2_bits = p_minus_2_bits();
+    let mut out = Vec::with_capacity(layout.p_minus_2_bit_cells.len());
+    for (i, &cell) in layout.p_minus_2_bit_cells.iter().enumerate() {
+        let actual = cur[cell];
+        let expected = F::from(pm2_bits[i] as u64);
+        out.push(actual - expected);
+    }
+    out
+}
+
+/// Emit ALL constraints for the v2 layout.  Returns row-uniform
+/// constraints followed by row-0 boundary constraints.  Callers that
+/// don't apply the row-0 indicator separately (e.g., the K=2
+/// satisfaction test that evaluates at exactly trace row 0) can use
+/// this directly: the row-0 boundary constraints must hold at row 0
+/// regardless of indicator.
+pub fn eval_ecdsa_verify_v2(
+    cur: &[F],
+    layout: &EcdsaVerifyV2Layout,
+) -> Vec<F> {
+    let mut out = eval_ecdsa_verify_v2_row_uniform(cur, layout);
+    out.extend(eval_ecdsa_verify_v2_row0_boundary(cur, layout));
     out
 }
 
@@ -539,6 +595,64 @@ mod tests {
             "v2 K=2 affine x mismatch: gadget={:?}, expected={:?}",
             x_aff.limbs, expected_x.limbs,
         );
+    }
+
+    /// POSITIVE soundness test: with honestly-filled (p-2) bits,
+    /// the row-0 boundary constraints all evaluate to zero.
+    #[test]
+    fn row0_boundary_zero_on_honest_bits() {
+        let g_x = 0;       let g_y = NUM_LIMBS;     let g_z = 2 * NUM_LIMBS;
+        let q_x = 3 * NUM_LIMBS; let q_y = 4 * NUM_LIMBS; let q_z = 5 * NUM_LIMBS;
+        let start = 6 * NUM_LIMBS;
+        let (layout, total) = build_ecdsa_verify_v2_layout(
+            start, g_x, g_y, g_z, q_x, q_y, q_z, 2,
+        );
+        let mut trace = make_trace_row(total);
+        // Place the honest (p-2) bits.
+        let pm2 = p_minus_2_bits();
+        for (i, &bit) in pm2.iter().enumerate() {
+            trace[layout.p_minus_2_bit_cells[i]][0] = F::from(bit as u64);
+        }
+        let cur: Vec<F> = (0..total).map(|c| trace[c][0]).collect();
+        let boundary = eval_ecdsa_verify_v2_row0_boundary(&cur, &layout);
+        assert_eq!(boundary.len(), ECDSA_V2_ROW0_BOUNDARY_CONSTRAINTS);
+        let nonzero = boundary.iter().filter(|v| !v.is_zero()).count();
+        assert_eq!(nonzero, 0,
+            "honest (p-2) bits must satisfy all 256 boundary constraints");
+    }
+
+    /// NEGATIVE soundness test: flipping a single (p-2) bit causes
+    /// the boundary constraint to fire (non-zero).  This is what
+    /// catches a malicious prover that tries to substitute a
+    /// different exponent into the Fermat chain.
+    #[test]
+    fn row0_boundary_catches_flipped_bit() {
+        let g_x = 0;       let g_y = NUM_LIMBS;     let g_z = 2 * NUM_LIMBS;
+        let q_x = 3 * NUM_LIMBS; let q_y = 4 * NUM_LIMBS; let q_z = 5 * NUM_LIMBS;
+        let start = 6 * NUM_LIMBS;
+        let (layout, total) = build_ecdsa_verify_v2_layout(
+            start, g_x, g_y, g_z, q_x, q_y, q_z, 2,
+        );
+        let mut trace = make_trace_row(total);
+        let pm2 = p_minus_2_bits();
+        for (i, &bit) in pm2.iter().enumerate() {
+            trace[layout.p_minus_2_bit_cells[i]][0] = F::from(bit as u64);
+        }
+        // Flip bit 100 — should make boundary[100] non-zero.
+        let cell_100 = layout.p_minus_2_bit_cells[100];
+        let original = trace[cell_100][0];
+        trace[cell_100][0] = if original.is_zero() {
+            F::from(1u64)
+        } else {
+            F::zero()
+        };
+        let cur: Vec<F> = (0..total).map(|c| trace[c][0]).collect();
+        let boundary = eval_ecdsa_verify_v2_row0_boundary(&cur, &layout);
+        let nonzero = boundary.iter().filter(|v| !v.is_zero()).count();
+        assert_eq!(nonzero, 1,
+            "flipping one bit must cause exactly one boundary constraint to fire");
+        assert!(!boundary[100].is_zero(),
+            "the boundary constraint at the flipped position must be non-zero");
     }
 
     /// End-to-end FRI round-trip exercising the new

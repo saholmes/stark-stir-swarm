@@ -1555,6 +1555,26 @@ pub fn deep_ali_merge_p256_ecdsa_streaming(
     (c_eval, info)
 }
 
+/// Row-0 Lagrange indicator polynomial s_0(X) evaluated on the LDE
+/// domain.  s_0 is the unique polynomial of degree < n_trace that
+/// satisfies s_0(ω_trace^0) = 1, s_0(ω_trace^j) = 0 for j ≠ 0.
+/// Multiplying a boundary constraint by s_0 makes it fire only at
+/// trace row 0 (and vanish on the padded rows of a single-row AIR).
+pub(crate) fn compute_row0_indicator_lde(n_trace: usize, blowup: usize) -> Vec<F> {
+    use ark_ff::One;
+    let n_lde = n_trace * blowup;
+    let mut trace_vals = vec![F::zero(); n_trace];
+    trace_vals[0] = <F as One>::one();
+    let trace_dom = GeneralEvaluationDomain::<F>::new(n_trace)
+        .expect("trace domain radix-2");
+    let coeffs = trace_dom.ifft(&trace_vals);
+    let mut padded = coeffs;
+    padded.resize(n_lde, F::zero());
+    let lde_dom = GeneralEvaluationDomain::<F>::new(n_lde)
+        .expect("LDE domain radix-2");
+    lde_dom.fft(&padded)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Streaming P-256 ECDSA verify merge — Phase 5 v2 AIR.
 //  Same structure as `deep_ali_merge_p256_ecdsa_streaming` (v0) but
@@ -1570,26 +1590,44 @@ pub fn deep_ali_merge_p256_ecdsa_v2_streaming(
     blowup: usize,
 ) -> (Vec<F>, CompositionInfo) {
     use crate::p256_ecdsa_air_v2::{
-        ecdsa_verify_v2_constraints, eval_ecdsa_verify_v2,
+        ecdsa_verify_v2_constraints, ecdsa_verify_v2_row_uniform_constraints,
+        eval_ecdsa_verify_v2_row0_boundary, eval_ecdsa_verify_v2_row_uniform,
     };
 
     let n = n_trace * blowup;
     let w = trace_evals_on_lde.len();
-    let k = ecdsa_verify_v2_constraints(layout);
+    let k_row_uniform = ecdsa_verify_v2_row_uniform_constraints(layout);
+    let k_total = ecdsa_verify_v2_constraints(layout);
 
-    assert_eq!(combination_coeffs.len(), k);
+    assert_eq!(combination_coeffs.len(), k_total);
     for col in trace_evals_on_lde {
         assert_eq!(col.len(), n);
     }
+
+    // ─── Row-0 Lagrange indicator on the LDE domain ────────────────
+    //
+    // Pins the row-0 boundary constraints (the 256 (p-2) bit-cell
+    // equality checks at the end of `combination_coeffs`) to fire
+    // only at the trace-row-0 LDE points.  On padded rows (where the
+    // bit cells are 0 even when the constant is 1), the indicator is
+    // 0 → boundary constraint contribution vanishes.
+    let row0_indicator: Vec<F> = compute_row0_indicator_lde(n_trace, blowup);
 
     let phi_eval: Vec<F> = {
         #[cfg(feature = "parallel")]
         {
             (0..n).into_par_iter().map(|i| {
                 let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
-                let cvals = eval_ecdsa_verify_v2(&cur, layout);
+                let row_uniform = eval_ecdsa_verify_v2_row_uniform(&cur, layout);
+                let boundary = eval_ecdsa_verify_v2_row0_boundary(&cur, layout);
                 let mut acc = F::zero();
-                for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                for j in 0..k_row_uniform {
+                    acc += combination_coeffs[j] * row_uniform[j];
+                }
+                let ind = row0_indicator[i];
+                for j in 0..boundary.len() {
+                    acc += combination_coeffs[k_row_uniform + j] * ind * boundary[j];
+                }
                 acc
             }).collect()
         }
@@ -1597,13 +1635,21 @@ pub fn deep_ali_merge_p256_ecdsa_v2_streaming(
         {
             (0..n).map(|i| {
                 let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
-                let cvals = eval_ecdsa_verify_v2(&cur, layout);
+                let row_uniform = eval_ecdsa_verify_v2_row_uniform(&cur, layout);
+                let boundary = eval_ecdsa_verify_v2_row0_boundary(&cur, layout);
                 let mut acc = F::zero();
-                for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                for j in 0..k_row_uniform {
+                    acc += combination_coeffs[j] * row_uniform[j];
+                }
+                let ind = row0_indicator[i];
+                for j in 0..boundary.len() {
+                    acc += combination_coeffs[k_row_uniform + j] * ind * boundary[j];
+                }
                 acc
             }).collect()
         }
     };
+    let k = k_total;
 
     let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
     let phi_coeffs = domain.ifft(&phi_eval);
