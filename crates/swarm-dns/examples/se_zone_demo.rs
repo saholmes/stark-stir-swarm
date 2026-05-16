@@ -78,8 +78,8 @@ use hickory_proto::rr::dnssec::tbs::rrset_tbs_with_sig;
 
 use swarm_dns::dns::{DnsRecord, merkle_build, merkle_root};
 use swarm_dns::prover::{
-    LdtMode, Nsec3Record, prove_inner_shard, prove_nsec3_completeness,
-    prove_outer_rollup, prove_zsk_ksk_binding_v2,
+    LdtMode, Nsec3Record, prove_ds_ksk_binding, prove_inner_shard,
+    prove_nsec3_completeness, prove_outer_rollup, prove_zsk_ksk_binding_v2,
 };
 
 type Ext = SexticExt;
@@ -964,6 +964,107 @@ fn prove_ecdsa_p256_rrsig_in_circuit_v2(
     })
 }
 
+// ─── DS → DNSKEY hash-chain binding (priority 5) ─────────────────────
+//
+// Per RFC 4034 §5.1.4 the parent zone's DS record commits to the
+// child zone's DNSKEY via:
+//
+//     digest = SHA-256( owner_name_canonical || dnskey_rdata )
+//
+// The existing `swarm_dns::prover::prove_ds_ksk_binding` proves
+// `SHA-256(input) == target_hash` in-circuit (FRI/STIR over the
+// sha256_air).  We wire it into the demo by constructing the
+// canonical input bytes from each captured (owner, DNSKEY) and
+// asserting the result equals the parent zone's published DS digest.
+
+/// Compute the canonical SHA-256 input per RFC 4034 §5.1.4:
+///   owner_name_in_canonical_wire_form || dnskey_rdata_wire_form
+fn dnskey_ds_input_bytes(owner_name: &Name, dnskey: &DNSKEY) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(owner_name.len() + 4 + dnskey.public_key().len());
+    // Owner name in canonical wire form: lowercase, length-prefixed
+    // labels, root terminator.
+    for label in owner_name.iter() {
+        // hickory Names iterate by label slice (raw bytes)
+        let lowered: Vec<u8> = label.iter()
+            .map(|b| b.to_ascii_lowercase()).collect();
+        buf.push(lowered.len() as u8);
+        buf.extend_from_slice(&lowered);
+    }
+    buf.push(0u8); // root terminator
+    // DNSKEY RDATA per RFC 4034 §2.1: 2-byte flags || 1-byte protocol
+    // || 1-byte algorithm || public_key bytes.
+    buf.extend_from_slice(&dnskey.flags().to_be_bytes());
+    buf.push(3u8); // protocol field is always 3 per RFC 4034 §2.1.2
+    buf.push(u8::from(dnskey.algorithm()));
+    buf.extend_from_slice(dnskey.public_key());
+    buf
+}
+
+#[derive(Debug, Clone)]
+struct DsKskBindingResult {
+    label: String,
+    proof_bytes: usize,
+    prove_ms: f64,
+    verify_ms: f64,
+    asserted_digest: [u8; 32],
+    parent_ds_digest: [u8; 32],
+    n_trace: usize,
+    proof_blob: Vec<u8>,
+    root_f0: Vec<u8>,
+    owner_name: String,
+}
+
+fn prove_ds_to_dnskey_binding(
+    owner_name: &Name,
+    dnskey: &DNSKEY,
+    ds: &DS,
+    fs_binding: [u8; 32],
+    ldt: LdtMode,
+) -> Option<DsKskBindingResult> {
+    // Only digest_type = SHA-256 (=2) is in-circuit today.  digest_type
+    // 1 (SHA-1) is deprecated; 4 (SHA-384) needs a SHA-384 AIR.
+    let dt: u8 = u8::from(ds.digest_type());
+    if dt != 2 {
+        return None;
+    }
+    if ds.digest().len() != 32 {
+        return None;
+    }
+    let mut parent_ds_hash = [0u8; 32];
+    parent_ds_hash.copy_from_slice(ds.digest());
+
+    let input = dnskey_ds_input_bytes(owner_name, dnskey);
+
+    let label = format!("{}/DNSKEY-DS", owner_name);
+    let t0 = Instant::now();
+    let out = prove_ds_ksk_binding(&input, &parent_ds_hash, &fs_binding, ldt);
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // SOUNDNESS: the AIR proves SHA-256(input) == asserted_digest.
+    // We additionally check the asserted_digest matches the DS's
+    // published digest.  Together: the DNSKEY rdata hashes to the
+    // value the parent zone committed in its DS record.
+    if out.asserted_digest != parent_ds_hash {
+        eprintln!("    [warn {label}] AIR's asserted_digest != DS.digest \
+                   — the captured DNSKEY does NOT match the parent's DS \
+                   (key rotation in flight, or wrong key_tag match)");
+        return None;
+    }
+
+    Some(DsKskBindingResult {
+        label,
+        proof_bytes: out.proof_bytes,
+        prove_ms: out.prove_ms.max(total_ms - out.local_verify_ms),
+        verify_ms: out.local_verify_ms,
+        asserted_digest: out.asserted_digest,
+        parent_ds_digest: parent_ds_hash,
+        n_trace: out.n_trace,
+        proof_blob: out.proof_blob,
+        root_f0: out.root_f0.to_vec(),
+        owner_name: owner_name.to_string(),
+    })
+}
+
 // ─── Main demo ───────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -1487,6 +1588,70 @@ async fn main() {
         (None, None)
     };
 
+    // ─── Step 2b-DS-KSK — DS → DNSKEY hash chain (priority 5) ──────
+    //
+    // For each captured DNSKEY+DS pair with digest_type=2 (SHA-256),
+    // prove SHA-256(owner_name || dnskey_rdata) == DS.digest in-
+    // circuit.  Gated by DS_KSK_LIMIT=N (default 0).
+    let dskk_limit: usize = std::env::var("DS_KSK_LIMIT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut ds_ksk_results: Vec<DsKskBindingResult> = Vec::new();
+    if dskk_limit > 0 {
+        println!("[Step 2b-DS-KSK] DS → DNSKEY in-circuit hash chain (RFC 4034 §5.1.4) …");
+        println!("                limit={dskk_limit} (digest_type=SHA-256 only)");
+        // Find captured (DNSKEY-RRset link, DS records) pairs.  Walk
+        // each link; if it has captured DS records AND the DNSKEY rdata,
+        // try to bind them.
+        let mut candidates: Vec<(Name, DNSKEY, DS)> = Vec::new();
+        for l in &links {
+            if l.record_type != RecordType::DNSKEY { continue; }
+            if l.ds_records.is_empty() { continue; }
+            // For each DS in the parent zone, match to a DNSKEY by key_tag.
+            for ds in &l.ds_records {
+                let target_tag = ds.key_tag();
+                let zone_name = Name::from_str(&format!("{}.", l.signer_name))
+                    .unwrap_or_else(|_| Name::root());
+                for r in &l.raw_records {
+                    if let Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) = r.data() {
+                        if k.calculate_key_tag().ok() == Some(target_tag)
+                            && u8::from(ds.digest_type()) == 2
+                        {
+                            candidates.push((zone_name.clone(), k.clone(), ds.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        println!("                candidates: {} (DNSKEY-DS pairs with SHA-256 digest)",
+            candidates.len());
+
+        let mut fs_dskk = [0u8; 32];
+        {
+            let mut h = Sha3_256::new();
+            h.update(b"STARK-DNS-SE-DS-KSK-FS-V1");
+            h.update(root);
+            let d: [u8; 32] = h.finalize().into();
+            fs_dskk.copy_from_slice(&d);
+        }
+        for (owner, dnskey, ds) in candidates.into_iter().take(dskk_limit) {
+            let label = format!("{}/DNSKEY-DS (tag={})", owner, ds.key_tag());
+            print!("    proving {label:48} … ");
+            match prove_ds_to_dnskey_binding(&owner, &dnskey, &ds, fs_dskk, LdtMode::Stir) {
+                Some(out) => {
+                    println!(
+                        "{:.0} ms prove · {:.1} ms verify · {:.1} KiB",
+                        out.prove_ms, out.verify_ms,
+                        out.proof_bytes as f64 / 1024.0,
+                    );
+                    ds_ksk_results.push(out);
+                }
+                None => println!("(skipped — digest mismatch or wrong digest_type)"),
+            }
+        }
+        println!();
+    }
+
     // ─── Step 2b' — Outer rollup STARK over the inner pi_hash ───────
     println!("[Step 2b'] Outer rollup STARK (commits inner pi_hash to epoch root) …");
     let outer = prove_outer_rollup(
@@ -1523,6 +1688,18 @@ async fn main() {
     if let Some(o) = &nsec3_output {
         binding.extend_from_slice(b"NSEC3-CHAIN-V1");
         binding.extend_from_slice(&o.chain_root);
+    }
+    // Bind DS→DNSKEY chain bindings when present.
+    if !ds_ksk_results.is_empty() {
+        binding.extend_from_slice(b"DS-KSK-CHAIN-V1");
+        binding.extend_from_slice(&(ds_ksk_results.len() as u64).to_le_bytes());
+        for r in &ds_ksk_results {
+            binding.extend_from_slice(r.owner_name.as_bytes());
+            binding.extend_from_slice(&r.asserted_digest);
+            binding.extend_from_slice(&r.parent_ds_digest);
+            binding.push(2u8); // digest_type=2 (SHA-256)
+            binding.extend_from_slice(&r.root_f0);
+        }
     }
     let binding_hash: [u8; 32] = Sha3_256::digest(&binding).into();
 
@@ -1730,6 +1907,18 @@ async fn main() {
                 .map(|r| (r.owner_hash.to_vec(), r.next_hash.to_vec()))
                 .collect()
         }),
+        // ─── DS → DNSKEY hash-chain bindings (Phase 5) ──────
+        ds_ksk_bindings: if ds_ksk_results.is_empty() { None } else {
+            Some(ds_ksk_results.iter().map(|r| swarm_dns::se_epoch_package::DsKskBinding {
+                owner_name:       r.owner_name.clone(),
+                asserted_digest:  r.asserted_digest,
+                parent_ds_digest: r.parent_ds_digest,
+                digest_type:      2,
+                n_trace:          r.n_trace,
+                stark_proof:      r.proof_blob.clone(),
+                root_f0:          r.root_f0.clone(),
+            }).collect())
+        },
     };
     if let Some(parent) = package_path.parent() {
         let _ = std::fs::create_dir_all(parent);

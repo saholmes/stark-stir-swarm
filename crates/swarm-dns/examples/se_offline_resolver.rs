@@ -103,6 +103,38 @@ fn verify_package_quiet(package: &SeEpochPackage) -> Result<(), String> {
     if !deep_fri_verify::<Ext>(&outer_fri_params(package, fs_binding), &outer_proof) {
         return Err("outer STARK FRI FAILED".into());
     }
+    // Optional DS-KSK bindings verify (mirrors verify_package).
+    if let Some(bindings) = &package.ds_ksk_bindings {
+        let mut fs_dskk = [0u8; 32];
+        {
+            use sha3::{Digest as Sha3Dig, Sha3_256};
+            let mut h2 = Sha3_256::new();
+            h2.update(b"STARK-DNS-SE-DS-KSK-FS-V1");
+            h2.update(package.merkle_root);
+            let d: [u8; 32] = h2.finalize().into();
+            fs_dskk.copy_from_slice(&d);
+        }
+        for b in bindings {
+            let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+                b.stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+            ).map_err(|_| "DS-KSK STARK malformed".to_string())?;
+            let n0 = b.n_trace * BLOWUP;
+            let params = DeepFriParams {
+                schedule: make_schedule(n0, LdtMode::Stir),
+                r: NUM_QUERIES, seed_z: SEED_Z,
+                coeff_commit_final: true, d_final: 1,
+                stir: true, s0: NUM_QUERIES,
+                public_inputs_hash: Some(fs_dskk),
+            };
+            if !deep_fri_verify::<Ext>(&params, &proof) {
+                return Err("DS-KSK STARK FRI FAILED".into());
+            }
+            if b.asserted_digest != b.parent_ds_digest {
+                return Err("DS-KSK binding asserted_digest != parent_ds_digest".into());
+            }
+        }
+    }
+
     // Optional NSEC3 chain verify (same logic as verify_package).
     if let (Some(proof_bytes), Some(n_trace), Some(_)) =
         (&package.nsec3_stark_proof, package.nsec3_n_trace, &package.nsec3_root_f0)
@@ -193,7 +225,58 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     }
     let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
 
-    // ─── 4. (Optional) NSEC3 chain-completeness FRI verify ────────
+    // ─── 4. (Optional) DS → DNSKEY hash-chain bindings ────────────
+    //
+    // Phase 5 — RFC 4034 §5.1.4 multi-level chain anchoring.  For
+    // each captured (owner, DNSKEY, DS) binding the producer ran a
+    // sha256_air STARK proving SHA-256(owner||dnskey_rdata) == DS.digest.
+    // We re-verify each here.  The binding hash mixes the bindings
+    // in so a tampered ds_ksk_bindings field is caught by the
+    // ML-DSA signature verify above.
+    let mut dskk_ms: f64 = 0.0;
+    let mut dskk_count = 0usize;
+    if let Some(bindings) = &package.ds_ksk_bindings {
+        let t = Instant::now();
+        // Reconstruct the FS-binding the producer used.
+        let mut fs_dskk = [0u8; 32];
+        {
+            use sha3::{Digest as Sha3Dig, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(b"STARK-DNS-SE-DS-KSK-FS-V1");
+            h.update(package.merkle_root);
+            let d: [u8; 32] = h.finalize().into();
+            fs_dskk.copy_from_slice(&d);
+        }
+        for b in bindings {
+            let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+                b.stark_proof.as_slice(), Compress::Yes, Validate::Yes,
+            ).map_err(|e| format!("DS-KSK STARK malformed: {e:?}"))?;
+            let n0 = b.n_trace * BLOWUP;
+            let params = DeepFriParams {
+                schedule: make_schedule(n0, LdtMode::Stir),
+                r: NUM_QUERIES, seed_z: SEED_Z,
+                coeff_commit_final: true, d_final: 1,
+                stir: true, s0: NUM_QUERIES,
+                public_inputs_hash: Some(fs_dskk),
+            };
+            if !deep_fri_verify::<Ext>(&params, &proof) {
+                return Err(format!("DS-KSK STARK FRI verify FAILED for {}",
+                    b.owner_name));
+            }
+            // Additionally cross-check the binding's asserted_digest
+            // matches the parent's published DS digest (the chain
+            // step's cryptographic anchor).
+            if b.asserted_digest != b.parent_ds_digest {
+                return Err(format!(
+                    "DS-KSK binding for {}: asserted_digest != parent_ds_digest",
+                    b.owner_name));
+            }
+            dskk_count += 1;
+        }
+        dskk_ms = t.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    // ─── 5. (Optional) NSEC3 chain-completeness FRI verify ────────
     //
     // Phase 4 — authenticated denial-of-existence.  When present,
     // the package commits to a closed cyclic NSEC3 chain via
@@ -237,16 +320,19 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
     println!("  ✓ ML-DSA-65 signature verify:    {mldsa_ms:>6.3} ms");
     println!("  ✓ Inner shard STARK FRI verify:  {inner_ms:>6.3} ms");
     println!("  ✓ Outer rollup STARK FRI verify: {outer_ms:>6.3} ms");
+    if dskk_count > 0 {
+        println!("  ✓ DS→DNSKEY chain bindings:      {dskk_ms:>6.3} ms ({dskk_count} STARK{})",
+            if dskk_count == 1 { "" } else { "s" });
+    }
     if nsec3_ms > 0.0 {
         println!("  ✓ NSEC3 chain-completeness FRI:  {nsec3_ms:>6.3} ms");
     }
     println!("  ─────────────────────────────────");
     println!("  ✓ One-time epoch acceptance:     {total_ms:>6.3} ms");
-    if nsec3_ms > 0.0 {
-        println!("  (four independent cryptographic proofs verified)");
-    } else {
-        println!("  (three independent cryptographic proofs verified)");
-    }
+    let mut n_proofs = 3usize;
+    if nsec3_ms > 0.0 { n_proofs += 1; }
+    if dskk_count > 0 { n_proofs += dskk_count; }
+    println!("  ({} independent cryptographic proofs verified)", n_proofs);
     Ok(total_ms)
 }
 

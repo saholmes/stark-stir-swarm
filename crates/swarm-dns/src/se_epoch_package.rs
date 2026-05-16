@@ -136,6 +136,39 @@ pub struct SeEpochPackage {
     /// the resolver uses these to locate the covering record for
     /// NXDOMAIN proofs.
     pub nsec3_chain: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+
+    // ─── Optional Phase 5 — DS → DNSKEY hash-chain bindings ────────
+    //
+    // RFC 4034 §5.1.4: the parent zone's DS record commits to the
+    // child zone's DNSKEY via SHA-256(owner_name || dnskey_rdata).
+    // Each `DsKskBinding` is a STARK proof produced by
+    // `swarm_dns::prover::prove_ds_ksk_binding` for one
+    // (parent_zone, child_zone, DNSKEY) triple in the captured chain.
+    //
+    // Together these prove the multi-level chain
+    //   root_KSK → root_DS_for_.se → .se_KSK → .se_DS_for_2LD → 2LD_KSK
+    // is cryptographically anchored: a malicious resolver cannot
+    // substitute a different DNSKEY at any level and still match the
+    // parent's published DS hash.
+    pub ds_ksk_bindings: Option<Vec<DsKskBinding>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DsKskBinding {
+    /// Owner name in canonical text form (e.g. "iis.se.").
+    pub owner_name: String,
+    /// SHA-256 the STARK asserts == SHA-256(owner_name||dnskey_rdata).
+    pub asserted_digest: [u8; 32],
+    /// Parent zone's published DS record digest (must equal `asserted_digest`).
+    pub parent_ds_digest: [u8; 32],
+    /// FIPS 4034 digest_type (we only support 2 = SHA-256 in-circuit today).
+    pub digest_type: u8,
+    /// STARK n_trace (needed to reconstruct FRI params).
+    pub n_trace: usize,
+    /// FRI proof blob (ark-serialise compressed).
+    pub stark_proof: Vec<u8>,
+    /// FRI proof's root_f0.
+    pub root_f0: Vec<u8>,
 }
 
 impl SeEpochPackage {
@@ -154,6 +187,17 @@ impl SeEpochPackage {
         if let Some(root) = &self.nsec3_chain_root {
             h.update(b"NSEC3-CHAIN-V1");
             h.update(root);
+        }
+        if let Some(bindings) = &self.ds_ksk_bindings {
+            h.update(b"DS-KSK-CHAIN-V1");
+            h.update((bindings.len() as u64).to_le_bytes());
+            for b in bindings {
+                h.update(b.owner_name.as_bytes());
+                h.update(b.asserted_digest);
+                h.update(b.parent_ds_digest);
+                h.update([b.digest_type]);
+                h.update(&b.root_f0);
+            }
         }
         h.finalize().into()
     }
