@@ -28,8 +28,23 @@ use deep_ali::sextic_ext::SexticExt;
 
 use swarm_dns::prover::{BLOWUP, LdtMode, NUM_QUERIES, SEED_Z, make_schedule};
 use swarm_dns::se_epoch_package::{
-    InclusionResult, ML_DSA_CTX, SeEpochPackage, load_from_file, resolve,
+    InclusionResult, ML_DSA_CTX, RrsigFreshness, SeEpochPackage,
+    load_from_file, resolve,
 };
+
+/// Read the wall clock once at resolver startup.  Used to enforce RFC
+/// 4034 §3.1.5 RRSIG inception/expiration windows at lookup time.  An
+/// offline resolver MUST still know what time it is — otherwise it
+/// would accept replay of long-since-expired signatures.  Mock the
+/// clock via `STARK_DNS_NOW` (Unix seconds) for the freshness test.
+fn wall_clock_now() -> u32 {
+    if let Ok(v) = std::env::var("STARK_DNS_NOW") {
+        if let Ok(n) = v.parse::<u32>() { return n; }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32).unwrap_or(0)
+}
 
 type Ext = SexticExt;
 
@@ -315,6 +330,36 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
         nsec3_ms = t.elapsed().as_secs_f64() * 1000.0;
     }
 
+    // ─── 6. RRSIG validity-window report (RFC 4034 §3.1.5) ────────
+    //
+    // Not a soundness check — the ML-DSA signature already covers the
+    // (sig_inception, sig_expiration) tuple via binding_hash so a
+    // tampered window is caught at the signature gate above.  This
+    // step:
+    //   * reports the zone-wide [max_inception, min_expiration] window
+    //   * flags whether `now` lies inside or outside it
+    //   * does NOT cause acceptance failure — per-record freshness is
+    //     enforced at lookup time below so individual stale records
+    //     are rejected without invalidating the whole epoch.
+    let now = wall_clock_now();
+    if let Some((zone_inc, zone_exp)) = package.zone_validity_window() {
+        let days_left = (zone_exp as i64 - now as i64) as f64 / 86_400.0;
+        let in_window = now >= zone_inc && now <= zone_exp;
+        let mark = if in_window { "✓" } else { "⚠" };
+        println!("  {mark} RRSIG zone-wide window:       [{zone_inc}, {zone_exp}] \
+                 (now={now}, Δ={days_left:+.1}d)");
+        if !in_window {
+            if now < zone_inc {
+                println!("     ⚠ NOT-YET-VALID for some records (now < max_inception)");
+            } else {
+                println!("     ⚠ EXPIRED for some records (now > min_expiration)");
+            }
+            println!("     per-record enforcement at lookup time will REJECT stale records");
+        }
+    } else {
+        println!("  · RRSIG zone-wide window:       (not stamped — legacy package)");
+    }
+
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
     println!("  ✓ ML-DSA-65 signature verify:    {mldsa_ms:>6.3} ms");
@@ -510,6 +555,8 @@ fn main() {
     let mut total_pos_us = 0.0_f64;
     let mut pos_accept = 0usize;
     let mut pos_reject = 0usize;
+    let mut pos_stale = 0usize;
+    let now_q = wall_clock_now();
     for (domain, rtype) in &positive_targets {
         let t = Instant::now();
         let result = resolve(&package, domain, *rtype);
@@ -517,8 +564,28 @@ fn main() {
         total_pos_us += dt_us;
         match result {
             Some(r) => {
-                pos_accept += 1;
-                show_inclusion(domain, *rtype, &r);
+                // RFC 4034 §3.1.5 freshness gate: the ML-DSA-bound
+                // RRSIG window must cover `now`.  An offline resolver
+                // that skipped this would happily serve replays of
+                // long-since-expired signatures (the only check a
+                // STARK can't replace — it's a wall-clock fact).
+                match package.record_freshness(r.record, now_q) {
+                    RrsigFreshness::Fresh => {
+                        pos_accept += 1;
+                        show_inclusion(domain, *rtype, &r);
+                    }
+                    RrsigFreshness::NotYetValid { inception, now } => {
+                        pos_stale += 1;
+                        println!("  {domain:24} type={rtype:>3}  ✗ NOT-YET-VALID \
+                                 (inception={inception}, now={now})");
+                    }
+                    RrsigFreshness::Expired { expiration, now } => {
+                        pos_stale += 1;
+                        let days_late = (now as i64 - expiration as i64) as f64 / 86_400.0;
+                        println!("  {domain:24} type={rtype:>3}  ✗ EXPIRED \
+                                 (exp={expiration}, now={now}, Δ={days_late:+.1}d)");
+                    }
+                }
             }
             None => {
                 pos_reject += 1;
@@ -526,6 +593,8 @@ fn main() {
             }
         }
     }
+    let _ = pos_reject;
+    let _ = pos_stale;
     let avg_pos_us = if !positive_targets.is_empty() {
         total_pos_us / positive_targets.len() as f64
     } else { 0.0 };
@@ -716,6 +785,34 @@ fn main() {
             expected_catcher: "Inner shard STARK FRI verify",
             mutate: Box::new(|p| {
                 if p.inner_stark_proof.len() > 100 { p.inner_stark_proof[100] ^= 0xFF }
+            }),
+        },
+        // RRSIG validity-window tampering (priority-6).  An adversary
+        // who has stolen a long-expired RRSIG tries to extend its
+        // expiration by editing `records[i].sig_expiration` in the
+        // package.  Since priority-6 mixes the validity windows into
+        // `binding_hash()`, this is caught by the ML-DSA signature
+        // gate — the resolver does NOT need to trust the editor.
+        TamperCase {
+            name: "records[0].sig_expiration += 1 year (window extend)",
+            expected_catcher: "ML-DSA-65 signature verify (RRSIG-VALIDITY-V1)",
+            mutate: Box::new(|p| {
+                if let Some(r) = p.records.first_mut() {
+                    if let Some(e) = r.sig_expiration.as_mut() {
+                        *e = e.saturating_add(31_536_000);  // +1 year
+                    }
+                }
+            }),
+        },
+        TamperCase {
+            name: "records[0].sig_inception = 0 (pre-date attack)",
+            expected_catcher: "ML-DSA-65 signature verify (RRSIG-VALIDITY-V1)",
+            mutate: Box::new(|p| {
+                if let Some(r) = p.records.first_mut() {
+                    if r.sig_inception.is_some() {
+                        r.sig_inception = Some(0);
+                    }
+                }
             }),
         },
     ];

@@ -1701,6 +1701,28 @@ async fn main() {
             binding.extend_from_slice(&r.root_f0);
         }
     }
+    // Bind RRSIG validity windows.  Must mirror `SeEpochPackage::binding_hash`
+    // exactly so the resolver's `package.binding_hash()` matches what we
+    // signed here (RFC 4034 §3.1.5 — RRSIG-VALIDITY-V1 tag in priority-6).
+    let rrsig_bounds: Vec<(Option<u32>, Option<u32>)> = records.iter().map(|r| {
+        let link = links.iter().find(|l| l.domain == r.domain
+            && u16::from(l.record_type) == r.record_type);
+        link.and_then(|l| l.rrsig.as_ref())
+            .map(|s| (Some(s.sig_inception()), Some(s.sig_expiration())))
+            .unwrap_or((None, None))
+    }).collect();
+    let has_any_validity = rrsig_bounds.iter()
+        .any(|(i, e)| i.is_some() || e.is_some());
+    if has_any_validity {
+        binding.extend_from_slice(b"RRSIG-VALIDITY-V1");
+        binding.extend_from_slice(&(rrsig_bounds.len() as u64).to_le_bytes());
+        for (inc, exp) in &rrsig_bounds {
+            binding.push(inc.is_some() as u8);
+            binding.extend_from_slice(&inc.unwrap_or(0).to_le_bytes());
+            binding.push(exp.is_some() as u8);
+            binding.extend_from_slice(&exp.unwrap_or(0).to_le_bytes());
+        }
+    }
     let binding_hash: [u8; 32] = Sha3_256::digest(&binding).into();
 
     use fips204::ml_dsa_65;
@@ -1862,16 +1884,77 @@ async fn main() {
     );
     println!();
     println!("[Phase 2] Persisting epoch package → {} …", package_path.display());
-    let epoch_records: Vec<EpochRecord> = records.iter().map(|r| EpochRecord {
-        domain: r.domain.clone(),
-        record_type: r.record_type,
-        algorithm: links.iter()
+    let epoch_records: Vec<EpochRecord> = records.iter().map(|r| {
+        // Locate the source link for (domain, type) so we can stamp its
+        // RRSIG's inception/expiration onto the EpochRecord.  Without
+        // this the offline resolver cannot enforce RFC 4034 §3.1.5
+        // freshness at query time.
+        let link = links.iter()
             .find(|l| l.domain == r.domain
-                && u16::from(l.record_type) == r.record_type)
-            .map(|l| l.algorithm).unwrap_or(0),
-        rdata: r.rdata.clone(),
-        ttl: r.ttl,
+                && u16::from(l.record_type) == r.record_type);
+        let algorithm = link.map(|l| l.algorithm).unwrap_or(0);
+        let (sig_inception, sig_expiration) = link
+            .and_then(|l| l.rrsig.as_ref())
+            .map(|s| (Some(s.sig_inception()), Some(s.sig_expiration())))
+            .unwrap_or((None, None));
+        EpochRecord {
+            domain: r.domain.clone(),
+            record_type: r.record_type,
+            algorithm,
+            rdata: r.rdata.clone(),
+            ttl: r.ttl,
+            sig_inception,
+            sig_expiration,
+        }
     }).collect();
+    // Print the zone-wide validity window (intersection over all
+    // records) so a producer operator can sanity-check it before
+    // shipping the epoch package.
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32).unwrap_or(0);
+        let bound_count = epoch_records.iter()
+            .filter(|r| r.sig_inception.is_some()
+                     || r.sig_expiration.is_some()).count();
+        println!("[Phase 2 validity] RRSIG inception/expiration windows:");
+        println!("  records with bounds:  {} / {}",
+            bound_count, epoch_records.len());
+        // Build a temporary SeEpochPackage view just for the helper.
+        // We can compute the intersection manually here without a
+        // full package (helper requires &self).
+        let mut max_inc: Option<u32> = None;
+        let mut min_exp: Option<u32> = None;
+        for r in &epoch_records {
+            if let Some(i) = r.sig_inception {
+                max_inc = Some(max_inc.map_or(i, |x| x.max(i)));
+            }
+            if let Some(e) = r.sig_expiration {
+                min_exp = Some(min_exp.map_or(e, |x| x.min(e)));
+            }
+        }
+        match (max_inc, min_exp) {
+            (Some(i), Some(e)) if i <= e => {
+                let secs_until_exp = e.saturating_sub(now) as i64;
+                let days_until_exp = secs_until_exp as f64 / 86_400.0;
+                println!("  zone-wide window:     [{i}, {e}] (UNIX seconds)");
+                println!("  earliest expiration:  {e}  (now={now}, Δ={days_until_exp:+.1} days)");
+                if i > now {
+                    println!("  ⚠ NOT-YET-VALID: earliest inception is in the future");
+                }
+                if e < now {
+                    println!("  ⚠ ALREADY EXPIRED: package will be rejected by resolver");
+                }
+            }
+            (Some(_), Some(_)) => {
+                println!("  ⚠ empty intersection — records can't all be fresh at once");
+            }
+            _ => {
+                println!("  (no bounds stamped — legacy/unsigned data)");
+            }
+        }
+        println!();
+    }
     let authority_pk_bytes: Vec<u8> = {
         use fips204::traits::SerDes;
         pk.clone().into_bytes().to_vec()

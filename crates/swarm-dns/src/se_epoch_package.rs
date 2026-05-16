@@ -52,6 +52,20 @@ pub struct EpochRecord {
     pub rdata:         Vec<u8>,
     /// Original DNS TTL (preserved from the wire capture).
     pub ttl:           u32,
+
+    /// RRSIG `sig_inception` (RFC 4034 §3.1.5, Unix seconds, u32).
+    /// Optional for backwards-compat with packages built before priority-6
+    /// wiring; `None` means the producer did not stamp a validity window
+    /// for this record (e.g. legacy demo data).  When present, the offline
+    /// resolver enforces `now ≥ sig_inception` at query time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig_inception: Option<u32>,
+    /// RRSIG `sig_expiration` (RFC 4034 §3.1.5, Unix seconds, u32).
+    /// Optional for the same backwards-compat reason as `sig_inception`.
+    /// When present, the resolver enforces `now ≤ sig_expiration` at
+    /// query time and REJECTs replay of a long-since-expired RRSIG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig_expiration: Option<u32>,
 }
 
 impl EpochRecord {
@@ -199,7 +213,69 @@ impl SeEpochPackage {
                 h.update(&b.root_f0);
             }
         }
+        // RRSIG validity windows: mix per-record (inception, expiration)
+        // bounds into the binding so the ML-DSA signature commits to
+        // them.  A tampered window (e.g. extending an expired record's
+        // expiration) is caught at signature verify.  Only mixed when
+        // at least one record has a bound — keeps backwards compatibility
+        // with pre-priority-6 packages.
+        let has_any_validity = self.records.iter().any(|r|
+            r.sig_inception.is_some() || r.sig_expiration.is_some());
+        if has_any_validity {
+            h.update(b"RRSIG-VALIDITY-V1");
+            h.update((self.records.len() as u64).to_le_bytes());
+            for r in &self.records {
+                // present-flag(1) || inception(4) || present-flag(1) || expiration(4)
+                let inc_flag = r.sig_inception.is_some() as u8;
+                h.update([inc_flag]);
+                h.update(r.sig_inception.unwrap_or(0).to_le_bytes());
+                let exp_flag = r.sig_expiration.is_some() as u8;
+                h.update([exp_flag]);
+                h.update(r.sig_expiration.unwrap_or(0).to_le_bytes());
+            }
+        }
         h.finalize().into()
+    }
+
+    /// Zone-wide validity window: the intersection of every record's
+    /// `[sig_inception, sig_expiration]` window.  Returns
+    /// `(max_inception, min_expiration)` over records that HAVE both
+    /// bounds.  Returns `None` if no record has any bound (legacy
+    /// pre-priority-6 packages) or if the intersection is empty
+    /// (`max_inception > min_expiration` — i.e. records can't all be
+    /// simultaneously fresh, which signals a misbuilt package).
+    pub fn zone_validity_window(&self) -> Option<(u32, u32)> {
+        let mut max_inc: Option<u32> = None;
+        let mut min_exp: Option<u32> = None;
+        for r in &self.records {
+            if let Some(inc) = r.sig_inception {
+                max_inc = Some(max_inc.map_or(inc, |x| x.max(inc)));
+            }
+            if let Some(exp) = r.sig_expiration {
+                min_exp = Some(min_exp.map_or(exp, |x| x.min(exp)));
+            }
+        }
+        match (max_inc, min_exp) {
+            (Some(i), Some(e)) if i <= e => Some((i, e)),
+            _ => None,
+        }
+    }
+
+    /// Per-record freshness verdict given a wall-clock `now` (Unix
+    /// seconds).  Records without bounds return `Fresh` (the package
+    /// predates priority-6 — caller can decide whether to reject
+    /// unbound records at policy level).
+    pub fn record_freshness(&self, record: &EpochRecord, now: u32)
+        -> RrsigFreshness
+    {
+        let _ = self;
+        if let Some(inc) = record.sig_inception {
+            if now < inc { return RrsigFreshness::NotYetValid { inception: inc, now }; }
+        }
+        if let Some(exp) = record.sig_expiration {
+            if now > exp { return RrsigFreshness::Expired { expiration: exp, now }; }
+        }
+        RrsigFreshness::Fresh
     }
 
     /// Total serialised size in bytes (sum of all variable components +
@@ -222,6 +298,17 @@ impl SeEpochPackage {
                 .map(|r| r.domain.len() + r.rdata.len() + 7)
                 .sum::<usize>()
     }
+}
+
+/// Three-way freshness verdict for an `EpochRecord` against a wall clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RrsigFreshness {
+    /// Record's RRSIG window covers `now` — safe to serve.
+    Fresh,
+    /// `now < sig_inception` — replay of a future-dated signature.
+    NotYetValid { inception: u32, now: u32 },
+    /// `now > sig_expiration` — replay of a long-since-expired signature.
+    Expired { expiration: u32, now: u32 },
 }
 
 /// Persist the package to disk via bincode 1.3.
