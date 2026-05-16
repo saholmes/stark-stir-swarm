@@ -1556,6 +1556,78 @@ pub fn deep_ali_merge_p256_ecdsa_streaming(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Streaming P-256 ECDSA verify merge — Phase 5 v2 AIR.
+//  Same structure as `deep_ali_merge_p256_ecdsa_streaming` (v0) but
+//  evaluates the v2 AIR which includes the Fp Fermat-inversion chain
+//  + Fp mul gadget that converts projective R to affine x.  This is
+//  the path that proves REAL ECDSA signatures (FIPS 186-4 §6.4.2).
+// ═══════════════════════════════════════════════════════════════════
+pub fn deep_ali_merge_p256_ecdsa_v2_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_air_v2::EcdsaVerifyV2Layout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_air_v2::{
+        ecdsa_verify_v2_constraints, eval_ecdsa_verify_v2,
+    };
+
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_verify_v2_constraints(layout);
+
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let phi_eval: Vec<F> = {
+        #[cfg(feature = "parallel")]
+        {
+            (0..n).into_par_iter().map(|i| {
+                let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+                let cvals = eval_ecdsa_verify_v2(&cur, layout);
+                let mut acc = F::zero();
+                for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                acc
+            }).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..n).map(|i| {
+                let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+                let cvals = eval_ecdsa_verify_v2(&cur, layout);
+                let mut acc = F::zero();
+                for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                acc
+            }).collect()
+        }
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    // Max constraint degree across v2 components: degree-3 group_add
+    // mults dominate; Fp Fermat steps and mul gadgets are degree 2-3.
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Legacy single-constraint merge (Fibonacci: Φ̃ = a·s + e − t)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1688,6 +1760,7 @@ pub mod p256_fp_fermat_air;
 pub mod p256_ecdsa_double_multirow_air;
 pub mod p256_ecdsa;
 pub mod p256_ecdsa_air;
+pub mod p256_ecdsa_air_v2;
 
 // ML-DSA-44 (FIPS 204) verify AIR — phase 1 scaffolding (2026-05-07).
 // Native references + Z_q field AIR + NTT layout + Keccak-f[1600]
