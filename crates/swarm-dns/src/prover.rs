@@ -32,9 +32,52 @@ use crate::dns::{merkle_build, merkle_root, merkle_verify, DnsRecord};
 // Picked up from deep_ali::binding_cells_commit::Ext so the workspace
 // stays consistent across all valid (sha3, mldsa) combinations.
 pub type Ext = DaExt;
+/// LDE rate denominator (1/BLOWUP).  Production calibration: 32 →
+/// rate 1/32 places us in the STIR Johnson regime where each FRI
+/// query yields ~2.5 unconditional soundness bits.  Lower blowup
+/// shrinks proofs but reduces per-query soundness; higher blowup
+/// inflates them without adding bits at the Johnson capacity ceiling.
 pub const BLOWUP: usize = 32;
+/// FRI query count.  Production calibration:
+///   r=54  → ~135 unconditional bits  (NIST PQ Level 1, ≥128 bits required)
+///   r=79  → ~197 unconditional bits  (NIST PQ Level 3, ≥192 bits required)
+///   r=105 → ~262 unconditional bits  (NIST PQ Level 5, ≥256 bits required)
+/// We deploy at r=54 — the lowest count that clears L1, which the
+/// .se HNPL paper requires.  L3/L5 retain the same code path with
+/// only this constant bumped + a re-run.
 pub const NUM_QUERIES: usize = 54;
 pub const SEED_Z: u64 = 0xDEEF_BAAD;
+
+/// One-line description of the deployed soundness configuration,
+/// derivable from `BLOWUP` + `NUM_QUERIES`.  Printed by both the
+/// producer and the resolver so a deployer can confirm what they
+/// are running at boot — STIR-STARK reviewers asked for explicit
+/// banners after the v2 soundness audit (see paper §V).
+pub fn soundness_banner() -> String {
+    let bits = (NUM_QUERIES as f64 * 2.5) as usize;  // Johnson regime
+    let level = match NUM_QUERIES {
+        r if r >= 105 => "NIST PQ Level 5 (≥256 bits)",
+        r if r >=  79 => "NIST PQ Level 3 (≥192 bits)",
+        r if r >=  54 => "NIST PQ Level 1 (≥128 bits)",
+        _             => "BELOW Level 1 — NOT production-ready",
+    };
+    format!(
+        "blowup={BLOWUP} (rate 1/{BLOWUP}), r={NUM_QUERIES}, \
+         hash=SHA3-{} | ~{bits} unconditional bits | {level} | \
+         Johnson regime (STIR memo, no DEEP-ALI conjecture)",
+        cfg_sha3_bits(),
+    )
+}
+
+/// Build-time SHA-3 hash family selected by feature flag.
+#[cfg(feature = "sha3-256")]
+fn cfg_sha3_bits() -> usize { 256 }
+#[cfg(all(feature = "sha3-384", not(feature = "sha3-256")))]
+fn cfg_sha3_bits() -> usize { 384 }
+#[cfg(all(feature = "sha3-512", not(any(feature = "sha3-256", feature = "sha3-384"))))]
+fn cfg_sha3_bits() -> usize { 512 }
+#[cfg(not(any(feature = "sha3-256", feature = "sha3-384", feature = "sha3-512")))]
+fn cfg_sha3_bits() -> usize { 256 }
 
 /// Low-degree-test mode for the inner shard proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

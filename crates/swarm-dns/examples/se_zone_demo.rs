@@ -1072,6 +1072,7 @@ async fn main() {
     println!("═══════════════════════════════════════════════════════════════");
     println!("STARK-DNS — HNPL Phase 1 demo over real Swedish .se DNSSEC data");
     println!("═══════════════════════════════════════════════════════════════");
+    println!("[soundness] {}", swarm_dns::prover::soundness_banner());
     println!();
 
     // Domain-list resolution priority:

@@ -401,6 +401,7 @@ fn main() {
     println!("    NO NETWORK — verifies epoch package + serves queries");
     println!("    against committed corpus via Merkle inclusion proofs");
     println!("═══════════════════════════════════════════════════════════════");
+    println!("[soundness] {}", swarm_dns::prover::soundness_banner());
     println!();
 
     let package_path = std::path::PathBuf::from(
