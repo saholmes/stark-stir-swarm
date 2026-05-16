@@ -56,9 +56,17 @@ use ark_serialize::{CanonicalSerialize, Compress};
 use num_bigint::BigUint;
 
 use deep_ali::{
+    deep_ali_merge_p256_ecdsa_v2_streaming,
     deep_ali_merge_rsa_stacked_streaming,
     fri::{DeepFriParams, FriDomain, deep_fri_prove, deep_fri_verify},
-    p256_ecdsa::{PublicKey as EcdsaPublicKey, Signature as EcdsaSignature, verify as ecdsa_verify_native},
+    p256_ecdsa::{PublicKey as EcdsaPublicKey, Signature as EcdsaSignature, reduce_digest_mod_n, verify as ecdsa_verify_native},
+    p256_ecdsa_air_v2::{
+        build_ecdsa_verify_v2_layout, ecdsa_verify_v2_constraints,
+        fill_ecdsa_verify_v2,
+    },
+    p256_field::{FieldElement as P256FieldElement, NUM_LIMBS as P256_NUM_LIMBS},
+    p256_group::GENERATOR as P256_GENERATOR,
+    p256_scalar::ScalarElement,
     rsa2048_stacked_air::{
         RsaStackedRecord, build_rsa_stacked_layout, fill_rsa_stacked,
         rsa_stacked_constraints,
@@ -769,6 +777,190 @@ fn prove_ed25519_rrsig_in_circuit(
     })
 }
 
+// ─── S_ic in-circuit ECDSA-P256 STARK over real captured RRSIGs ─────
+//
+// Paper §IV-A Step 2b "in-circuit verified" path for ECDSA-P256
+// (DNSSEC algorithm 13, RFC 6605).  Uses the Phase 5 v2 AIR
+// (`p256_ecdsa_air_v2`) which composes:
+//   1. u_1·G chain (ported scalar-mult)
+//   2. u_2·Q chain (ported scalar-mult)
+//   3. final_add: R = u_1·G + u_2·Q (ported group_add)
+//   4. Z3⁻¹ = Z3^(p-2) mod p via Fermat chain (256 bits)
+//   5. X_aff = X3 · Z3⁻¹ mod p (Fp mul)
+//   6. X_aff mod n (existing reduce-mod-n)
+//   7. X_aff mod n == r (existing equality)
+//
+// This is the FIPS 186-4 §6.4.2 ECDSA verify equation in-circuit.
+// At K=256, the AIR proves real signatures (the v2 K=2 test verifies
+// affine x equals the native AffinePoint::add result).  Per the
+// K-scaling sweep, at smoke (blowup=4, r=8) K=256 takes ~77 s on
+// consumer Mac hardware.
+
+fn scalar_to_msb_bits_256(s: &ScalarElement) -> Vec<bool> {
+    let bytes = s.to_be_bytes(); // 32 bytes MSB-first
+    let mut bits = Vec::with_capacity(256);
+    for byte in bytes.iter() {
+        for shift in (0..8).rev() {
+            bits.push((byte >> shift) & 1 == 1);
+        }
+    }
+    bits
+}
+
+fn prove_ecdsa_p256_rrsig_in_circuit_v2(
+    label: String,
+    dnskey: &DNSKEY,
+    rrsig: &RRSIG,
+    zone_name: &Name,
+    rrset_records: &[Record],
+    blowup: usize,
+    r_queries: usize,
+    n_trace: usize,
+) -> Option<SicOutput> {
+    use ark_ff::Zero as ArkZero;
+    use ark_goldilocks::Goldilocks as Fg;
+    use sha2::{Digest as Sha2Digest, Sha256};
+
+    // ─── 1. Parse Q from RFC 6605 DNSKEY ────────────────────────────
+    let pk_bytes = dnskey.public_key();
+    if pk_bytes.len() != 64 {
+        return None;
+    }
+    let mut qx_bytes = [0u8; 32]; qx_bytes.copy_from_slice(&pk_bytes[0..32]);
+    let mut qy_bytes = [0u8; 32]; qy_bytes.copy_from_slice(&pk_bytes[32..64]);
+    let pk_native = EcdsaPublicKey::from_be_bytes(&qx_bytes, &qy_bytes)?;
+
+    // ─── 2. Parse (r, s) from RRSIG ────────────────────────────────
+    let sig_bytes_raw = rrsig.sig();
+    if sig_bytes_raw.len() != 64 {
+        return None;
+    }
+    let mut r_bytes = [0u8; 32]; r_bytes.copy_from_slice(&sig_bytes_raw[0..32]);
+    let mut s_bytes = [0u8; 32]; s_bytes.copy_from_slice(&sig_bytes_raw[32..64]);
+    let sig_native = EcdsaSignature::from_be_bytes(&r_bytes, &s_bytes)?;
+
+    // ─── 3. Canonical TBS + SHA-256 digest ─────────────────────────
+    let tbs = rrset_tbs_with_sig(zone_name, DNSClass::IN, &**rrsig, rrset_records).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(tbs.as_ref());
+    let digest_arr: [u8; 32] = hasher.finalize().into();
+
+    // ─── 4. Native FIPS 186-4 §6.4.2 pre-check ─────────────────────
+    if !ecdsa_verify_native(&digest_arr, &pk_native, &sig_native) {
+        eprintln!("    [skip {label}] native ECDSA verify failed; will not produce STARK proof");
+        return None;
+    }
+
+    // ─── 5. Compute u_1, u_2 natively (Steps 3+4 of §6.4.2) ────────
+    let e = reduce_digest_mod_n(&digest_arr);
+    let w = sig_native.s.invert();
+    let u_1 = e.mul(&w);
+    let u_2 = sig_native.r.mul(&w);
+    let u1_bits = scalar_to_msb_bits_256(&u_1);
+    let u2_bits = scalar_to_msb_bits_256(&u_2);
+
+    // ─── 6. Build v2 AIR layout at K=256 ───────────────────────────
+    let g_x_base = 0;
+    let g_y_base = P256_NUM_LIMBS;
+    let g_z_base = 2 * P256_NUM_LIMBS;
+    let q_x_base = 3 * P256_NUM_LIMBS;
+    let q_y_base = 4 * P256_NUM_LIMBS;
+    let q_z_base = 5 * P256_NUM_LIMBS;
+    let start = 6 * P256_NUM_LIMBS;
+    let (layout, total) = build_ecdsa_verify_v2_layout(
+        start, g_x_base, g_y_base, g_z_base,
+        q_x_base, q_y_base, q_z_base,
+        256,
+    );
+
+    // ─── 7. Construct trace ────────────────────────────────────────
+    let n_lde = n_trace * blowup;
+    let mut trace_cols: Vec<Vec<Fg>> = (0..total)
+        .map(|_| vec![Fg::zero(); n_trace]).collect();
+
+    // Fill row 0 via the helper, then transcribe into the wider trace.
+    let mut row0_trace: Vec<Vec<Fg>> = (0..total)
+        .map(|_| vec![Fg::zero(); 1]).collect();
+    let g = *P256_GENERATOR;
+    fill_ecdsa_verify_v2(
+        &mut row0_trace, 0, &layout,
+        &g.x, &g.y,
+        &pk_native.point.x, &pk_native.point.y,
+        &u1_bits, &u2_bits,
+        &sig_native.r,    // ← REAL r from the signature, NOT tautological
+    );
+    for c in 0..total {
+        trace_cols[c][0] = row0_trace[c][0];
+    }
+
+    // ─── 8. LDE + merge + FRI prove ───────────────────────────────
+    let t_lde = Instant::now();
+    let lde_cols = lde_trace_columns(&trace_cols, n_trace, blowup)
+        .ok()?;
+    let lde_ms = t_lde.elapsed().as_secs_f64() * 1000.0;
+
+    let k_constraints = ecdsa_verify_v2_constraints(&layout);
+    let combination_coeffs: Vec<Fg> =
+        (0..k_constraints).map(|i| Fg::from((i + 1) as u64)).collect();
+
+    let t_merge = Instant::now();
+    let (c_eval, info) = deep_ali_merge_p256_ecdsa_v2_streaming(
+        &lde_cols, &combination_coeffs, &layout, n_trace, blowup,
+    );
+    let merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(c_eval.len(), n_lde);
+    assert_eq!(info.num_constraints, k_constraints);
+
+    let domain = FriDomain::new_radix2(n_lde);
+    // FS-binding: SHA3 over a tag + the captured RRSIG signature bytes
+    // so the produced pi_hash is bound to this specific signature.
+    let pi_hash: [u8; 32] = {
+        let mut h = Sha3_256::new();
+        h.update(b"STARK-DNS-SE-ECDSA-P256-S_IC-V2");
+        h.update(label.as_bytes());
+        h.update(rrsig.sig());
+        h.finalize().into()
+    };
+    let params = DeepFriParams {
+        schedule: (0..n_lde.trailing_zeros() as usize)
+            .map(|_| 2).collect(),
+        r: r_queries, seed_z: 0xDEEFu64,
+        coeff_commit_final: true, d_final: 1,
+        stir: false, s0: r_queries,
+        public_inputs_hash: Some(pi_hash),
+    };
+
+    let t_fri = Instant::now();
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    let fri_ms = t_fri.elapsed().as_secs_f64() * 1000.0;
+
+    let t_verify = Instant::now();
+    let ok = deep_fri_verify::<Ext>(&params, &proof);
+    let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+    if !ok {
+        eprintln!("    [skip {label}] v2 FRI self-verify failed");
+        return None;
+    }
+
+    let mut buf = Vec::new();
+    proof.serialize_with_mode(&mut buf, Compress::Yes).ok()?;
+    let proof_bytes = buf.len();
+
+    eprintln!(
+        "    ECDSA v2  width={total:>8}  LDE={lde_ms:>5.0} ms  \
+         merge={merge_ms:>5.0} ms  fri={fri_ms:>4.0} ms  \
+         verify={verify_ms:>4.1} ms  π={:>5.1} KiB",
+        proof_bytes as f64 / 1024.0,
+    );
+
+    Some(SicOutput {
+        label,
+        proof_bytes,
+        prove_ms: lde_ms + merge_ms + fri_ms,
+        verify_ms,
+    })
+}
+
 // ─── Main demo ───────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -1166,6 +1358,79 @@ async fn main() {
         println!();
     }
 
+    // ─── Step 2b-S_ic-ECDSA-P256 — In-circuit ECDSA-P256 v2 STARK ─
+    //
+    // Algorithm 13 (ECDSA-P256, RFC 6605).  Uses the Phase 5 v2 AIR
+    // that includes the projective→affine conversion via Fp Fermat
+    // inversion.  Per the K-scaling sweep, K=256 at smoke params
+    // (blowup=4, r=8) is ~77 s on consumer Mac hardware.  HEAVY path.
+    //
+    // Opt-in via ECDSA_SIG_LIMIT=N (default 0).  Override smoke
+    // params via ECDSA_BLOWUP / ECDSA_R_QUERIES / ECDSA_N_TRACE.
+    let ecdsa_limit: usize = std::env::var("ECDSA_SIG_LIMIT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ecdsa_blowup: usize = std::env::var("ECDSA_BLOWUP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let ecdsa_r_queries: usize = std::env::var("ECDSA_R_QUERIES")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let ecdsa_n_trace: usize = std::env::var("ECDSA_N_TRACE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+
+    if ecdsa_limit > 0 {
+        println!("[Step 2b-S_ic ECDSA-P256] In-circuit Phase 5 v2 STARK over real RRSIGs …");
+        println!("                         paper §IV-A Step 2b — FIPS 186-4 §6.4.2 affine equality");
+        println!("                         limit={ecdsa_limit} blowup={ecdsa_blowup} r={ecdsa_r_queries} n_trace={ecdsa_n_trace}");
+        println!("                         ⚠ heavy path: ~77 s/sig at smoke params on Mac;");
+        println!("                           paper Tab. II quotes ~0.68 s/sig at production blowup=32");
+
+        let candidates: Vec<(&ChainLink, DNSKEY, Vec<Record>)> = links.iter()
+            .filter(|l| l.algorithm == 13) // ECDSAP256SHA256
+            .filter_map(|l| {
+                if !matches!(l.native_verify, NativeVerifyVerdict::Accepted) {
+                    return None;
+                }
+                let rrsig = l.rrsig.as_ref()?;
+                let target_tag = rrsig.key_tag();
+                let signer = links.iter()
+                    .filter(|m| m.signer_name == l.signer_name)
+                    .filter(|m| m.record_type == RecordType::DNSKEY)
+                    .flat_map(|m| m.raw_records.iter())
+                    .filter_map(|r| match r.data() {
+                        Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => Some(k.clone()),
+                        _ => None,
+                    })
+                    .find(|k| k.calculate_key_tag().ok() == Some(target_tag))?;
+                Some((l, signer, l.raw_records.clone()))
+            })
+            .collect();
+        let to_run: Vec<_> = candidates.into_iter().take(ecdsa_limit).collect();
+        println!("                         candidates: {} → running {}",
+            to_run.len(), to_run.len());
+
+        for (link, signer_key, raw_records) in to_run.iter() {
+            let zone_name = Name::from_str(&format!("{}.", link.signer_name))
+                .unwrap_or_else(|_| Name::root());
+            let label = format!("{}/{:?}", link.signer_name, link.record_type);
+            let rrsig = link.rrsig.as_ref().expect("ACCEPT-verdict link has RRSIG");
+            print!("    proving {label:40} … ");
+            match prove_ecdsa_p256_rrsig_in_circuit_v2(
+                label.clone(), signer_key, rrsig, &zone_name, raw_records,
+                ecdsa_blowup, ecdsa_r_queries, ecdsa_n_trace,
+            ) {
+                Some(out) => {
+                    println!(
+                        "{:.0} ms prove · {:.1} ms verify · {:.1} KiB",
+                        out.prove_ms, out.verify_ms,
+                        out.proof_bytes as f64 / 1024.0,
+                    );
+                    sic_outputs.push(out);
+                }
+                None => println!("(skipped — see [skip ...] line above)"),
+            }
+        }
+        println!();
+    }
+
     // ─── Step 2b' — Outer rollup STARK over the inner pi_hash ───────
     println!("[Step 2b'] Outer rollup STARK (commits inner pi_hash to epoch root) …");
     let outer = prove_outer_rollup(
@@ -1289,7 +1554,7 @@ async fn main() {
         epoch_package_bytes);
     if !sic_outputs.is_empty() {
         println!();
-        println!("  In-circuit RSA-2048 STARK (S_ic path — paper §IV-A Step 2b):");
+        println!("  In-circuit S_ic STARK (paper §IV-A Step 2b — mixed RSA/ECDSA/Ed25519):");
         let mut total_prove = 0.0_f64;
         let mut total_verify = 0.0_f64;
         let mut total_bytes = 0_usize;
@@ -1327,15 +1592,14 @@ async fn main() {
         .filter(|(_, v)| matches!(v, NativeVerifyVerdict::Rejected(_))).count();
     let ecdsa_skip = ecdsa_native.iter()
         .filter(|(_, v)| matches!(v, NativeVerifyVerdict::Skipped(_))).count();
-    println!("    ◐ ECDSA-P256 — AIR ported from sibling fork ({} files, 10 116 LOC,",
-        13);
-    println!("                   138 unit tests passing).  Native reference verifier");
-    println!("                   `deep_ali::p256_ecdsa::verify` cross-checked on real .se");
-    println!("                   captures: {ecdsa_accept} ACCEPT  {ecdsa_reject} REJECT  {ecdsa_skip} SKIP");
-    println!("                   FRI-merge layer `deep_ali_merge_p256_ecdsa_streaming` is");
-    println!("                   the remaining ~500 LOC piece for full S_ic in-circuit.");
-    println!("    ◐ Ed25519    — STARK AIR exists (deep_ali::ed25519_verify_air) but no Ed25519");
-    println!("                   was captured in this .se sample (none of the 10 zones use it)");
+    println!("    ✓ ECDSA-P256 — Phase 5 v2 AIR (`deep_ali::p256_ecdsa_air_v2`) wired:");
+    println!("                   v0 ported (10 116 LOC, 138 tests) + v2 adds Fp Fermat + Fp mul");
+    println!("                   for projective→affine conversion (FIPS 186-4 §6.4.2 affine eq).");
+    println!("                   Native cross-check via `p256_ecdsa::verify` on real .se:");
+    println!("                   {ecdsa_accept} ACCEPT  {ecdsa_reject} REJECT  {ecdsa_skip} SKIP");
+    println!("                   In-circuit STARK opt-in via ECDSA_SIG_LIMIT (heavy path).");
+    println!("    ✓ Ed25519    — STARK AIR exists (`deep_ali::ed25519_verify_air`);");
+    println!("                   in-circuit STARK opt-in via ED25519_SIG_LIMIT.");
     println!();
     println!("  Remaining for full paper pipeline:");
     println!("    ◐ TLD-scale aggregation via sharded master recursion");
