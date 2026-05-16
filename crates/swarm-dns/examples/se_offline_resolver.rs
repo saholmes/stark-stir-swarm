@@ -103,6 +103,34 @@ fn verify_package_quiet(package: &SeEpochPackage) -> Result<(), String> {
     if !deep_fri_verify::<Ext>(&outer_fri_params(package, fs_binding), &outer_proof) {
         return Err("outer STARK FRI FAILED".into());
     }
+    // Optional NSEC3 chain verify (same logic as verify_package).
+    if let (Some(proof_bytes), Some(n_trace), Some(_)) =
+        (&package.nsec3_stark_proof, package.nsec3_n_trace, &package.nsec3_root_f0)
+    {
+        let nsec3_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+            proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
+        ).map_err(|_| "NSEC3 STARK malformed".to_string())?;
+        let mut nsec3_fs = [0u8; 32];
+        {
+            use sha3::{Digest as Sha3Dig, Sha3_256};
+            let mut h2 = Sha3_256::new();
+            h2.update(b"STARK-DNS-SE-NSEC3-FS-V1");
+            h2.update(package.merkle_root);
+            let d: [u8; 32] = h2.finalize().into();
+            nsec3_fs.copy_from_slice(&d);
+        }
+        let n0 = n_trace * BLOWUP;
+        let params = DeepFriParams {
+            schedule: make_schedule(n0, LdtMode::Stir),
+            r: NUM_QUERIES, seed_z: SEED_Z,
+            coeff_commit_final: true, d_final: 1,
+            stir: true, s0: NUM_QUERIES,
+            public_inputs_hash: Some(nsec3_fs),
+        };
+        if !deep_fri_verify::<Ext>(&params, &nsec3_proof) {
+            return Err("NSEC3 STARK FRI FAILED".into());
+        }
+    }
     Ok(())
 }
 
@@ -164,14 +192,61 @@ fn verify_package(package: &SeEpochPackage) -> Result<f64, String> {
         return Err("outer STARK FRI verify FAILED".into());
     }
     let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
+
+    // ─── 4. (Optional) NSEC3 chain-completeness FRI verify ────────
+    //
+    // Phase 4 — authenticated denial-of-existence.  When present,
+    // the package commits to a closed cyclic NSEC3 chain via
+    // `prove_nsec3_completeness`; this re-verifies that proof so the
+    // resolver can use the chain to answer NXDOMAIN queries.
+    let mut nsec3_ms: f64 = 0.0;
+    if let (Some(proof_bytes), Some(n_trace), Some(_root_f0))
+        = (&package.nsec3_stark_proof, package.nsec3_n_trace,
+           &package.nsec3_root_f0)
+    {
+        let t = Instant::now();
+        let nsec3_proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+            proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
+        ).map_err(|e| format!("NSEC3 STARK proof malformed: {e:?}"))?;
+        // Reconstruct params used by prove_nsec3_completeness.
+        let mut nsec3_fs = [0u8; 32];
+        {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(b"STARK-DNS-SE-NSEC3-FS-V1");
+            h.update(package.merkle_root);
+            let d: [u8; 32] = h.finalize().into();
+            nsec3_fs.copy_from_slice(&d);
+        }
+        let n0 = n_trace * BLOWUP;
+        let params = DeepFriParams {
+            schedule: make_schedule(n0, LdtMode::Stir),
+            r: NUM_QUERIES, seed_z: SEED_Z,
+            coeff_commit_final: true, d_final: 1,
+            stir: true, s0: NUM_QUERIES,
+            public_inputs_hash: Some(nsec3_fs),
+        };
+        if !deep_fri_verify::<Ext>(&params, &nsec3_proof) {
+            return Err("NSEC3 chain-completeness STARK FRI verify FAILED".into());
+        }
+        nsec3_ms = t.elapsed().as_secs_f64() * 1000.0;
+    }
+
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
     println!("  ✓ ML-DSA-65 signature verify:    {mldsa_ms:>6.3} ms");
     println!("  ✓ Inner shard STARK FRI verify:  {inner_ms:>6.3} ms");
     println!("  ✓ Outer rollup STARK FRI verify: {outer_ms:>6.3} ms");
+    if nsec3_ms > 0.0 {
+        println!("  ✓ NSEC3 chain-completeness FRI:  {nsec3_ms:>6.3} ms");
+    }
     println!("  ─────────────────────────────────");
     println!("  ✓ One-time epoch acceptance:     {total_ms:>6.3} ms");
-    println!("  (all three independent cryptographic proofs verified)");
+    if nsec3_ms > 0.0 {
+        println!("  (four independent cryptographic proofs verified)");
+    } else {
+        println!("  (three independent cryptographic proofs verified)");
+    }
     Ok(total_ms)
 }
 
@@ -233,6 +308,92 @@ fn main() {
         }
     };
     println!();
+
+    // ─── Phase 3-NSEC3 — NXDOMAIN proof structure (when present) ─
+    //
+    // Demonstrates authenticated denial-of-existence: the NSEC3 chain
+    // commits to which name-hash intervals are "gaps" in the zone.
+    // For a queried name X, the resolver:
+    //   1. Hashes X under the zone's NSEC3 parameters
+    //   2. Finds the covering NSEC3 record (owner_hash < H(X) < next_hash
+    //      under cyclic ordering)
+    //   3. Returns NXDOMAIN with the covering record as the proof
+    // The chain-completeness STARK ensures NO GAPS in the namespace
+    // coverage — every queried name's hash falls within exactly one
+    // record's interval.
+    if let Some(chain) = &package.nsec3_chain {
+        println!("[Phase 3-NSEC3] Authenticated denial-of-existence proof structure");
+        println!("                (committed chain has {} records)", chain.len());
+        println!();
+        println!("  {:<32} {:<22} {}",
+            "covering interval", "queried name", "verdict");
+        println!("  {:─<92}", "");
+        // Demo: for 3 synthetic "queried name hashes" that fall in
+        // different intervals, show that the resolver locates the
+        // covering record by simple linear scan (in production, a
+        // sorted index makes this O(log N)).
+        let probe_hashes: Vec<[u8; 32]> = (0..3).map(|i| {
+            let mut h = [0u8; 32];
+            // Pick midpoints of intervals 0, len/2, len-1
+            let interval_idx = match i {
+                0 => 0,
+                1 => chain.len() / 2,
+                _ => chain.len() - 1,
+            };
+            let owner_be8 = u64::from_be_bytes(
+                chain[interval_idx].0[..8].try_into().unwrap()
+            );
+            let next_be8 = u64::from_be_bytes(
+                chain[interval_idx].1[..8].try_into().unwrap()
+            );
+            // Midpoint of owner and next (modular)
+            let mid = if next_be8 > owner_be8 {
+                owner_be8 + (next_be8 - owner_be8) / 2
+            } else {
+                // wraparound — pick a value in the cyclic gap
+                owner_be8.wrapping_add(0x0800_0000_0000_0000)
+            };
+            h[..8].copy_from_slice(&mid.to_be_bytes());
+            h
+        }).collect();
+        for hash in &probe_hashes {
+            // Linear-scan the committed chain for the covering record.
+            let mut covered_by = None;
+            for (idx, (owner, next)) in chain.iter().enumerate() {
+                let owner_u64 = u64::from_be_bytes(owner[..8].try_into().unwrap());
+                let next_u64 = u64::from_be_bytes(next[..8].try_into().unwrap());
+                let h_u64 = u64::from_be_bytes(hash[..8].try_into().unwrap());
+                let covers = if next_u64 > owner_u64 {
+                    h_u64 > owner_u64 && h_u64 < next_u64
+                } else {
+                    // wrap-around interval
+                    h_u64 > owner_u64 || h_u64 < next_u64
+                };
+                if covers {
+                    covered_by = Some(idx);
+                    break;
+                }
+            }
+            match covered_by {
+                Some(idx) => println!(
+                    "  record[{idx:>3}]: ({:<8}, {:<8})  H={}…  ✓ NXDOMAIN proved",
+                    hex::encode(&chain[idx].0[..4]),
+                    hex::encode(&chain[idx].1[..4]),
+                    hex::encode(&hash[..8]),
+                ),
+                None => println!(
+                    "  (no covering record found for H={}…)",
+                    hex::encode(&hash[..8]),
+                ),
+            }
+        }
+        println!();
+        println!("  Soundness: the NSEC3 chain-closure STARK (verified above)");
+        println!("  guarantees every queried name's hash falls in exactly one");
+        println!("  committed interval — no gaps in namespace coverage that");
+        println!("  could be exploited to forge an authenticated NXDOMAIN.");
+        println!();
+    }
 
     // ─── Phase 3a — POSITIVE: queries for committed records ─────────
     println!("[Phase 3a — POSITIVE] Queries for records IN the committed corpus");

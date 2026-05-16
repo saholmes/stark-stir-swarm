@@ -102,10 +102,47 @@ pub struct SeEpochPackage {
 
     /// Records (ordered; index `i` corresponds to leaf-index `i`).
     pub records: Vec<EpochRecord>,
+
+    // ─── Optional Phase 4 — NSEC3 chain-completeness commitment ────
+    //
+    // Closes the paper's biggest acknowledged gap (authenticated
+    // denial-of-existence) by binding a STARK proof of NSEC3 chain
+    // closure into the same epoch package.  Optional because:
+    //   * a producer may not yet have wired NSEC3 capture (legacy
+    //     packages built before priority-4 lift have these fields
+    //     unset; bincode treats `Option<T> = None` as backwards-compat)
+    //   * zones not signed with NSEC3 (e.g. pure NSEC or unsigned)
+    //     have nothing to commit here
+    //
+    // When present, the offline resolver's NXDOMAIN-proof path can
+    // answer "this name is provably NOT in the corpus" by:
+    //   1. verifying the NSEC3 STARK chain-closure proof
+    //   2. hashing the queried name with the zone's NSEC3 params
+    //   3. finding the covering NSEC3 record by `owner_hash < q < next_hash`
+    /// SHA3-256 chain root = SHA3-256("DNS-NSEC3-CHAIN-ROOT-V1" || salt
+    ///                                || count(LE) || record0 || … || recordN).
+    /// Bound into `binding_hash` via the field below when present.
+    pub nsec3_chain_root: Option<[u8; 32]>,
+    /// Record count committed in the NSEC3 chain.
+    pub nsec3_record_count: Option<usize>,
+    /// NSEC3 chain STARK proof (ark-serialise compressed).  Produced
+    /// by `swarm_dns::prover::prove_nsec3_completeness`.
+    pub nsec3_stark_proof: Option<Vec<u8>>,
+    /// NSEC3 chain STARK's n_trace (needed to reconstruct FRI params).
+    pub nsec3_n_trace: Option<usize>,
+    /// NSEC3 chain STARK's root_f0 (FRI commitment).
+    pub nsec3_root_f0: Option<Vec<u8>>,
+    /// The committed (owner_hash, next_hash) pairs in chain order;
+    /// the resolver uses these to locate the covering record for
+    /// NXDOMAIN proofs.
+    pub nsec3_chain: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl SeEpochPackage {
     /// Binding hash the ML-DSA signature covers (paper Def. 1).
+    /// When `nsec3_chain_root` is present, it is mixed into the
+    /// binding so the authority's signature commits to the NSEC3
+    /// chain-completeness claim AS WELL AS the positive records.
     pub fn binding_hash(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
         h.update(&self.outer_root_f0);
@@ -114,6 +151,10 @@ impl SeEpochPackage {
         h.update(self.epoch_t.to_le_bytes());
         h.update(self.epoch_seq.to_le_bytes());
         h.update(self.epoch_prev);
+        if let Some(root) = &self.nsec3_chain_root {
+            h.update(b"NSEC3-CHAIN-V1");
+            h.update(root);
+        }
         h.finalize().into()
     }
 

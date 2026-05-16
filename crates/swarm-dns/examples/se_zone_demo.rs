@@ -77,7 +77,10 @@ use deep_ali::{
 use hickory_proto::rr::dnssec::tbs::rrset_tbs_with_sig;
 
 use swarm_dns::dns::{DnsRecord, merkle_build, merkle_root};
-use swarm_dns::prover::{LdtMode, prove_inner_shard, prove_outer_rollup, prove_zsk_ksk_binding_v2};
+use swarm_dns::prover::{
+    LdtMode, Nsec3Record, prove_inner_shard, prove_nsec3_completeness,
+    prove_outer_rollup, prove_zsk_ksk_binding_v2,
+};
 
 type Ext = SexticExt;
 
@@ -1431,6 +1434,59 @@ async fn main() {
         println!();
     }
 
+    // ─── Step 2b-NSEC3 — Chain-completeness STARK ───────────────────
+    //
+    // Paper §VII follow-on (authenticated denial-of-existence) — the
+    // §I "out-of-scope" gap.  Builds a STARK over a closed cyclic
+    // NSEC3 chain via `prove_nsec3_completeness`, binding the chain
+    // root into the epoch's Def. 1 signature.
+    //
+    // The chain itself is SYNTHETIC at this step — real .se NSEC3
+    // capture via NXDOMAIN authority sections is the natural
+    // follow-on and would use the SAME `prove_nsec3_completeness`
+    // path with real (owner_hash, next_hash) pairs.  Gated by
+    // NSEC3_DEMO=N (default 0) to keep the smoke run fast.
+    let nsec3_demo: usize = std::env::var("NSEC3_DEMO")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let (nsec3_output, nsec3_chain_records): (Option<swarm_dns::prover::Nsec3Output>, Option<Vec<Nsec3Record>>) = if nsec3_demo > 0 {
+        println!("[Step 2b-NSEC3] Chain-completeness STARK (synthetic closed chain) …");
+        // Build a small synthetic closed cyclic NSEC3 chain.  Each
+        // record is `(owner_hash, next_hash)`; the chain closes when
+        // records[n-1].next_hash == records[0].owner_hash.
+        let n_records: usize = nsec3_demo.max(2);
+        let chain: Vec<Nsec3Record> = (0..n_records).map(|i| {
+            let mut owner = [0u8; 32];
+            owner[..8].copy_from_slice(&((i as u64) * 0x1000_0000_0000_0000).to_be_bytes());
+            let mut next = [0u8; 32];
+            // records[n-1].next == records[0].owner ensures closure.
+            let next_idx = (i + 1) % n_records;
+            next[..8].copy_from_slice(&((next_idx as u64) * 0x1000_0000_0000_0000).to_be_bytes());
+            Nsec3Record { owner_hash: owner, next_hash: next }
+        }).collect();
+        // Sanity: chain is closed.
+        assert_eq!(chain.last().unwrap().next_hash, chain[0].owner_hash);
+
+        let nsec3_salt: [u8; 16] = [0xA5; 16];
+        let mut nsec3_fs = [0u8; 32];
+        {
+            let mut h = Sha3_256::new();
+            h.update(b"STARK-DNS-SE-NSEC3-FS-V1");
+            h.update(root);
+            let d: [u8; 32] = h.finalize().into();
+            nsec3_fs.copy_from_slice(&d);
+        }
+        let out = prove_nsec3_completeness(&chain, &nsec3_salt, &nsec3_fs, LdtMode::Stir);
+        println!("  chain records:       {}", out.record_count);
+        println!("  chain root (hex):    {}", hex::encode(&out.chain_root[..16]));
+        println!("  proof size:          {:.1} KiB", out.proof_bytes as f64 / 1024.0);
+        println!("  prove:               {:.1} ms", out.prove_ms);
+        println!("  local verify:        {:.2} ms", out.local_verify_ms);
+        println!();
+        (Some(out), Some(chain))
+    } else {
+        (None, None)
+    };
+
     // ─── Step 2b' — Outer rollup STARK over the inner pi_hash ───────
     println!("[Step 2b'] Outer rollup STARK (commits inner pi_hash to epoch root) …");
     let outer = prove_outer_rollup(
@@ -1455,13 +1511,19 @@ async fn main() {
     //   H(π_outer_root_f0 || inner_pi_hash || merkle_root || T || seq || prev)
     // — every component of the epoch package committed to a single
     // 32-byte hash the ML-DSA signature covers.
-    let mut binding = Vec::with_capacity(160);
+    let mut binding = Vec::with_capacity(192);
     binding.extend_from_slice(&outer.root_f0);     // STARK π provenance commitment
     binding.extend_from_slice(&inner.pi_hash);     // inner-shard pi_hash
     binding.extend_from_slice(&root);              // local Merkle root (edge inclusion proofs)
     binding.extend_from_slice(&epoch_t.to_le_bytes());
     binding.extend_from_slice(&epoch_seq.to_le_bytes());
     binding.extend_from_slice(&epoch_prev);
+    // Bind the NSEC3 chain-completeness commitment when present
+    // (matches `SeEpochPackage::binding_hash()`).
+    if let Some(o) = &nsec3_output {
+        binding.extend_from_slice(b"NSEC3-CHAIN-V1");
+        binding.extend_from_slice(&o.chain_root);
+    }
     let binding_hash: [u8; 32] = Sha3_256::digest(&binding).into();
 
     use fips204::ml_dsa_65;
@@ -1657,6 +1719,17 @@ async fn main() {
         merkle_levels:     tree.clone(),
         merkle_salt:       salt,
         records:           epoch_records,
+        // ─── NSEC3 chain-completeness commitment (Phase 4) ───
+        nsec3_chain_root:   nsec3_output.as_ref().map(|o| o.chain_root),
+        nsec3_record_count: nsec3_output.as_ref().map(|o| o.record_count),
+        nsec3_stark_proof:  nsec3_output.as_ref().map(|o| o.proof_blob.clone()),
+        nsec3_n_trace:      nsec3_output.as_ref().map(|o| o.n_trace),
+        nsec3_root_f0:      nsec3_output.as_ref().map(|o| o.root_f0.to_vec()),
+        nsec3_chain:        nsec3_chain_records.as_ref().map(|chain| {
+            chain.iter()
+                .map(|r| (r.owner_hash.to_vec(), r.next_hash.to_vec()))
+                .collect()
+        }),
     };
     if let Some(parent) = package_path.parent() {
         let _ = std::fs::create_dir_all(parent);
