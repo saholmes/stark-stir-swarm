@@ -69,7 +69,7 @@ use deep_ali::{
 use hickory_proto::rr::dnssec::tbs::rrset_tbs_with_sig;
 
 use swarm_dns::dns::{DnsRecord, merkle_build, merkle_root};
-use swarm_dns::prover::{LdtMode, prove_inner_shard, prove_outer_rollup};
+use swarm_dns::prover::{LdtMode, prove_inner_shard, prove_outer_rollup, prove_zsk_ksk_binding_v2};
 
 type Ext = SexticExt;
 
@@ -700,6 +700,75 @@ async fn capture_one_domain(
     out
 }
 
+// ─── S_ic in-circuit Ed25519 STARK over real captured RRSIGs ────────
+//
+// Paper §IV-A Step 2b "in-circuit verified" path for Ed25519 (DNSSEC
+// algorithm 15, RFC 8080).  For each captured Ed25519 RRSIG + signer
+// DNSKEY, build the canonical RFC 4034 §6 TBS bytes (via hickory's
+// `rrset_tbs_with_sig`) and call `prove_zsk_ksk_binding_v2` which
+// runs the ed25519_verify_air STARK (deep_ali_merge_ed25519_verify →
+// deep_fri_prove → deep_fri_verify round-trip).
+//
+// Per paper Tab. II: ~1.05 s/sig at production blowup=32.  At smoke
+// parameters (this demo's defaults), much faster.
+
+fn prove_ed25519_rrsig_in_circuit(
+    label: String,
+    dnskey: &DNSKEY,
+    rrsig: &RRSIG,
+    zone_name: &Name,
+    rrset_records: &[Record],
+    k_scalar: usize,
+    ldt: LdtMode,
+) -> Option<SicOutput> {
+    // Ed25519 DNSKEY pubkey is 32 bytes (raw Edwards-compressed) per RFC 8080.
+    if dnskey.public_key().len() != 32 {
+        return None;
+    }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(dnskey.public_key());
+
+    // Ed25519 signature is 64 bytes (R || S).
+    if rrsig.sig().len() != 64 {
+        return None;
+    }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(rrsig.sig());
+
+    // Canonical signed bytes via hickory's RFC 4034 §6 helper.  Ed25519
+    // signs the message directly (no caller-side pre-hash).
+    let tbs = rrset_tbs_with_sig(zone_name, DNSClass::IN, &**rrsig, rrset_records).ok()?;
+    let signed_data = tbs.as_ref().to_vec();
+
+    // FS-binding + merkle anchor; same recipe shape as the demo's
+    // inner-shard binding so the produced pi_hash chains cleanly.
+    let mut fs_binding = [0u8; 32];
+    {
+        let mut h = Sha3_256::new();
+        h.update(b"STARK-DNS-SE-ED25519-S_IC-V1");
+        h.update(label.as_bytes());
+        let d: [u8; 32] = h.finalize().into();
+        fs_binding.copy_from_slice(&d);
+    }
+    let merkle_root = [0u8; 32]; // placeholder anchor — not consumed at this level
+
+    let t_total = Instant::now();
+    let out = prove_zsk_ksk_binding_v2(
+        &pubkey, &sig_bytes, &signed_data,
+        &fs_binding, &merkle_root, k_scalar, ldt,
+    );
+    let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+    if !out.verified || out.proof_blob.is_empty() {
+        return None;
+    }
+    Some(SicOutput {
+        label,
+        proof_bytes: out.proof_bytes,
+        prove_ms: out.prove_ms.max(total_ms - out.local_verify_ms),
+        verify_ms: out.local_verify_ms,
+    })
+}
+
 // ─── Main demo ───────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -1012,6 +1081,86 @@ async fn main() {
                     let dt = t0.elapsed().as_secs_f64() * 1000.0;
                     println!("(skipped after {dt:.0} ms — e≠65537 or non-2048-bit key)");
                 }
+            }
+        }
+        println!();
+    }
+
+    // ─── Step 2b-S_ic-Ed25519 — In-circuit Ed25519 STARK ───────────
+    //
+    // Algorithm 15 (Ed25519, RFC 8080).  Per paper Tab. II: ~1.05 s/sig
+    // at production blowup=32 on AWS Graviton4 r8g.4xlarge (16 vCPU).
+    // On consumer Mac hardware, single-threaded FFT pieces make the
+    // production-calibration prove time materially longer (several
+    // minutes per sig is typical).
+    //
+    // The HEAVY path — opt-in via `ED25519_SIG_LIMIT=N` (default 0).
+    // `k_scalar` MUST be 256 per the production `prove_zsk_ksk_binding_v2`
+    // docstring; smaller values are stub-only and fail self-verify.
+    let ed25519_limit: usize = std::env::var("ED25519_SIG_LIMIT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ed25519_k_scalar: usize = {
+        let requested: usize = std::env::var("ED25519_K_SCALAR")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+        if requested != 256 && ed25519_limit > 0 {
+            eprintln!(
+                "    [warn] ED25519_K_SCALAR={requested} ignored — \
+                 production prove_zsk_ksk_binding_v2 requires 256; \
+                 smaller values fail self-verify per docstring"
+            );
+            256
+        } else { requested }
+    };
+
+    if ed25519_limit > 0 {
+        println!("[Step 2b-S_ic Ed25519] In-circuit Ed25519 STARK over real RRSIGs …");
+        println!("                      paper §IV-A Step 2b / Tab. II 'in-circuit verified'");
+        println!("                      limit={ed25519_limit} k_scalar={ed25519_k_scalar}");
+        println!("                      ⚠ heavy path: minutes per sig on Mac hardware");
+        println!("                        (paper Tab. II quotes ~1.05 s/sig on AWS Graviton4 16 vCPU)");
+        let candidates: Vec<(&ChainLink, DNSKEY, Vec<Record>)> = links.iter()
+            .filter(|l| l.algorithm == 15) // Ed25519
+            .filter_map(|l| {
+                if !matches!(l.native_verify, NativeVerifyVerdict::Accepted) {
+                    return None;
+                }
+                let rrsig = l.rrsig.as_ref()?;
+                let target_tag = rrsig.key_tag();
+                let signer = links.iter()
+                    .filter(|m| m.signer_name == l.signer_name)
+                    .filter(|m| m.record_type == RecordType::DNSKEY)
+                    .flat_map(|m| m.raw_records.iter())
+                    .filter_map(|r| match r.data() {
+                        Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => Some(k.clone()),
+                        _ => None,
+                    })
+                    .find(|k| k.calculate_key_tag().ok() == Some(target_tag))?;
+                Some((l, signer, l.raw_records.clone()))
+            })
+            .collect();
+        let to_run: Vec<_> = candidates.into_iter().take(ed25519_limit).collect();
+        println!("                      candidates: {} → running {}",
+            to_run.len(), to_run.len());
+
+        for (link, signer_key, raw_records) in to_run.iter() {
+            let zone_name = Name::from_str(&format!("{}.", link.signer_name))
+                .unwrap_or_else(|_| Name::root());
+            let label = format!("{}/{:?}", link.signer_name, link.record_type);
+            let rrsig = link.rrsig.as_ref().expect("ACCEPT-verdict link has RRSIG");
+            print!("    proving {label:40} … ");
+            match prove_ed25519_rrsig_in_circuit(
+                label.clone(), signer_key, rrsig, &zone_name, raw_records,
+                ed25519_k_scalar, LdtMode::Stir,
+            ) {
+                Some(out) => {
+                    println!(
+                        "{:.0} ms prove · {:.1} ms verify · {:.1} KiB",
+                        out.prove_ms, out.verify_ms,
+                        out.proof_bytes as f64 / 1024.0,
+                    );
+                    sic_outputs.push(out);
+                }
+                None => println!("(skipped — pubkey/sig wrong length or native verify failed)"),
             }
         }
         println!();
