@@ -485,6 +485,137 @@ fn ecdsa_native_verify_captured(
     }
 }
 
+// ─── Generic per-record-type capture (RFC 1035 + DNSSEC extensions) ─
+//
+// Originally the demo captured only `A` (IPv4) records.  In production
+// DNSSEC, virtually every signed RRset has its own RRSIG and should be
+// committed to the epoch package — `AAAA`, `MX`, `TXT`, `NS`, `SOA`,
+// `CAA`, `SRV`, `TLSA`, etc.  The structural shape is identical for
+// every type — only the canonical rdata bytes differ.
+//
+// `SE_RECORD_TYPES="A,AAAA,MX,TXT,NS,SOA,CAA"` env knob selects which
+// types to capture (default: just `A` to preserve baseline behaviour).
+
+fn parse_record_types(spec: &str) -> Vec<RecordType> {
+    spec.split(',')
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.as_str() {
+            "A"      => Some(RecordType::A),
+            "AAAA"   => Some(RecordType::AAAA),
+            "MX"     => Some(RecordType::MX),
+            "TXT"    => Some(RecordType::TXT),
+            "NS"     => Some(RecordType::NS),
+            "SOA"    => Some(RecordType::SOA),
+            "CAA"    => Some(RecordType::CAA),
+            "SRV"    => Some(RecordType::SRV),
+            "TLSA"   => Some(RecordType::TLSA),
+            "CNAME"  => Some(RecordType::CNAME),
+            "PTR"    => Some(RecordType::PTR),
+            other => {
+                eprintln!("    [warn] unrecognised SE_RECORD_TYPES entry: {other}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Deterministic canonical rdata bytes for an RRset.  The HashRollup
+/// AIR is record-type-agnostic — it just hashes whatever bytes we
+/// commit — but we still want a deterministic, type-aware encoding so
+/// that different rtypes can't accidentally collide.
+fn canonical_rdata_bytes(records: &[Record], rtype: RecordType) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&u16::from(rtype).to_be_bytes()); // type discriminator
+    for r in records {
+        match r.data() {
+            Some(RData::A(a))    => out.extend_from_slice(&a.octets()),
+            Some(RData::AAAA(a)) => out.extend_from_slice(&a.octets()),
+            Some(RData::MX(mx)) => {
+                out.extend_from_slice(&mx.preference().to_be_bytes());
+                out.extend_from_slice(mx.exchange().to_string().to_ascii_lowercase().as_bytes());
+            }
+            Some(RData::TXT(txt)) => {
+                for chunk in txt.iter() {
+                    out.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Some(RData::NS(ns))    => out.extend_from_slice(ns.to_string().to_ascii_lowercase().as_bytes()),
+            Some(RData::SOA(soa)) => {
+                out.extend_from_slice(soa.mname().to_string().to_ascii_lowercase().as_bytes());
+                out.extend_from_slice(b"|");
+                out.extend_from_slice(soa.rname().to_string().to_ascii_lowercase().as_bytes());
+                out.extend_from_slice(&soa.serial().to_be_bytes());
+                out.extend_from_slice(&soa.refresh().to_be_bytes());
+                out.extend_from_slice(&soa.retry().to_be_bytes());
+                out.extend_from_slice(&soa.expire().to_be_bytes());
+                out.extend_from_slice(&soa.minimum().to_be_bytes());
+            }
+            Some(RData::CAA(caa)) => {
+                out.push(u8::from(caa.issuer_critical()));
+                out.extend_from_slice(format!("{caa}").as_bytes());
+            }
+            Some(RData::SRV(srv)) => {
+                out.extend_from_slice(&srv.priority().to_be_bytes());
+                out.extend_from_slice(&srv.weight().to_be_bytes());
+                out.extend_from_slice(&srv.port().to_be_bytes());
+                out.extend_from_slice(srv.target().to_string().to_ascii_lowercase().as_bytes());
+            }
+            Some(RData::CNAME(cn)) => out.extend_from_slice(cn.to_string().to_ascii_lowercase().as_bytes()),
+            Some(RData::PTR(p))   => out.extend_from_slice(p.to_string().to_ascii_lowercase().as_bytes()),
+            Some(other) => {
+                // Fallback: deterministic Debug formatting for less common types
+                out.extend_from_slice(format!("{other:?}").as_bytes());
+            }
+            None => {}
+        }
+        out.push(0u8); // separator between records
+    }
+    out
+}
+
+/// Generic single-RRset capture + native verify.  Returns a ChainLink
+/// if the RRset has both content and a covering RRSIG that validates
+/// (or fails to validate) under one of `dnskeys`.  Returns `None` if
+/// no signed RRset was captured for `(name, rtype)`.
+async fn capture_rrset_for_type(
+    resolver: &TokioAsyncResolver,
+    zone_name: &Name,
+    domain: &str,
+    normalized: &str,
+    rtype: RecordType,
+    dnskeys: &[DNSKEY],
+) -> Option<ChainLink> {
+    let rs = fetch_records(resolver, normalized, rtype).await;
+    let mut rrsigs = extract_rrsig(&rs);
+    if rrsigs.is_empty() {
+        rrsigs = fetch_rrsigs_covering(resolver, normalized, rtype).await;
+    }
+    let raw: Vec<Record> = rs.iter()
+        .filter(|r| r.record_type() == rtype)
+        .cloned().collect();
+    if raw.is_empty() || rrsigs.is_empty() {
+        return None;
+    }
+    let canonical = canonical_rdata_bytes(&raw, rtype);
+    let rrsig0 = rrsigs[0].clone();
+    let leaf_alg = u8::from(rrsig0.algorithm());
+    let verdict = native_verify_rrsig(zone_name, &raw, &rrsig0, dnskeys);
+    Some(ChainLink {
+        domain: domain.to_string(),
+        signer_name: domain.to_string(),
+        record_type: rtype,
+        rrset_canonical: canonical,
+        raw_records: raw,
+        rrsig: Some(rrsig0),
+        dnskey: None,
+        ds_records: Vec::new(),
+        algorithm: leaf_alg,
+        native_verify: verdict,
+    })
+}
+
 // ─── Per-domain capture worker (for concurrent JoinSet capture) ─────
 //
 // One async task per .se domain.  Fetches:
@@ -497,6 +628,7 @@ fn ecdsa_native_verify_captured(
 async fn capture_one_domain(
     resolver: std::sync::Arc<TokioAsyncResolver>,
     domain: String,
+    record_types: std::sync::Arc<Vec<RecordType>>,
 ) -> Vec<ChainLink> {
     let mut out = Vec::new();
     let normalized = if domain.ends_with('.') {
@@ -546,41 +678,22 @@ async fn capture_one_domain(
         });
     }
 
-    // A + RRSIG(A) for non-apex zones
-    if domain != "se" && domain != "se." && domain != "." {
-        let a_rs = fetch_records(&resolver, &normalized, RecordType::A).await;
-        let a_records = extract_a(&a_rs);
-        let mut a_rrsigs = extract_rrsig(&a_rs);
-        if a_rrsigs.is_empty() {
-            a_rrsigs = fetch_rrsigs_covering(
-                &resolver, &normalized, RecordType::A,
-            ).await;
+    // Per-record-type capture loop.  For each rtype in `record_types`
+    // (env-controlled list), fetch the RRset + its covering RRSIG and
+    // run the native pre-proof oracle against the zone's DNSKEYs.
+    // Non-apex zones get all configured record types; apex zones skip
+    // record types that don't apply at the apex (e.g., a leaf A
+    // record on the .se apex doesn't make sense, but SOA/NS do).
+    let is_apex = domain == "se" || domain == "se." || domain == ".";
+    for rtype in record_types.iter().copied() {
+        // Apex-zone skips: leaf-only record types
+        if is_apex && matches!(rtype, RecordType::A | RecordType::AAAA | RecordType::CNAME | RecordType::PTR) {
+            continue;
         }
-        let a_raw: Vec<Record> = a_rs.iter()
-            .filter(|r| r.record_type() == RecordType::A)
-            .cloned().collect();
-        if !a_records.is_empty() && !a_rrsigs.is_empty() {
-            let mut canonical = Vec::new();
-            for a in &a_records {
-                canonical.extend_from_slice(&a.octets());
-            }
-            let rrsig0 = a_rrsigs[0].clone();
-            let leaf_alg = u8::from(rrsig0.algorithm());
-            let verdict = native_verify_rrsig(
-                &zone_name, &a_raw, &rrsig0, &dnskeys,
-            );
-            out.push(ChainLink {
-                domain: domain.clone(),
-                signer_name: domain.clone(),
-                record_type: RecordType::A,
-                rrset_canonical: canonical,
-                raw_records: a_raw,
-                rrsig: Some(rrsig0),
-                dnskey: None,
-                ds_records: Vec::new(),
-                algorithm: leaf_alg,
-                native_verify: verdict,
-            });
+        if let Some(link) = capture_rrset_for_type(
+            &resolver, &zone_name, &domain, &normalized, rtype, &dnskeys,
+        ).await {
+            out.push(link);
         }
     }
 
@@ -624,10 +737,16 @@ async fn main() {
     let mut domains: Vec<String> = domains.into_iter().take(limit).collect();
     let concurrency: usize = std::env::var("CAPTURE_CONCURRENCY")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let record_types_spec = std::env::var("SE_RECORD_TYPES")
+        .unwrap_or_else(|_| "A".to_string());
+    let record_types = std::sync::Arc::new(parse_record_types(&record_types_spec));
 
     println!("Configuration:");
     println!("  Resolver:    public anycast (1.1.1.1, 8.8.8.8, 9.9.9.9)");
     println!("  Mode:        capture-raw (validate=false, EDNS0 DO=1)");
+    println!("  Record types: {} ({:?})",
+        record_types.len(),
+        record_types.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(","));
     println!("  .se domains: {} (concurrency cap = {concurrency})", domains.len());
     if domains.len() <= 20 {
         for d in &domains { println!("    - {d}"); }
@@ -698,9 +817,10 @@ async fn main() {
     for d in domains.drain(..) {
         let r = resolver.clone();
         let sem = semaphore.clone();
+        let rt = record_types.clone();
         joinset.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore not closed");
-            capture_one_domain(r, d).await
+            capture_one_domain(r, d, rt).await
         });
     }
 
