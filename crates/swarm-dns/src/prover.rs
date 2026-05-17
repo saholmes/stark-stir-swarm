@@ -54,17 +54,21 @@ pub const SEED_Z: u64 = 0xDEEF_BAAD;
 /// are running at boot — STIR-STARK reviewers asked for explicit
 /// banners after the v2 soundness audit (see paper §V).
 pub fn soundness_banner() -> String {
-    let bits = (NUM_QUERIES as f64 * 2.5) as usize;  // Johnson regime
-    let level = match NUM_QUERIES {
-        r if r >= 105 => "NIST PQ Level 5 (≥256 bits)",
-        r if r >=  79 => "NIST PQ Level 3 (≥192 bits)",
-        r if r >=  54 => "NIST PQ Level 1 (≥128 bits)",
-        _             => "BELOW Level 1 — NOT production-ready",
-    };
+    // Johnson regime, unconditional: per-query bits = ½·log₂(blowup)
+    // (BCIKS / STIR Thm. 1).  The constant "2.5" is the SPECIAL CASE
+    // at blowup=32; at any other blowup r must scale to maintain the
+    // same total bits.  See `deep_ali::stark_level` for the canonical
+    // formula.
+    let bits_per_q = 0.5_f64 * (BLOWUP as f64).log2();
+    let bits = (NUM_QUERIES as f64 * bits_per_q) as usize;
+    let level = if bits >= 256 { "NIST PQ Level 5 (≥256 bits)" }
+        else if bits >= 192 { "NIST PQ Level 3 (≥192 bits)" }
+        else if bits >= 128 { "NIST PQ Level 1 (≥128 bits)" }
+        else { "BELOW Level 1 — NOT production-ready" };
     format!(
         "blowup={BLOWUP} (rate 1/{BLOWUP}), r={NUM_QUERIES}, \
-         hash=SHA3-{} | ~{bits} unconditional bits | {level} | \
-         Johnson regime (STIR memo, no DEEP-ALI conjecture)",
+         hash=SHA3-{} | {bits_per_q:.2} bits/q × {NUM_QUERIES} = {bits} \
+         unconditional bits | {level} | Johnson regime (BCIKS/STIR Thm. 1)",
         cfg_sha3_bits(),
     )
 }

@@ -66,54 +66,97 @@ fn main() {
     let n: usize = parse_env_usize("N_INNER", 16);
     let shard_size: usize = parse_env_usize("SHARD_SIZE", 4);
     let k = (n + shard_size - 1) / shard_size;
-    // Defaults: smoke calibration (blowup=4, r=135) — L1-soundness-equivalent
-    // to blowup=32 r=54 under STIR Johnson regime but ~8× faster prove on
-    // dev hardware (at the cost of larger proofs).  Override via env vars
-    // for production-L1 calibration runs (blowup=32 r=54 at every level).
+    // Defaults: smoke-fast prove (blowup=4) at L1-equivalent r (=135 at
+    // blowup=4 gives 135 bits unconditional Johnson, matching blowup=32
+    // r=54).  Override via env vars for production-L1 calibration
+    // (blowup=32 r=54 at every level — smaller wire, faster verify).
+    //
+    // r-floor for L1 (128 bits) at each blowup, ½·log₂(blowup) bits/query:
+    //   blowup= 4: r ≥ 128 (set to 135 here, 7 bit margin)
+    //   blowup= 8: r ≥  86
+    //   blowup=16: r ≥  64
+    //   blowup=32: r ≥  52 (set to 54 here, 7 bit margin)
+    // Bumping r is cheap (per-query work scales linearly); bumping
+    // blowup is expensive (LDE work scales ~linearly).  At blowup=4
+    // the prove is ~8× faster than blowup=32 even with the 2.5× more
+    // queries — that's the smoke advantage.
+    //
+    // CAVEAT: inner v2's `V2_NUM_QUERIES = 54` is hardcoded from
+    // `deep_ali::stark_level`, independent of the `INNER_BLOWUP`
+    // env value.  So `inner_blowup=4` produces a v2 inner proof
+    // at only 54 bits unconditional (sub-L1).  Set
+    // `INNER_BLOWUP=32` to recover full L1 soundness on the inner
+    // stage.  This is a known v2 limitation flagged on this date.
     let inner_blowup:  usize = parse_env_usize("INNER_BLOWUP",  4);
     let master_blowup: usize = parse_env_usize("MASTER_BLOWUP", 4);
     let master_r:      usize = parse_env_usize("MASTER_R",      135);
     let merkle_blowup: usize = parse_env_usize("MERKLE_BLOWUP", 4);
-    let merkle_r:      usize = parse_env_usize("MERKLE_R",      54);
+    // merkle_r default fixed to 135 (was 54 — gave 54 bits at blowup=4,
+    // failed L1 by 74 bits).  Banner now flags this if a caller
+    // overrides it below the L1 floor.
+    let merkle_r:      usize = parse_env_usize("MERKLE_R",      135);
 
-    // Soundness banner — canonical STIR Johnson-regime UNCONDITIONAL bound
-    // is 2.5 bits/query (BCIKS / STIR Thm. 1, blowup-independent above ~8).
-    // NOT the conjectural ~log2(blowup) capacity claim — that requires the
-    // proximity-gap conjecture which is OPEN for both FRI and STIR.
-    // See `feedback_stir_johnson_unconditional_only.md`.
+    // Soundness banner — CORRECT unconditional Johnson formula
+    // (BCIKS / STIR Thm. 1): per-query bits = ½·log₂(blowup), so the
+    // required `r` to clear a given NIST PQ Level scales INVERSELY
+    // with blowup:
+    //   blowup= 4: ½·log₂(4)  = 1.0 bits/q  → r ≥ 128 for L1
+    //   blowup= 8: ½·log₂(8)  = 1.5 bits/q  → r ≥ 86  for L1
+    //   blowup=16: ½·log₂(16) = 2.0 bits/q  → r ≥ 64  for L1
+    //   blowup=32: ½·log₂(32) = 2.5 bits/q  → r ≥ 52  for L1 (canonical 54)
     //
-    // NIST PQ levels (unconditional, λ-bits required):
-    //   L1 (λ=128): r ≥ 54   → 135 bits margin
-    //   L3 (λ=192): r ≥ 79   → 197.5 bits margin
-    //   L5 (λ=256): r ≥ 105  → 262.5 bits margin
-    // Inner v2 uses its OWN `V2_NUM_QUERIES = NUM_QUERIES_LEVEL = 54` from
-    // `deep_ali::stark_level`, so the master_r / merkle_r values below are
-    // ONLY the master + top-Merkle STARKs in the bridge.
-    let master_bits  = master_r as f64 * 2.5;
-    let merkle_bits  = merkle_r as f64 * 2.5;
+    // r=54 ONLY clears L1 at blowup=32.  At lower blowups r must
+    // increase proportionally.  Earlier banner versions reported
+    // capacity-regime bits (conjectural, requires proximity-gap
+    // conjecture) — fixed now to match `deep_ali::stark_level`'s
+    // documented Johnson formula.
+    //
+    // Inner v2 has a separate caveat: it uses `V2_NUM_QUERIES = 54`
+    // hardcoded from `deep_ali::stark_level`, regardless of the
+    // `INNER_BLOWUP` passed.  So `inner_blowup=4` gives 54 bits
+    // unconditional (sub-L1).  Use `inner_blowup=32` to hit L1.
+    let bits_per_q = |bw: usize| -> f64 {
+        if bw < 2 { 0.0 } else { 0.5 * (bw as f64).log2() }
+    };
+    let r_for_level = |bw: usize, target: f64| -> usize {
+        let bpq = bits_per_q(bw).max(0.01);
+        (target / bpq).ceil() as usize
+    };
     let level_label = |bits: f64| -> &'static str {
         if bits >= 256.0 { "≥L5" }
         else if bits >= 192.0 { "≥L3" }
         else if bits >= 128.0 { "≥L1" }
-        else { "<L1 (smoke, NOT production-sound)" }
+        else { "<L1 (NOT production-sound)" }
     };
-    let mode = if inner_blowup >= 32 && master_blowup >= 32 && merkle_blowup >= 32 {
-        "PRODUCTION-L1 (all blowup=32, r=54) — matches swarm-dns core pipeline"
-    } else if master_blowup >= 32 && merkle_blowup >= 32 {
-        "MIXED (inner=4 for fast prove, master/merkle=32 for production wire/verify)"
+    let inner_bits  = bits_per_q(inner_blowup)  * 54.0; // v2 internal r=54
+    let master_bits = bits_per_q(master_blowup) * master_r as f64;
+    let merkle_bits = bits_per_q(merkle_blowup) * merkle_r as f64;
+    let mode = if inner_bits >= 128.0 && master_bits >= 128.0 && merkle_bits >= 128.0 {
+        if inner_blowup >= 32 && master_blowup >= 32 && merkle_blowup >= 32 {
+            "PRODUCTION-L1 (all blowup=32, r=54 — matches swarm-dns core pipeline)"
+        } else {
+            "L1-SOUND (mixed blowup but all r-values scaled for L1)"
+        }
     } else {
-        "SMOKE (low blowup for fast iteration — soundness via large r)"
+        "BELOW L1 — at least one stage is under-provisioned (see ❌ flags)"
     };
     println!("Configuration:");
     println!("  N (inner signatures):  {n}");
     println!("  Ni (shard_size):       {shard_size}");
     println!("  K (shards):            {k}  (= ceil(N / Ni))");
-    println!("  inner v2 blowup:       {inner_blowup}  (inner r=V2_NUM_QUERIES=54 → 135 bits ≥L1)");
-    println!("  master blowup × r:     {master_blowup} × {master_r}  ({master_bits:.0} bits unconditional Johnson, {})",
+    let inner_flag = if inner_bits >= 128.0 { "✓" } else { "❌" };
+    let master_flag = if master_bits >= 128.0 { "✓" } else { "❌" };
+    let merkle_flag = if merkle_bits >= 128.0 { "✓" } else { "❌" };
+    println!("  inner v2 blowup:       {inner_blowup}  (V2_NUM_QUERIES=54 hardcoded → {inner_bits:.0} bits, {}) {inner_flag}",
+        level_label(inner_bits));
+    println!("  master blowup × r:     {master_blowup} × {master_r}  ({master_bits:.0} bits unconditional Johnson, {}) {master_flag}",
         level_label(master_bits));
-    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}  ({merkle_bits:.0} bits unconditional Johnson, {})",
+    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}  ({merkle_bits:.0} bits unconditional Johnson, {}) {merkle_flag}",
         level_label(merkle_bits));
     println!("  calibration mode:      {mode}");
+    println!("  L1 r-floor at this blowup combo: master r≥{}, merkle r≥{}",
+        r_for_level(master_blowup, 128.0),
+        r_for_level(merkle_blowup, 128.0));
     println!();
 
     // ─── 1. Build N inner v2 + recursive STARK pairs ─────────────────
