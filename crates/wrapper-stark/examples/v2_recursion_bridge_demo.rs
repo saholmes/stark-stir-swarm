@@ -279,7 +279,7 @@ fn main() {
     // ─── 9. UPGRADED sub-circuit 1: REAL V17 per-query residues ───
     println!("[REAL-V17] Sub-circuit 1 upgraded: V17 sub-AIR per-query residues");
     let t = Instant::now();
-    let v17_comp = build_v2_v17_subair_composition(&proof)
+    let v17_comp = build_v2_v17_subair_composition(&proof, /*inner_blowup=*/4)
         .expect("V17 residue extraction must succeed");
     let v17_extract_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("      V17 residue extraction: {v17_extract_ms:.2} ms");
@@ -290,7 +290,7 @@ fn main() {
     println!("      honest V17: every residue coord is zero = {all_zero}");
 
     let t = Instant::now();
-    let v17_rec = prove_v2_v17_composed_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+    let v17_rec = prove_v2_v17_composed_recursive(&proof, &w, /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false)
         .expect("V17-real composed prove must succeed");
     let v17_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -340,7 +340,7 @@ fn main() {
     println!("         (V17 + 4×INTT + Decompose + UseHint + W1Encode + TRANSCRIPT)");
 
     let t = Instant::now();
-    let residues = extract_v2_all_subair_residues(&proof, &w)
+    let residues = extract_v2_all_subair_residues(&proof, &w, /*inner_blowup=*/4)
         .expect("all-sub-AIR residue extraction must succeed");
     let extract_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("      residue extraction: {extract_ms:.2} ms");
@@ -359,14 +359,14 @@ fn main() {
     assert!(residues.all_zero());
 
     let t = Instant::now();
-    let all_comp = build_v2_all_subairs_composition(&proof, &w)
+    let all_comp = build_v2_all_subairs_composition(&proof, &w, /*inner_blowup=*/4)
         .expect("all-sub-AIRs composition build");
     let build_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("      composition build:  {build_ms:.2} ms  ({} IsZero constraints)",
         all_comp.constraints.len());
 
     let t = Instant::now();
-    let all_rec = prove_v2_all_subairs_composed_recursive(&proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false)
+    let all_rec = prove_v2_all_subairs_composed_recursive(&proof, &w, /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false)
         .expect("all-10 composed prove must succeed");
     let all_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -455,7 +455,7 @@ fn main() {
 
     let t = Instant::now();
     let fri_rec = prove_v2_v17_with_fri_verify_composed_recursive(
-        &proof_fri_mode, &w_fri, /*blowup=*/4, /*r=*/54, /*stir=*/false,
+        &proof_fri_mode, &w_fri, /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false,
     ).expect("V17 + FRI-verify composed prove must succeed");
     let fri_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
     std::env::remove_var("MMIYC_V2_USE_FRI");
@@ -544,7 +544,7 @@ fn main() {
 
     let t = Instant::now();
     let bundle = prove_v2_with_in_air_merkle_path(
-        &proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false,
+        &proof, &w, /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false,
         /*merkle_blowup=*/4, /*merkle_r=*/54, /*merkle_use_stir=*/false,
     ).expect("v2 + Merkle bundle prove must succeed");
     let bundle_prove_ms = t.elapsed().as_secs_f64() * 1000.0;

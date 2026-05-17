@@ -88,7 +88,7 @@ fn main() {
 
         let t = Instant::now();
         let rec = prove_v2_all_subairs_composed_recursive(
-            &v2_proof, &w, outer_blowup, outer_r, /*stir=*/false,
+            &v2_proof, &w, inner_blowup, outer_blowup, outer_r, /*stir=*/false,
         ).expect("recursive STARK wrap");
         let rec_ms = t.elapsed().as_secs_f64() * 1000.0;
         t_rec_total += rec_ms;

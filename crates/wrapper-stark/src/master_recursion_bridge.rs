@@ -870,7 +870,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let v2_proof = prove_v2_real(&w, &c_tilde, /*blowup=*/4);
         prove_v2_all_subairs_composed_recursive(
-            &v2_proof, &w, /*blowup=*/4, /*r=*/54, /*stir=*/false,
+            &v2_proof, &w, /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false,
         ).expect("recursive STARK prove")
     }
 

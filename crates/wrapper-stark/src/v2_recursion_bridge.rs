@@ -819,6 +819,7 @@ pub fn prove_v2_in_air_merkle_binding(
 pub fn prove_v2_with_in_air_merkle_path(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
     blowup: usize,
     r: usize,
     use_stir: bool,
@@ -826,8 +827,9 @@ pub fn prove_v2_with_in_air_merkle_path(
     merkle_r: usize,
     merkle_use_stir: bool,
 ) -> Result<V2WithMerklePathProof, V2MerkleBindingError> {
-    let recursive = prove_v2_all_subairs_composed_recursive(proof, public, blowup, r, use_stir)
-        .map_err(V2MerkleBindingError::Inner)?;
+    let recursive = prove_v2_all_subairs_composed_recursive(
+        proof, public, inner_blowup, blowup, r, use_stir,
+    ).map_err(V2MerkleBindingError::Inner)?;
     let (merkle_path, merkle_root) = prove_v2_in_air_merkle_binding(
         proof.pi_hash, merkle_blowup, merkle_r, merkle_use_stir,
     )?;
@@ -1179,8 +1181,15 @@ impl V2SubAirResidues {
 pub fn extract_v2_all_subair_residues(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
 ) -> Result<V2SubAirResidues, V2BridgeError> {
-    let blowup = 4;  // v2 sub-AIRs all use this blowup
+    // `inner_blowup` MUST match the blowup `prove_v2_real` was called
+    // with.  Mismatch silently corrupts FRI query-position decoding
+    // (the bridge re-derives `n0 = n_trace * inner_blowup` and that
+    // becomes the LDE-domain modulus for the prover's STIR raw query
+    // indices).  Historically hardcoded to 4 — fixed 2026-05-17 so
+    // production-L1 inner blowups (32) work in the recursive path.
+    let blowup = inner_blowup;
     let pi_hash = proof.pi_hash;
 
     // V17.
@@ -1262,8 +1271,9 @@ pub fn extract_v2_all_subair_residues(
 pub fn build_v2_all_subairs_composition(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
 ) -> Result<CompositionClaim<Goldilocks>, V2BridgeError> {
-    let residues = extract_v2_all_subair_residues(proof, public)?;
+    let residues = extract_v2_all_subair_residues(proof, public, inner_blowup)?;
     let total_ext = residues.total();
     let total_base = total_ext * EXT_DEGREE;
 
@@ -1323,10 +1333,11 @@ pub fn build_v2_all_subairs_composition(
 /// with probability ≥ 1 − n/|Goldilocks|, catching the tamper.
 pub fn build_v2_v17_subair_composition(
     proof: &V2ProofReal,
+    inner_blowup: usize,
 ) -> Result<CompositionClaim<Goldilocks>, V2BridgeError> {
     let v17_n_trace = VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
     let residues = extract_sub_air_residues(
-        &proof.fri_v17, v17_n_trace, /*blowup=*/4,
+        &proof.fri_v17, v17_n_trace, inner_blowup,
         proof.pi_hash, b"v17",
         V17_WIDTH, V17_NUM_CONSTRAINTS,
         |cur, nxt, row| deep_ali::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
@@ -1536,13 +1547,14 @@ pub fn prove_v2_composed_recursive(
 pub fn prove_v2_v17_with_fri_verify_composed_recursive(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
     blowup: usize,
     r: usize,
     use_stir: bool,
 ) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
     // Merge V17 per-query residues + V17 FRI DEEP-quotient residues
     // into ONE composition claim.
-    let mut comp_sub_air = build_v2_v17_subair_composition(proof)
+    let mut comp_sub_air = build_v2_v17_subair_composition(proof, inner_blowup)
         .map_err(V2OodRecursiveError::Bridge)?;
     let comp_fri = build_v2_v17_fri_deep_quotient_composition(proof)
         .map_err(V2OodRecursiveError::Bridge)?;
@@ -1597,12 +1609,13 @@ pub fn prove_v2_v17_with_fri_verify_composed_recursive(
 pub fn prove_v2_all_subairs_composed_recursive(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
     blowup: usize,
     r: usize,
     use_stir: bool,
 ) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
     // Sub-circuit 1: REAL all-10-sub-AIRs per-query residue composition.
-    let comp_claim = build_v2_all_subairs_composition(proof, public)
+    let comp_claim = build_v2_all_subairs_composition(proof, public, inner_blowup)
         .map_err(V2OodRecursiveError::Bridge)?;
 
     // Sub-circuit 2: full F2b OOD bundle, flattened.
@@ -1628,12 +1641,13 @@ pub fn prove_v2_all_subairs_composed_recursive(
 pub fn prove_v2_v17_composed_recursive(
     proof: &V2ProofReal,
     public: &V2Witness,
+    inner_blowup: usize,
     blowup: usize,
     r: usize,
     use_stir: bool,
 ) -> Result<RecursiveStarkProof, V2OodRecursiveError> {
     // Sub-circuit 1: REAL V17 per-query residue composition.
-    let comp_claim = build_v2_v17_subair_composition(proof)
+    let comp_claim = build_v2_v17_subair_composition(proof, inner_blowup)
         .map_err(V2OodRecursiveError::Bridge)?;
 
     // Sub-circuit 2: full F2b OOD bundle, flattened.
@@ -1849,7 +1863,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let claim = build_v2_v17_subair_composition(&proof)
+        let claim = build_v2_v17_subair_composition(&proof, /*inner_blowup=*/4)
             .expect("V17 residue extraction must succeed on honest proof");
 
         // V17 ships V2_NUM_QUERIES queries (L1 = 54) × EXT_DEGREE = 6 coords.
@@ -1894,7 +1908,7 @@ mod tests {
 
         let bundle = prove_v2_with_in_air_merkle_path(
             &proof, &w,
-            /*blowup=*/4, /*r=*/54, /*stir=*/false,
+            /*inner_blowup=*/4, /*blowup=*/4, /*r=*/54, /*stir=*/false,
             /*merkle_blowup=*/4, /*merkle_r=*/54, /*merkle_use_stir=*/false,
         ).expect("v2 + in-AIR merkle bundle must succeed");
 
@@ -1945,7 +1959,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let rec = prove_v2_v17_with_fri_verify_composed_recursive(&proof, &w, 4, 54, false)
+        let rec = prove_v2_v17_with_fri_verify_composed_recursive(&proof, &w, 4, 4, 54, false)
             .expect("V17 + FRI-verify composed prove must succeed");
         std::env::remove_var("MMIYC_V2_USE_FRI");
 
@@ -1961,7 +1975,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let residues = extract_v2_all_subair_residues(&proof, &w)
+        let residues = extract_v2_all_subair_residues(&proof, &w, /*inner_blowup=*/4)
             .expect("all-sub-AIR residue extraction must succeed");
 
         // Counts: V17 + K INTT + 3 COEFF + 1 TRANSCRIPT.
@@ -2004,7 +2018,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let claim = build_v2_all_subairs_composition(&proof, &w)
+        let claim = build_v2_all_subairs_composition(&proof, &w, /*inner_blowup=*/4)
             .expect("all-sub-AIRs composition must build on honest proof");
 
         // Multiple of EXT_DEGREE = 6.
@@ -2028,7 +2042,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let rec = prove_v2_all_subairs_composed_recursive(&proof, &w, 4, 54, false)
+        let rec = prove_v2_all_subairs_composed_recursive(&proof, &w, 4, 4, 54, false)
             .expect("all-10-sub-AIR composed prove must succeed");
 
         assert!(verify_recursive_stark(&rec),
@@ -2045,7 +2059,7 @@ mod tests {
             ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
         let proof = prove_v2_real(&w, &c_tilde, 4);
 
-        let rec = prove_v2_v17_composed_recursive(&proof, &w, 4, 54, false)
+        let rec = prove_v2_v17_composed_recursive(&proof, &w, 4, 4, 54, false)
             .expect("V17-real composed recursive prove must succeed");
 
         assert!(verify_recursive_stark(&rec),
