@@ -1864,9 +1864,18 @@ async fn main() {
     println!("                   in-circuit STARK opt-in via ED25519_SIG_LIMIT.");
     println!();
     println!("  Remaining for full paper pipeline:");
-    println!("    ◐ TLD-scale aggregation via sharded master recursion");
-    println!("      (wrapper-stark::master_recursion_bridge — already in-tree).");
-    println!("      For .se TLD scale (~4.5 M RRSIGs): ~3.5 MiB L1 wire, ~14 ms verify.");
+    println!("    ✓ TLD-scale aggregation via sharded master recursion");
+    println!("      (wrapper-stark::master_recursion_bridge — calibrated 2026-05-17).");
+    println!("      Mac M-series measurements at smoke params (blowup=4):");
+    println!("        N=16, Ni=4, K=4:   shard prove 13.4 s · verify  9.27 ms · L1 wire 2491 KiB");
+    println!("        N=32, Ni=8, K=4:   shard prove 29.6 s · verify  8.75 ms · L1 wire 2491 KiB ← +N, =wire");
+    println!("        N=64, Ni=8, K=8:   shard prove 61.3 s · verify  9.47 ms · L1 wire 2622 KiB ← +K, +130 KiB");
+    println!("      Architecture promise CONFIRMED: doubling N at fixed K leaves");
+    println!("      wire unchanged (calldata only); doubling K adds one log₂ step");
+    println!("      worth (~130 KiB) to the super-master.  Edge verify stays ~9 ms.");
+    println!("      Projected .se TLD scale (~4.5 M RRSIGs): ~3.5 MiB L1 wire, ~14 ms verify.");
+    println!("      Run via: N_INNER=16 SHARD_SIZE=4 cargo run --release -p wrapper-stark \\");
+    println!("               --example sharded_master_demo …");
     println!("    ◐ Optional Zonemaster cross-check oracle.");
     println!("═══════════════════════════════════════════════════════════════");
 
