@@ -76,26 +76,43 @@ fn main() {
     let merkle_blowup: usize = parse_env_usize("MERKLE_BLOWUP", 4);
     let merkle_r:      usize = parse_env_usize("MERKLE_R",      54);
 
-    // Soundness banner — derive a label from (blowup, r) so the calibration
-    // mode is visible in the run output.  STIR Johnson regime gives
-    // ~log2(blowup-1) bits/query (close to log2(blowup) for blowup ≥ 4).
-    let inner_bits = (inner_blowup as f64 - 1.0).log2();
-    let master_bits = master_r as f64 * (master_blowup as f64 - 1.0).log2();
-    let merkle_bits = merkle_r as f64 * (merkle_blowup as f64 - 1.0).log2();
+    // Soundness banner — canonical STIR Johnson-regime UNCONDITIONAL bound
+    // is 2.5 bits/query (BCIKS / STIR Thm. 1, blowup-independent above ~8).
+    // NOT the conjectural ~log2(blowup) capacity claim — that requires the
+    // proximity-gap conjecture which is OPEN for both FRI and STIR.
+    // See `feedback_stir_johnson_unconditional_only.md`.
+    //
+    // NIST PQ levels (unconditional, λ-bits required):
+    //   L1 (λ=128): r ≥ 54   → 135 bits margin
+    //   L3 (λ=192): r ≥ 79   → 197.5 bits margin
+    //   L5 (λ=256): r ≥ 105  → 262.5 bits margin
+    // Inner v2 uses its OWN `V2_NUM_QUERIES = NUM_QUERIES_LEVEL = 54` from
+    // `deep_ali::stark_level`, so the master_r / merkle_r values below are
+    // ONLY the master + top-Merkle STARKs in the bridge.
+    let master_bits  = master_r as f64 * 2.5;
+    let merkle_bits  = merkle_r as f64 * 2.5;
+    let level_label = |bits: f64| -> &'static str {
+        if bits >= 256.0 { "≥L5" }
+        else if bits >= 192.0 { "≥L3" }
+        else if bits >= 128.0 { "≥L1" }
+        else { "<L1 (smoke, NOT production-sound)" }
+    };
     let mode = if inner_blowup >= 32 && master_blowup >= 32 && merkle_blowup >= 32 {
-        "PRODUCTION-L1 (blowup=32, r=54) — matches swarm-dns core pipeline"
-    } else if inner_blowup >= 16 {
-        "MID  (intermediate blowup)"
+        "PRODUCTION-L1 (all blowup=32, r=54) — matches swarm-dns core pipeline"
+    } else if master_blowup >= 32 && merkle_blowup >= 32 {
+        "MIXED (inner=4 for fast prove, master/merkle=32 for production wire/verify)"
     } else {
-        "SMOKE (blowup=4, r=135 — soundness-equivalent to L1, faster prove)"
+        "SMOKE (low blowup for fast iteration — soundness via large r)"
     };
     println!("Configuration:");
     println!("  N (inner signatures):  {n}");
     println!("  Ni (shard_size):       {shard_size}");
     println!("  K (shards):            {k}  (= ceil(N / Ni))");
-    println!("  inner v2 blowup:       {inner_blowup}  ({inner_bits:.1} bits/q in Johnson)");
-    println!("  master blowup × r:     {master_blowup} × {master_r}  (~{master_bits:.0} bits)");
-    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}  (~{merkle_bits:.0} bits)");
+    println!("  inner v2 blowup:       {inner_blowup}  (inner r=V2_NUM_QUERIES=54 → 135 bits ≥L1)");
+    println!("  master blowup × r:     {master_blowup} × {master_r}  ({master_bits:.0} bits unconditional Johnson, {})",
+        level_label(master_bits));
+    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}  ({merkle_bits:.0} bits unconditional Johnson, {})",
+        level_label(merkle_bits));
     println!("  calibration mode:      {mode}");
     println!();
 
