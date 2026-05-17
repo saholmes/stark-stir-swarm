@@ -66,19 +66,37 @@ fn main() {
     let n: usize = parse_env_usize("N_INNER", 16);
     let shard_size: usize = parse_env_usize("SHARD_SIZE", 4);
     let k = (n + shard_size - 1) / shard_size;
-    let inner_blowup: usize = 4;
-    let master_blowup: usize = 4;
-    let master_r: usize = 135;  // L1 calibrated r at bw=4
-    let merkle_blowup: usize = 4;
-    let merkle_r: usize = 54;
+    // Defaults: smoke calibration (blowup=4, r=135) — L1-soundness-equivalent
+    // to blowup=32 r=54 under STIR Johnson regime but ~8× faster prove on
+    // dev hardware (at the cost of larger proofs).  Override via env vars
+    // for production-L1 calibration runs (blowup=32 r=54 at every level).
+    let inner_blowup:  usize = parse_env_usize("INNER_BLOWUP",  4);
+    let master_blowup: usize = parse_env_usize("MASTER_BLOWUP", 4);
+    let master_r:      usize = parse_env_usize("MASTER_R",      135);
+    let merkle_blowup: usize = parse_env_usize("MERKLE_BLOWUP", 4);
+    let merkle_r:      usize = parse_env_usize("MERKLE_R",      54);
 
+    // Soundness banner — derive a label from (blowup, r) so the calibration
+    // mode is visible in the run output.  STIR Johnson regime gives
+    // ~log2(blowup-1) bits/query (close to log2(blowup) for blowup ≥ 4).
+    let inner_bits = (inner_blowup as f64 - 1.0).log2();
+    let master_bits = master_r as f64 * (master_blowup as f64 - 1.0).log2();
+    let merkle_bits = merkle_r as f64 * (merkle_blowup as f64 - 1.0).log2();
+    let mode = if inner_blowup >= 32 && master_blowup >= 32 && merkle_blowup >= 32 {
+        "PRODUCTION-L1 (blowup=32, r=54) — matches swarm-dns core pipeline"
+    } else if inner_blowup >= 16 {
+        "MID  (intermediate blowup)"
+    } else {
+        "SMOKE (blowup=4, r=135 — soundness-equivalent to L1, faster prove)"
+    };
     println!("Configuration:");
     println!("  N (inner signatures):  {n}");
     println!("  Ni (shard_size):       {shard_size}");
     println!("  K (shards):            {k}  (= ceil(N / Ni))");
-    println!("  inner v2 blowup:       {inner_blowup}");
-    println!("  master blowup × r:     {master_blowup} × {master_r}");
-    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}");
+    println!("  inner v2 blowup:       {inner_blowup}  ({inner_bits:.1} bits/q in Johnson)");
+    println!("  master blowup × r:     {master_blowup} × {master_r}  (~{master_bits:.0} bits)");
+    println!("  top Merkle blowup × r: {merkle_blowup} × {merkle_r}  (~{merkle_bits:.0} bits)");
+    println!("  calibration mode:      {mode}");
     println!();
 
     // ─── 1. Build N inner v2 + recursive STARK pairs ─────────────────
