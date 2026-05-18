@@ -509,30 +509,102 @@ the proof artifact.
 ignored): 2 inners → 1 shard master → super-master + 2 inner bindings
 + 1 shard binding → 3-piece verify at BOTH levels.
 
-## Phase 4b — Recursive aggregation wrap (DEFERRED)
+## Phase 4b — Recursive aggregation wrap (2026-05-18)
 
-The Phase 4a artifact's wire is linear in N+K, defeating
-sharded-master-architecture.md's `$56/batch constant` target at scale.
-Phase 4b collapses the (N+K) binding bundles into a single outer
-`RecursiveStarkProof` via the existing `prove_master_recursive`
-gadget.
+Collapses N `BatchedMerklePathProof`s into ONE outer
+`RecursiveStarkProof` via the same FRI-residue-extraction pattern the
+master uses for inner recursive STARKs.
 
-**Key challenge**: `BatchedMerklePathProof.public` has shape
-`BatchedMerklePathPublicInputs` (per-path `(root, leaf_index, depth)`
-triples) — distinct from `RecursiveStarkPublicInputs`. Recursive
-aggregation needs either:
+**Solution**: Option 1 from the prior design note — adapt
+`BatchedMerklePathProof` to the `RecursiveStarkProof`-compatible
+extraction pattern through new helpers:
 
-1. A conversion that wraps a `BatchedMerklePathProof` into a
-   `RecursiveStarkProof`-shaped artifact (build composition + OOD +
-   perm-arg sub-circuits over the binding's FRI proof — mirroring
-   `extract_recursive_fri_residues` but with the binding's public-input
-   shape absorbed into the master's FS seed).
-2. OR a parallel aggregation gadget that natively handles
-   `BatchedMerklePathProof` plus `RecursiveStarkProof` in one outer
-   STARK.
+- `batched_merkle_proof_params(bmp)` mirrors `recursive_proof_params`
+  but reads `bmp.public.pi_hash` instead of `outer_pi_hash`.
+- `extract_batched_merkle_fri_residues(bmp)` mirrors
+  `extract_recursive_fri_residues`.
+- `build_aggregator_{composition, ood_anchor, vestige_perm_arg}` use
+  FS seeds `AGGREGATOR-FRI-MERKLE-{COMP,OOD,PI}-V1` over binding
+  `public.pi_hash`es.  Since `BatchedMerklePathPublicInputs.pi_hash`
+  already SHA-3-binds `(variant, B, per-path (depth, root, leaf_index))`,
+  the aggregator's `outer_pi_hash` is transitively bound to every
+  binding's complete public commitment.
+- `aggregate_fri_merkle_bindings(bindings, ...)` runs the three
+  sub-circuits through `prove_recursive_stark` to produce a
+  `RecursiveStarkProof` whose FRI-quotient relation attests every
+  binding's FRI-quotient relation.
 
-Option (1) preserves the single-gadget invariant and is the cleaner
-follow-up. Phase 4b is meaningful but not in this session's scope.
+**Compact API** (`CompactFriMerkleBundle`):
+
+```rust
+pub struct CompactFriMerkleBundle {
+    pub master: RecursiveStarkProof,             // L1 wire
+    pub binding_aggregator: RecursiveStarkProof, // L1 wire (constant in N)
+    /// Per-binding public inputs needed for Piece 2 cross-check.
+    /// Size ≈ N × (32 + B × 48) B; small compared to ~789 KiB STARKs.
+    pub binding_publics: Vec<BatchedMerklePathPublicInputs>,
+}
+```
+
+**`prove_master_with_fri_merkle_binding_aggregated`** orchestrates:
+
+1. Run Phase 3 linear form (`prove_master_with_fri_merkle_binding`).
+2. `aggregate_fri_merkle_bindings(&linear.fri_merkle_bindings, ...)`.
+3. Strip binding `fri_proof`s from wire; keep only `binding_publics`.
+
+**`verify_master_with_fri_merkle_binding_aggregated`** checks:
+
+1. Master STARK FRI-verifies.
+2. Binding aggregator FRI-verifies.
+3. Each `binding_publics[i].pi_hash` deterministically re-derives from
+   its `(variant, B, per-path triples)` (defense-in-depth against
+   binding_publics tamper not actually consumed by the aggregator).
+4. Per-inner Piece 2 cross-check (unchanged from Phase 3).
+
+**Wire cost projection** (sha3-256 prod blowup=32, r=54):
+
+| Component | Linear (Phase 3) | Compact (Phase 4b) | Δ |
+|-----------|-----------------:|-------------------:|--:|
+| Master | ~789 KiB | ~789 KiB | — |
+| N bindings @ B=810 | N × ~500 KiB | — | removed |
+| Aggregator | — | ~789 KiB | added (constant in N) |
+| binding_publics | — | N × ~39 KiB | new (linear but tiny) |
+| **Total at N=10** | ~5.7 MiB | ~1.97 MiB | **−65%** |
+| **Total at N=100** | ~50 MiB | ~5.5 MiB | **−89%** |
+
+Constant-in-N L1 wire achieved (modulo small per-inner publics
+calldata which is much cheaper than full STARK).
+
+**Anchored**: `prove_master_with_fri_merkle_binding_aggregated_n1_subset_b10`
+ignored test verifies the full compact-form pipeline end-to-end on a
+real inner v2 STARK at B=10 subset.  Tamper test
+`prove_master_with_fri_merkle_binding_aggregated_rejects_tampered_publics`
+confirms binding_publics tampering is detected.
+
+**Known soundness gap (M6 follow-up)**: the compact form's current
+verifier doesn't re-derive `aggregator.public.outer_pi_hash` from
+`binding_publics` deterministically.  Without that link, a malicious
+prover could submit a DEGENERATE aggregator (proven over residues all
+set to zero) plus the real `binding_publics` — passing both the
+aggregator FRI verify AND the Piece 2 cross-check.  The gap is closed
+by adding `binding_meta: Vec<(n_trace, blowup, r, use_stir)>` (32 B
+per binding) to `CompactFriMerkleBundle` so the verifier can
+reconstruct each binding's `n_constraints = r × log2(n_trace × blowup)
+× EXT_DEGREE`, re-derive the alphas from the FS-seed, rebuild the
+sub-circuit pi_hashes, and confirm
+`aggregator.public.outer_pi_hash` matches.  Documented as Phase 4b-2.
+
+**Out-of-scope (next pickups)**:
+
+- **Phase 4b-2 — soundness completion** — add binding_meta + verifier
+  re-derivation of aggregator.outer_pi_hash from binding_publics.
+  ~half-day; binding_meta is constant-in-binding wire (~32 B each).
+- **Sharded compact form** — combine Phase 4a + 4b to aggregate
+  inner+shard bindings into a single aggregator for the sharded
+  variant (`CompactShardedFriMerkleBundle`).  Mechanical extension.
+- **Multi-level aggregation** — for very large N, aggregate batches of
+  bindings into mid-level aggregators, then super-aggregate.  Same
+  shape as the existing sharded master at the aggregator layer.
 
 ## Status
 
