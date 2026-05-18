@@ -54,7 +54,8 @@ use crate::merkle_path_air::{
     BatchedMerklePathClaim, MerkleNode, MerklePathClaim, merkle_build_and_open,
 };
 use crate::merkle_prover::{
-    MerklePathProof, MerklePathProverError, prove_merkle_path, verify_merkle_path,
+    BatchedMerklePathProof, MerklePathProof, MerklePathProverError, prove_batched_merkle_paths,
+    prove_merkle_path, verify_batched_merkle_paths, verify_merkle_path,
 };
 use crate::recursive_prover::{
     OodAccumulatorClaim, RecursiveProverError, RecursiveStarkProof,
@@ -199,13 +200,16 @@ pub fn build_master_composition(
         }
     }
 
-    // FS alphas seeded from concatenated outer_pi_hashes (binds the
-    // master composition's coefficients to the specific N-tuple of
-    // inner recursive STARKs).
+    // FS alphas seeded from concatenated outer_pi_hashes + every inner
+    // FRI proof's Merkle roots (Phase 3 Piece 1 — binds the master
+    // composition's coefficients to the specific N-tuple of inner
+    // recursive STARKs INCLUDING their FRI commitments, so a prover
+    // cannot swap inner FRI roots without re-deriving the alphas).
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-COMP-V1");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-COMP-V2");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
     }
     let seed: [u8; 32] = Digest::finalize(hasher).into();
     let alphas = alphas_from_transcript::<Goldilocks>(&seed, constraints.len());
@@ -216,6 +220,22 @@ pub fn build_master_composition(
         alphas,
         expected: Goldilocks::zero(),
     })
+}
+
+/// **Phase 3 Piece 1**: absorb an inner FRI proof's Merkle commitments
+/// into the FS transcript so the master STARK's seed is bound to the
+/// specific FRI tree the residue extraction reads from.  Format:
+/// `roots_count(8 LE) | root_f0(32) | roots[0](32) | … | roots[L-1](32)`.
+fn absorb_inner_fri_roots(
+    hasher: &mut sha3::Sha3_256,
+    rec: &RecursiveStarkProof,
+) {
+    let fri = &rec.fri_proof;
+    Digest::update(hasher, &(fri.roots.len() as u64).to_le_bytes());
+    Digest::update(hasher, fri.root_f0);
+    for r in &fri.roots {
+        Digest::update(hasher, r);
+    }
 }
 
 /// Sub-circuit 2: OOD anchor over the inner outer_pi_hashes.
@@ -247,9 +267,10 @@ pub fn build_master_ood_anchor(
     }
 
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-OOD-V1");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-OOD-V2");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
     }
     let seed: [u8; 32] = Digest::finalize(hasher).into();
     let alphas = alphas_from_transcript::<Goldilocks>(&seed, claims.len());
@@ -271,9 +292,10 @@ pub fn build_master_vestige_perm_arg(
     // outer_pi_hashes.  This is what the verifier sees as the
     // "master proof's public-input commitment."
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-PI-V1");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-PI-V2");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
     }
     let master_pi: [u8; 32] = Digest::finalize(hasher).into();
 
@@ -1078,6 +1100,171 @@ fn sha3_variant_for_hash_bytes(
     }
 }
 
+// ─── Phase 3: Master-level FRI-Merkle binding ────────────────────────
+//
+// Closes the prover-supplied-residue caveat at the master STARK level
+// by binding every inner FRI proof's per-(query, fold-layer)
+// `(f, s, q)` payloads to the inner's Merkle commitments via in-AIR
+// SHA-3 hashing.  Three-piece soundness chain (per
+// `scripts/results/fri-merkle-binding-phase0-design.md`):
+//
+//   1. **FS-binds inner FRI roots** — landed in this commit by
+//      extending `MASTER-RECURSION-{COMP,OOD,PI}-V2` seeds to absorb
+//      every inner's `(root_f0, roots[*])`.  A prover cannot swap
+//      inner FRI roots without re-deriving the master STARK's alphas.
+//   2. **Per-inner binding bundle public roots match inner FRI roots** —
+//      verifier re-derives `inner.fri_proof.roots[ell]` per (k, ell)
+//      and cross-checks against each `BatchedMerklePathProof`'s
+//      public root list.
+//   3. **Leaf encodings match `per_layer_payloads`** — the binding
+//      bundle's per-block public `(root, leaf_index, depth)` triples
+//      come from the same extractor that consumes
+//      `per_layer_payloads`, so the master STARK's sub-circuit 1
+//      residues and the bundle's committed leaves reference the SAME
+//      `(f, s, q)` triples.
+//
+// Together, any prover-supplied substitution of `(f, q)` values in
+// sub-circuit 1 either (a) trips Piece 1 (changed root → different
+// alphas) or (b) trips Piece 2 (bundle root doesn't match) or (c)
+// trips the binding STARK's FRI verify (leaf hash mismatch).
+
+/// Composed proof: master `RecursiveStarkProof` + N per-inner FRI-
+/// Merkle binding bundles (one per inner).  Each binding bundle is a
+/// `BatchedMerklePathProof` over that inner's r × L arity-2 fold-layer
+/// openings (the bulk of `per_layer_payloads`).
+pub struct MasterWithFriMerkleProof {
+    pub master: RecursiveStarkProof,
+    /// One binding bundle per inner.  Order matches `inner_proofs`.
+    pub fri_merkle_bindings: Vec<BatchedMerklePathProof>,
+}
+
+/// Errors from `prove_master_with_fri_merkle_binding`.
+#[derive(Debug, Clone)]
+pub enum FriMerkleBindingError {
+    Master(MasterBridgeError),
+    Extract(FriMerkleExtractError),
+    Binding(MerklePathProverError),
+    Empty,
+}
+
+impl std::fmt::Display for FriMerkleBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Master(e) => write!(f, "FRI-Merkle binding: master: {e}"),
+            Self::Extract(e) => write!(f, "FRI-Merkle binding: extract: {e}"),
+            Self::Binding(e) => write!(f, "FRI-Merkle binding: binding STARK: {e}"),
+            Self::Empty => write!(f, "FRI-Merkle binding: zero inner proofs supplied"),
+        }
+    }
+}
+impl std::error::Error for FriMerkleBindingError {}
+
+/// **Phase 3 main entry**: produce master `RecursiveStarkProof` +
+/// per-inner FRI-Merkle binding bundles.
+///
+/// For each inner: `extract_fri_merkle_openings` → BatchedMerklePathClaim
+/// (r × L paths, DS-aware per Phase 2.5 extension) → `prove_batched_merkle_paths`.
+///
+/// The caller may optionally supply a `subset_paths` Vec to slice each
+/// per-inner claim down to a tractable subset for testing (e.g.
+/// `Some(vec![0, 1, 10, 100])` selects only those paths).  In production
+/// the subset is `None` (= full B = r × L).
+pub fn prove_master_with_fri_merkle_binding(
+    inner_proofs: &[RecursiveStarkProof],
+    master_blowup: usize, master_r: usize, master_use_stir: bool,
+    binding_blowup: usize, binding_r: usize, binding_use_stir: bool,
+    subset_paths: Option<&[usize]>,
+) -> Result<MasterWithFriMerkleProof, FriMerkleBindingError> {
+    if inner_proofs.is_empty() {
+        return Err(FriMerkleBindingError::Empty);
+    }
+
+    let master = prove_master_recursive(
+        inner_proofs, master_blowup, master_r, master_use_stir,
+    ).map_err(FriMerkleBindingError::Master)?;
+
+    let mut fri_merkle_bindings = Vec::with_capacity(inner_proofs.len());
+    for rec in inner_proofs {
+        let mut bundle_claim = extract_fri_merkle_openings(rec)
+            .map_err(FriMerkleBindingError::Extract)?;
+        if let Some(indices) = subset_paths {
+            let subset = indices.iter()
+                .map(|&i| bundle_claim.paths[i].clone())
+                .collect();
+            bundle_claim.paths = subset;
+        }
+        let binding = prove_batched_merkle_paths(
+            &bundle_claim, binding_blowup, binding_r, binding_use_stir,
+        ).map_err(FriMerkleBindingError::Binding)?;
+        fri_merkle_bindings.push(binding);
+    }
+
+    Ok(MasterWithFriMerkleProof { master, fri_merkle_bindings })
+}
+
+/// Verify a `MasterWithFriMerkleProof` — three-piece soundness chain.
+///
+/// 1. Master STARK FRI-verifies (Piece 1: its FS seeds absorbed every
+///    inner FRI proof's roots via `MASTER-RECURSION-*-V2`).
+/// 2. Per-inner binding bundle FRI-verifies.
+/// 3. Per-inner binding bundle public `(root, leaf_index, depth)`
+///    triples match `inner.fri_proof.roots[ell]` + `per_layer_refs[ell].i`
+///    + `log2(layer_size)` for the same indices the extractor used
+///    (Piece 2 cross-check).
+///
+/// `subset_paths` MUST match the slice used at prove time (else the
+/// per-inner bundle.batch_size won't equal the re-derived count and
+/// verify rejects).
+pub fn verify_master_with_fri_merkle_binding(
+    bundle: &MasterWithFriMerkleProof,
+    inner_proofs: &[RecursiveStarkProof],
+    subset_paths: Option<&[usize]>,
+) -> bool {
+    if bundle.fri_merkle_bindings.len() != inner_proofs.len() {
+        return false;
+    }
+    if !verify_master_recursive(&bundle.master) {
+        return false;
+    }
+    for (i, rec) in inner_proofs.iter().enumerate() {
+        let binding = &bundle.fri_merkle_bindings[i];
+        if !verify_batched_merkle_paths(binding) {
+            return false;
+        }
+        // Re-derive the expected public-path triples from the inner
+        // FRI proof and cross-check against the binding bundle.
+        let expected_claim = match extract_fri_merkle_openings(rec) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let expected_paths: Vec<&MerklePathClaim> =
+            if let Some(indices) = subset_paths {
+                if indices.iter().any(|&i| i >= expected_claim.paths.len()) {
+                    return false;
+                }
+                indices.iter().map(|&i| &expected_claim.paths[i]).collect()
+            } else {
+                expected_claim.paths.iter().collect()
+            };
+        if binding.public.paths.len() != expected_paths.len() {
+            return false;
+        }
+        for (j, expected) in expected_paths.iter().enumerate() {
+            let (got_root, got_leaf_index, got_depth) = &binding.public.paths[j];
+            if got_root != &expected.root {
+                return false;
+            }
+            if *got_leaf_index != expected.leaf_index {
+                return false;
+            }
+            if *got_depth != expected.depth() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1307,54 @@ mod tests {
         assert_eq!(perm.left, perm.right);
         assert_eq!(perm.left.len(), 4);
         assert_eq!(perm.perm_tag, "master-vestige");
+    }
+
+    #[test]
+    #[ignore = "Phase 3 — N=1 master + per-inner FRI-Merkle binding bundle at B=10 subset; ~4-5 min"]
+    fn prove_master_with_fri_merkle_binding_n1_subset_b10() {
+        // Smallest end-to-end Phase 3 test: 1 inner v2 → master STARK
+        // + 1 per-inner binding bundle over a B=10 subset of the
+        // inner's r × L = 810 FRI Merkle openings (smoke L1).
+        let inner = build_one_inner_recursive(913);
+
+        // Sanity: full extract works.
+        let full_claim = extract_fri_merkle_openings(&inner)
+            .expect("extractor must succeed on honest inner");
+        assert_eq!(full_claim.batch_size(), 810,
+            "expected 810 paths at smoke L1 r=54 L=15");
+
+        // B=10 subset spanning multiple FRI layers (same pattern as the
+        // Phase 2.5 integration test).
+        let l = inner.fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1,
+            l, l + 1,
+            2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let inner_proofs = vec![inner];
+        let proof = prove_master_with_fri_merkle_binding(
+            &inner_proofs,
+            /*master_blowup=*/ 4, /*master_r=*/ 54, /*master_stir=*/ false,
+            /*binding_blowup=*/ 4, /*binding_r=*/ 54, /*binding_stir=*/ false,
+            Some(&subset_indices),
+        ).expect("Phase 3 prove must succeed at N=1 subset");
+
+        assert_eq!(proof.fri_merkle_bindings.len(), 1);
+        assert_eq!(proof.fri_merkle_bindings[0].batch_size, 10);
+
+        // Verify the full 3-piece chain.
+        assert!(verify_master_with_fri_merkle_binding(
+            &proof, &inner_proofs, Some(&subset_indices),
+        ), "Phase 3 N=1 subset must verify end-to-end");
+    }
+
+    #[test]
+    fn prove_master_with_fri_merkle_binding_rejects_empty() {
+        let result = prove_master_with_fri_merkle_binding(
+            &[], 4, 54, false, 4, 54, false, None,
+        );
+        assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
     }
 
     #[test]
