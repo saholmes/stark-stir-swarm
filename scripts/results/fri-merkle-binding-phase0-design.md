@@ -606,6 +606,67 @@ sub-circuit pi_hashes, and confirm
   bindings into mid-level aggregators, then super-aggregate.  Same
   shape as the existing sharded master at the aggregator layer.
 
+## Phase 5 — Sub-circuit 1a (FRI fold relation) + Piece 2 tamper (2026-05-18)
+
+### Sub-circuit 1a — FRI fold relation
+
+Master sub-circuit 1 previously encoded only the DEEP-quotient
+relation `q · (x − z) = f − fz` per (k, ell).  Phase 5 adds the
+fold relation `s_val[ell] − f_val[ell+1] = 0` per (k, ell) for ell
+in 0..L-1, making the master STARK's algebraic attestation of each
+inner's FRI verify COMPLETE (DEEP-quotient ∧ fold) — previously the
+fold check was implicit in the inner's own FRI verify, but with the
+master sub-circuit 1 we want full algebraic encoding.
+
+New helper `extract_recursive_fold_residues(rec)` returns
+`n_queries × (L − 1)` Ext residues; appended to
+`build_master_composition`'s column_values + IsZero constraints.
+
+FS seeds bumped V2 → V3 (`MASTER-RECURSION-{COMP,OOD,PI}-V3`) to
+reflect the new constraint set (otherwise unchanged byte format).
+
+Total constraint count per master sub-circuit 1: previously
+`N × n_queries × L × EXT_DEGREE`; now `N × n_queries × (2L − 1) × EXT_DEGREE`.
+At smoke L1 r=54 L=15: 5184 → 10044 constraints per inner.
+
+`extract_recursive_fold_residues_shape` ignored test confirms shape
+and that honest fold residues are all zero in F_ext.
+
+### Piece 2 tamper test
+
+`fri_merkle_binding_piece_2_tamper_rejects` ignored test:
+1. Honest end-to-end prove + verify (Phase 3 shape, N=1 B=10 subset)
+2. Flip one byte in `binding.public.paths[3].0` (root)
+3. Verifier MUST reject (Piece 2 cross-check against re-extracted
+   inner FRI fails)
+
+### Known soundness gaps (Phase 5-2 follow-up)
+
+- **Piece 1 tamper** (swap `inner.fri_proof.root_f0` post-prove):
+  current verifier reads `master.public.outer_pi_hash` at face value
+  rather than re-deriving it from supplied `inner_proofs`.  Adversary
+  could submit (master_real, inner_proofs_with_swapped_root_f0) — FRI
+  verify still passes because outer_pi_hash is baked into the proof.
+  Same structural issue as Phase 4b-2 (compact-aggregator gap).
+- **Piece 3 tamper** (modify `per_layer_payloads[ell].f_val`): the
+  binding bundle's committed leaf bytes are private witness inside
+  the BMP FRI proof.  Without explicit leaf-encoding cross-check at
+  verify time, an adversary modifying `per_layer_payloads[ell].f_val`
+  in the supplied inner_proofs causes the re-derived expected leaf
+  bytes to differ from the binding's committed leaves — but the
+  current verifier only cross-checks public roots, not leaves.
+
+Both close by adding `binding_meta` (or equivalent) to the proof
+artifact + re-deriving the chain of pi_hashes from supplied inputs.
+Phase 5-2 tracks this work alongside Phase 4b-2.
+
+### Out-of-scope (next pickups)
+
+- **Aggregator sub-circuit 1a** — extend the Phase 4b aggregator to
+  also include fold residues over binding bundles' FRI proofs.
+  Same shape extension as master sub-circuit 1a but at the aggregator
+  layer.  Bump AGGREGATOR seeds V1 → V2.
+
 ## Status
 
 - Phase 0 (this doc) — **done**.

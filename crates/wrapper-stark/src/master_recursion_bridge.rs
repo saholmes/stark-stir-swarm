@@ -170,10 +170,18 @@ fn extract_recursive_fri_residues(
 }
 
 /// Sub-circuit 1: composition over per-recursive-proof FRI DEEP-quotient
-/// residues, flattened to EXT_DEGREE Goldilocks coords.  Asserts every
-/// inner recursive STARK's algebraic FRI-verify relation holds.
+/// residues + (V3, Phase 5) sub-circuit 1a FRI-fold residues, flattened
+/// to EXT_DEGREE Goldilocks coords.  Asserts:
 ///
-/// Total constraint count: N × n_queries × L × EXT_DEGREE.
+/// - **1.** DEEP-quotient: `q_val · (x − z_ext) − (f_val − fz) = 0`
+///   per (k, ell) over each inner's FRI proof.
+/// - **1a.** Fold relation: `s_val[ell] − f_val[ell+1] = 0` per
+///   (k, ell) over ell in 0..L-1.  Without this the v2 inner's
+///   FRI-fold check would be implicit — sub-circuit 1a makes it
+///   algebraic so the master STARK directly attests the inner's
+///   complete FRI-verify (DEEP-quotient ∧ fold) relation.
+///
+/// Total constraint count: N × n_queries × (L + L−1) × EXT_DEGREE.
 pub fn build_master_composition(
     inner_proofs: &[RecursiveStarkProof],
 ) -> Result<CompositionClaim<Goldilocks>, MasterBridgeError> {
@@ -185,6 +193,7 @@ pub fn build_master_composition(
     let mut constraints: Vec<BitOp> = Vec::new();
     let mut next_col = 0usize;
 
+    // Sub-circuit 1: DEEP-quotient residues.
     for rec in inner_proofs {
         let residues = extract_recursive_fri_residues(rec)?;
         for row in &residues {
@@ -200,13 +209,31 @@ pub fn build_master_composition(
         }
     }
 
+    // Sub-circuit 1a (Phase 5): FRI-fold residues `s[ell] − f[ell+1] = 0`.
+    for rec in inner_proofs {
+        let fold_residues = extract_recursive_fold_residues(rec)?;
+        for row in &fold_residues {
+            for r in row {
+                let coords = r.to_fp_components();
+                for c in 0..EXT_DEGREE {
+                    let cell = CellRef::new(0, next_col);
+                    column_values.push((cell, coords[c]));
+                    constraints.push(BitOp::IsZero { cell });
+                    next_col += 1;
+                }
+            }
+        }
+    }
+
     // FS alphas seeded from concatenated outer_pi_hashes + every inner
     // FRI proof's Merkle roots (Phase 3 Piece 1 — binds the master
     // composition's coefficients to the specific N-tuple of inner
-    // recursive STARKs INCLUDING their FRI commitments, so a prover
-    // cannot swap inner FRI roots without re-deriving the alphas).
+    // recursive STARKs INCLUDING their FRI commitments).  Seed bumped
+    // from V2 → V3 in Phase 5 to reflect the new sub-circuit 1a
+    // fold-residue constraints; the seed string is a domain-separator
+    // and the byte format is otherwise identical.
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-COMP-V2");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-COMP-V3");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
         absorb_inner_fri_roots(&mut hasher, rec);
@@ -220,6 +247,47 @@ pub fn build_master_composition(
         alphas,
         expected: Goldilocks::zero(),
     })
+}
+
+/// **Phase 5 sub-circuit 1a**: extract FRI-fold residues from an inner
+/// `RecursiveStarkProof`'s embedded FRI proof.  Returns
+/// `n_queries × (L − 1)` Ext residues where
+/// `residue[k][ell] = s_val[ell] − f_val[ell+1]`.
+///
+/// FRI semantics: `s_val[ell]` is the "fold result" at layer `ell`
+/// for query `k` — it equals the `f_val` at the SAME query's
+/// folded position in layer `ell+1`.  On an honest FRI proof
+/// every residue is zero in F_ext.
+fn extract_recursive_fold_residues(
+    rec: &RecursiveStarkProof,
+) -> Result<Vec<Vec<Ext>>, MasterBridgeError> {
+    let fri_proof = &rec.fri_proof;
+    if fri_proof.queries.is_empty() {
+        return Err(MasterBridgeError::StirNotSupported);
+    }
+    let l = recursive_proof_params(rec).schedule.len();
+    if l == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut residues_per_query: Vec<Vec<Ext>> =
+        Vec::with_capacity(fri_proof.queries.len());
+    for qp in &fri_proof.queries {
+        if qp.per_layer_payloads.len() < l {
+            return Err(MasterBridgeError::MalformedFriProof(format!(
+                "fold extract: query payloads {} < L = {l}",
+                qp.per_layer_payloads.len()
+            )));
+        }
+        let mut row = Vec::with_capacity(l - 1);
+        for ell in 0..(l - 1) {
+            let s_curr = qp.per_layer_payloads[ell].s_val;
+            let f_next = qp.per_layer_payloads[ell + 1].f_val;
+            row.push(s_curr - f_next);
+        }
+        residues_per_query.push(row);
+    }
+    Ok(residues_per_query)
 }
 
 /// **Phase 3 Piece 1**: absorb an inner FRI proof's Merkle commitments
@@ -267,7 +335,7 @@ pub fn build_master_ood_anchor(
     }
 
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-OOD-V2");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-OOD-V3");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
         absorb_inner_fri_roots(&mut hasher, rec);
@@ -292,7 +360,7 @@ pub fn build_master_vestige_perm_arg(
     // outer_pi_hashes.  This is what the verifier sees as the
     // "master proof's public-input commitment."
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"MASTER-RECURSION-PI-V2");
+    Digest::update(&mut hasher, b"MASTER-RECURSION-PI-V3");
     for rec in inner_proofs {
         Digest::update(&mut hasher, rec.public.outer_pi_hash);
         absorb_inner_fri_roots(&mut hasher, rec);
@@ -1971,6 +2039,73 @@ mod tests {
             &[], 4, 54, false, 4, 54, false, 4, 54, false, None,
         );
         assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
+    }
+
+    // ─── Phase 5 sub-circuit 1a tests ───────────────────────────────
+
+    #[test]
+    #[ignore = "Phase 5 — builds one inner + extracts fold residues; ~4-5 s"]
+    fn extract_recursive_fold_residues_shape() {
+        // Build a real inner and confirm fold-residue shape:
+        // n_queries × (L - 1) Ext residues.
+        let inner = build_one_inner_recursive(960);
+        let r = inner.fri_proof.queries.len();
+        let l = inner.fri_proof.queries[0].per_layer_payloads.len();
+
+        let fold = extract_recursive_fold_residues(&inner)
+            .expect("fold extract must succeed on honest inner");
+
+        assert_eq!(fold.len(), r,
+            "fold residues outer dim must equal n_queries");
+        for row in &fold {
+            assert_eq!(row.len(), l - 1,
+                "fold residues inner dim must equal L - 1");
+        }
+
+        // Honest residues must all be zero (s_val[ell] == f_val[ell+1]).
+        for row in &fold {
+            for r in row {
+                use ark_ff::Zero;
+                assert!(r.is_zero(),
+                    "honest fold residue must be zero in F_ext");
+            }
+        }
+    }
+
+    // ─── Phase 5 Piece 2 tamper test ────────────────────────────────
+
+    #[test]
+    #[ignore = "Phase 5 Piece 2 tamper: flip binding bundle public root → verifier must reject; ~4 min"]
+    fn fri_merkle_binding_piece_2_tamper_rejects() {
+        // Honest end-to-end then tamper one binding public root and
+        // confirm verify rejects.  Uses the same N=1 B=10 shape as
+        // the Phase 3 round-trip test.
+        let inner = build_one_inner_recursive(961);
+        let inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let mut proof = prove_master_with_fri_merkle_binding(
+            &inner_proofs,
+            4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest Phase 3 prove must succeed");
+
+        // Verify honest case first.
+        assert!(verify_master_with_fri_merkle_binding(
+            &proof, &inner_proofs, Some(&subset_indices),
+        ), "honest Phase 3 must verify");
+
+        // Tamper one public root: flip a single byte.
+        let binding = &mut proof.fri_merkle_bindings[0];
+        binding.public.paths[3].0.0[0] ^= 0xFF;
+
+        // Verifier MUST reject (Piece 2 cross-check fails).
+        assert!(!verify_master_with_fri_merkle_binding(
+            &proof, &inner_proofs, Some(&subset_indices),
+        ), "Piece 2 cross-check must reject tampered binding root");
     }
 
     #[test]
