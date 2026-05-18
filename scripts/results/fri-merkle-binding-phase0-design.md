@@ -459,6 +459,81 @@ to 128 B > 104 B rate (2 blocks instead of 1), and sha3-512 input to
 needs awareness of DS-byte length to compute correct rows_per_hop at
 L3/L5.  Documented; not blocking for L1.
 
+## Phase 3 — Master-level FRI-Merkle binding (2026-05-18, commit f885ee8)
+
+The 3-piece soundness chain landed end-to-end at the master STARK level:
+
+- **Piece 1** — FS-seeds (`MASTER-RECURSION-{COMP,OOD,PI}-V2`) absorb
+  every inner's `(root_f0, roots[*])` via new `absorb_inner_fri_roots`
+  helper. Master STARK alphas now bound to the specific N-tuple of
+  inner FRI commitments.
+- **Piece 2** — `verify_master_with_fri_merkle_binding` re-extracts each
+  inner's expected Merkle openings (via `extract_fri_merkle_openings`)
+  and cross-checks per-block `(root, leaf_index, depth)` triples
+  against the binding bundle's `BatchedMerklePathPublicInputs.paths`.
+- **Piece 3** — Leaf encodings inherit from Phase 2.5's DS-aware
+  extractor — bundle's committed leaves are
+  `SHA3(DsLabel || ext_leaf_fields(f, s, q))` for the same inner
+  `per_layer_payloads` the sub-circuit 1 residue extraction reads.
+
+`MasterWithFriMerkleProof { master, fri_merkle_bindings: Vec<BatchedMerklePathProof> }`
+is the proof artifact. `prove_master_with_fri_merkle_binding(...,
+subset_paths: Option<&[usize]>)` allows tractable testing on subsets.
+
+**Anchored**: `prove_master_with_fri_merkle_binding_n1_subset_b10`
+ignored test verifies in 226 s end-to-end on a real inner v2 STARK.
+
+## Phase 4a — Sharded master-level FRI-Merkle binding (this phase)
+
+Applies the Phase 3 3-piece chain at BOTH levels of the sharded
+recursion:
+
+- N per-inner binding bundles (Phase 3 shape) — bind each inner's FRI
+  Merkle openings.
+- K per-shard binding bundles (new) — bind each first-level shard
+  master's FRI Merkle openings.
+- Super-master's V2 seed already absorbs shard masters' FRI roots via
+  the V1→V2 extension from Phase 3 (called recursively when proving
+  the super-master over shard_masters).
+
+**Wire-cost note**: Linear in N+K until Phase 4b recursive aggregation
+lands. The shard masters are carried in the proof artifact (Option A
+from design) because the verifier needs them for the per-shard
+binding's Piece 2 cross-check.
+
+`TwoLevelShardedFriMerkleProof { super_master, shard_masters,
+inner_fri_merkle_bindings, shard_fri_merkle_bindings, shard_size }` is
+the proof artifact.
+
+**Round-trip anchor** (`prove_sharded_with_fri_merkle_binding_n2_k1_subset_b10`,
+ignored): 2 inners → 1 shard master → super-master + 2 inner bindings
++ 1 shard binding → 3-piece verify at BOTH levels.
+
+## Phase 4b — Recursive aggregation wrap (DEFERRED)
+
+The Phase 4a artifact's wire is linear in N+K, defeating
+sharded-master-architecture.md's `$56/batch constant` target at scale.
+Phase 4b collapses the (N+K) binding bundles into a single outer
+`RecursiveStarkProof` via the existing `prove_master_recursive`
+gadget.
+
+**Key challenge**: `BatchedMerklePathProof.public` has shape
+`BatchedMerklePathPublicInputs` (per-path `(root, leaf_index, depth)`
+triples) — distinct from `RecursiveStarkPublicInputs`. Recursive
+aggregation needs either:
+
+1. A conversion that wraps a `BatchedMerklePathProof` into a
+   `RecursiveStarkProof`-shaped artifact (build composition + OOD +
+   perm-arg sub-circuits over the binding's FRI proof — mirroring
+   `extract_recursive_fri_residues` but with the binding's public-input
+   shape absorbed into the master's FS seed).
+2. OR a parallel aggregation gadget that natively handles
+   `BatchedMerklePathProof` plus `RecursiveStarkProof` in one outer
+   STARK.
+
+Option (1) preserves the single-gadget invariant and is the cleaner
+follow-up. Phase 4b is meaningful but not in this session's scope.
+
 ## Status
 
 - Phase 0 (this doc) — **done**.
