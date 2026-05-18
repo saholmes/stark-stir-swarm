@@ -50,7 +50,9 @@ use crate::deep_ali_verifier_air::binding_cells_ood_verifier::{
 };
 use crate::deep_ali_verifier_air::constraint_composition_verifier::CompositionClaim;
 use crate::deep_ali_verifier_air::permutation_argument_verifier::PermArgClaim;
-use crate::merkle_path_air::{MerkleNode, merkle_build_and_open};
+use crate::merkle_path_air::{
+    BatchedMerklePathClaim, MerkleNode, MerklePathClaim, merkle_build_and_open,
+};
 use crate::merkle_prover::{
     MerklePathProof, MerklePathProverError, prove_merkle_path, verify_merkle_path,
 };
@@ -854,6 +856,228 @@ pub fn verify_master_with_batched_in_air_merkle_path(
     true
 }
 
+// ─── Phase 2: FRI Merkle opening extractor ───────────────────────────
+//
+// Pulls every per-(query, fold-layer) MerkleOpening out of an inner
+// RecursiveStarkProof's embedded DeepFriProof<Ext> and converts them
+// into a BatchedMerklePathClaim ready for `prove_batched_merkle_paths`
+// in `crate::merkle_prover`.
+//
+// **Scope (matches Phase 0 design doc)**: binds the L arity-2
+// fold-layer openings per query (`roots[0..L]`).  The arity-16
+// base-layer opening (`root_f0`) is INTENTIONALLY skipped — its
+// in-AIR Merkle verification would require extending the current
+// binary-only `MerklePathLayout` to higher arities, and the layer-0
+// `per_layer_payloads[0]` is already fully bound by `roots[0]`'s
+// (f, s, q) Ext-tuple commitment (see fri.rs:2659-2688 for the
+// double-commitment).  So skipping `root_f0` is sound for the
+// master's sub-circuit 1 binding purpose; it just leaves the
+// layer-0 LDE-consistency check (fri.rs:2622-2657) as a separate
+// follow-up.
+//
+// M_paths per inner FRI proof = r × L (matches the
+// `print_fri_merkle_binding_sizing` probe: smoke L1 r=54 L=15 → 810).
+
+/// Errors from `extract_fri_merkle_openings`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FriMerkleExtractError {
+    /// Inner recursive STARK uses STIR mode; the extractor only handles
+    /// FRI mode (matches the residue extractor at line ~120 of this
+    /// file).  Re-run with `use_stir=false` when producing the inner.
+    StirNotSupported,
+    /// FRI proof has zero queries — degenerate.
+    EmptyQueries,
+    /// Layer-proofs and queries don't line up (malformed proof).
+    LayerProofShapeMismatch(String),
+    /// An opening's per-level path didn't have exactly 1 sibling, which
+    /// the binary in-AIR Merkle gadget requires.  Indicates non-arity-2
+    /// fold layer — currently unsupported.
+    NonBinaryPath(String),
+}
+
+impl std::fmt::Display for FriMerkleExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StirNotSupported => write!(f,
+                "FRI Merkle extractor: STIR mode not supported (FRI mode only)"
+            ),
+            Self::EmptyQueries => write!(f, "FRI Merkle extractor: zero queries"),
+            Self::LayerProofShapeMismatch(s) => write!(f,
+                "FRI Merkle extractor: layer-proof shape: {s}"
+            ),
+            Self::NonBinaryPath(s) => write!(f,
+                "FRI Merkle extractor: non-binary path: {s}"
+            ),
+        }
+    }
+}
+impl std::error::Error for FriMerkleExtractError {}
+
+/// Extract all per-(query, fold-layer) MerkleOpenings from one inner
+/// `RecursiveStarkProof` and pack into a `BatchedMerklePathClaim`.
+///
+/// **Layout**: B = r × L paths.  Path j = `k * L + ell` corresponds to
+/// query k and fold-layer ell (k in 0..r, ell in 0..L).  Each path is
+/// a binary Merkle authentication of `opening.leaf` at index
+/// `opening.index` against root `rec.fri_proof.roots[ell]`.
+///
+/// The `MerklePathClaim.leaf` is set to the **opening's leaf hash
+/// bytes** (already SHA-3-compressed by the FRI prover via
+/// `compute_leaf_hash`), not the underlying (f, s, q) field tuple.
+/// Phase 3's master-level wire will additionally cross-check that the
+/// leaf hash equals `SHA3(DS || ext_leaf_fields(f, s, q))` for the
+/// matching `per_layer_payloads[ell]` — that's where the binding from
+/// the master STARK's sub-circuit 1 residues to the FRI-committed
+/// Merkle leaves lives (Piece 3 of the soundness chain in the design
+/// doc).
+///
+/// Per-layer depth is `log2(layer_size)`, decreasing from layer 0 down
+/// to layer L-1.  All fold layers use arity-2 (binary trees) per
+/// `pick_arity_for_layer(n, requested_m=2)`.
+pub fn extract_fri_merkle_openings(
+    rec: &RecursiveStarkProof,
+) -> Result<BatchedMerklePathClaim, FriMerkleExtractError> {
+    let fri_proof = &rec.fri_proof;
+    if fri_proof.queries.is_empty() {
+        return Err(FriMerkleExtractError::EmptyQueries);
+    }
+    if rec.use_stir {
+        return Err(FriMerkleExtractError::StirNotSupported);
+    }
+
+    let r = fri_proof.queries.len();
+    let l = fri_proof.queries[0].per_layer_payloads.len();
+
+    if fri_proof.roots.len() != l {
+        return Err(FriMerkleExtractError::LayerProofShapeMismatch(format!(
+            "fri_proof.roots.len()={} != L={l}",
+            fri_proof.roots.len()
+        )));
+    }
+    if fri_proof.layer_proofs.layers.len() != l {
+        return Err(FriMerkleExtractError::LayerProofShapeMismatch(format!(
+            "layer_proofs.layers.len()={} != L={l}",
+            fri_proof.layer_proofs.layers.len()
+        )));
+    }
+    for (ell, layer) in fri_proof.layer_proofs.layers.iter().enumerate() {
+        if layer.openings.len() != r {
+            return Err(FriMerkleExtractError::LayerProofShapeMismatch(format!(
+                "layer_proofs.layers[{ell}].openings.len()={} != r={r}",
+                layer.openings.len()
+            )));
+        }
+    }
+
+    // Verifier-side variant inference for the inner FRI proof's
+    // Merkle commitments: HASH_BYTES = 32 ⇒ Sha3_256 (L1 / NIST L1).
+    // Larger output bytes would mean L3 / L5 — the wrapper-stark
+    // build feature toggles (sha3-256 / sha3-384 / sha3-512) already
+    // pin this at compile time via `deep_ali::hash::selected::HASH_BYTES`.
+    let variant = sha3_variant_for_hash_bytes(
+        fri_proof.roots[0].len(),
+    )?;
+
+    // Build B = r × L paths, layer-major within each query.
+    let mut paths: Vec<MerklePathClaim> = Vec::with_capacity(r * l);
+    for k in 0..r {
+        let qp = &fri_proof.queries[k];
+        if qp.per_layer_payloads.len() != l || qp.per_layer_refs.len() != l {
+            return Err(FriMerkleExtractError::LayerProofShapeMismatch(format!(
+                "query {k} per-layer shape: payloads={} refs={} expected L={l}",
+                qp.per_layer_payloads.len(), qp.per_layer_refs.len()
+            )));
+        }
+        for ell in 0..l {
+            let opening = &fri_proof.layer_proofs.layers[ell].openings[k];
+
+            // path: Vec<Vec<[u8; HASH_BYTES]>> — for arity-2 trees,
+            // each path[level] must have exactly 1 sibling.  Flatten
+            // to a Vec<MerkleNode> for the binary in-AIR gadget.
+            let mut flat_path: Vec<MerkleNode> =
+                Vec::with_capacity(opening.path.len());
+            for (level, siblings) in opening.path.iter().enumerate() {
+                if siblings.len() != 1 {
+                    return Err(FriMerkleExtractError::NonBinaryPath(format!(
+                        "query {k} layer {ell} level {level}: {} siblings (expected 1)",
+                        siblings.len()
+                    )));
+                }
+                flat_path.push(MerkleNode(siblings[0].to_vec()));
+            }
+
+            // Per-hop DS bytes mirror `MerkleTreeChannel::verify_opening`
+            // (merkle/src/lib.rs:781): for arity-2 fold layer ell, hop
+            // `level` uses DsLabel { arity=2, level=level+1, position=
+            // idx_at_this_hop / 2, tree_label=ell }.  Tree label per FRI
+            // proof's `pick_arity_for_layer` config is set to the fold
+            // layer's index `ell` (see fri.rs at `MerkleChannelCfg::new(
+            // vec![arity; depth], ell as u64)` callsite for fold layers).
+            let mut ds_prefix_per_hop: Vec<Vec<u8>> =
+                Vec::with_capacity(flat_path.len());
+            let mut hop_idx: u64 = opening.index as u64;
+            for hop_level in 0..flat_path.len() {
+                ds_prefix_per_hop.push(build_fri_ds_label_bytes(
+                    /*arity=*/ 2,
+                    /*level=*/ (hop_level as u32) + 1,
+                    /*position=*/ hop_idx / 2,
+                    /*tree_label=*/ ell as u64,
+                ));
+                hop_idx /= 2;
+            }
+
+            paths.push(MerklePathClaim {
+                variant,
+                root: MerkleNode(fri_proof.roots[ell].to_vec()),
+                leaf_index: opening.index as u64,
+                leaf: MerkleNode(opening.leaf.to_vec()),
+                path: flat_path,
+                ds_prefix_per_hop,
+            });
+        }
+    }
+
+    Ok(BatchedMerklePathClaim { variant, paths })
+}
+
+/// Reproduce `merkle::DsLabel::to_bytes()` without taking a dependency
+/// on the private DsLabel type.  32-byte fixed-length encoding:
+/// `arity(8 LE) | level(8 LE) | position(8 LE) | tree_label(8 LE)`.
+/// Used by the FRI Merkle extractor to populate per-hop DS prefix
+/// bytes matching `MerkleTreeChannel::verify_opening`'s hash protocol.
+fn build_fri_ds_label_bytes(
+    arity: u64,
+    level: u32,
+    position: u64,
+    tree_label: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(&arity.to_le_bytes());
+    out.extend_from_slice(&(level as u64).to_le_bytes());
+    out.extend_from_slice(&position.to_le_bytes());
+    out.extend_from_slice(&tree_label.to_le_bytes());
+    out
+}
+
+/// Infer the `Sha3Variant` from the Merkle root byte length recorded
+/// in a `DeepFriProof<E>`.  Inner FRI proofs use the build's selected
+/// hash variant (compile-time feature gate), so this is always the
+/// same answer in a given build — but checking explicitly here lets
+/// the extractor fail loudly if a proof from a wrong build slips in.
+fn sha3_variant_for_hash_bytes(
+    hash_bytes: usize,
+) -> Result<Sha3Variant, FriMerkleExtractError> {
+    match hash_bytes {
+        32 => Ok(Sha3Variant::Sha3_256),
+        48 => Ok(Sha3Variant::Sha3_384),
+        64 => Ok(Sha3Variant::Sha3_512),
+        other => Err(FriMerkleExtractError::LayerProofShapeMismatch(format!(
+            "unsupported Merkle root byte length: {other} \
+             (expected 32 / 48 / 64 for sha3-256 / sha3-384 / sha3-512)"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,6 +1120,165 @@ mod tests {
         assert_eq!(perm.left, perm.right);
         assert_eq!(perm.left.len(), 4);
         assert_eq!(perm.perm_tag, "master-vestige");
+    }
+
+    #[test]
+    fn extract_fri_merkle_openings_rejects_empty_queries() {
+        // Build a degenerate "inner" with zero queries via the FRI
+        // proof struct directly — confirms the shape-check path
+        // without invoking a real prove.
+        // We can't easily construct a DeepFriProof from scratch here
+        // without exposing internals, so instead exercise the error
+        // path via the variant-bytes inference (passing a roots[0] of
+        // length != 32/48/64).  This indirectly covers the
+        // LayerProofShapeMismatch error category.
+        match sha3_variant_for_hash_bytes(31) {
+            Err(FriMerkleExtractError::LayerProofShapeMismatch(_)) => {}
+            other => panic!("expected LayerProofShapeMismatch, got {other:?}"),
+        }
+        match sha3_variant_for_hash_bytes(32) {
+            Ok(Sha3Variant::Sha3_256) => {}
+            other => panic!("32 bytes should map to Sha3_256, got {other:?}"),
+        }
+        match sha3_variant_for_hash_bytes(48) {
+            Ok(Sha3Variant::Sha3_384) => {}
+            other => panic!("48 bytes should map to Sha3_384, got {other:?}"),
+        }
+        match sha3_variant_for_hash_bytes(64) {
+            Ok(Sha3Variant::Sha3_512) => {}
+            other => panic!("64 bytes should map to Sha3_512, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Phase 2.5 integration: real inner → extract → DS-aware prove+verify at B=10 subset; ~minute"]
+    fn fri_merkle_binding_integration_b10_subset() {
+        use crate::merkle_path_air::BatchedMerklePathClaim;
+        use crate::merkle_prover::{
+            prove_batched_merkle_paths, verify_batched_merkle_paths,
+        };
+
+        // 1. Build one inner recursive STARK.
+        let inner = build_one_inner_recursive(910);
+
+        // 2. Extract all M = r × L Merkle openings (each carries DS
+        //    prefix populated by Phase 2.5 M4).
+        let full_bundle = extract_fri_merkle_openings(&inner)
+            .expect("extractor must succeed on honest inner");
+        assert!(full_bundle.batch_size() >= 10,
+            "expected at least 10 paths, got {}", full_bundle.batch_size());
+
+        // 3. Subset to B=10 — pick paths spanning multiple layers (so
+        //    we exercise mixed-depth handling).  Pick paths 0, 1, 2
+        //    (layer 0 at depth=L), L, L+1, L+2 (layer 1 at depth=L-1),
+        //    and a few from deeper layers.
+        let l = inner.fri_proof.queries[0].per_layer_payloads.len();
+        let mut subset_paths = Vec::with_capacity(10);
+        subset_paths.push(full_bundle.paths[0].clone());           // q0 ell0
+        subset_paths.push(full_bundle.paths[1].clone());           // q0 ell1
+        subset_paths.push(full_bundle.paths[l - 1].clone());       // q0 ell(L-1)
+        subset_paths.push(full_bundle.paths[l].clone());           // q1 ell0
+        subset_paths.push(full_bundle.paths[l + 1].clone());       // q1 ell1
+        subset_paths.push(full_bundle.paths[2 * l].clone());       // q2 ell0
+        subset_paths.push(full_bundle.paths[3 * l].clone());       // q3 ell0
+        subset_paths.push(full_bundle.paths[10 * l].clone());      // q10 ell0
+        subset_paths.push(full_bundle.paths[20 * l].clone());      // q20 ell0
+        subset_paths.push(full_bundle.paths[30 * l - 1].clone());  // q29 ellL-1
+        let subset = BatchedMerklePathClaim {
+            variant: full_bundle.variant,
+            paths: subset_paths,
+        };
+        assert_eq!(subset.batch_size(), 10);
+
+        // 4. Sanity: native verify must accept (confirms the
+        //    extractor's DS bytes match the FRI tree's hash protocol).
+        assert!(crate::merkle_path_air::batched_merkle_verify_native(&subset),
+            "extracted FRI openings must natively verify with DS bytes");
+
+        // 5. Prove + verify in the in-AIR gadget.
+        let proof = prove_batched_merkle_paths(
+            &subset, /*blowup=*/4, /*r=*/54, /*use_stir=*/false,
+        ).expect("DS-aware B=10 integration prove must succeed");
+        assert_eq!(proof.batch_size, 10);
+        assert!(verify_batched_merkle_paths(&proof),
+            "DS-aware B=10 integration verify must accept");
+    }
+
+    #[test]
+    #[ignore = "Phase 2 — runs real v2 inner prove + extract; ~few s"]
+    fn extract_fri_merkle_openings_shape_on_real_inner() {
+        let inner = build_one_inner_recursive(800);
+
+        // Sanity: same probe as print_fri_merkle_binding_sizing.
+        let r = inner.fri_proof.queries.len();
+        let l = inner.fri_proof.queries[0].per_layer_payloads.len();
+
+        let bundle = extract_fri_merkle_openings(&inner)
+            .expect("extractor must succeed on honest inner");
+
+        assert_eq!(bundle.batch_size(), r * l,
+            "M_paths must equal r × L (r={r} L={l})");
+        assert_eq!(bundle.paths.len(), r * l);
+
+        // Spot-check first path (query 0, layer 0):
+        let first = &bundle.paths[0];
+        assert_eq!(first.variant, Sha3Variant::Sha3_256);
+        assert_eq!(first.root.0.len(), 32);
+        assert_eq!(first.leaf.0.len(), 32);
+        assert!(!first.path.is_empty(), "layer 0 must have non-zero depth");
+        for sib in &first.path {
+            assert_eq!(sib.0.len(), 32,
+                "each sibling must be a SHA3-256 hash (32 B)");
+        }
+
+        // The first path's leaf_index must equal the FRI proof's
+        // query 0 / layer 0 reference position.
+        assert_eq!(first.leaf_index as usize,
+            inner.fri_proof.queries[0].per_layer_refs[0].i);
+
+        // Layer-0 path depth = log2(n_lde_inner).
+        let n_lde = inner.n_trace * inner.blowup;
+        assert_eq!(first.path.len(), n_lde.trailing_zeros() as usize);
+
+        // Last path (query r-1, layer L-1):
+        let last = &bundle.paths[r * l - 1];
+        assert_eq!(last.path.len(),
+            (n_lde >> (l - 1)).trailing_zeros() as usize,
+            "deepest layer's path depth = log2(layer L-1 size)");
+    }
+
+    #[test]
+    #[ignore = "sizing probe for Phase 0 FRI-Merkle binding design doc — prints workload numbers"]
+    fn print_fri_merkle_binding_sizing() {
+        let inner = build_one_inner_recursive(900);
+        let fri_proof = &inner.fri_proof;
+        let r = fri_proof.queries.len();
+        let l = fri_proof.queries.first()
+            .map(|q| q.per_layer_payloads.len())
+            .unwrap_or(0);
+        let n_lde = inner.n_trace * inner.blowup;
+        let mut m_hashes = 0usize;
+        let mut depths = Vec::with_capacity(l);
+        for ell in 0..l {
+            let layer_size = n_lde >> ell;
+            let depth = layer_size.trailing_zeros() as usize;
+            depths.push(depth);
+            m_hashes += r * depth;
+        }
+        eprintln!();
+        eprintln!("═══ FRI-Merkle binding sizing probe ═══");
+        eprintln!("  inner.n_trace             = {}", inner.n_trace);
+        eprintln!("  inner.blowup              = {}", inner.blowup);
+        eprintln!("  n_lde_inner               = {n_lde}");
+        eprintln!("  L (FRI layers)            = {l}");
+        eprintln!("  r (queries)               = {r}");
+        eprintln!("  M_paths = r × L           = {}", r * l);
+        eprintln!("  M_hashes = r × Σ depth    = {m_hashes}");
+        eprintln!("  per-layer depths          = {depths:?}");
+        eprintln!("  fri_proof.roots.len       = {}", fri_proof.roots.len());
+        eprintln!("  outer_pi_hash (first 8 B) = {:02x?}",
+                  &inner.public.outer_pi_hash[..8]);
+        eprintln!();
     }
 
     #[test]

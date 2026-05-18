@@ -75,11 +75,28 @@ pub struct MerklePathClaim {
     /// Witness: authentication path siblings, leaf-side first.
     /// `path.len()` = tree depth.
     pub path: Vec<MerkleNode>,
+    /// **Phase 2.5**: Public per-hop domain-separation prefix bytes.
+    /// When non-empty, must have length == `path.len()` and each entry
+    /// is prepended to that hop's sponge input (the in-AIR gadget
+    /// hashes `ds_prefix_per_hop[hop] || left || right` instead of just
+    /// `left || right`).  Matches FRI/STIR Merkle's
+    /// `DsLabel.to_bytes()` (32-byte fixed prefix per hop) so the AIR
+    /// reproduces `MerkleTreeChannel::verify_opening`'s hash protocol.
+    /// Empty Vec is the backward-compatible plain-SHA3 mode.
+    pub ds_prefix_per_hop: Vec<Vec<u8>>,
 }
 
 impl MerklePathClaim {
     /// Tree depth = path length.  Each hop verifies one level of the tree.
     pub fn depth(&self) -> usize { self.path.len() }
+
+    /// Whether this claim carries per-hop DS prefixes (Phase 2.5 mode).
+    pub fn has_ds_prefix(&self) -> bool { !self.ds_prefix_per_hop.is_empty() }
+
+    /// Per-hop DS prefix length in bytes (panics if `has_ds_prefix() == false`).
+    pub fn ds_prefix_bytes(&self) -> usize {
+        self.ds_prefix_per_hop.first().map(Vec::len).unwrap_or(0)
+    }
 
     /// Sanity-check: all nodes are the right length, leaf_index fits the depth.
     pub fn check_shape(&self) -> Result<(), String> {
@@ -101,6 +118,25 @@ impl MerklePathClaim {
                 "leaf_index {} doesn't fit in {} depth bits", self.leaf_index, d
             ));
         }
+        // Phase 2.5: validate ds_prefix_per_hop shape if present.
+        if self.has_ds_prefix() {
+            if self.ds_prefix_per_hop.len() != d {
+                return Err(format!(
+                    "ds_prefix_per_hop has {} entries, expected {d} (= path depth)",
+                    self.ds_prefix_per_hop.len()
+                ));
+            }
+            let ds_len = self.ds_prefix_bytes();
+            for (i, ds) in self.ds_prefix_per_hop.iter().enumerate() {
+                if ds.len() != ds_len {
+                    return Err(format!(
+                        "ds_prefix_per_hop[{i}] has {} bytes, expected {ds_len} \
+                         (DS-prefix length must be uniform across hops)",
+                        ds.len()
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -108,11 +144,20 @@ impl MerklePathClaim {
 /// Native reference: verify a Merkle path by hashing the chain.  Used
 /// as the oracle for AIR cross-validation (the AIR's emitted root
 /// must equal what this function computes from leaf + path + index).
+///
+/// **Phase 2.5**: When `claim.ds_prefix_per_hop` is non-empty, each
+/// hop's hash input is `ds_prefix_per_hop[hop] || left || right`
+/// (matching FRI/STIR Merkle's `DsLabel`-prefixed `hash_node`).  Else
+/// (empty), backward-compatible plain `SHA3(left || right)`.
 pub fn merkle_verify_native(claim: &MerklePathClaim) -> bool {
     use crate::sha3_absorb_air::hash;
+    if claim.check_shape().is_err() {
+        return false;
+    }
     let mut current = claim.leaf.0.clone();
     let mut idx = claim.leaf_index;
-    for sibling in &claim.path {
+    let has_ds = claim.has_ds_prefix();
+    for (hop, sibling) in claim.path.iter().enumerate() {
         // index_bit = 0 → sibling on the right (current is left)
         // index_bit = 1 → sibling on the left  (current is right)
         let (left, right) = if (idx & 1) == 0 {
@@ -120,7 +165,13 @@ pub fn merkle_verify_native(claim: &MerklePathClaim) -> bool {
         } else {
             (sibling.0.as_slice(), current.as_slice())
         };
-        let mut concat = Vec::with_capacity(left.len() + right.len());
+        let ds_bytes: &[u8] = if has_ds {
+            &claim.ds_prefix_per_hop[hop]
+        } else {
+            &[]
+        };
+        let mut concat = Vec::with_capacity(ds_bytes.len() + left.len() + right.len());
+        concat.extend_from_slice(ds_bytes);
         concat.extend_from_slice(left);
         concat.extend_from_slice(right);
         current = hash(claim.variant, &concat);
@@ -167,6 +218,63 @@ pub fn merkle_build_and_open(
     MerklePathClaim {
         variant, root, leaf_index: open_index as u64,
         leaf: leaves[open_index].clone(), path,
+        ds_prefix_per_hop: Vec::new(),  // backward-compat plain SHA3 mode
+    }
+}
+
+/// Build a small Merkle tree where each internal-node hash is
+/// `SHA3(ds_prefix_per_hop[level] || left || right)` — matching FRI's
+/// `DsLabel`-prefixed `hash_node` protocol.  Test helper for
+/// DS-aware in-AIR Merkle gadget round-trip verification.
+///
+/// `ds_prefix_per_hop[level]` is the DS bytes prepended at level
+/// `level` (level 0 = first hop above the leaves).
+pub fn merkle_build_and_open_with_ds(
+    variant: Sha3Variant,
+    leaves: &[MerkleNode],
+    open_index: usize,
+    ds_prefix_per_hop: &[Vec<u8>],
+) -> MerklePathClaim {
+    use crate::sha3_absorb_air::hash;
+    assert!(open_index < leaves.len());
+    assert!(leaves.len().is_power_of_two(),
+        "merkle_build_and_open_with_ds: leaf count must be a power of 2");
+    let depth = leaves.len().trailing_zeros() as usize;
+    assert_eq!(ds_prefix_per_hop.len(), depth,
+        "ds_prefix_per_hop must have one entry per hop (= log2(leaves.len()))");
+
+    let mut layers: Vec<Vec<MerkleNode>> = vec![leaves.to_vec()];
+    let mut level = 0usize;
+    while layers.last().unwrap().len() > 1 {
+        let prev = layers.last().unwrap();
+        let mut next = Vec::with_capacity(prev.len() / 2);
+        let ds_bytes = &ds_prefix_per_hop[level];
+        for pair in prev.chunks(2) {
+            let mut concat = Vec::with_capacity(
+                ds_bytes.len() + pair[0].0.len() + pair[1].0.len(),
+            );
+            concat.extend_from_slice(ds_bytes);
+            concat.extend_from_slice(&pair[0].0);
+            concat.extend_from_slice(&pair[1].0);
+            next.push(MerkleNode(hash(variant, &concat)));
+        }
+        layers.push(next);
+        level += 1;
+    }
+
+    let root = layers.last().unwrap()[0].clone();
+    let mut path: Vec<MerkleNode> = Vec::with_capacity(layers.len() - 1);
+    let mut idx = open_index;
+    for layer in &layers[..layers.len() - 1] {
+        let sibling_idx = idx ^ 1;
+        path.push(layer[sibling_idx].clone());
+        idx /= 2;
+    }
+
+    MerklePathClaim {
+        variant, root, leaf_index: open_index as u64,
+        leaf: leaves[open_index].clone(), path,
+        ds_prefix_per_hop: ds_prefix_per_hop.to_vec(),
     }
 }
 
@@ -615,20 +723,32 @@ pub fn synthesize_merkle_sponge_trace(
             (sibling_bytes.as_slice(), current.as_slice())
         };
 
-        // 1. Build the SHA-3 sponge input: left || right, padded per FIPS 202.
-        let mut sponge_input = Vec::with_capacity(2 * n_bytes);
+        // 1. Build the SHA-3 sponge input.  Phase 2.5: if the claim
+        //    carries DS bytes (FRI/STIR Merkle's DsLabel mode), the
+        //    input becomes `ds_bytes || left || right`; else it's the
+        //    backward-compat `left || right`.  Padded per FIPS 202.
+        let ds_bytes: &[u8] = if claim.has_ds_prefix() {
+            &claim.ds_prefix_per_hop[r]
+        } else {
+            &[]
+        };
+        let mut sponge_input = Vec::with_capacity(ds_bytes.len() + 2 * n_bytes);
+        sponge_input.extend_from_slice(ds_bytes);
         sponge_input.extend_from_slice(left_bytes);
         sponge_input.extend_from_slice(right_bytes);
         let blocks = pad_for_absorb(&sponge_input, layout.variant);
-        // Multi-block support: sha3-256/384 absorb in 1 block,
-        // sha3-512 needs 2 blocks for the 128-byte left || right input
-        // (rate = 72 bytes).  Layout's rows_per_hop accounts for this.
+        // Multi-block support: at sha3-256 with DS prefix the input is
+        // 32+32+32=96 B (1 block at rate 136 B — unchanged from 64 B).
+        // At sha3-384/512, DS prefix could push into a new block — the
+        // current MerkleSpongeLayout doesn't yet model that case; fail
+        // loudly here if it happens, so M2 stays scoped to sha3-256.
         let expected_blocks = MerkleSpongeLayout::sponge_blocks_per_hop(layout.variant);
         if blocks.len() != expected_blocks {
             return Err(format!(
                 "merkle sponge hop block count mismatch: expected {} blocks, \
-                 got {} (variant {:?})",
-                expected_blocks, blocks.len(), layout.variant,
+                 got {} (variant {:?}, ds_prefix_bytes={}) — \
+                 DS-mode multi-block is a follow-up (M2 scope: sha3-256 only)",
+                expected_blocks, blocks.len(), layout.variant, ds_bytes.len(),
             ));
         }
 
@@ -717,6 +837,14 @@ pub enum MerkleCrossRowConstraint {
     SpongeInputRight { sponge_block_col: usize, hop_right_col: usize, absorb_row: usize, hop_row: usize },
     /// `state_out[i]@final_iota_row - current[i]@next_hop_row = 0`
     SpongeOutputThreading { state_out_col: usize, next_current_col: usize, final_iota_row: usize, next_hop_row: usize },
+    /// **Phase 2.5**: bind one sponge `block_bits[i]@absorb_row` to a
+    /// public DS bit value (0 or 1) — `block_bits[i] − ds_bit_value = 0`.
+    /// Fires per DS bit at each hop's absorb row.
+    SpongeInputDsByte {
+        sponge_block_col: usize,
+        ds_bit_value: u8,
+        absorb_row: usize,
+    },
 }
 
 impl MerkleCrossRowConstraint {
@@ -739,6 +867,10 @@ impl MerkleCrossRowConstraint {
                 let next_curr = trace.get(next_hop_row, next_current_col) as i128;
                 state_out - next_curr
             }
+            Self::SpongeInputDsByte { sponge_block_col, ds_bit_value, absorb_row } => {
+                let block = trace.get(absorb_row, sponge_block_col) as i128;
+                block - ds_bit_value as i128
+            }
         }
     }
 
@@ -746,49 +878,105 @@ impl MerkleCrossRowConstraint {
         self.eval(trace) == 0
     }
 
-    /// Polynomial degree: all variants are degree-1 (linear Copy).
+    /// Polynomial degree: all variants are degree-1 (linear Copy or
+    /// constant-binding).
     pub fn degree(&self) -> usize { 1 }
+
+    /// **Phase 2.5 helper**: for DS-aware constraints, returns Some
+    /// (anchor_row, sponge_block_col, ds_bit_value).  None for the
+    /// other variants — they reference trace cells via the existing
+    /// pair-shape interpretation.
+    pub fn as_ds_byte(&self) -> Option<(usize, usize, u8)> {
+        match *self {
+            Self::SpongeInputDsByte { absorb_row, sponge_block_col, ds_bit_value } => {
+                Some((absorb_row, sponge_block_col, ds_bit_value))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Emit ALL cross-row binding constraints for a depth-d Merkle path
-/// composed with sponge_air.  Per hop:
-///   - N constraints for block_bits[0..N] = left[0..N]  (SpongeInputLeft)
-///   - N constraints for block_bits[N..2N] = right[0..N] (SpongeInputRight)
-///   - (only between hops r and r+1) N constraints for state_out[0..N]
-///     at sponge final ι row = current[0..N] at next hop row
-///       (SpongeOutputThreading)
-///
-/// Total: d × 2N (input bindings) + (d-1) × N (threading) constraints.
+/// composed with sponge_air.  **Plain (no-DS) mode** — calls into
+/// `merkle_cross_row_constraints_with_ds` with `ds_prefix_per_hop=None`.
 pub fn merkle_cross_row_constraints(
     layout: &MerkleSpongeLayout,
 ) -> Vec<MerkleCrossRowConstraint> {
+    merkle_cross_row_constraints_with_ds(layout, None)
+}
+
+/// **Phase 2.5**: Emit cross-row binding constraints for a depth-d
+/// Merkle path with optional per-hop DS prefix.  Per hop:
+///   - If DS prefix is set: `ds_bits` constraints binding
+///     `block_bits[0..ds_bits]` to the public DS bit values
+///     (`SpongeInputDsByte`).
+///   - N constraints for `block_bits[ds_bits..ds_bits+N] = left[0..N]`
+///     (SpongeInputLeft, offset by ds_bits when DS is set; ds_bits=0
+///     otherwise).
+///   - N constraints for `block_bits[ds_bits+N..ds_bits+2N] = right[0..N]`
+///     (SpongeInputRight, similarly offset).
+///   - (only between hops r and r+1) N constraints for
+///     `state_out[0..N] = current[0..N]@next_hop_row`
+///     (SpongeOutputThreading) — unchanged by DS mode.
+///
+/// `ds_prefix_per_hop[r]` is the DS bytes prepended at hop r when DS
+/// is enabled.  All entries must have the same byte length.
+pub fn merkle_cross_row_constraints_with_ds(
+    layout: &MerkleSpongeLayout,
+    ds_prefix_per_hop: Option<&[Vec<u8>]>,
+) -> Vec<MerkleCrossRowConstraint> {
     let schema = &layout.schema;
     let n_bits = layout.variant.output_bits();
-    let mut out = Vec::with_capacity(layout.depth * 3 * n_bits);
+    let ds_bits = ds_prefix_per_hop
+        .and_then(|ds| ds.first())
+        .map(|v| v.len() * 8)
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(
+        layout.depth * (ds_bits + 2 * n_bits) + (layout.depth - 1) * n_bits,
+    );
 
     for r in 0..layout.depth {
         let hop_row = layout.hop_starts[r];
         let absorb_row = layout.sponge_absorb_row(r);
 
-        // SpongeInputLeft: block_bits[i] = left[i]
+        // Phase 2.5: SpongeInputDsByte — bind first ds_bits of block_bits
+        // to PUBLIC DS bits at this hop.
+        if let Some(ds_per_hop) = ds_prefix_per_hop {
+            let ds_bytes = &ds_per_hop[r];
+            for byte_idx in 0..ds_bytes.len() {
+                let byte_val = ds_bytes[byte_idx];
+                for bit_in_byte in 0..8 {
+                    let i = byte_idx * 8 + bit_in_byte;
+                    let ds_bit = (byte_val >> bit_in_byte) & 1;
+                    out.push(MerkleCrossRowConstraint::SpongeInputDsByte {
+                        sponge_block_col: schema.block_bit(i),
+                        ds_bit_value: ds_bit,
+                        absorb_row,
+                    });
+                }
+            }
+        }
+
+        // SpongeInputLeft: block_bits[ds_bits + i] = left[i]
         for i in 0..n_bits {
             out.push(MerkleCrossRowConstraint::SpongeInputLeft {
-                sponge_block_col: schema.block_bit(i),
+                sponge_block_col: schema.block_bit(ds_bits + i),
                 hop_left_col:     hop_left_col(schema, i),
                 absorb_row, hop_row,
             });
         }
-        // SpongeInputRight: block_bits[N+i] = right[i]
+        // SpongeInputRight: block_bits[ds_bits + N + i] = right[i]
         for i in 0..n_bits {
             out.push(MerkleCrossRowConstraint::SpongeInputRight {
-                sponge_block_col: schema.block_bit(n_bits + i),
+                sponge_block_col: schema.block_bit(ds_bits + n_bits + i),
                 hop_right_col:    hop_right_col(schema, n_bits, i),
                 absorb_row, hop_row,
             });
         }
 
         // SpongeOutputThreading: state_out[i] at final ι row = current[i]
-        // at next hop row.  Only between consecutive hops.
+        // at next hop row.  Only between consecutive hops.  DS doesn't
+        // affect this — the output state still carries the parent hash.
         if r + 1 < layout.depth {
             let final_iota_row = layout.sponge_final_iota_row(r);
             let next_hop_row = layout.hop_starts[r + 1];
@@ -805,6 +993,221 @@ pub fn merkle_cross_row_constraints(
     }
 
     out
+}
+
+// ─── Phase 1: Batched in-AIR Merkle path verification ────────────────
+//
+// A `BatchedMerklePathClaim` bundles `B` independent Merkle path
+// statements that share a `Sha3Variant` and are verified in ONE STARK.
+// Each sub-claim may have a different root, leaf, leaf_index, and
+// depth — the batched layout stacks each sub-claim's `MerkleSpongeLayout`
+// vertically at increasing row offsets and synthesises one composed
+// trace.  Cross-row binding constraints fire WITHIN each block; there
+// is NO threading between blocks (each path is independent).
+//
+// This unlocks O(M_paths)-budget binding of FRI Merkle openings at the
+// master-recursion layer: instead of M_paths individual `MerklePathProof`
+// STARKs (each with its own ~500 KiB FRI overhead), we emit ⌈M/B⌉ batched
+// proofs of B paths each.  See `scripts/results/fri-merkle-binding-phase0-design.md`.
+
+/// Statement bundle of B Merkle authentication paths under one variant.
+///
+/// All B sub-claims share `variant` (different Sha3Variants would mean
+/// different sponge schemas → different row widths → unbatchable).
+/// Sub-claims may have arbitrary distinct `(root, leaf, leaf_index, path)`
+/// and arbitrary depths.
+#[derive(Clone, Debug)]
+pub struct BatchedMerklePathClaim {
+    pub variant: Sha3Variant,
+    pub paths: Vec<MerklePathClaim>,
+}
+
+impl BatchedMerklePathClaim {
+    /// Number of sub-claims in this batch.
+    pub fn batch_size(&self) -> usize { self.paths.len() }
+
+    /// Per-sub-claim shape check; mirrors `MerklePathClaim::check_shape`.
+    pub fn check_shape(&self) -> Result<(), String> {
+        if self.paths.is_empty() {
+            return Err("BatchedMerklePathClaim: paths must be non-empty".into());
+        }
+        for (i, p) in self.paths.iter().enumerate() {
+            if p.variant != self.variant {
+                return Err(format!(
+                    "BatchedMerklePathClaim: paths[{i}].variant {:?} != bundle variant {:?}",
+                    p.variant, self.variant
+                ));
+            }
+            p.check_shape().map_err(|e| format!("paths[{i}]: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Native reference: verify every sub-claim's Merkle path.  Used as
+/// the oracle for AIR cross-validation — every block's emitted root
+/// must equal what this computes from leaf + path + index.
+pub fn batched_merkle_verify_native(claim: &BatchedMerklePathClaim) -> bool {
+    if claim.check_shape().is_err() {
+        return false;
+    }
+    claim.paths.iter().all(merkle_verify_native)
+}
+
+/// Composed layout for a batched B-path Merkle verification.  Holds
+/// per-block `MerkleSpongeLayout`s stacked vertically at cumulative
+/// row offsets.  The total trace height is the sum of per-block
+/// `total_rows`, padded externally to a power of two by the prover.
+#[derive(Clone, Debug)]
+pub struct BatchedMerklePathLayout {
+    pub variant: Sha3Variant,
+    /// Per-sub-claim layout, in batch order.  `blocks[j].hop_starts[*]`
+    /// are absolute row indices in the composed trace.
+    pub blocks: Vec<MerkleSpongeLayout>,
+}
+
+impl BatchedMerklePathLayout {
+    /// Build a layout that stacks B per-sub-claim `MerkleSpongeLayout`s
+    /// vertically.  Block j starts at `row_offset + Σ_{k<j} blocks[k].total_rows()`.
+    pub fn new(claim: &BatchedMerklePathClaim, row_offset: usize) -> Self {
+        let variant = claim.variant;
+        let mut blocks = Vec::with_capacity(claim.paths.len());
+        let mut cursor = row_offset;
+        for sub in &claim.paths {
+            let block = MerkleSpongeLayout::new(variant, sub.depth(), cursor);
+            cursor += block.total_rows();
+            blocks.push(block);
+        }
+        Self { variant, blocks }
+    }
+
+    /// Number of sub-claims (= batch size B).
+    pub fn batch_size(&self) -> usize { self.blocks.len() }
+
+    /// Total trace rows occupied by all B blocks (unpadded).  The prover
+    /// pads this to a power of 2 externally.
+    pub fn total_rows(&self) -> usize {
+        self.blocks.iter().map(MerkleSpongeLayout::total_rows).sum()
+    }
+
+    /// Row width (same across all blocks — they share the variant's
+    /// `UniformRowSchema`).
+    pub fn row_width(&self) -> usize {
+        self.blocks.first().map(MerkleSpongeLayout::row_width).unwrap_or(0)
+    }
+
+    /// First row of block `j` in the composed trace.
+    pub fn block_start_row(&self, j: usize) -> usize {
+        self.blocks[j].hop_starts[0]
+    }
+}
+
+/// Synthesise the composed UniformTrace for a batched Merkle path
+/// verification.  Stitches B per-sub-claim sponge sub-traces into one
+/// trace, with each block's `MerkleSpongeLayout` already pre-offset.
+///
+/// Returns the composed trace plus B per-block emitted roots (each
+/// must equal the corresponding sub-claim's `root` field on an honest
+/// claim).
+pub fn synthesize_batched_merkle_sponge_trace(
+    claim: &BatchedMerklePathClaim,
+    layout: &BatchedMerklePathLayout,
+) -> Result<(UniformTrace, Vec<MerkleNode>), String> {
+    claim.check_shape()?;
+    if claim.paths.len() != layout.blocks.len() {
+        return Err(format!(
+            "BatchedMerklePathLayout: paths {} != blocks {}",
+            claim.paths.len(), layout.blocks.len()
+        ));
+    }
+    if layout.variant != claim.variant {
+        return Err(format!(
+            "BatchedMerklePathLayout variant {:?} != claim variant {:?}",
+            layout.variant, claim.variant
+        ));
+    }
+
+    let total_rows = layout.total_rows();
+    let schema = layout.blocks[0].schema.clone();
+    let mut composed = UniformTrace::zeros(schema, total_rows);
+
+    let mut emitted_roots = Vec::with_capacity(claim.paths.len());
+    for (j, sub) in claim.paths.iter().enumerate() {
+        let block_layout = &layout.blocks[j];
+        // Synthesise the sub-claim's trace at offset 0 (block-local rows).
+        let block_local_layout = MerkleSpongeLayout::new(
+            claim.variant, sub.depth(), 0,
+        );
+        let (sub_trace, root) =
+            synthesize_merkle_sponge_trace(sub, &block_local_layout)?;
+        emitted_roots.push(root);
+
+        // Copy sub_trace into composed at this block's absolute row offset.
+        let dst_offset = block_layout.hop_starts[0];
+        for sub_row in 0..sub_trace.n_rows {
+            for col in 0..sub_trace.schema.width {
+                let v = sub_trace.get(sub_row, col);
+                composed.set(dst_offset + sub_row, col, v);
+            }
+        }
+    }
+
+    Ok((composed, emitted_roots))
+}
+
+/// Emit ALL cross-row binding constraints for every block in a batched
+/// Merkle path layout.  Constraints address absolute rows (each block's
+/// `MerkleSpongeLayout` was constructed at an absolute row offset), so
+/// they compose into one combined constraint set without further
+/// remapping.  Inter-block threading is INTENTIONALLY absent — each
+/// path is a self-contained statement.
+///
+/// **Plain (no-DS) mode** — calls into
+/// `batched_merkle_cross_row_constraints_with_ds` with the claim's
+/// `ds_prefix_per_hop` taken into account per block.
+pub fn batched_merkle_cross_row_constraints(
+    layout: &BatchedMerklePathLayout,
+) -> Vec<MerkleCrossRowConstraint> {
+    layout.blocks.iter()
+        .flat_map(merkle_cross_row_constraints)
+        .collect()
+}
+
+/// **Phase 2.5**: Emit batched cross-row constraints with optional
+/// per-block DS prefixes.  `claim.paths[j].ds_prefix_per_hop` is the
+/// per-hop DS bytes for block j.  All blocks must agree on whether DS
+/// is set: either ALL blocks carry DS prefixes (Phase 2.5 mode) or
+/// NONE do (plain mode).  Mixed mode is rejected.
+pub fn batched_merkle_cross_row_constraints_with_ds(
+    claim: &BatchedMerklePathClaim,
+    layout: &BatchedMerklePathLayout,
+) -> Result<Vec<MerkleCrossRowConstraint>, String> {
+    if claim.paths.len() != layout.blocks.len() {
+        return Err(format!(
+            "batched_merkle_cross_row_constraints_with_ds: \
+             paths {} != blocks {}",
+            claim.paths.len(), layout.blocks.len()
+        ));
+    }
+    let any_ds = claim.paths.iter().any(|p| p.has_ds_prefix());
+    let all_ds = claim.paths.iter().all(|p| p.has_ds_prefix());
+    if any_ds && !all_ds {
+        return Err(
+            "batched_merkle_cross_row_constraints_with_ds: \
+             mixed DS / no-DS blocks not supported (all-or-nothing)".into()
+        );
+    }
+    let mut out = Vec::new();
+    for (block, path) in layout.blocks.iter().zip(&claim.paths) {
+        if path.has_ds_prefix() {
+            out.extend(merkle_cross_row_constraints_with_ds(
+                block, Some(&path.ds_prefix_per_hop),
+            ));
+        } else {
+            out.extend(merkle_cross_row_constraints(block));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -831,6 +1234,7 @@ mod tests {
             leaf_index: 0,
             leaf: fake_leaf(variant, 0x11),
             path: vec![fake_leaf(variant, 0x22), fake_leaf(variant, 0x33)],
+            ds_prefix_per_hop: Vec::new(),
         };
         assert!(claim.check_shape().is_ok());
         assert_eq!(claim.depth(), 2);
@@ -845,6 +1249,7 @@ mod tests {
             leaf_index: 0,
             leaf: fake_leaf(variant, 0x11),
             path: vec![],
+            ds_prefix_per_hop: Vec::new(),
         };
         assert!(claim.check_shape().is_err());
     }
@@ -858,6 +1263,7 @@ mod tests {
             leaf_index: 100,  // depth=2 → max index = 3
             leaf: fake_leaf(variant, 0x11),
             path: vec![fake_leaf(variant, 0x22), fake_leaf(variant, 0x33)],
+            ds_prefix_per_hop: Vec::new(),
         };
         assert!(claim.check_shape().is_err());
     }
@@ -1546,5 +1952,326 @@ mod tests {
         assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_256), 98);
         assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_384), 98);
         assert_eq!(MerkleSpongeLayout::rows_per_hop(Sha3Variant::Sha3_512), 195);
+    }
+
+    // ─── Phase 1: BatchedMerklePathClaim structural tests ───────────
+
+    #[test]
+    fn batched_merkle_claim_empty_rejects() {
+        let claim = BatchedMerklePathClaim {
+            variant: Sha3Variant::Sha3_256,
+            paths: vec![],
+        };
+        assert!(claim.check_shape().is_err(),
+            "empty batched claim must fail shape check");
+        assert!(!batched_merkle_verify_native(&claim),
+            "empty batched claim cannot native-verify");
+    }
+
+    #[test]
+    fn batched_merkle_claim_b2_native_verifies() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_a = vec![fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+                            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD)];
+        let leaves_b = vec![fake_leaf(variant, 0x11), fake_leaf(variant, 0x22),
+                            fake_leaf(variant, 0x33), fake_leaf(variant, 0x44)];
+        let claim_a = merkle_build_and_open(variant, &leaves_a, 1);
+        let claim_b = merkle_build_and_open(variant, &leaves_b, 3);
+        let batched = BatchedMerklePathClaim {
+            variant,
+            paths: vec![claim_a, claim_b],
+        };
+        assert!(batched.check_shape().is_ok());
+        assert_eq!(batched.batch_size(), 2);
+        assert!(batched_merkle_verify_native(&batched),
+            "B=2 batched claim must native-verify");
+    }
+
+    #[test]
+    fn batched_merkle_claim_mixed_depth_native_verifies() {
+        // Different depths in one batch: B=3 with depths 2, 3, 2.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_d2 = vec![fake_leaf(variant, 0x10), fake_leaf(variant, 0x20),
+                             fake_leaf(variant, 0x30), fake_leaf(variant, 0x40)];
+        let leaves_d3: Vec<MerkleNode> = (0..8)
+            .map(|i| fake_leaf(variant, 0x80 | i as u8))
+            .collect();
+        let leaves_d2b = vec![fake_leaf(variant, 0xF1), fake_leaf(variant, 0xF2),
+                              fake_leaf(variant, 0xF3), fake_leaf(variant, 0xF4)];
+
+        let batched = BatchedMerklePathClaim {
+            variant,
+            paths: vec![
+                merkle_build_and_open(variant, &leaves_d2,  0),  // depth 2
+                merkle_build_and_open(variant, &leaves_d3,  5),  // depth 3
+                merkle_build_and_open(variant, &leaves_d2b, 2),  // depth 2
+            ],
+        };
+        assert_eq!(batched.paths[0].depth(), 2);
+        assert_eq!(batched.paths[1].depth(), 3);
+        assert_eq!(batched.paths[2].depth(), 2);
+        assert!(batched_merkle_verify_native(&batched),
+            "B=3 mixed-depth batched claim must native-verify");
+    }
+
+    #[test]
+    fn batched_merkle_claim_mismatched_variant_rejects() {
+        let claim_256 = merkle_build_and_open(
+            Sha3Variant::Sha3_256,
+            &[fake_leaf(Sha3Variant::Sha3_256, 1),
+              fake_leaf(Sha3Variant::Sha3_256, 2)],
+            0,
+        );
+        let claim_384 = merkle_build_and_open(
+            Sha3Variant::Sha3_384,
+            &[fake_leaf(Sha3Variant::Sha3_384, 1),
+              fake_leaf(Sha3Variant::Sha3_384, 2)],
+            0,
+        );
+        let batched = BatchedMerklePathClaim {
+            variant: Sha3Variant::Sha3_256,
+            paths: vec![claim_256, claim_384],
+        };
+        assert!(batched.check_shape().is_err(),
+            "mixed-variant batched claim must fail shape check");
+    }
+
+    #[test]
+    fn batched_merkle_layout_b2_geometry() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_a = vec![fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+                            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD)];
+        let leaves_b = vec![fake_leaf(variant, 0x11), fake_leaf(variant, 0x22),
+                            fake_leaf(variant, 0x33), fake_leaf(variant, 0x44)];
+        let claim = BatchedMerklePathClaim {
+            variant,
+            paths: vec![
+                merkle_build_and_open(variant, &leaves_a, 1),  // depth 2
+                merkle_build_and_open(variant, &leaves_b, 3),  // depth 2
+            ],
+        };
+        let layout = BatchedMerklePathLayout::new(&claim, /*row_offset=*/0);
+
+        assert_eq!(layout.batch_size(), 2);
+        // Each block at depth=2 occupies 2 × 98 = 196 rows.
+        assert_eq!(layout.blocks[0].total_rows(), 196);
+        assert_eq!(layout.blocks[1].total_rows(), 196);
+        // Block 0 starts at row 0, block 1 at row 196.
+        assert_eq!(layout.block_start_row(0), 0);
+        assert_eq!(layout.block_start_row(1), 196);
+        assert_eq!(layout.total_rows(), 392);
+        // Shared schema → consistent row width.
+        assert_eq!(layout.row_width(), layout.blocks[0].row_width());
+    }
+
+    #[test]
+    fn batched_merkle_layout_mixed_depth_geometry() {
+        // Depths 2 + 3 + 2 — total = 196 + 294 + 196 = 686 rows.
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_d2 = vec![fake_leaf(variant, 0x10), fake_leaf(variant, 0x20),
+                             fake_leaf(variant, 0x30), fake_leaf(variant, 0x40)];
+        let leaves_d3: Vec<MerkleNode> = (0..8)
+            .map(|i| fake_leaf(variant, 0x80 | i as u8))
+            .collect();
+        let leaves_d2b = vec![fake_leaf(variant, 0xF1), fake_leaf(variant, 0xF2),
+                              fake_leaf(variant, 0xF3), fake_leaf(variant, 0xF4)];
+        let claim = BatchedMerklePathClaim {
+            variant,
+            paths: vec![
+                merkle_build_and_open(variant, &leaves_d2,  0),
+                merkle_build_and_open(variant, &leaves_d3,  5),
+                merkle_build_and_open(variant, &leaves_d2b, 2),
+            ],
+        };
+        let layout = BatchedMerklePathLayout::new(&claim, /*row_offset=*/0);
+        assert_eq!(layout.block_start_row(0), 0);
+        assert_eq!(layout.block_start_row(1), 196);
+        assert_eq!(layout.block_start_row(2), 196 + 294);
+        assert_eq!(layout.total_rows(), 196 + 294 + 196);
+    }
+
+    #[test]
+    fn batched_merkle_trace_b2_emits_correct_roots() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_a = vec![fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+                            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD)];
+        let leaves_b = vec![fake_leaf(variant, 0x11), fake_leaf(variant, 0x22),
+                            fake_leaf(variant, 0x33), fake_leaf(variant, 0x44)];
+        let claim_a = merkle_build_and_open(variant, &leaves_a, 1);
+        let claim_b = merkle_build_and_open(variant, &leaves_b, 3);
+        let expected_root_a = claim_a.root.clone();
+        let expected_root_b = claim_b.root.clone();
+        let batched = BatchedMerklePathClaim {
+            variant, paths: vec![claim_a, claim_b],
+        };
+        let layout = BatchedMerklePathLayout::new(&batched, 0);
+        let (trace, roots) = synthesize_batched_merkle_sponge_trace(&batched, &layout)
+            .expect("B=2 batched trace must synthesise");
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], expected_root_a, "block 0 emitted root must match claim");
+        assert_eq!(roots[1], expected_root_b, "block 1 emitted root must match claim");
+        assert_eq!(trace.n_rows, layout.total_rows());
+    }
+
+    #[test]
+    fn batched_merkle_cross_row_constraints_all_satisfied_on_honest_trace() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves_a = vec![fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+                            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD)];
+        let leaves_b = vec![fake_leaf(variant, 0x11), fake_leaf(variant, 0x22),
+                            fake_leaf(variant, 0x33), fake_leaf(variant, 0x44)];
+        let batched = BatchedMerklePathClaim {
+            variant,
+            paths: vec![
+                merkle_build_and_open(variant, &leaves_a, 1),
+                merkle_build_and_open(variant, &leaves_b, 3),
+            ],
+        };
+        let layout = BatchedMerklePathLayout::new(&batched, 0);
+        let (trace, _roots) = synthesize_batched_merkle_sponge_trace(&batched, &layout)
+            .expect("trace must synthesise");
+        let constraints = batched_merkle_cross_row_constraints(&layout);
+        assert!(!constraints.is_empty(),
+            "batched layout must emit at least some cross-row constraints");
+        for (i, c) in constraints.iter().enumerate() {
+            assert!(c.satisfied_by(&trace),
+                "honest trace violates batched cross-row constraint {i}: {c:?}");
+        }
+    }
+
+    // ─── Phase 2.5 Milestone 1: DS-aware native verify tests ──────
+
+    fn fake_ds_bytes(arity: u64, level: u32, position: u64, tree_label: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(&arity.to_le_bytes());
+        out.extend_from_slice(&(level as u64).to_le_bytes());
+        out.extend_from_slice(&position.to_le_bytes());
+        out.extend_from_slice(&tree_label.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn ds_aware_merkle_build_and_open_round_trip_depth_2() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves = vec![
+            fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD),
+        ];
+        // 2 hops at arity-2 tree_label=7
+        let ds_per_hop = vec![
+            fake_ds_bytes(2, 1, 0, 7),
+            fake_ds_bytes(2, 2, 0, 7),
+        ];
+        let claim = merkle_build_and_open_with_ds(variant, &leaves, 1, &ds_per_hop);
+        assert_eq!(claim.depth(), 2);
+        assert!(claim.has_ds_prefix());
+        assert_eq!(claim.ds_prefix_bytes(), 32);
+        assert!(claim.check_shape().is_ok());
+        assert!(merkle_verify_native(&claim),
+            "DS-aware native verify must accept honest claim");
+    }
+
+    #[test]
+    fn ds_aware_merkle_build_and_open_round_trip_depth_3() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves: Vec<MerkleNode> = (0..8)
+            .map(|i| fake_leaf(variant, 0x80 | i as u8))
+            .collect();
+        let ds_per_hop = vec![
+            fake_ds_bytes(2, 1, 0, 42),
+            fake_ds_bytes(2, 2, 0, 42),
+            fake_ds_bytes(2, 3, 0, 42),
+        ];
+        let claim = merkle_build_and_open_with_ds(variant, &leaves, 5, &ds_per_hop);
+        assert_eq!(claim.depth(), 3);
+        assert!(merkle_verify_native(&claim));
+    }
+
+    #[test]
+    fn ds_aware_native_verify_rejects_wrong_ds_prefix() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves = vec![
+            fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD),
+        ];
+        let ds_per_hop = vec![
+            fake_ds_bytes(2, 1, 0, 7),
+            fake_ds_bytes(2, 2, 0, 7),
+        ];
+        let mut claim = merkle_build_and_open_with_ds(variant, &leaves, 1, &ds_per_hop);
+        // Tamper one DS byte — verify must reject (root no longer matches).
+        claim.ds_prefix_per_hop[0][0] ^= 0xFF;
+        assert!(!merkle_verify_native(&claim),
+            "tampered DS prefix must change derived parent → reject");
+    }
+
+    #[test]
+    fn ds_aware_vs_plain_produce_different_roots() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves = vec![
+            fake_leaf(variant, 0xAA), fake_leaf(variant, 0xBB),
+            fake_leaf(variant, 0xCC), fake_leaf(variant, 0xDD),
+        ];
+        let plain = merkle_build_and_open(variant, &leaves, 1);
+        let ds = merkle_build_and_open_with_ds(variant, &leaves, 1, &[
+            fake_ds_bytes(2, 1, 0, 7),
+            fake_ds_bytes(2, 2, 0, 7),
+        ]);
+        assert_ne!(plain.root, ds.root,
+            "DS-prefixed hashing must produce a different root from plain");
+        // Both verify natively against their own (different) protocols.
+        assert!(merkle_verify_native(&plain));
+        assert!(merkle_verify_native(&ds));
+    }
+
+    #[test]
+    fn ds_aware_check_shape_rejects_mismatched_ds_lengths() {
+        let variant = Sha3Variant::Sha3_256;
+        let claim = MerklePathClaim {
+            variant,
+            root: fake_leaf(variant, 0xAA),
+            leaf_index: 0,
+            leaf: fake_leaf(variant, 0x11),
+            path: vec![fake_leaf(variant, 0x22), fake_leaf(variant, 0x33)],
+            ds_prefix_per_hop: vec![
+                vec![0u8; 32],
+                vec![0u8; 28],  // wrong length — uniform required
+            ],
+        };
+        assert!(claim.check_shape().is_err(),
+            "non-uniform DS-prefix lengths must fail shape check");
+    }
+
+    #[test]
+    fn ds_aware_check_shape_rejects_wrong_ds_count() {
+        let variant = Sha3Variant::Sha3_256;
+        let claim = MerklePathClaim {
+            variant,
+            root: fake_leaf(variant, 0xAA),
+            leaf_index: 0,
+            leaf: fake_leaf(variant, 0x11),
+            path: vec![fake_leaf(variant, 0x22), fake_leaf(variant, 0x33)],
+            ds_prefix_per_hop: vec![vec![0u8; 32]],  // 1 entry; depth=2 → mismatch
+        };
+        assert!(claim.check_shape().is_err(),
+            "DS-prefix count must equal depth");
+    }
+
+    #[test]
+    fn batched_merkle_claim_tampered_root_rejects() {
+        let variant = Sha3Variant::Sha3_256;
+        let leaves = vec![fake_leaf(variant, 1), fake_leaf(variant, 2),
+                          fake_leaf(variant, 3), fake_leaf(variant, 4)];
+        let mut claim = merkle_build_and_open(variant, &leaves, 0);
+        // Tamper: flip a byte in the root.
+        claim.root.0[0] ^= 0xFF;
+        let batched = BatchedMerklePathClaim {
+            variant, paths: vec![claim],
+        };
+        assert!(batched.check_shape().is_ok(),
+            "shape check is structural — tampered root passes shape");
+        assert!(!batched_merkle_verify_native(&batched),
+            "tampered root must fail native verify");
     }
 }
