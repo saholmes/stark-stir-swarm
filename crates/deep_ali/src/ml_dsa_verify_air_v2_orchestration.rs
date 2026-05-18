@@ -768,7 +768,7 @@ pub(crate) fn comb_coeffs(num: usize, pi_hash: &[u8; 32], domain_sep: &[u8]) -> 
     }).collect()
 }
 
-pub fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+pub fn v2_fri_params(n0: usize, blowup: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     // Default: **STIR** mode (since `verify_one_sub_air_with_trace`'s
     // per-query trace-cell soundness check was generalized to handle
     // both FRI and STIR proof structures via
@@ -782,14 +782,25 @@ pub fn v2_fri_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     let use_fri = std::env::var("MMIYC_V2_USE_FRI")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // Scale r with blowup so the v2 sub-AIRs stay at the active
+    // NIST PQ Level (sha3-256 → L1, sha3-384 → L3, sha3-512 → L5)
+    // regardless of the inner blowup.  Pre-2026-05-17 this was a
+    // hardcoded `V2_NUM_QUERIES = 54` calibrated only for blowup=32;
+    // at lower blowups the v2 inner silently slipped below L1
+    // (e.g. 54 bits at blowup=4).  Now it auto-scales:
+    //   blowup= 4 → r = 130 (TARGET_IT_BITS=128 at sha3-256)
+    //   blowup= 8 → r =  88
+    //   blowup=16 → r =  66
+    //   blowup=32 → r =  54 (matches the legacy V2_NUM_QUERIES)
+    let r = crate::stark_level::num_queries_for_blowup(blowup);
     DeepFriParams {
         schedule: make_v2_schedule(n0),
-        r: V2_NUM_QUERIES,
+        r,
         seed_z: V2_SEED_Z,
         coeff_commit_final: true,
         d_final: 1,
         stir: !use_fri,
-        s0: V2_NUM_QUERIES,
+        s0: r,
         public_inputs_hash: Some(pi_hash),
     }
 }
@@ -819,7 +830,7 @@ fn prove_one_sub_air(
     let lde = lde_trace_columns(trace, n_trace, blowup).expect("LDE");
     let c_eval = c_eval_fn(&lde, n_trace, blowup);
     drop(lde);
-    let params = v2_fri_params(n0, pi_hash);
+    let params = v2_fri_params(n0, blowup, pi_hash);
     let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
     serialize_fri(&proof)
 }
@@ -841,7 +852,7 @@ fn verify_one_sub_air(
     // itself carries this metadata: `stir_coset_evals.is_some()`
     // iff STIR was used.  Override the env-derived default with
     // the proof-derived truth.
-    let mut params = v2_fri_params(n0, pi_hash);
+    let mut params = v2_fri_params(n0, blowup, pi_hash);
     params.stir = proof.stir_coset_evals.is_some();
     if deep_fri_verify::<Ext>(&params, &proof) {
         Ok(())
@@ -902,7 +913,7 @@ pub fn prove_v2_real_from_traces(
             |lde, n_trace, blowup, comb_coeffs| {
                 crate::deep_ali_merge_ml_dsa_v17(lde, comb_coeffs, F::zero(), n_trace, blowup).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
     // L5 inclusion proofs REMOVED 2026-05-12 — superseded by L5 OOD
     // binding.  Empty Vec preserves wire format; verifier skips the
@@ -924,7 +935,7 @@ pub fn prove_v2_real_from_traces(
             let domain_sep = format!("l5_v17_a_ntt_{ll}").into_bytes();
             let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
                 &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
-                &domain_sep, v2_fri_params,
+                &domain_sep, |n0, ph| v2_fri_params(n0, blowup, ph),
             );
             bccs.push(commit.to_bytes());
         }
@@ -936,7 +947,7 @@ pub fn prove_v2_real_from_traces(
             let col_idx = eq_base + col_fn;
             let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
                 &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
-                ds, v2_fri_params,
+                ds, |n0, ph| v2_fri_params(n0, blowup, ph),
             );
             bccs.push(commit.to_bytes());
         }
@@ -964,7 +975,7 @@ pub fn prove_v2_real_from_traces(
             |lde, n_trace, blowup, comb_coeffs| {
                 crate::deep_ali_merge_t7_chained_ntt(lde, comb_coeffs, F::zero(), n_trace, blowup).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         let l0_opening = crate::sub_air_with_trace::open_trace_row_at_raw_position(
             &lde, &tree, crate::ml_dsa_ntt_chained_air::BUTTERFLIES_PER_NTT, blowup,
@@ -995,7 +1006,7 @@ pub fn prove_v2_real_from_traces(
             |lde, n_trace, blowup, comb_coeffs| {
                 crate::deep_ali_merge_t_decompose(lde, comb_coeffs, F::zero(), n_trace, blowup).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
     // F2b Decompose K·N row openings REMOVED 2026-05-12 — superseded
     // by L1 OOD.  Empty Vec preserves wire format.
@@ -1012,7 +1023,7 @@ pub fn prove_v2_real_from_traces(
             |lde, n_trace, blowup, comb_coeffs| {
                 crate::deep_ali_merge_t_use_hint(lde, comb_coeffs, F::zero(), n_trace, blowup).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
     // F2b UseHint K·N row openings REMOVED 2026-05-12 — superseded
     // by L2a + L2b + L2c + L3 OOD bindings.  Empty Vec preserves wire format.
@@ -1032,7 +1043,7 @@ pub fn prove_v2_real_from_traces(
             &decompose_lde,
             &[crate::ml_dsa_decompose_air::col_r1()],
             coeff_n_trace_local, blowup, pi_hash, b"l2a_decompose",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1046,7 +1057,7 @@ pub fn prove_v2_real_from_traces(
             &decompose_lde,
             &[crate::ml_dsa_decompose_air::col_r()],
             coeff_n_trace_local, blowup, pi_hash, b"l1_decompose_r",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1055,7 +1066,7 @@ pub fn prove_v2_real_from_traces(
             &use_hint_lde,
             &[crate::ml_dsa_use_hint_air::COL_R1],
             coeff_n_trace_local, blowup, pi_hash, b"l2a_use_hint",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1069,7 +1080,7 @@ pub fn prove_v2_real_from_traces(
             |lde, n_trace, blowup, comb_coeffs| {
                 crate::deep_ali_merge_t_w1_encode(lde, comb_coeffs, F::zero(), n_trace, blowup).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
     // F2b W1Encode K·N row openings REMOVED 2026-05-12 — superseded
     // by L3 + L4 OOD bindings.  Empty Vec preserves wire format.
@@ -1084,7 +1095,7 @@ pub fn prove_v2_real_from_traces(
             &use_hint_lde,
             &[crate::ml_dsa_use_hint_air::COL_ADJUSTED_R1],
             coeff_n_trace_local, blowup, pi_hash, b"l3_use_hint_adj",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1093,7 +1104,7 @@ pub fn prove_v2_real_from_traces(
             &w1_encode_lde,
             &[crate::ml_dsa_w1_encode_air::col_r1()],
             coeff_n_trace_local, blowup, pi_hash, b"l3_w1_encode_r1",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1110,7 +1121,7 @@ pub fn prove_v2_real_from_traces(
             let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
                 &w1_encode_lde, &[col_idx],
                 coeff_n_trace_local, blowup, pi_hash,
-                &domain_sep, v2_fri_params,
+                &domain_sep, |n0, ph| v2_fri_params(n0, blowup, ph),
             );
             bccs.push(commit.to_bytes());
         }
@@ -1123,7 +1134,7 @@ pub fn prove_v2_real_from_traces(
             &use_hint_lde,
             &[crate::ml_dsa_use_hint_air::COL_H],
             coeff_n_trace_local, blowup, pi_hash, b"l2c_use_hint_h",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1134,7 +1145,7 @@ pub fn prove_v2_real_from_traces(
             &use_hint_lde,
             &[crate::ml_dsa_use_hint_air::COL_R0_SIGN],
             coeff_n_trace_local, blowup, pi_hash, b"l2b_use_hint_r0_sign",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         commit.to_bytes()
     };
@@ -1152,7 +1163,7 @@ pub fn prove_v2_real_from_traces(
                     lde, comb_coeffs, F::zero(), n_trace, blowup, &layout_for_closure,
                 ).0
             },
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         )
     );
 
@@ -1220,7 +1231,7 @@ pub fn verify_v2_real(
             crate::ml_dsa_verify_air_v17::WIDTH,
             crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
             |cur, nxt, row| crate::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 V17: {e}"))?;
 
         // F2b L5 inclusion proofs REMOVED 2026-05-12 — L5 OOD
@@ -1259,7 +1270,7 @@ pub fn verify_v2_real(
             crate::ml_dsa_ntt_chained_air::WIDTH,
             crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS,
             |cur, nxt, row| crate::ml_dsa_ntt_chained_air::eval_per_row(cur, nxt, row),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 INTT[{k}]: {e}"))?;
 
         // F2b L0 cross-binding: verify the row-1024 opening pins
@@ -1335,7 +1346,7 @@ pub fn verify_v2_real(
             crate::ml_dsa_decompose_air::WIDTH,
             crate::ml_dsa_decompose_air::NUM_CONSTRAINTS,
             |cur, nxt, row| crate::ml_dsa_decompose_air::eval_per_row(cur, nxt, row),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 Decompose: {e}"))?;
 
         // F2b Decompose K·N row openings REMOVED — superseded by L1 OOD
@@ -1356,7 +1367,7 @@ pub fn verify_v2_real(
             crate::ml_dsa_use_hint_air::WIDTH,
             crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS,
             |cur, nxt, row| crate::ml_dsa_use_hint_air::eval_per_row(cur, nxt, row),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 UseHint: {e}"))?;
 
         // F2b UseHint K·N row openings REMOVED — superseded by
@@ -1375,7 +1386,7 @@ pub fn verify_v2_real(
             crate::ml_dsa_w1_encode_air::WIDTH,
             crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS,
             |cur, nxt, row| crate::ml_dsa_w1_encode_air::eval_per_row(cur, nxt, row),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 W1Encode: {e}"))?;
 
         // F2b L3 + L4 inclusion-proof checks REMOVED 2026-05-12.
@@ -1406,7 +1417,7 @@ pub fn verify_v2_real(
             ml_dsa_shake_absorb_multi_air::WIDTH,
             ml_dsa_shake_absorb_multi_air::num_constraints(&layout),
             move |cur, nxt, row| ml_dsa_shake_absorb_multi_air::eval_per_row(cur, nxt, row, &layout),
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 TRANSCRIPT: {e}"))?;
     }
 
@@ -1426,7 +1437,7 @@ pub fn verify_v2_real(
             &proof.l2a_use_hint_bcc,
         ).map_err(|e| format!("v2 L2a OOD: use_hint bcc deserialize: {e}"))?;
         crate::binding_cells_commit::verify_ood_consistency(
-            &decompose_bcc, &use_hint_bcc, pi_hash, v2_fri_params,
+            &decompose_bcc, &use_hint_bcc, pi_hash, |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 L2a OOD: {e}"))?;
     }
 
@@ -1439,7 +1450,7 @@ pub fn verify_v2_real(
             &proof.l3_w1_encode_bcc,
         ).map_err(|e| format!("v2 L3 OOD: w1_encode bcc deserialize: {e}"))?;
         crate::binding_cells_commit::verify_ood_consistency(
-            &use_hint_bcc, &w1_encode_bcc, pi_hash, v2_fri_params,
+            &use_hint_bcc, &w1_encode_bcc, pi_hash, |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 L3 OOD: {e}"))?;
     }
 
@@ -1460,7 +1471,7 @@ pub fn verify_v2_real(
             &proof.l2c_use_hint_bcc,
         ).map_err(|e| format!("v2 L2c OOD: deserialize: {e}"))?;
         crate::binding_cells_commit::verify_ood_against_public_trace_col(
-            &use_hint_h_bcc, &public_h_col, pi_hash, V2_SEED_Z, v2_fri_params,
+            &use_hint_h_bcc, &public_h_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 L2c OOD: {e}"))?;
     }
 
@@ -1492,7 +1503,7 @@ pub fn verify_v2_real(
                 &proof.l5_v17_eq_bccs[col_idx],
             ).map_err(|e| format!("v2 L5 a_ntt[{ll}]: deserialize: {e}"))?;
             crate::binding_cells_commit::verify_ood_against_public_trace_col(
-                &bcc, &trace_col, pi_hash, V2_SEED_Z, v2_fri_params,
+                &bcc, &trace_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
             ).map_err(|e| format!("v2 L5 a_ntt[{ll}]: {e}"))?;
             col_idx += 1;
         }
@@ -1507,7 +1518,7 @@ pub fn verify_v2_real(
                 &proof.l5_v17_eq_bccs[col_idx],
             ).map_err(|e| format!("v2 L5 c_ntt: deserialize: {e}"))?;
             crate::binding_cells_commit::verify_ood_against_public_trace_col(
-                &bcc, &trace_col, pi_hash, V2_SEED_Z, v2_fri_params,
+                &bcc, &trace_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
             ).map_err(|e| format!("v2 L5 c_ntt: {e}"))?;
             col_idx += 1;
         }
@@ -1523,7 +1534,7 @@ pub fn verify_v2_real(
                 &proof.l5_v17_eq_bccs[col_idx],
             ).map_err(|e| format!("v2 L5 t1d_ntt: deserialize: {e}"))?;
             crate::binding_cells_commit::verify_ood_against_public_trace_col(
-                &bcc, &trace_col, pi_hash, V2_SEED_Z, v2_fri_params,
+                &bcc, &trace_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
             ).map_err(|e| format!("v2 L5 t1d_ntt: {e}"))?;
             col_idx += 1;
         }
@@ -1539,7 +1550,7 @@ pub fn verify_v2_real(
                 &proof.l5_v17_eq_bccs[col_idx],
             ).map_err(|e| format!("v2 L5 w_approx_ntt: deserialize: {e}"))?;
             crate::binding_cells_commit::verify_ood_against_public_trace_col(
-                &bcc, &trace_col, pi_hash, V2_SEED_Z, v2_fri_params,
+                &bcc, &trace_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
             ).map_err(|e| format!("v2 L5 w_approx_ntt: {e}"))?;
         }
     }
@@ -1566,7 +1577,7 @@ pub fn verify_v2_real(
             &proof.l1_decompose_bcc,
         ).map_err(|e| format!("v2 L1 OOD: deserialize: {e}"))?;
         crate::binding_cells_commit::verify_ood_against_public_trace_col(
-            &decompose_bcc, &canonical_w_approx_flat, pi_hash, V2_SEED_Z, v2_fri_params,
+            &decompose_bcc, &canonical_w_approx_flat, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 L1 OOD: {e}"))?;
     }
 
@@ -1600,7 +1611,7 @@ pub fn verify_v2_real(
             &proof.l2b_use_hint_bcc,
         ).map_err(|e| format!("v2 L2b OOD: deserialize: {e}"))?;
         crate::binding_cells_commit::verify_ood_against_public_trace_col(
-            &use_hint_r0s_bcc, &translated_col, pi_hash, V2_SEED_Z, v2_fri_params,
+            &use_hint_r0s_bcc, &translated_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
         ).map_err(|e| format!("v2 L2b OOD: {e}"))?;
     }
 
@@ -1636,7 +1647,7 @@ pub fn verify_v2_real(
                 &proof.l4_w1_encode_bccs[b],
             ).map_err(|e| format!("v2 L4 bit[{b}]: deserialize: {e}"))?;
             crate::binding_cells_commit::verify_ood_against_public_trace_col(
-                &bcc, &trace_col, pi_hash, V2_SEED_Z, v2_fri_params,
+                &bcc, &trace_col, pi_hash, V2_SEED_Z, |n0, ph| v2_fri_params(n0, blowup, ph),
             ).map_err(|e| format!("v2 L4 bit[{b}]: {e}"))?;
         }
     }
@@ -2388,17 +2399,17 @@ mod tests {
             &decompose_lde,
             &[crate::ml_dsa_decompose_air::col_r1()],
             coeff_n_trace, blowup, pi_hash, b"l2a_decompose",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         let (use_hint_bcc, _) = commit_binding_cells(
             &use_hint_lde,
             &[crate::ml_dsa_use_hint_air::COL_R1],
             coeff_n_trace, blowup, pi_hash, b"l2a_use_hint",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
 
         // Honest case: r1 values match, OOD-consistency should accept.
-        verify_ood_consistency(&decompose_bcc, &use_hint_bcc, pi_hash, v2_fri_params)
+        verify_ood_consistency(&decompose_bcc, &use_hint_bcc, pi_hash, |n0, ph| v2_fri_params(n0, blowup, ph))
             .expect("L2a OOD consistency must accept honest commits");
 
         // Tampering test: build a TAMPERED Decompose trace where
@@ -2416,11 +2427,11 @@ mod tests {
             &tampered_decompose_lde,
             &[crate::ml_dsa_decompose_air::col_r1()],
             coeff_n_trace, blowup, pi_hash, b"l2a_decompose",
-            v2_fri_params,
+            |n0, ph| v2_fri_params(n0, blowup, ph),
         );
 
         let res = verify_ood_consistency(
-            &tampered_decompose_bcc, &use_hint_bcc, pi_hash, v2_fri_params,
+            &tampered_decompose_bcc, &use_hint_bcc, pi_hash, |n0, ph| v2_fri_params(n0, blowup, ph),
         );
         assert!(res.is_err(),
             "L2a OOD consistency MUST reject tampered Decompose col_r1: got {res:?}");

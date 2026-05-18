@@ -50,6 +50,49 @@ pub mod stark_level {
     #[cfg(feature = "sha3-512")]
     pub const NIST_LEVEL: u8 = 5;
 
+    /// IT-soundness target in bits for the active NIST PQ level.
+    ///   sha3-256 → 128 (Level 1)
+    ///   sha3-384 → 192 (Level 3)
+    ///   sha3-512 → 256 (Level 5)
+    #[cfg(feature = "sha3-256")]
+    pub const TARGET_IT_BITS: usize = 128;
+    #[cfg(feature = "sha3-384")]
+    pub const TARGET_IT_BITS: usize = 192;
+    #[cfg(feature = "sha3-512")]
+    pub const TARGET_IT_BITS: usize = 256;
+
+    /// Compute the minimum FRI query count `r` to reach the active
+    /// NIST PQ Level's IT-soundness at a given `blowup` (LDE rate
+    /// denominator).  Uses the unconditional Johnson formula
+    /// `bits/query = ½·log₂(blowup)` (BCIKS / STIR Thm. 1).
+    ///
+    /// Returns `r = ⌈TARGET_IT_BITS / (½·log₂(blowup))⌉` with a
+    /// small constant safety margin of +2 (mirrors `NUM_QUERIES_LEVEL`'s
+    /// +7-ish margin at blowup=32).
+    ///
+    /// Examples (sha3-256, TARGET_IT_BITS=128):
+    ///   blowup= 4 → r = 130 (½·log₂(4) = 1.0 b/q, ⌈128/1.0⌉ + 2)
+    ///   blowup= 8 → r =  88 (1.5 b/q, ⌈128/1.5⌉ + 2)
+    ///   blowup=16 → r =  66 (2.0 b/q, ⌈128/2.0⌉ + 2)
+    ///   blowup=32 → r =  54 (2.5 b/q, ⌈128/2.5⌉ + 2, matches NUM_QUERIES_LEVEL)
+    ///   blowup=64 → r =  45 (3.0 b/q)
+    ///
+    /// Used by `v2_fri_params` so the v2 sub-AIRs stay at L1 even when
+    /// callers pass a non-32 inner blowup (smoke iteration / scaling
+    /// studies).  Returns a value that, multiplied by ½·log₂(blowup),
+    /// is at least `TARGET_IT_BITS`.
+    pub fn num_queries_for_blowup(blowup: usize) -> usize {
+        // Guard against blowup ≤ 1 — Johnson rate is 0 there.
+        if blowup < 2 {
+            return usize::MAX; // unreachable in practice; fail loud
+        }
+        let bits_per_q = 0.5_f64 * (blowup as f64).log2();
+        // Minimum r to clear TARGET_IT_BITS, plus a small margin so a
+        // single rounding error doesn't drop below the threshold.
+        let r_min = (TARGET_IT_BITS as f64 / bits_per_q).ceil() as usize;
+        r_min + 2
+    }
+
     /// Target collision-resistance bits (matches `min(n_out, c)` of
     /// the active SHA-3 instance).
     #[cfg(feature = "sha3-256")]

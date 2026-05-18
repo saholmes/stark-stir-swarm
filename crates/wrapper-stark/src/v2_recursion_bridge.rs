@@ -305,7 +305,9 @@ fn evaluate_public_col_at_z_ext(
         )));
     }
     let packed_n_lde = n_trace * (bcc.blowup as usize) * (bcc.num_cols as usize);
-    let params = v2_fri_params(packed_n_lde, pi_hash);
+    // `bcc.blowup` is the BCC's own blowup, the same one v2's
+    // `commit_binding_cells` used as r-derivation input.
+    let params = v2_fri_params(packed_n_lde, bcc.blowup as usize, pi_hash);
     let fri_proof = <DeepFriProof<Ext> as CanonicalDeserialize>::deserialize_with_mode(
         bcc.fri_proof_bytes.as_slice(), Compress::Yes, Validate::Yes,
     ).map_err(|e| V2BridgeError::OodExtractFailed(
@@ -917,7 +919,7 @@ pub fn extract_v2_fri_deep_quotient_residues(
         format!("FRI deserialize: {e:?}")
     ))?;
     let n0 = n_trace * blowup;
-    let params = v2_fri_params(n0, aug_pi_hash);
+    let params = v2_fri_params(n0, blowup, aug_pi_hash);
     let l = params.schedule.len();
     let sizes = layer_sizes_from_schedule(fri_proof.n0, &params.schedule);
     let z_ext = derive_z_ext_for_proof::<Ext>(&fri_proof, &params);
@@ -1070,7 +1072,7 @@ fn extract_sub_air_residues(
         format!("sub-air FRI deserialize: {e:?}")
     ))?;
     let n0 = n_trace * blowup;
-    let params = v2_fri_params(n0, aug_pi_hash);
+    let params = v2_fri_params(n0, blowup, aug_pi_hash);
     let m0 = params.schedule.first().copied().unwrap_or(2);
 
     let positions = extract_query_positions(&fri_proof)
