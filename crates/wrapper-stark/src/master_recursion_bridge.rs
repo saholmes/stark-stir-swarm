@@ -1295,6 +1295,20 @@ pub fn verify_master_with_fri_merkle_binding(
     if !verify_master_recursive(&bundle.master) {
         return false;
     }
+    // **Phase 5-2**: master.outer_pi_hash must match the deterministic
+    // re-derivation from inner_proofs.  Closes Piece 1 (FRI-root swap)
+    // and Piece 3 (per_layer_payload tamper) — the master is now bound
+    // to the SPECIFIC inner proofs supplied to the verifier.
+    let expected_master_outer = match rederive_master_outer_pi_hash(
+        inner_proofs,
+        bundle.master.public.n_trace_max,
+    ) {
+        Some(h) => h,
+        None => return false,
+    };
+    if expected_master_outer != bundle.master.public.outer_pi_hash {
+        return false;
+    }
     for (i, rec) in inner_proofs.iter().enumerate() {
         let binding = &bundle.fri_merkle_bindings[i];
         if !verify_batched_merkle_paths(binding) {
@@ -1478,9 +1492,39 @@ pub fn verify_two_level_sharded_master_with_fri_merkle_binding(
         return false;
     }
 
+    // 1.5. **Phase 5-2 at super layer**: super_master.outer_pi_hash
+    //      must re-derive deterministically from supplied shard_masters.
+    //      Catches shard_master tamper (e.g. swapped FRI roots).
+    let expected_super_outer = match rederive_master_outer_pi_hash(
+        &proof.shard_masters,
+        proof.super_master.public.n_trace_max,
+    ) {
+        Some(h) => h,
+        None => return false,
+    };
+    if expected_super_outer != proof.super_master.public.outer_pi_hash {
+        return false;
+    }
+
     // 2. Each shard-master FRI-verifies (Piece 1 at the shard layer).
-    for sm in &proof.shard_masters {
+    //    **Phase 5-2 at shard layer**: each shard_master.outer_pi_hash
+    //    must re-derive from its slice of inner_proofs.  Catches inner
+    //    FRI root tamper.
+    for (k, sm) in proof.shard_masters.iter().enumerate() {
         if !verify_recursive_stark(sm) {
+            return false;
+        }
+        let shard_start = k * proof.shard_size;
+        let shard_end = ((k + 1) * proof.shard_size).min(inner_proofs.len());
+        let shard_inners = &inner_proofs[shard_start..shard_end];
+        let expected_shard_outer = match rederive_master_outer_pi_hash(
+            shard_inners,
+            sm.public.n_trace_max,
+        ) {
+            Some(h) => h,
+            None => return false,
+        };
+        if expected_shard_outer != sm.public.outer_pi_hash {
             return false;
         }
     }
@@ -1980,6 +2024,146 @@ pub fn rederive_aggregator_outer_pi_hash(
     Some(out)
 }
 
+// ─── Phase 5-2: master outer_pi_hash re-derivation (Piece 1+3) ──────
+//
+// Closes the gap where the master STARK verifier reads
+// `master.public.outer_pi_hash` at face value rather than re-deriving
+// it from the supplied `inner_proofs`.  Without this check, an adversary
+// could submit (master_real, inner_proofs_with_tampered_root_f0) — FRI
+// verify still passes because outer_pi_hash is baked into the proof.
+//
+// Same fix shape as Phase 4b-2 but at the master STARK layer:
+// reconstruct each sub-circuit's claim deterministically from
+// `inner_proofs` + master.n_trace_max, call the same
+// `for_claim` constructors, and confirm `master.public.outer_pi_hash`
+// matches.  Closes Piece 1 (FRI-root swap) and Piece 3 (per_layer_payload
+// tamper) tamper detection by tying the master back to the supplied
+// inner FRI proofs.
+
+/// **Phase 5-2**: deterministically re-derive
+/// `master.public.outer_pi_hash` from `inner_proofs` + `n_trace_max`,
+/// mirroring `build_master_composition` (V3 with sub-circuit 1a) +
+/// `build_master_ood_anchor` + `build_master_vestige_perm_arg` +
+/// `prove_recursive_stark`'s outer_pi_hash chain.
+///
+/// Returns `None` on shape mismatch.  No `_meta` extension needed —
+/// `RecursiveStarkProof` already carries `n_trace`, `blowup`, `r`,
+/// `use_stir` for the verifier to reconstruct each inner's
+/// FRI-shape contribution.
+pub fn rederive_master_outer_pi_hash(
+    inner_proofs: &[RecursiveStarkProof],
+    n_trace_max: usize,
+) -> Option<[u8; 32]> {
+    if inner_proofs.is_empty() {
+        return None;
+    }
+    let n_inners = inner_proofs.len();
+
+    // 1. Total comp constraints: per inner = r × (2L − 1) × EXT_DEGREE
+    //    (V3 sub-circuit 1 + 1a — DEEP-quotient + fold residues).
+    let n_total: usize = inner_proofs.iter().map(|rec| {
+        let n_lde = rec.n_trace * rec.blowup;
+        let l = n_lde.trailing_zeros() as usize;
+        let deep = rec.r * l * EXT_DEGREE;
+        let fold = if l == 0 { 0 } else { rec.r * (l - 1) * EXT_DEGREE };
+        deep + fold
+    }).sum();
+
+    // 2. Comp seed → alphas (mirrors build_master_composition).
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"MASTER-RECURSION-COMP-V3");
+    for rec in inner_proofs {
+        Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
+    }
+    let comp_seed: [u8; 32] = Digest::finalize(hasher).into();
+    let comp_alphas = alphas_from_transcript::<Goldilocks>(&comp_seed, n_total);
+
+    // 3. Synthetic comp claim — zero column_values (residues are zero
+    //    on honest inner proofs; flattens identically).
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(n_total);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(n_total);
+    for j in 0..n_total {
+        let cell = CellRef::new(0, j);
+        column_values.push((cell, Goldilocks::zero()));
+        constraints.push(BitOp::IsZero { cell });
+    }
+    let comp_claim = CompositionClaim {
+        column_values, constraints,
+        alphas: comp_alphas,
+        expected: Goldilocks::zero(),
+    };
+    let expected_comp_pi = CompositionAccumulatorPublicInputs::for_claim(&comp_claim).pi_hash;
+
+    // 4. OOD anchor: 4 trivially-equal claims per inner outer_pi_hash chunk.
+    let n_ood = n_inners * 4;
+    let mut ood_claims = Vec::with_capacity(n_ood);
+    for rec in inner_proofs {
+        for chunk_idx in 0..4 {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(
+                &rec.public.outer_pi_hash[8*chunk_idx..8*(chunk_idx+1)]
+            );
+            let v = Goldilocks::from(u64::from_le_bytes(bytes));
+            ood_claims.push(OodEqualityClaim {
+                z: Goldilocks::zero(),
+                f_at_z: v, g_at_z: v,
+                binding_tag: "master-pi-anchor",
+            });
+        }
+    }
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"MASTER-RECURSION-OOD-V3");
+    for rec in inner_proofs {
+        Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
+    }
+    let ood_seed: [u8; 32] = Digest::finalize(hasher).into();
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(&ood_seed, n_ood);
+    let ood_claim = OodAccumulatorClaim {
+        bundle: OodClaimBundle { claims: ood_claims },
+        alphas: ood_alphas,
+    };
+    let expected_ood_pi = OodAccumulatorPublicInputs::for_claim(&ood_claim).pi_hash;
+
+    // 5. Vestige perm-arg: derive master_pi → 4-elem multiset over chunks.
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"MASTER-RECURSION-PI-V3");
+    for rec in inner_proofs {
+        Digest::update(&mut hasher, rec.public.outer_pi_hash);
+        absorb_inner_fri_roots(&mut hasher, rec);
+    }
+    let master_pi: [u8; 32] = Digest::finalize(hasher).into();
+    let mut elems = Vec::with_capacity(4);
+    for chunk_idx in 0..4 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&master_pi[8*chunk_idx..8*(chunk_idx+1)]);
+        elems.push(Goldilocks::from(u64::from_le_bytes(bytes)));
+    }
+    let mut seed = master_pi;
+    seed[0] ^= 0xE7;
+    let gamma = alphas_from_transcript::<Goldilocks>(&seed, 1)[0];
+    let perm_claim = PermArgClaim {
+        left: elems.clone(),
+        right: elems,
+        gamma,
+        perm_tag: "master-vestige",
+    };
+    let expected_perm_pi = PermArgPublicInputs::for_claim(&perm_claim).pi_hash;
+
+    // 6. Combine into expected outer_pi_hash.
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"WRAPPER-RECURSIVE-V1");
+    Digest::update(&mut h, expected_comp_pi);
+    Digest::update(&mut h, expected_ood_pi);
+    Digest::update(&mut h, expected_perm_pi);
+    Digest::update(&mut h, (n_trace_max as u64).to_le_bytes());
+    let digest = Digest::finalize(h);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Some(out)
+}
+
 /// **Phase 4b verify**: confirms (i) master STARK FRI-verifies,
 /// (ii) binding aggregator FRI-verifies, (iii) aggregator was produced
 /// over the supplied `binding_publics` (FS-seed re-derivation),
@@ -2245,6 +2429,89 @@ mod tests {
     }
 
     // ─── Phase 5 Piece 2 tamper test ────────────────────────────────
+
+    // ─── Phase 5-2 tests ────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Phase 5-2 — honest re-derivation match for master.outer_pi_hash; ~4 min"]
+    fn phase_5_2_rederive_master_matches_on_honest_bundle() {
+        let inner = build_one_inner_recursive(950);
+        let inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let bundle = prove_master_with_fri_merkle_binding(
+            &inner_proofs, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest prove");
+
+        let rederived = rederive_master_outer_pi_hash(
+            &inner_proofs,
+            bundle.master.public.n_trace_max,
+        ).expect("re-derivation must succeed");
+
+        assert_eq!(rederived, bundle.master.public.outer_pi_hash,
+            "Phase 5-2 re-derived master.outer_pi_hash must match");
+    }
+
+    #[test]
+    #[ignore = "Phase 5-2 Piece 1 tamper: swap inner FRI root → verifier must reject; ~4 min"]
+    fn phase_5_2_piece_1_tamper_rejects() {
+        // Build an honest Phase 3 bundle.  Tamper one byte in
+        // inner_proofs[0].fri_proof.root_f0 — the master STARK's
+        // outer_pi_hash baked in at prove time was over the HONEST
+        // root_f0, so re-derivation from the tampered inner_proofs
+        // produces a different expected outer_pi_hash → reject.
+        let inner = build_one_inner_recursive(951);
+        let mut inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let bundle = prove_master_with_fri_merkle_binding(
+            &inner_proofs, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest prove");
+
+        // Sanity: honest verifies.
+        assert!(verify_master_with_fri_merkle_binding(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "honest must verify");
+
+        // Tamper one byte in inner_proofs[0].fri_proof.root_f0.
+        inner_proofs[0].fri_proof.root_f0[0] ^= 0xFF;
+
+        // Verifier must reject via Phase 5-2 outer_pi_hash mismatch.
+        assert!(!verify_master_with_fri_merkle_binding(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "Piece 1 tamper (root_f0 swap) must be rejected by Phase 5-2");
+    }
+
+    #[test]
+    #[ignore = "Phase 5-2 Piece 1 tamper at fold-layer root: flip inner.fri_proof.roots[0] → reject; ~4 min"]
+    fn phase_5_2_piece_1_fold_layer_root_tamper_rejects() {
+        let inner = build_one_inner_recursive(952);
+        let mut inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let bundle = prove_master_with_fri_merkle_binding(
+            &inner_proofs, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest prove");
+
+        // Tamper inner_proofs[0].fri_proof.roots[0] (first fold-layer root).
+        inner_proofs[0].fri_proof.roots[0][0] ^= 0xFF;
+
+        assert!(!verify_master_with_fri_merkle_binding(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "fold-layer root tamper must be rejected by Phase 5-2");
+    }
 
     #[test]
     #[ignore = "Phase 5 Piece 2 tamper: flip binding bundle public root → verifier must reject; ~4 min"]

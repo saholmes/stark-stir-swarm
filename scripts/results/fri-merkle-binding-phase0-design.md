@@ -663,25 +663,49 @@ and that honest fold residues are all zero in F_ext.
 3. Verifier MUST reject (Piece 2 cross-check against re-extracted
    inner FRI fails)
 
-### Known soundness gaps (Phase 5-2 follow-up)
+### Phase 5-2 — master/sharded outer_pi_hash re-derivation (2026-05-19, landed)
 
-- **Piece 1 tamper** (swap `inner.fri_proof.root_f0` post-prove):
-  current verifier reads `master.public.outer_pi_hash` at face value
-  rather than re-deriving it from supplied `inner_proofs`.  Adversary
-  could submit (master_real, inner_proofs_with_swapped_root_f0) — FRI
-  verify still passes because outer_pi_hash is baked into the proof.
-  Same structural issue as Phase 4b-2 (compact-aggregator gap).
-- **Piece 3 tamper** (modify `per_layer_payloads[ell].f_val`): the
-  binding bundle's committed leaf bytes are private witness inside
-  the BMP FRI proof.  Without explicit leaf-encoding cross-check at
-  verify time, an adversary modifying `per_layer_payloads[ell].f_val`
-  in the supplied inner_proofs causes the re-derived expected leaf
-  bytes to differ from the binding's committed leaves — but the
-  current verifier only cross-checks public roots, not leaves.
+Same fix shape as Phase 4b-2 but at the master STARK level.
+Critically simpler: `inner_proofs` already carry `n_trace`, `blowup`,
+`r`, `use_stir` — no extra `_meta` struct extension needed.
 
-Both close by adding `binding_meta` (or equivalent) to the proof
-artifact + re-deriving the chain of pi_hashes from supplied inputs.
-Phase 5-2 tracks this work alongside Phase 4b-2.
+**New helper** `rederive_master_outer_pi_hash(inner_proofs, n_trace_max)`
+mirrors `build_master_composition` (V3 with sub-circuit 1a) +
+`build_master_ood_anchor` + `build_master_vestige_perm_arg` +
+`prove_recursive_stark`'s outer_pi_hash chain:
+
+1. Per-inner constraint contribution `r × (2L − 1) × EXT_DEGREE` (V3
+   DEEP-quotient + fold residues).
+2. Reconstruct sub-circuit seeds (V3 strings, absorb each inner's
+   `outer_pi_hash + FRI roots` via `absorb_inner_fri_roots`).
+3. Synthetic comp claim (zero column_values), `for_claim` → comp.pi_hash.
+4. OOD anchor: 4 trivially-equal claims per inner's outer_pi_hash chunks.
+5. Vestige perm-arg: 4-elem multiset over chunks of `master_pi`.
+6. Combine via `WRAPPER-RECURSIVE-V1` chain + `n_trace_max`.
+
+**Verifier wiring**:
+- `verify_master_with_fri_merkle_binding` calls helper, rejects mismatch.
+- `verify_two_level_sharded_master_with_fri_merkle_binding` calls helper
+  at **two layers**: (a) super_master.outer_pi_hash re-derives from
+  supplied `shard_masters`; (b) each `shard_master[k].outer_pi_hash`
+  re-derives from `inner_proofs[k×Ni .. (k+1)×Ni]`.
+
+**Tamper tests landed**:
+- `phase_5_2_piece_1_tamper_rejects` — flip `inner.fri_proof.root_f0`
+  byte → verifier rejects via outer_pi_hash mismatch.
+- `phase_5_2_piece_1_fold_layer_root_tamper_rejects` — flip
+  `inner.fri_proof.roots[0]` byte → reject.
+- `phase_5_2_rederive_master_matches_on_honest_bundle` — bit-exact
+  re-derivation match on honest input.
+
+**Piece 3 coverage**: Phase 5-2's re-derivation absorbs `outer_pi_hash`
+which is bound to the inner's sub-circuit pi_hashes which depend on
+the inner's actual `per_layer_payloads` (via composition residues).
+A `per_layer_payloads[ell].f_val` tamper changes the inner's
+`outer_pi_hash` (Schwartz-Zippel on the residue accumulator), so the
+master's re-derived outer_pi_hash from the tampered inner differs from
+the honest one baked into `master.public.outer_pi_hash` → rejects.
+Piece 3 is therefore caught by Phase 5-2 indirectly.
 
 ### Out-of-scope (next pickups)
 
