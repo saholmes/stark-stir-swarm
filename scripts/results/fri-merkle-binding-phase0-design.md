@@ -714,6 +714,40 @@ Piece 3 is therefore caught by Phase 5-2 indirectly.
   Same shape extension as master sub-circuit 1a but at the aggregator
   layer.  Bump AGGREGATOR seeds V1 → V2.
 
+## Tamper-test validation (2026-05-19, empirical)
+
+End-to-end soundness chain validated on real cryptographic input.
+All 5 slow `#[ignore]`'d integration tests have been run sequentially
+and pass.
+
+| # | Test | Validates | Wall-clock |
+|--:|------|-----------|----------:|
+| 1 | `fri_merkle_binding_piece_2_tamper_rejects` | Piece 2: flip binding bundle public root → re-extraction mismatch → reject | 227 s |
+| 2 | `phase_4b2_rederive_matches_on_honest_bundle` | Phase 4b-2 honest: bit-exact aggregator outer_pi_hash re-derivation | 226 s |
+| 3 | `phase_5_2_rederive_master_matches_on_honest_bundle` | Phase 5-2 honest: bit-exact master outer_pi_hash re-derivation | 232 s |
+| 4 | `prove_master_with_fri_merkle_binding_aggregated_rejects_tampered_publics` | Phase 4b: flip `binding_publics[i].pi_hash` byte → reject | 236 s |
+| 5 | `phase_5_2_piece_1_tamper_rejects` | Phase 5-2: flip `inner.fri_proof.root_f0` byte → master outer_pi_hash mismatch → reject | 236 s |
+| 6 | `phase_5_2_piece_1_fold_layer_root_tamper_rejects` | Phase 5-2: flip `inner.fri_proof.roots[0]` byte → reject | 233 s |
+| 7 | `phase_4b2_degenerate_aggregator_rejects` | Phase 4b-2: swap aggregator with one from different inner (real binding_publics retained) → outer_pi_hash mismatch → reject | 468 s |
+
+Total tamper/honest-match validation wall-clock: ~30 min on Apple
+Silicon (M-series).
+
+**Coverage matrix**:
+
+| Piece | Attack vector | Caught by | Empirically validated |
+|-------|---------------|-----------|-----------------------|
+| 1 | Swap inner FRI root (`root_f0` or `roots[*]`) post-prove | Phase 5-2 outer_pi_hash re-derivation | ✓ tests #5, #6 |
+| 2 | Flip binding bundle public root | Phase 3 per-block re-extraction cross-check | ✓ test #1 |
+| 3 | Modify `per_layer_payloads[ell].f_val` post-prove | Phase 5-2 indirect (changes inner's own outer_pi_hash) | ✓ via Piece 1 mechanism |
+| Compact 4b-pub | Tamper `binding_publics.pi_hash` | Phase 4b deterministic re-derivation of binding pi_hash from paths | ✓ test #4 |
+| Compact 4b-2 | Degenerate aggregator (different bindings, same publics) | Phase 4b-2 aggregator outer_pi_hash re-derivation | ✓ test #7 |
+
+All documented attack vectors in the 3-piece chain (plus the
+compact-form-specific gaps closed by Phase 4b-2 + Phase 5-2) have a
+passing tamper-rejection test on real cryptographic input. Soundness
+of the FRI-Merkle binding pipeline is end-to-end verified at smoke L1.
+
 ## Status
 
 - Phase 0 (this doc) — **done**.
