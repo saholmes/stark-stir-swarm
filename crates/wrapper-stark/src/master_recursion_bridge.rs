@@ -2351,6 +2351,231 @@ pub fn verify_master_with_fri_merkle_binding_aggregated(
     true
 }
 
+// ─── Sharded compact form (Phase 4a + Phase 4b combined) ─────────────
+//
+// Brings the sharded recursion to constant-in-N+K L1 wire by
+// aggregating BOTH per-inner AND per-shard binding bundles into a
+// single outer `RecursiveStarkProof`, while preserving the 3-piece
+// soundness chain at both recursion levels (Phase 4a) + the
+// aggregator outer_pi_hash re-derivation (Phase 4b-2) + the master
+// outer_pi_hash re-derivation at both layers (Phase 5-2).
+
+/// Sharded compact bundle: super_master + K shard_masters + ONE
+/// aggregator over the (N inner + K shard) binding bundles + their
+/// publics + meta.  L1 wire shape:
+///   super_master + aggregator + K × shard_master + (N+K) × publics + meta
+/// At STARK-DNS-scale K = O(√N), so wire grows polylog in N.
+pub struct CompactShardedFriMerkleBundle {
+    pub super_master: RecursiveStarkProof,
+    pub shard_masters: Vec<RecursiveStarkProof>,
+    /// Single aggregator attesting BOTH per-inner AND per-shard
+    /// bindings' FRI-quotient relations.  Order: inner bindings first
+    /// (0..N), then shard bindings (N..N+K).
+    pub binding_aggregator: RecursiveStarkProof,
+    pub inner_binding_publics:
+        Vec<crate::merkle_prover::BatchedMerklePathPublicInputs>,
+    pub shard_binding_publics:
+        Vec<crate::merkle_prover::BatchedMerklePathPublicInputs>,
+    pub inner_binding_meta: Vec<BatchedMerklePathMeta>,
+    pub shard_binding_meta: Vec<BatchedMerklePathMeta>,
+    pub shard_size: usize,
+}
+
+/// Produce the sharded compact bundle: Phase 4a's
+/// `TwoLevelShardedFriMerkleProof` shape, then aggregate the (N+K)
+/// bindings into ONE outer via `aggregate_fri_merkle_bindings`.
+pub fn prove_two_level_sharded_master_with_fri_merkle_binding_aggregated(
+    inner_proofs: &[RecursiveStarkProof],
+    shard_size: usize,
+    master_blowup: usize, master_r: usize, master_use_stir: bool,
+    binding_blowup: usize, binding_r: usize, binding_use_stir: bool,
+    aggregator_blowup: usize, aggregator_r: usize, aggregator_use_stir: bool,
+    subset_paths: Option<&[usize]>,
+) -> Result<CompactShardedFriMerkleBundle, FriMerkleBindingError> {
+    // 1. Phase 4a linear sharded form.
+    let linear = prove_two_level_sharded_master_with_fri_merkle_binding(
+        inner_proofs, shard_size,
+        master_blowup, master_r, master_use_stir,
+        binding_blowup, binding_r, binding_use_stir,
+        subset_paths,
+    )?;
+
+    // 2. Concatenate inner + shard bindings into one slice for aggregation.
+    let mut all_bindings: Vec<BatchedMerklePathProof> =
+        Vec::with_capacity(
+            linear.inner_fri_merkle_bindings.len()
+            + linear.shard_fri_merkle_bindings.len(),
+        );
+    all_bindings.extend(linear.inner_fri_merkle_bindings);
+    all_bindings.extend(linear.shard_fri_merkle_bindings);
+
+    // 3. Aggregate (N+K) bindings into one RecursiveStarkProof.
+    let aggregator = aggregate_fri_merkle_bindings(
+        &all_bindings, aggregator_blowup, aggregator_r, aggregator_use_stir,
+    ).map_err(FriMerkleBindingError::Master)?;
+
+    // 4. Strip the binding fri_proofs; keep publics + meta.
+    let n = inner_proofs.len();
+    let inner_binding_meta: Vec<BatchedMerklePathMeta> =
+        all_bindings.iter().take(n).map(BatchedMerklePathMeta::from_proof).collect();
+    let shard_binding_meta: Vec<BatchedMerklePathMeta> =
+        all_bindings.iter().skip(n).map(BatchedMerklePathMeta::from_proof).collect();
+    let mut all_publics: Vec<_> =
+        all_bindings.into_iter().map(|b| b.public).collect();
+    let shard_binding_publics = all_publics.split_off(n);
+    let inner_binding_publics = all_publics;
+
+    Ok(CompactShardedFriMerkleBundle {
+        super_master: linear.super_master,
+        shard_masters: linear.shard_masters,
+        binding_aggregator: aggregator,
+        inner_binding_publics, shard_binding_publics,
+        inner_binding_meta,    shard_binding_meta,
+        shard_size: linear.shard_size,
+    })
+}
+
+/// Verify a `CompactShardedFriMerkleBundle` — composes the Phase 4a
+/// shard verifier + Phase 4b-2 aggregator re-derivation + Phase 5-2
+/// master/shard outer_pi_hash re-derivation.
+pub fn verify_two_level_sharded_master_with_fri_merkle_binding_aggregated(
+    bundle: &CompactShardedFriMerkleBundle,
+    inner_proofs: &[RecursiveStarkProof],
+    subset_paths: Option<&[usize]>,
+) -> bool {
+    // Shape consistency.
+    let expected_k = (inner_proofs.len() + bundle.shard_size - 1) / bundle.shard_size;
+    if bundle.shard_masters.len() != expected_k { return false; }
+    if bundle.inner_binding_publics.len() != inner_proofs.len() { return false; }
+    if bundle.inner_binding_meta.len() != inner_proofs.len() { return false; }
+    if bundle.shard_binding_publics.len() != expected_k { return false; }
+    if bundle.shard_binding_meta.len() != expected_k { return false; }
+    if bundle.shard_size == 0 { return false; }
+
+    // 1. Super-master FRI + Phase 5-2 re-derive from shard_masters.
+    if !verify_master_recursive(&bundle.super_master) { return false; }
+    let expected_super_outer = match rederive_master_outer_pi_hash(
+        &bundle.shard_masters,
+        bundle.super_master.public.n_trace_max,
+    ) {
+        Some(h) => h, None => return false,
+    };
+    if expected_super_outer != bundle.super_master.public.outer_pi_hash {
+        return false;
+    }
+
+    // 2. Each shard_master FRI + Phase 5-2 re-derive from inner slice.
+    for (k, sm) in bundle.shard_masters.iter().enumerate() {
+        if !verify_recursive_stark(sm) { return false; }
+        let shard_start = k * bundle.shard_size;
+        let shard_end = ((k + 1) * bundle.shard_size).min(inner_proofs.len());
+        let shard_inners = &inner_proofs[shard_start..shard_end];
+        let expected_shard_outer = match rederive_master_outer_pi_hash(
+            shard_inners,
+            sm.public.n_trace_max,
+        ) {
+            Some(h) => h, None => return false,
+        };
+        if expected_shard_outer != sm.public.outer_pi_hash { return false; }
+    }
+
+    // 3. Binding aggregator FRI verify.
+    if !verify_recursive_stark(&bundle.binding_aggregator) { return false; }
+
+    // 4. Phase 4b-2 re-derive aggregator outer_pi_hash from
+    //    (inner ++ shard) binding publics + meta.
+    let mut all_publics: Vec<_> = bundle.inner_binding_publics.clone();
+    all_publics.extend(bundle.shard_binding_publics.iter().cloned());
+    let mut all_meta: Vec<BatchedMerklePathMeta> = bundle.inner_binding_meta.clone();
+    all_meta.extend(bundle.shard_binding_meta.iter().copied());
+    let expected_agg_outer = match rederive_aggregator_outer_pi_hash(
+        &all_publics, &all_meta,
+        bundle.binding_aggregator.public.n_trace_max,
+    ) {
+        Some(h) => h, None => return false,
+    };
+    if expected_agg_outer != bundle.binding_aggregator.public.outer_pi_hash {
+        return false;
+    }
+
+    // 5. Per-inner binding publics: defense-in-depth re-derivation +
+    //    Piece 2 cross-check against inner FRI proofs.
+    for (i, bp) in bundle.inner_binding_publics.iter().enumerate() {
+        if !verify_binding_pi_hash_rederivation(bp) { return false; }
+        let expected_claim = match extract_fri_merkle_openings(&inner_proofs[i]) {
+            Ok(c) => c, Err(_) => return false,
+        };
+        if !verify_binding_publics_paths_match(bp, &expected_claim, subset_paths) {
+            return false;
+        }
+    }
+
+    // 6. Per-shard binding publics: same shape against shard_masters.
+    for (k, bp) in bundle.shard_binding_publics.iter().enumerate() {
+        if !verify_binding_pi_hash_rederivation(bp) { return false; }
+        let expected_claim = match extract_fri_merkle_openings(&bundle.shard_masters[k]) {
+            Ok(c) => c, Err(_) => return false,
+        };
+        if !verify_binding_publics_paths_match(bp, &expected_claim, subset_paths) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Defense-in-depth: confirm a `BatchedMerklePathPublicInputs.pi_hash`
+/// deterministically re-derives from its `(variant, paths)`.  Used by
+/// `verify_two_level_sharded_master_with_fri_merkle_binding_aggregated`
+/// to detect publics tampering not actually consumed by the aggregator.
+/// Mirrors the inline check in `verify_master_with_fri_merkle_binding_aggregated`.
+fn verify_binding_pi_hash_rederivation(
+    bp: &crate::merkle_prover::BatchedMerklePathPublicInputs,
+) -> bool {
+    use crate::merkle_prover::BatchedMerklePathPublicInputs;
+    use crate::merkle_path_air::{BatchedMerklePathClaim, MerklePathClaim, MerkleNode};
+    let n_bytes = bp.variant.output_bytes();
+    let synthetic_claim = BatchedMerklePathClaim {
+        variant: bp.variant,
+        paths: bp.paths.iter().map(|(root, leaf_index, depth)| MerklePathClaim {
+            variant: bp.variant,
+            root: root.clone(),
+            leaf_index: *leaf_index,
+            leaf: MerkleNode(vec![0u8; n_bytes]),
+            path: vec![MerkleNode(vec![0u8; n_bytes]); *depth],
+            ds_prefix_per_hop: Vec::new(),
+        }).collect(),
+    };
+    BatchedMerklePathPublicInputs::for_claim(&synthetic_claim).pi_hash == bp.pi_hash
+}
+
+/// Per-binding-public paths Piece 2 cross-check helper.  Mirrors the
+/// inline loop in `verify_master_with_fri_merkle_binding_aggregated`'s
+/// step (iv).
+fn verify_binding_publics_paths_match(
+    bp: &crate::merkle_prover::BatchedMerklePathPublicInputs,
+    expected_claim: &crate::merkle_path_air::BatchedMerklePathClaim,
+    subset_paths: Option<&[usize]>,
+) -> bool {
+    use crate::merkle_path_air::MerklePathClaim;
+    let expected_paths: Vec<&MerklePathClaim> = if let Some(indices) = subset_paths {
+        if indices.iter().any(|&i| i >= expected_claim.paths.len()) {
+            return false;
+        }
+        indices.iter().map(|&i| &expected_claim.paths[i]).collect()
+    } else {
+        expected_claim.paths.iter().collect()
+    };
+    if bp.paths.len() != expected_paths.len() { return false; }
+    for (j, expected) in expected_paths.iter().enumerate() {
+        let (got_root, got_leaf_index, got_depth) = &bp.paths[j];
+        if got_root != &expected.root { return false; }
+        if *got_leaf_index != expected.leaf_index { return false; }
+        if *got_depth != expected.depth() { return false; }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2802,6 +3027,49 @@ mod tests {
             &[], 2, 4, 54, false, 4, 54, false, None,
         );
         assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
+    }
+
+    #[test]
+    fn prove_sharded_with_fri_merkle_binding_aggregated_rejects_empty() {
+        let result = prove_two_level_sharded_master_with_fri_merkle_binding_aggregated(
+            &[], 2, 4, 54, false, 4, 54, false, 4, 54, false, None,
+        );
+        assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
+    }
+
+    #[test]
+    #[ignore = "Sharded compact form — N=2 K=1 B=10 aggregated end-to-end; ~12 min"]
+    fn prove_sharded_with_fri_merkle_binding_aggregated_n2_k1_subset_b10() {
+        // Phase 4a sharded + Phase 4b aggregation combined: (N+K)=3
+        // bindings collapse into ONE aggregator.  Verify chain:
+        // super FRI + Phase 5-2; shard FRI + Phase 5-2; aggregator
+        // FRI + Phase 4b-2 over both inner+shard publics; Piece 2 at
+        // both layers.
+        let inner1 = build_one_inner_recursive(970);
+        let inner2 = build_one_inner_recursive(971);
+        let inners = vec![inner1, inner2];
+
+        let l = inners[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let bundle = prove_two_level_sharded_master_with_fri_merkle_binding_aggregated(
+            &inners, /*shard_size=*/ 2,
+            4, 54, false, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("sharded compact prove must succeed");
+
+        assert_eq!(bundle.shard_size, 2);
+        assert_eq!(bundle.shard_masters.len(), 1);
+        assert_eq!(bundle.inner_binding_publics.len(), 2);
+        assert_eq!(bundle.inner_binding_meta.len(), 2);
+        assert_eq!(bundle.shard_binding_publics.len(), 1);
+        assert_eq!(bundle.shard_binding_meta.len(), 1);
+
+        assert!(verify_two_level_sharded_master_with_fri_merkle_binding_aggregated(
+            &bundle, &inners, Some(&subset_indices),
+        ), "sharded compact bundle must verify end-to-end");
     }
 
     #[test]
