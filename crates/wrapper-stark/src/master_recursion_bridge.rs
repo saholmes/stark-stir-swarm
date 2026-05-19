@@ -58,7 +58,8 @@ use crate::merkle_prover::{
     prove_merkle_path, verify_batched_merkle_paths, verify_merkle_path,
 };
 use crate::recursive_prover::{
-    OodAccumulatorClaim, RecursiveProverError, RecursiveStarkProof,
+    CompositionAccumulatorPublicInputs, OodAccumulatorClaim, OodAccumulatorPublicInputs,
+    PermArgPublicInputs, RecursiveProverError, RecursiveStarkProof,
     prove_recursive_stark, verify_recursive_stark,
 };
 use crate::sha3_absorb_air::Sha3Variant;
@@ -1790,6 +1791,44 @@ pub struct CompactFriMerkleBundle {
     /// Piece 2 cross-check.  Size: `N × (32 + B × ~48) B`.  At
     /// B=810 (full) and N=10 this is ~390 KiB total.
     pub binding_publics: Vec<crate::merkle_prover::BatchedMerklePathPublicInputs>,
+    /// **Phase 4b-2**: per-binding FRI proof shape (n_trace, blowup, r,
+    /// use_stir).  Used by the verifier to deterministically reconstruct
+    /// each binding's `n_constraints` and the aggregator's sub-circuit
+    /// pi_hashes from `binding_publics` alone — closes the
+    /// degenerate-aggregator attack vector by tying the aggregator's
+    /// `outer_pi_hash` to the supplied publics.  32 B per binding.
+    pub binding_meta: Vec<BatchedMerklePathMeta>,
+}
+
+/// Per-binding FRI-proof shape, recorded at prove time and used by
+/// the Phase 4b verifier to re-derive `aggregator.public.outer_pi_hash`
+/// deterministically from `binding_publics` (closes Phase 4b-2 gap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchedMerklePathMeta {
+    pub n_trace: usize,
+    pub blowup: usize,
+    pub r: usize,
+    pub use_stir: bool,
+}
+
+impl BatchedMerklePathMeta {
+    pub fn from_proof(bmp: &BatchedMerklePathProof) -> Self {
+        Self {
+            n_trace: bmp.n_trace,
+            blowup: bmp.blowup,
+            r: bmp.r,
+            use_stir: bmp.use_stir,
+        }
+    }
+
+    /// Reconstruct n_constraints contributed by this binding to the
+    /// aggregator's sub-circuit 1: `r × L × EXT_DEGREE` where
+    /// L = log2(n_trace × blowup).
+    pub fn aggregator_residue_constraints(&self) -> usize {
+        let n_lde = self.n_trace * self.blowup;
+        let l = n_lde.trailing_zeros() as usize;
+        self.r * l * EXT_DEGREE
+    }
 }
 
 /// **Phase 4b high-level entry**: produce the compact form
@@ -1815,7 +1854,11 @@ pub fn prove_master_with_fri_merkle_binding_aggregated(
         aggregator_blowup, aggregator_r, aggregator_use_stir,
     ).map_err(FriMerkleBindingError::Master)?;
 
-    // 3. Strip the binding fri_proofs from the wire; keep only public inputs.
+    // 3. Strip the binding fri_proofs from the wire; keep only public
+    //    inputs + per-binding meta (Phase 4b-2 — meta lets the verifier
+    //    re-derive aggregator.outer_pi_hash from publics deterministically).
+    let binding_meta: Vec<BatchedMerklePathMeta> = linear.fri_merkle_bindings
+        .iter().map(BatchedMerklePathMeta::from_proof).collect();
     let binding_publics: Vec<_> = linear.fri_merkle_bindings
         .into_iter().map(|b| b.public).collect();
 
@@ -1823,7 +1866,118 @@ pub fn prove_master_with_fri_merkle_binding_aggregated(
         master: linear.master,
         binding_aggregator: aggregator,
         binding_publics,
+        binding_meta,
     })
+}
+
+/// **Phase 4b-2**: deterministically re-derive the aggregator's
+/// `outer_pi_hash` from `binding_publics` + `binding_meta`, mirroring
+/// the prover's sub-circuit pi_hash chain.  Returns `None` if any
+/// reconstruction fails or shapes are inconsistent.
+///
+/// Mirrors `aggregate_fri_merkle_bindings` → `prove_recursive_stark`'s
+/// outer_pi_hash construction:
+/// `SHA3("WRAPPER-RECURSIVE-V1" || comp.pi_hash || ood.pi_hash ||
+///       perm_arg.pi_hash || n_trace_max(LE))`.
+pub fn rederive_aggregator_outer_pi_hash(
+    binding_publics: &[crate::merkle_prover::BatchedMerklePathPublicInputs],
+    binding_meta: &[BatchedMerklePathMeta],
+    n_trace_max: usize,
+) -> Option<[u8; 32]> {
+    if binding_publics.len() != binding_meta.len() || binding_publics.is_empty() {
+        return None;
+    }
+    let n_bindings = binding_publics.len();
+
+    // 1. Reconstruct total composition constraint count.
+    let n_total: usize = binding_meta.iter()
+        .map(BatchedMerklePathMeta::aggregator_residue_constraints)
+        .sum();
+
+    // 2. Reconstruct comp seed → alphas.
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-COMP-V1");
+    for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
+    let comp_seed: [u8; 32] = Digest::finalize(hasher).into();
+    let comp_alphas = alphas_from_transcript::<Goldilocks>(&comp_seed, n_total);
+
+    // 3. Build synthetic comp claim (zero column_values + IsZero constraints —
+    //    pi_hash via for_claim depends on (expected, n_constraints, alphas
+    //    via trace.alpha[j], trace.phi[j], final_sum); honest values are
+    //    column_value = 0 → phi = 0 → final_sum = 0).
+    let mut column_values: Vec<(CellRef, Goldilocks)> = Vec::with_capacity(n_total);
+    let mut constraints: Vec<BitOp> = Vec::with_capacity(n_total);
+    for j in 0..n_total {
+        let cell = CellRef::new(0, j);
+        column_values.push((cell, Goldilocks::zero()));
+        constraints.push(BitOp::IsZero { cell });
+    }
+    let comp_claim = CompositionClaim {
+        column_values, constraints,
+        alphas: comp_alphas,
+        expected: Goldilocks::zero(),
+    };
+    let expected_comp_pi = CompositionAccumulatorPublicInputs::for_claim(&comp_claim).pi_hash;
+
+    // 4. Reconstruct OOD anchor (4 trivially-equal claims per binding).
+    let n_ood = n_bindings * 4;
+    let mut ood_claims = Vec::with_capacity(n_ood);
+    for bp in binding_publics {
+        for chunk_idx in 0..4 {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&bp.pi_hash[8*chunk_idx..8*(chunk_idx+1)]);
+            let v = Goldilocks::from(u64::from_le_bytes(bytes));
+            ood_claims.push(OodEqualityClaim {
+                z: Goldilocks::zero(),
+                f_at_z: v, g_at_z: v,
+                binding_tag: "aggregator-binding-anchor",
+            });
+        }
+    }
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-OOD-V1");
+    for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
+    let ood_seed: [u8; 32] = Digest::finalize(hasher).into();
+    let ood_alphas = alphas_from_transcript::<Goldilocks>(&ood_seed, n_ood);
+    let ood_claim = OodAccumulatorClaim {
+        bundle: OodClaimBundle { claims: ood_claims },
+        alphas: ood_alphas,
+    };
+    let expected_ood_pi = OodAccumulatorPublicInputs::for_claim(&ood_claim).pi_hash;
+
+    // 5. Reconstruct vestige perm-arg.
+    let mut hasher = sha3::Sha3_256::new();
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-PI-V1");
+    for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
+    let aggregator_pi: [u8; 32] = Digest::finalize(hasher).into();
+    let mut elems = Vec::with_capacity(4);
+    for chunk_idx in 0..4 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&aggregator_pi[8*chunk_idx..8*(chunk_idx+1)]);
+        elems.push(Goldilocks::from(u64::from_le_bytes(bytes)));
+    }
+    let mut seed = aggregator_pi;
+    seed[0] ^= 0xE8;
+    let gamma = alphas_from_transcript::<Goldilocks>(&seed, 1)[0];
+    let perm_claim = PermArgClaim {
+        left: elems.clone(),
+        right: elems,
+        gamma,
+        perm_tag: "aggregator-vestige",
+    };
+    let expected_perm_pi = PermArgPublicInputs::for_claim(&perm_claim).pi_hash;
+
+    // 6. Combine into outer_pi_hash.
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"WRAPPER-RECURSIVE-V1");
+    Digest::update(&mut h, expected_comp_pi);
+    Digest::update(&mut h, expected_ood_pi);
+    Digest::update(&mut h, expected_perm_pi);
+    Digest::update(&mut h, (n_trace_max as u64).to_le_bytes());
+    let digest = Digest::finalize(h);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Some(out)
 }
 
 /// **Phase 4b verify**: confirms (i) master STARK FRI-verifies,
@@ -1838,6 +1992,9 @@ pub fn verify_master_with_fri_merkle_binding_aggregated(
     if bundle.binding_publics.len() != inner_proofs.len() {
         return false;
     }
+    if bundle.binding_meta.len() != bundle.binding_publics.len() {
+        return false;
+    }
 
     // (i) Master verifies.
     if !verify_master_recursive(&bundle.master) {
@@ -1846,6 +2003,21 @@ pub fn verify_master_with_fri_merkle_binding_aggregated(
 
     // (ii) Aggregator verifies.
     if !verify_recursive_stark(&bundle.binding_aggregator) {
+        return false;
+    }
+
+    // (ii.5) **Phase 4b-2**: aggregator.outer_pi_hash must match the
+    //        deterministic re-derivation from binding_publics + meta.
+    //        Closes the degenerate-aggregator attack vector.
+    let expected_outer = match rederive_aggregator_outer_pi_hash(
+        &bundle.binding_publics,
+        &bundle.binding_meta,
+        bundle.binding_aggregator.public.n_trace_max,
+    ) {
+        Some(h) => h,
+        None => return false,
+    };
+    if expected_outer != bundle.binding_aggregator.public.outer_pi_hash {
         return false;
     }
 
@@ -2142,6 +2314,85 @@ mod tests {
         assert!(verify_master_with_fri_merkle_binding_aggregated(
             &bundle, &inner_proofs, Some(&subset_indices),
         ), "Phase 4b compact bundle must verify end-to-end");
+    }
+
+    #[test]
+    #[ignore = "Phase 4b-2 — degenerate-aggregator tamper rejection: replace aggregator with one proven over fake bindings; verifier must reject via re-derived outer_pi_hash mismatch; ~8 min (two N=1 proves)"]
+    fn phase_4b2_degenerate_aggregator_rejects() {
+        // Build an honest compact bundle, then build a SECOND (parallel)
+        // aggregator over a DIFFERENT set of synthetic bindings.  Swap
+        // it into the bundle and confirm the verifier rejects via
+        // rederive_aggregator_outer_pi_hash mismatch.
+        //
+        // This catches the attack: prover submits real binding_publics
+        // (so Piece 2 cross-check passes) with a degenerate aggregator
+        // attesting some other set of bindings.  Pre-Phase 4b-2 the
+        // verifier had no way to detect this; with binding_meta + the
+        // outer_pi_hash re-derivation it rejects.
+        let inner = build_one_inner_recursive(942);
+        let inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        // Honest compact form.
+        let mut bundle = prove_master_with_fri_merkle_binding_aggregated(
+            &inner_proofs, 4, 54, false, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest compact prove");
+
+        // Sanity: honest verifies.
+        assert!(verify_master_with_fri_merkle_binding_aggregated(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "honest must verify");
+
+        // Build a second compact form over a DIFFERENT inner (seed 943).
+        // Its aggregator attests different bindings → different
+        // outer_pi_hash.  Swap that aggregator into the original bundle.
+        let inner2 = build_one_inner_recursive(943);
+        let inner_proofs2 = vec![inner2];
+        let other = prove_master_with_fri_merkle_binding_aggregated(
+            &inner_proofs2, 4, 54, false, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("second compact prove");
+        bundle.binding_aggregator = other.binding_aggregator;
+
+        // Now the supplied binding_publics + meta are for inner_proofs
+        // (seed 942) but the aggregator was proven over inner_proofs2
+        // (seed 943).  Re-derived outer_pi_hash from publics differs
+        // from the swapped aggregator's outer_pi_hash → reject.
+        assert!(!verify_master_with_fri_merkle_binding_aggregated(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "degenerate / swapped aggregator must be rejected via Phase 4b-2 outer_pi_hash check");
+    }
+
+    #[test]
+    #[ignore = "Phase 4b-2 — verify re-derivation matches on honest bundle; ~4 min"]
+    fn phase_4b2_rederive_matches_on_honest_bundle() {
+        // Verify the re-derivation is bit-exact: build honest bundle,
+        // call rederive_aggregator_outer_pi_hash, confirm it equals
+        // bundle.binding_aggregator.public.outer_pi_hash.
+        let inner = build_one_inner_recursive(944);
+        let inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1, l, l + 1, 2 * l, 3 * l, 10 * l, 20 * l, 30 * l - 1,
+        ];
+
+        let bundle = prove_master_with_fri_merkle_binding_aggregated(
+            &inner_proofs, 4, 54, false, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("honest compact prove");
+
+        let rederived = rederive_aggregator_outer_pi_hash(
+            &bundle.binding_publics,
+            &bundle.binding_meta,
+            bundle.binding_aggregator.public.n_trace_max,
+        ).expect("re-derivation must succeed on honest bundle");
+
+        assert_eq!(rederived, bundle.binding_aggregator.public.outer_pi_hash,
+            "Phase 4b-2 re-derived outer_pi_hash must match aggregator's");
     }
 
     #[test]

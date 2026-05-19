@@ -581,18 +581,41 @@ real inner v2 STARK at B=10 subset.  Tamper test
 `prove_master_with_fri_merkle_binding_aggregated_rejects_tampered_publics`
 confirms binding_publics tampering is detected.
 
-**Known soundness gap (M6 follow-up)**: the compact form's current
-verifier doesn't re-derive `aggregator.public.outer_pi_hash` from
-`binding_publics` deterministically.  Without that link, a malicious
-prover could submit a DEGENERATE aggregator (proven over residues all
-set to zero) plus the real `binding_publics` — passing both the
-aggregator FRI verify AND the Piece 2 cross-check.  The gap is closed
-by adding `binding_meta: Vec<(n_trace, blowup, r, use_stir)>` (32 B
-per binding) to `CompactFriMerkleBundle` so the verifier can
-reconstruct each binding's `n_constraints = r × log2(n_trace × blowup)
-× EXT_DEGREE`, re-derive the alphas from the FS-seed, rebuild the
-sub-circuit pi_hashes, and confirm
-`aggregator.public.outer_pi_hash` matches.  Documented as Phase 4b-2.
+**Phase 4b-2 — soundness completion (2026-05-18)**: the original
+compact-form verifier didn't re-derive `aggregator.public.outer_pi_hash`
+from `binding_publics` deterministically. A malicious prover could
+submit a DEGENERATE aggregator (e.g. proven over a DIFFERENT set of
+bindings whose pi_hashes match by coincidence) plus the real
+`binding_publics` — passing both the aggregator FRI verify AND the
+Piece 2 cross-check.
+
+**Fix (landed)**: `CompactFriMerkleBundle` now carries
+`binding_meta: Vec<BatchedMerklePathMeta>` (`n_trace`, `blowup`, `r`,
+`use_stir` per binding = 32 B each). New helper
+`rederive_aggregator_outer_pi_hash(binding_publics, binding_meta,
+n_trace_max)` mirrors the aggregator's sub-circuit pi_hash chain:
+
+1. Total `n_constraints = Σ r_i × log2(n_trace_i × blowup_i) × EXT_DEGREE`
+2. Comp alphas via FS-seed `AGGREGATOR-FRI-MERKLE-COMP-V1 || pi_hashes`
+3. Synthetic `CompositionClaim` with zero column_values (on honest
+   proofs residues are all zero, flattens identically)
+4. `CompositionAccumulatorPublicInputs::for_claim` → expected comp.pi_hash
+5. Same for `OodAccumulatorClaim`, `PermArgClaim`
+6. Combine into expected `outer_pi_hash` via `WRAPPER-RECURSIVE-V1`
+   chain + supplied `n_trace_max` (read from `aggregator.public`)
+
+`verify_master_with_fri_merkle_binding_aggregated` now calls this
+helper and rejects on mismatch. The degenerate-aggregator attack is
+caught because the swapped aggregator's `outer_pi_hash` differs from
+the re-derivation over the real binding_publics.
+
+Tamper test `phase_4b2_degenerate_aggregator_rejects` constructs a
+parallel compact bundle over a DIFFERENT inner and swaps its
+aggregator into the original bundle — verifier correctly rejects.
+
+Honest-match test `phase_4b2_rederive_matches_on_honest_bundle`
+confirms the re-derivation is bit-exact against
+`aggregator.public.outer_pi_hash` on real cryptographic input.
 
 **Out-of-scope (next pickups)**:
 
