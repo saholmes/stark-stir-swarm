@@ -2669,6 +2669,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Phase 6 scaling anchor — N=1 B=100 subset.  EMPIRICAL FINDING (2026-05-19): OOM-killed on commodity Apple Silicon at smoke L1 (working set exceeds ~32 GB RAM at LDE expansion).  Confirms Phase 0 Shape D single-batch memory wall.  Production-tractable B=810 requires intra-inner batching (~13 batches of B=64 each + recursive aggregation) or cloud nodes with 64+ GB RAM."]
+    fn prove_master_with_fri_merkle_binding_n1_subset_b100() {
+        // Anchor the B=10 → B=810 extrapolation by measuring an
+        // intermediate B=100 point.  Expected scaling: trace pads to
+        // next pow2, so B=10 trace ≈ 2^14, B=100 trace ≈ 2^17 (=8×
+        // larger).  Projected prove time: ~8× B=10 ≈ ~30 min.
+        let inner = build_one_inner_recursive(990);
+
+        // 100 evenly-distributed indices across the 810 full paths.
+        let full_claim = extract_fri_merkle_openings(&inner)
+            .expect("extract must succeed");
+        let m = full_claim.batch_size();
+        assert!(m >= 100, "expected at least 100 paths, got {m}");
+        let subset_indices: Vec<usize> = (0..100)
+            .map(|i| i * m / 100)
+            .collect();
+
+        let inner_proofs = vec![inner];
+        let t = std::time::Instant::now();
+        let proof = prove_master_with_fri_merkle_binding(
+            &inner_proofs, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("Phase 3 B=100 prove must succeed");
+        let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
+        assert!(verify_master_with_fri_merkle_binding(
+            &proof, &inner_proofs, Some(&subset_indices),
+        ), "B=100 verify must accept");
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Print anchor numbers for the bench narrative (visible with --nocapture).
+        eprintln!();
+        eprintln!("═══ B=100 scaling anchor ═══");
+        eprintln!("  master + binding (B=100) prove: {:.2} s", prove_ms / 1000.0);
+        eprintln!("  master + binding (B=100) verify: {:.2} ms", verify_ms);
+        eprintln!("  vs B=10 anchor: 220.69 s prove + 5.1 ms verify");
+        eprintln!("  scaling ratio (prove): {:.2}×", prove_ms / 1000.0 / 220.69);
+        eprintln!();
+
+        assert_eq!(proof.fri_merkle_bindings.len(), 1);
+        assert_eq!(proof.fri_merkle_bindings[0].batch_size, 100);
+    }
+
+    #[test]
     fn aggregate_fri_merkle_bindings_rejects_empty() {
         let result = aggregate_fri_merkle_bindings(&[], 4, 54, false);
         assert!(matches!(result, Err(MasterBridgeError::EmptyInput)));

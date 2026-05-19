@@ -748,6 +748,48 @@ compact-form-specific gaps closed by Phase 4b-2 + Phase 5-2) have a
 passing tamper-rejection test on real cryptographic input. Soundness
 of the FRI-Merkle binding pipeline is end-to-end verified at smoke L1.
 
+## B=100 scaling anchor — OOM finding (2026-05-19, empirical)
+
+Attempting to anchor the B=10 → B=810 extrapolation by running an
+intermediate B=100 prove at smoke L1 (blowup=4 r=54) on Apple Silicon
+produced an OOM kill (`signal: 9, SIGKILL`), confirming the
+single-batch memory wall:
+
+| B | Trace (rows) | LDE (rows) | Working set | Outcome |
+|---|------------:|-----------:|------------:|---------|
+| 10  | ~16 K (2¹⁴) | ~65 K | ~5 GB | ✓ 220.69 s |
+| 100 | ~131 K (2¹⁷) | ~524 K | >RAM | ✗ OOM-killed |
+| 810 (projected) | ~1 M (2²⁰) | ~4.2 M | ~46 GB | ✗ untenable on commodity |
+
+This empirically validates the Phase 0 Shape D recommendation:
+single-batch B=810 per-inner is impractical on commodity hardware
+(<64 GB).  The correct production path is **intra-inner batching**:
+split the M = r·L = 810 openings per inner into N_b ≈ 13 batched
+STARKs of B=64 each, each fitting in ~750 MB working set, then
+recursively aggregate via the existing `aggregate_fri_merkle_bindings`
+gadget.
+
+**Currently implemented**: cross-inner aggregation (Phase 4b
+collapses N binding bundles → 1 outer aggregator).  This is the right
+piece for the multi-inner master STARK.
+
+**Currently missing**: intra-inner batching (Shape D Phase 1's
+original recommendation).  The full per-inner B=810 binding remains
+single-batch in the current code; to be production-tractable it
+should split into ~13 small batches and aggregate via the existing
+recursion gadget.  This is mechanical extension; the gadget itself
+already supports it (just iterate `prove_batched_merkle_paths` at
+B=64 over `M/B` chunks, then aggregate).
+
+**Practical immediate consequence**: at TLD scale on commodity
+hardware, full per-inner binding requires either (a) implementing
+intra-inner Shape D batching, or (b) cloud nodes with 64+ GB RAM, or
+(c) accepting spot-check binding (B ≤ ~50) as the production setting.
+The paper's deployment-mode matrix (operator-controlled / federated /
+open-permissionless) makes the operational case for (c) — full
+binding is reserved for smaller deployments or audits, not full-TLD
+coverage.
+
 ## Status
 
 - Phase 0 (this doc) — **done**.
