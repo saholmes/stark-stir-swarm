@@ -1688,10 +1688,49 @@ fn extract_batched_merkle_fri_residues(
     Ok(residues_per_query)
 }
 
-/// Aggregator sub-circuit 1: composition over per-binding-bundle FRI
-/// DEEP-quotient residues, flattened to EXT_DEGREE Goldilocks coords.
-/// Mirrors `build_master_composition` but with FS seed
-/// `AGGREGATOR-FRI-MERKLE-COMP-V1` over binding `public.pi_hash`s.
+/// Per-binding-bundle FRI-fold residues `s[ell] − f[ell+1] = 0` per
+/// (k, ell) for ell in 0..L-1.  Mirrors `extract_recursive_fold_residues`
+/// at the aggregator layer.  On an honest binding bundle every
+/// residue is zero in F_ext.
+fn extract_batched_merkle_fold_residues(
+    bmp: &BatchedMerklePathProof,
+) -> Result<Vec<Vec<Ext>>, MasterBridgeError> {
+    let fri_proof = &bmp.fri_proof;
+    if fri_proof.queries.is_empty() {
+        return Err(MasterBridgeError::StirNotSupported);
+    }
+    let l = batched_merkle_proof_params(bmp).schedule.len();
+    if l == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut residues_per_query: Vec<Vec<Ext>> =
+        Vec::with_capacity(fri_proof.queries.len());
+    for qp in &fri_proof.queries {
+        if qp.per_layer_payloads.len() < l {
+            return Err(MasterBridgeError::MalformedFriProof(format!(
+                "binding fold extract: query payloads {} < L = {l}",
+                qp.per_layer_payloads.len()
+            )));
+        }
+        let mut row = Vec::with_capacity(l - 1);
+        for ell in 0..(l - 1) {
+            let s_curr = qp.per_layer_payloads[ell].s_val;
+            let f_next = qp.per_layer_payloads[ell + 1].f_val;
+            row.push(s_curr - f_next);
+        }
+        residues_per_query.push(row);
+    }
+    Ok(residues_per_query)
+}
+
+/// Aggregator sub-circuit 1 + 1a: composition over per-binding-bundle
+/// FRI DEEP-quotient residues + (V2) FRI-fold residues, flattened to
+/// EXT_DEGREE Goldilocks coords.  Mirrors V3 `build_master_composition`
+/// at the aggregator layer with FS seed
+/// `AGGREGATOR-FRI-MERKLE-COMP-V2` over binding `public.pi_hash`s.
+///
+/// Total constraints per binding: r × (2L − 1) × EXT_DEGREE.
 pub fn build_aggregator_composition(
     bindings: &[BatchedMerklePathProof],
 ) -> Result<CompositionClaim<Goldilocks>, MasterBridgeError> {
@@ -1703,6 +1742,7 @@ pub fn build_aggregator_composition(
     let mut constraints: Vec<BitOp> = Vec::new();
     let mut next_col = 0usize;
 
+    // Sub-circuit 1: DEEP-quotient residues.
     for bmp in bindings {
         let residues = extract_batched_merkle_fri_residues(bmp)?;
         for row in &residues {
@@ -1718,8 +1758,24 @@ pub fn build_aggregator_composition(
         }
     }
 
+    // Sub-circuit 1a: FRI-fold residues `s[ell] − f[ell+1] = 0`.
+    for bmp in bindings {
+        let fold_residues = extract_batched_merkle_fold_residues(bmp)?;
+        for row in &fold_residues {
+            for r in row {
+                let coords = r.to_fp_components();
+                for c in 0..EXT_DEGREE {
+                    let cell = CellRef::new(0, next_col);
+                    column_values.push((cell, coords[c]));
+                    constraints.push(BitOp::IsZero { cell });
+                    next_col += 1;
+                }
+            }
+        }
+    }
+
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-COMP-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-COMP-V2");
     for bmp in bindings {
         Digest::update(&mut hasher, bmp.public.pi_hash);
     }
@@ -1759,7 +1815,7 @@ pub fn build_aggregator_ood_anchor(
     }
 
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-OOD-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-OOD-V2");
     for bmp in bindings {
         Digest::update(&mut hasher, bmp.public.pi_hash);
     }
@@ -1778,7 +1834,7 @@ pub fn build_aggregator_vestige_perm_arg(
     bindings: &[BatchedMerklePathProof],
 ) -> PermArgClaim<Goldilocks> {
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-PI-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-PI-V2");
     for bmp in bindings {
         Digest::update(&mut hasher, bmp.public.pi_hash);
     }
@@ -1866,12 +1922,16 @@ impl BatchedMerklePathMeta {
     }
 
     /// Reconstruct n_constraints contributed by this binding to the
-    /// aggregator's sub-circuit 1: `r × L × EXT_DEGREE` where
-    /// L = log2(n_trace × blowup).
+    /// V2 aggregator's sub-circuit 1 + 1a: `r × (2L − 1) × EXT_DEGREE`
+    /// where L = log2(n_trace × blowup).  V2 = V1 (DEEP-quotient only:
+    /// `r × L × EXT_DEGREE`) plus FRI-fold residues
+    /// (`r × (L − 1) × EXT_DEGREE`).
     pub fn aggregator_residue_constraints(&self) -> usize {
         let n_lde = self.n_trace * self.blowup;
         let l = n_lde.trailing_zeros() as usize;
-        self.r * l * EXT_DEGREE
+        let deep = self.r * l * EXT_DEGREE;
+        let fold = if l == 0 { 0 } else { self.r * (l - 1) * EXT_DEGREE };
+        deep + fold
     }
 }
 
@@ -1940,7 +2000,7 @@ pub fn rederive_aggregator_outer_pi_hash(
 
     // 2. Reconstruct comp seed → alphas.
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-COMP-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-COMP-V2");
     for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
     let comp_seed: [u8; 32] = Digest::finalize(hasher).into();
     let comp_alphas = alphas_from_transcript::<Goldilocks>(&comp_seed, n_total);
@@ -1979,7 +2039,7 @@ pub fn rederive_aggregator_outer_pi_hash(
         }
     }
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-OOD-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-OOD-V2");
     for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
     let ood_seed: [u8; 32] = Digest::finalize(hasher).into();
     let ood_alphas = alphas_from_transcript::<Goldilocks>(&ood_seed, n_ood);
@@ -1991,7 +2051,7 @@ pub fn rederive_aggregator_outer_pi_hash(
 
     // 5. Reconstruct vestige perm-arg.
     let mut hasher = sha3::Sha3_256::new();
-    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-PI-V1");
+    Digest::update(&mut hasher, b"AGGREGATOR-FRI-MERKLE-PI-V2");
     for bp in binding_publics { Digest::update(&mut hasher, bp.pi_hash); }
     let aggregator_pi: [u8; 32] = Digest::finalize(hasher).into();
     let mut elems = Vec::with_capacity(4);
@@ -2398,6 +2458,55 @@ mod tests {
     }
 
     // ─── Phase 5 sub-circuit 1a tests ───────────────────────────────
+
+    #[test]
+    #[ignore = "Aggregator sub-circuit 1a — builds inner + binding + extracts fold residues; ~4 min"]
+    fn extract_batched_merkle_fold_residues_shape() {
+        // Build a real inner v2 → recursive STARK, extract the FRI
+        // Merkle openings, prove a B=10 subset binding, and confirm
+        // the binding's fold residues have shape r × (L − 1) and are
+        // all zero on honest input.
+        use crate::merkle_path_air::BatchedMerklePathClaim;
+        use crate::merkle_prover::prove_batched_merkle_paths;
+
+        let inner = build_one_inner_recursive(960);
+        let l_inner = inner.fri_proof.queries[0].per_layer_payloads.len();
+        let mut full_claim = extract_fri_merkle_openings(&inner)
+            .expect("extract must succeed");
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l_inner - 1, l_inner, l_inner + 1,
+            2 * l_inner, 3 * l_inner, 10 * l_inner, 20 * l_inner, 30 * l_inner - 1,
+        ];
+        full_claim.paths = subset_indices.iter()
+            .map(|&i| full_claim.paths[i].clone()).collect();
+        let subset_claim: BatchedMerklePathClaim = full_claim;
+
+        let binding = prove_batched_merkle_paths(
+            &subset_claim, /*blowup=*/4, /*r=*/54, /*use_stir=*/false,
+        ).expect("binding prove");
+
+        let r = binding.fri_proof.queries.len();
+        let l = binding.fri_proof.queries[0].per_layer_payloads.len();
+
+        let fold = extract_batched_merkle_fold_residues(&binding)
+            .expect("fold extract must succeed");
+
+        assert_eq!(fold.len(), r,
+            "fold residues outer dim must equal binding's n_queries");
+        for row in &fold {
+            assert_eq!(row.len(), l - 1,
+                "fold residues inner dim must equal L − 1");
+        }
+
+        // Honest residues all zero (s_val[ell] = f_val[ell+1] in F_ext).
+        use ark_ff::Zero;
+        for row in &fold {
+            for r in row {
+                assert!(r.is_zero(),
+                    "honest aggregator fold residue must be zero");
+            }
+        }
+    }
 
     #[test]
     #[ignore = "Phase 5 — builds one inner + extracts fold residues; ~4-5 s"]
