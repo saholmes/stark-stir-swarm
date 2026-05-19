@@ -2576,6 +2576,236 @@ fn verify_binding_publics_paths_match(
     true
 }
 
+// ─── Shape D intra-inner batching (Phase 0 design doc) ────────────────
+//
+// Splits each inner's full M = r × L Merkle openings into chunks of
+// at most `chunk_size` paths, proves each chunk as an independent
+// `BatchedMerklePathProof`, then aggregates ALL chunks across ALL
+// inners into ONE outer `RecursiveStarkProof` via the existing Phase
+// 4b aggregator.  Each chunk's working set is bounded by `chunk_size`
+// (e.g. B=64 fits ~750 MB on commodity hardware), making
+// full-coverage binding tractable where single-batch B=810 OOMs.
+//
+// Empirical anchor (2026-05-19, smoke L1 on Apple Silicon):
+//   B=10 single-batch:  220.69 s, ~5 GB working set ✓
+//   B=100 single-batch: OOM-killed (SIGKILL)
+//   Shape D B=64 chunks: ~13 chunks/inner, each fits, sequential prove
+// See `scripts/results/fri-merkle-binding-phase0-design.md` for
+// the full Shape D analysis.
+
+/// Prove the FULL FRI-Merkle binding for ONE inner via intra-inner
+/// batching: extract M=r·L Merkle openings, split into contiguous
+/// chunks of size `chunk_size`, prove each chunk as an independent
+/// `BatchedMerklePathProof`.  Returns the per-chunk proofs in order
+/// (chunk 0 covers paths 0..chunk_size, chunk 1 covers
+/// chunk_size..2*chunk_size, etc).
+///
+/// Per-chunk working set is bounded by `chunk_size` × per-path trace,
+/// avoiding the single-batch memory wall that OOMs at B≥~100.
+pub fn prove_shape_d_inner_binding(
+    inner: &RecursiveStarkProof,
+    chunk_size: usize,
+    binding_blowup: usize, binding_r: usize, binding_use_stir: bool,
+    subset_paths: Option<&[usize]>,
+) -> Result<Vec<BatchedMerklePathProof>, FriMerkleBindingError> {
+    if chunk_size == 0 {
+        return Err(FriMerkleBindingError::Master(MasterBridgeError::EmptyInput));
+    }
+    let full_claim = extract_fri_merkle_openings(inner)
+        .map_err(FriMerkleBindingError::Extract)?;
+    // Restrict to subset_paths if supplied (mirrors Phase 3
+    // `prove_master_with_fri_merkle_binding`'s subset_paths threading
+    // for tractable testing without disabling the gadget).
+    let path_indices: Vec<usize> = match subset_paths {
+        Some(indices) => indices.to_vec(),
+        None => (0..full_claim.paths.len()).collect(),
+    };
+    let m = path_indices.len();
+    if m == 0 {
+        return Err(FriMerkleBindingError::Empty);
+    }
+    let n_chunks = (m + chunk_size - 1) / chunk_size;
+    let mut chunk_bindings = Vec::with_capacity(n_chunks);
+    for chunk_idx in 0..n_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = ((chunk_idx + 1) * chunk_size).min(m);
+        let chunk_paths = (start..end)
+            .map(|j| full_claim.paths[path_indices[j]].clone())
+            .collect();
+        let chunk_claim = crate::merkle_path_air::BatchedMerklePathClaim {
+            variant: full_claim.variant,
+            paths: chunk_paths,
+        };
+        let chunk_proof = prove_batched_merkle_paths(
+            &chunk_claim, binding_blowup, binding_r, binding_use_stir,
+        ).map_err(FriMerkleBindingError::Binding)?;
+        chunk_bindings.push(chunk_proof);
+    }
+    Ok(chunk_bindings)
+}
+
+/// Shape D compact bundle: master + cross-aggregator + per-inner
+/// per-chunk publics + meta.  L1 wire shape:
+///   master + aggregator + Σ_i (n_chunks_i × per-chunk-publics)
+/// At full M=810 per inner with chunk_size=64: n_chunks=13;
+/// per-chunk publics ~4 KiB each → ~52 KiB per inner of publics,
+/// vs ~40 KiB for single-batch B=810 publics — roughly comparable,
+/// while making the prover memory tractable.
+pub struct ShapeDFriMerkleBundle {
+    pub master: RecursiveStarkProof,
+    /// Aggregator over ALL chunks across ALL inners
+    /// (flattened: inner 0's chunks first, then inner 1's, etc.).
+    pub binding_aggregator: RecursiveStarkProof,
+    /// `per_inner_publics[i]` = vec of chunk publics for inner i.
+    pub per_inner_publics:
+        Vec<Vec<crate::merkle_prover::BatchedMerklePathPublicInputs>>,
+    /// `per_inner_meta[i]` = vec of chunk meta for inner i.
+    pub per_inner_meta: Vec<Vec<BatchedMerklePathMeta>>,
+    /// Chunk size used at prove time (uniform across inners).
+    pub chunk_size: usize,
+}
+
+/// **Shape D main entry**: produce the master STARK + per-inner Shape D
+/// binding chunks + ONE cross-inner aggregator over all chunks.
+pub fn prove_master_with_fri_merkle_binding_shape_d(
+    inner_proofs: &[RecursiveStarkProof],
+    chunk_size: usize,
+    master_blowup: usize, master_r: usize, master_use_stir: bool,
+    binding_blowup: usize, binding_r: usize, binding_use_stir: bool,
+    aggregator_blowup: usize, aggregator_r: usize, aggregator_use_stir: bool,
+    subset_paths: Option<&[usize]>,
+) -> Result<ShapeDFriMerkleBundle, FriMerkleBindingError> {
+    if inner_proofs.is_empty() {
+        return Err(FriMerkleBindingError::Empty);
+    }
+    if chunk_size == 0 {
+        return Err(FriMerkleBindingError::Master(MasterBridgeError::EmptyInput));
+    }
+
+    // 1. Master STARK.
+    let master = prove_master_recursive(
+        inner_proofs, master_blowup, master_r, master_use_stir,
+    ).map_err(FriMerkleBindingError::Master)?;
+
+    // 2. Per inner: split openings into B-sized chunks, prove each.
+    //    `subset_paths` (when supplied) is applied per inner BEFORE
+    //    chunking, so each inner gets the same subset → chunks shape.
+    let mut per_inner_chunks: Vec<Vec<BatchedMerklePathProof>> =
+        Vec::with_capacity(inner_proofs.len());
+    for rec in inner_proofs {
+        let chunks = prove_shape_d_inner_binding(
+            rec, chunk_size, binding_blowup, binding_r, binding_use_stir,
+            subset_paths,
+        )?;
+        per_inner_chunks.push(chunks);
+    }
+
+    // 3. Record per-inner chunk publics + meta BEFORE flattening
+    //    (BatchedMerklePathProof doesn't impl Clone; we move into
+    //    `all_chunks` for the aggregator and snapshot publics+meta
+    //    here for the bundle).
+    let mut per_inner_publics: Vec<Vec<_>> = Vec::with_capacity(inner_proofs.len());
+    let mut per_inner_meta: Vec<Vec<BatchedMerklePathMeta>> = Vec::with_capacity(inner_proofs.len());
+    for inner_chunks in &per_inner_chunks {
+        let publics: Vec<_> = inner_chunks.iter().map(|b| b.public.clone()).collect();
+        let meta: Vec<_> = inner_chunks.iter().map(BatchedMerklePathMeta::from_proof).collect();
+        per_inner_publics.push(publics);
+        per_inner_meta.push(meta);
+    }
+
+    // 4. Flatten across inners + aggregate via existing gadget.
+    let all_chunks: Vec<BatchedMerklePathProof> = per_inner_chunks
+        .into_iter().flatten().collect();
+    let binding_aggregator = aggregate_fri_merkle_bindings(
+        &all_chunks, aggregator_blowup, aggregator_r, aggregator_use_stir,
+    ).map_err(FriMerkleBindingError::Master)?;
+
+    Ok(ShapeDFriMerkleBundle {
+        master, binding_aggregator,
+        per_inner_publics, per_inner_meta,
+        chunk_size,
+    })
+}
+
+/// Verify a `ShapeDFriMerkleBundle` — master FRI verify + Phase 5-2
+/// master re-derivation + aggregator FRI verify + Phase 4b-2
+/// re-derivation over flattened publics + per-chunk Piece 2 against
+/// contiguous slices of each inner's openings.
+pub fn verify_master_with_fri_merkle_binding_shape_d(
+    bundle: &ShapeDFriMerkleBundle,
+    inner_proofs: &[RecursiveStarkProof],
+    subset_paths: Option<&[usize]>,
+) -> bool {
+    if bundle.per_inner_publics.len() != inner_proofs.len() { return false; }
+    if bundle.per_inner_meta.len() != inner_proofs.len() { return false; }
+    if bundle.chunk_size == 0 { return false; }
+
+    // (i) Master FRI verify.
+    if !verify_master_recursive(&bundle.master) { return false; }
+
+    // (i.5) Phase 5-2: master.outer_pi_hash matches re-derivation.
+    let expected_master_outer = match rederive_master_outer_pi_hash(
+        inner_proofs, bundle.master.public.n_trace_max,
+    ) {
+        Some(h) => h, None => return false,
+    };
+    if expected_master_outer != bundle.master.public.outer_pi_hash {
+        return false;
+    }
+
+    // (ii) Aggregator FRI verify.
+    if !verify_recursive_stark(&bundle.binding_aggregator) { return false; }
+
+    // (ii.5) Phase 4b-2: aggregator.outer_pi_hash matches flattened publics.
+    let flat_publics: Vec<_> = bundle.per_inner_publics.iter()
+        .flat_map(|v| v.iter().cloned()).collect();
+    let flat_meta: Vec<BatchedMerklePathMeta> = bundle.per_inner_meta.iter()
+        .flat_map(|v| v.iter().copied()).collect();
+    let expected_agg_outer = match rederive_aggregator_outer_pi_hash(
+        &flat_publics, &flat_meta,
+        bundle.binding_aggregator.public.n_trace_max,
+    ) {
+        Some(h) => h, None => return false,
+    };
+    if expected_agg_outer != bundle.binding_aggregator.public.outer_pi_hash {
+        return false;
+    }
+
+    // (iii) Per-inner per-chunk publics: defense-in-depth pi_hash
+    //       re-derivation + Piece 2 against contiguous chunk slices of
+    //       each inner's (subset-restricted) Merkle openings.
+    for (i, rec) in inner_proofs.iter().enumerate() {
+        let expected_claim = match extract_fri_merkle_openings(rec) {
+            Ok(c) => c, Err(_) => return false,
+        };
+        // `subset_paths` indexes into the inner's full openings;
+        // chunks index into the subset.
+        let path_indices: Vec<usize> = match subset_paths {
+            Some(indices) => indices.to_vec(),
+            None => (0..expected_claim.paths.len()).collect(),
+        };
+        let m = path_indices.len();
+        let chunks = &bundle.per_inner_publics[i];
+        let n_chunks = (m + bundle.chunk_size - 1) / bundle.chunk_size;
+        if chunks.len() != n_chunks { return false; }
+        for (chunk_idx, bp) in chunks.iter().enumerate() {
+            if !verify_binding_pi_hash_rederivation(bp) { return false; }
+            let start = chunk_idx * bundle.chunk_size;
+            let end = ((chunk_idx + 1) * bundle.chunk_size).min(m);
+            // Translate chunk subset-indices back to inner-full indices.
+            let chunk_indices: Vec<usize> = (start..end)
+                .map(|j| path_indices[j]).collect();
+            if !verify_binding_publics_paths_match(
+                bp, &expected_claim, Some(&chunk_indices),
+            ) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2666,6 +2896,57 @@ mod tests {
             &[], 4, 54, false, 4, 54, false, None,
         );
         assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
+    }
+
+    #[test]
+    fn prove_master_with_fri_merkle_binding_shape_d_rejects_empty() {
+        let result = prove_master_with_fri_merkle_binding_shape_d(
+            &[], 64, 4, 54, false, 4, 54, false, 4, 54, false, None,
+        );
+        assert!(matches!(result, Err(FriMerkleBindingError::Empty)));
+    }
+
+    #[test]
+    #[ignore = "Shape D round-trip — N=1 inner v2 + intra-inner Shape D batching over 20-path subset in 4 chunks of B=5; ~15 min"]
+    fn prove_master_with_fri_merkle_binding_shape_d_n1_b5_chunks() {
+        // Small Shape D demonstration: 20 paths split into 4 chunks of
+        // B=5 each.  Exercises the new prove + aggregator + verifier
+        // chain without hitting the OOM wall.
+        let inner = build_one_inner_recursive(995);
+        let inner_proofs = vec![inner];
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let subset_indices: Vec<usize> = vec![
+            0, 1, l - 1,            // query 0 (spanning layers)
+            l, l + 1,                // query 1
+            2 * l, 2 * l + 1,        // query 2
+            3 * l, 4 * l, 5 * l,     // queries 3, 4, 5 first layer
+            10 * l, 15 * l, 20 * l,  // sparse coverage
+            25 * l, 26 * l, 27 * l,
+            28 * l, 29 * l - 1,
+            29 * l, 30 * l - 1,
+        ];
+        assert_eq!(subset_indices.len(), 20);
+
+        let bundle = prove_master_with_fri_merkle_binding_shape_d(
+            &inner_proofs, /*chunk_size=*/ 5,
+            4, 54, false, 4, 54, false, 4, 54, false,
+            Some(&subset_indices),
+        ).expect("Shape D prove must succeed");
+
+        // Shape sanity: 1 inner × 4 chunks (20 paths / B=5).
+        assert_eq!(bundle.per_inner_publics.len(), 1);
+        assert_eq!(bundle.per_inner_publics[0].len(), 4);
+        assert_eq!(bundle.per_inner_meta.len(), 1);
+        assert_eq!(bundle.per_inner_meta[0].len(), 4);
+        assert_eq!(bundle.chunk_size, 5);
+        for chunk_pub in &bundle.per_inner_publics[0] {
+            assert_eq!(chunk_pub.paths.len(), 5);
+        }
+
+        // Verify the full chain.
+        assert!(verify_master_with_fri_merkle_binding_shape_d(
+            &bundle, &inner_proofs, Some(&subset_indices),
+        ), "Shape D round-trip must verify end-to-end");
     }
 
     #[test]
