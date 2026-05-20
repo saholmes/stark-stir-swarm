@@ -2907,6 +2907,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Shape D full-coverage anchor — N=1 inner, FULL M=810 paths, chunk_size=64 → 13 chunks; ~3-4 h overnight.  Confirms intra-inner batching unlocks B=810 coverage on commodity hardware (single-batch B=100 OOMs; chunked B=64 fits ~750 MB per chunk)."]
+    fn prove_master_with_fri_merkle_binding_shape_d_n1_full_b64_chunks() {
+        // The TLD-scale anchor: full per-inner FRI-Merkle binding
+        // coverage via Shape D intra-inner batching at the design-doc-
+        // recommended chunk_size=64.
+        let inner = build_one_inner_recursive(1064);
+        let inner_proofs = vec![inner];
+
+        // Sanity: confirm full M = r × L.
+        let r = inner_proofs[0].fri_proof.queries.len();
+        let l = inner_proofs[0].fri_proof.queries[0].per_layer_payloads.len();
+        let m = r * l;
+        eprintln!("=== Shape D full-coverage anchor ===");
+        eprintln!("  inner.r = {r}, L = {l}, M = r·L = {m}");
+        eprintln!("  chunk_size = 64, expected n_chunks = {}", (m + 63) / 64);
+
+        let t = std::time::Instant::now();
+        let bundle = prove_master_with_fri_merkle_binding_shape_d(
+            &inner_proofs, /*chunk_size=*/ 64,
+            /*master_blowup=*/ 4, /*master_r=*/ 54, /*master_stir=*/ false,
+            /*binding_blowup=*/ 4, /*binding_r=*/ 54, /*binding_stir=*/ false,
+            /*aggregator_blowup=*/ 4, /*aggregator_r=*/ 54, /*aggregator_stir=*/ false,
+            /*subset_paths=*/ None,
+        ).expect("Shape D full-coverage prove must succeed");
+        let prove_s = t.elapsed().as_secs_f64();
+        eprintln!("  Shape D full prove:  {prove_s:.1} s ({:.2} h)", prove_s / 3600.0);
+
+        let expected_chunks = (m + 63) / 64;
+        assert_eq!(bundle.per_inner_publics.len(), 1);
+        assert_eq!(bundle.per_inner_publics[0].len(), expected_chunks);
+        assert_eq!(bundle.per_inner_meta[0].len(), expected_chunks);
+        // All chunks fully packed except possibly the last.
+        let mut total_paths = 0;
+        for chunk_pub in &bundle.per_inner_publics[0] {
+            assert!(chunk_pub.paths.len() <= 64);
+            total_paths += chunk_pub.paths.len();
+        }
+        assert_eq!(total_paths, m);
+
+        let t = std::time::Instant::now();
+        let ok = verify_master_with_fri_merkle_binding_shape_d(
+            &bundle, &inner_proofs, /*subset_paths=*/ None,
+        );
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Shape D full verify: {verify_ms:.2} ms");
+        assert!(ok, "Shape D full-coverage must verify end-to-end");
+    }
+
+    #[test]
     #[ignore = "Shape D round-trip — N=1 inner v2 + intra-inner Shape D batching over 20-path subset in 4 chunks of B=5; ~15 min"]
     fn prove_master_with_fri_merkle_binding_shape_d_n1_b5_chunks() {
         // Small Shape D demonstration: 20 paths split into 4 chunks of
