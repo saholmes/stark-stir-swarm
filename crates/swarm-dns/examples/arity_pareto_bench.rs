@@ -48,6 +48,7 @@ fn schedule_from_spec(spec: &str, log_n0: usize) -> (Vec<usize>, bool) {
         "fri8"  => (uniform(3), false),
         "fri16" => (uniform(4), false),
         "fri32" => (uniform(5), false),
+        "u2"  => (uniform(1), true),   // STIR arity-2 (binary coset)
         "u4"  => (uniform(2), true),
         "u8"  => (uniform(3), true),
         "u16" => (uniform(4), true),
@@ -132,6 +133,46 @@ fn main() {
     assert!(deep_fri_verify::<Ext>(&params, &proof), "proof must verify");
     let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
     let bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+
+    // Component byte-and-hash budget (reviewer-requested matched-arity
+    // accounting).  HASH=32 at SHA3-256/L1; EXT = Fp6 = 48 B; base F = 8 B.
+    if std::env::var("BREAKDOWN").is_ok() {
+        const HASH: usize = 32;
+        let ext = std::mem::size_of::<u64>() * 6; // Fp6
+        let roots = HASH + proof.roots.len() * HASH;
+        let finalp = proof.final_poly_coeffs.len() * ext;
+        if use_stir {
+            let coset: usize = proof.stir_coset_evals.as_ref().unwrap()
+                .iter().map(|v| v.len() * ext).sum();
+            let pq = proof.stir_proximity_queries.as_ref().unwrap();
+            let fibers: usize = pq.iter().map(|p| p.fiber_f_vals.len() * 8).sum();
+            let ood = pq.len() * ext;
+            let mut npaths = 0usize; let mut pathb = 0usize;
+            for p in pq {
+                npaths += 1; pathb += HASH + p.f0_packed_opening.path.iter().map(|l| l.len()*HASH).sum::<usize>();
+                if let Some(l1) = &p.layer1_opening { npaths += 1; pathb += HASH + l1.path.iter().map(|l| l.len()*HASH).sum::<usize>(); }
+                // Per-layer (ell ≥ 1) fiber openings now committed per query
+                // after the under-opening soundness fix.
+                for lo in &p.layer_openings {
+                    for o in &lo.fiber_openings {
+                        npaths += 1; pathb += HASH + o.path.iter().map(|l| l.len()*HASH).sum::<usize>();
+                    }
+                }
+            }
+            eprintln!("[BREAKDOWN STIR k={} r={r}] roots={roots} finalpoly={finalp} coset_evals={coset} fibers(8B)={fibers} ood_ext={ood} merkle_paths={npaths}({pathb}B) | total={}",
+                schedule[0], roots+finalp+coset+fibers+ood+pathb);
+        } else {
+            let fz = proof.fz_per_layer.len() * ext;
+            let payloads: usize = proof.queries.iter().map(|q| q.per_layer_payloads.len()*3*ext).sum();
+            let f0b: usize = proof.f0_openings.iter().map(|o| HASH + o.path.iter().map(|l| l.len()*HASH).sum::<usize>()).sum();
+            let mut npaths = proof.f0_openings.len(); let mut layerb = 0usize;
+            for layer in &proof.layer_proofs.layers {
+                for o in &layer.openings { npaths += 1; layerb += HASH + o.path.iter().map(|l| l.len()*HASH).sum::<usize>(); }
+            }
+            eprintln!("[BREAKDOWN FRI  k={} r={r}] roots={roots} finalpoly={finalp} fz={fz} payloads(3ext/layer/q)={payloads} f0_paths={f0b} layer_paths={layerb} merkle_paths={npaths} | total={}",
+                schedule[0], roots+finalp+fz+payloads+f0b+layerb);
+        }
+    }
 
     let ldt = if use_stir { "STIR" } else { "FRI " };
     let nist = deep_ali::stark_level::NIST_LEVEL;

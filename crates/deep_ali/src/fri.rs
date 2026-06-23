@@ -1287,6 +1287,29 @@ pub struct FriQueryPayload<E: TowerField> {
     pub final_index: usize,
 }
 
+/// Per-layer opening data for a single STIR proximity query at an
+/// **intermediate** folded layer `ell ≥ 1`.
+///
+/// Soundness (round-by-round): every folded layer must be queried in
+/// the in-domain commitment, not merely bound by the OOD coset evals
+/// absorbed into Fiat–Shamir.  At layer `ell` the verifier needs all
+/// `m_ell` fiber values `{f_ell[base + j·n_next]}` to recompute the
+/// coset fold; each must be Merkle-opened against `roots[ell]` so the
+/// fold inputs are committed.  The fold output is then required to
+/// equal the opened base value at the next layer (or the final poly
+/// at the terminal layer).
+#[derive(Clone, ark_serialize::CanonicalSerialize, ark_serialize::CanonicalDeserialize)]
+pub struct StirLayerOpening<E: TowerField> {
+    /// Base position of this layer's coset, in `0..n_ell/m_ell`.
+    pub base_index: usize,
+    /// The `m_ell` fiber positions `base + j·n_next`, `j ∈ 0..m_ell`.
+    pub fiber_indices: Vec<usize>,
+    /// The `m_ell` fiber values `f_ell[fiber_indices[j]]`.
+    pub fiber_vals: Vec<E>,
+    /// One Merkle opening per fiber position against `roots[ell]`.
+    pub fiber_openings: Vec<MerkleOpening>,
+}
+
 #[derive(Clone, ark_serialize::CanonicalSerialize, ark_serialize::CanonicalDeserialize)]
 pub struct StirProximityPayload<E: TowerField> {
     pub base_index: usize,
@@ -1296,6 +1319,15 @@ pub struct StirProximityPayload<E: TowerField> {
     pub f0_packed_opening: MerkleOpening,
     pub f_next_val: E,
     pub layer1_opening: Option<MerkleOpening>,
+    /// Per-layer openings for folded layers `1..L` (i.e. one entry per
+    /// non-terminal layer beyond layer 0).  `layer_openings[k]`
+    /// corresponds to layer `ell = k + 1`.  Empty when `L < 2` (single
+    /// fold straight to the final polynomial).
+    ///
+    /// This is the fix for the STIR under-opening soundness gap: layers
+    /// `≥ 2` were previously committed but never opened per query, so the
+    /// fold chain from layer 1 onward was unverified.
+    pub layer_openings: Vec<StirLayerOpening<E>>,
 }
 
 #[derive(Clone, ark_serialize::CanonicalSerialize, ark_serialize::CanonicalDeserialize)]
@@ -1897,22 +1929,28 @@ fn stir_prove_proximity_queries<E: TowerField>(
     }
     f0_tree.finalize();
 
-    let layer1_tree: Option<MerkleTreeChannel> = if L >= 2 {
-        let layer1_info = &st.transcript.layers[1];
-        let arity = pick_arity_for_layer(layer1_info.n, layer1_info.m).max(2);
-        let depth = merkle_depth(layer1_info.n, arity);
-        let cfg = MerkleChannelCfg::new(vec![arity; depth], 1u64);
+    // Build a per-position Merkle tree for EVERY folded layer ell ≥ 1
+    // (layer 0 is the packed-fiber tree above).  The leaf encoding and
+    // tree config MUST mirror exactly what the prove loop committed for
+    // each layer (`stir_leaf_fields(cur_f[i])` with arity/depth derived
+    // from `pick_arity_for_layer`/`merkle_depth`, domain tag = ell), so
+    // the rebuilt root matches `st.transcript.layers[ell].root`.
+    let mut layer_trees: Vec<Option<MerkleTreeChannel>> = Vec::with_capacity(L);
+    layer_trees.push(None); // layer 0 handled by the packed f0_tree
+    for ell in 1..L {
+        let layer_info = &st.transcript.layers[ell];
+        let arity = pick_arity_for_layer(layer_info.n, layer_info.m).max(2);
+        let depth = merkle_depth(layer_info.n, arity);
+        let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
         let mut tree = MerkleTreeChannel::new(cfg, st.trace_hash);
-        let n1 = st.f_layers_ext[1].len();
-        for i in 0..n1 {
-            let fields = stir_leaf_fields(st.f_layers_ext[1][i]);
+        let n_ell = st.f_layers_ext[ell].len();
+        for i in 0..n_ell {
+            let fields = stir_leaf_fields(st.f_layers_ext[ell][i]);
             tree.push_leaf(&fields);
         }
         tree.finalize();
-        Some(tree)
-    } else {
-        None
-    };
+        layer_trees.push(Some(tree));
+    }
 
     let mut payloads = Vec::with_capacity(s0);
 
@@ -1922,6 +1960,7 @@ fn stir_prove_proximity_queries<E: TowerField>(
         let raw_i = index_from_seed(seed, n_pow2) % n0;
         let base_index = raw_i % n_next;
 
+        // ── Layer 0: packed-fiber opening (unchanged) ──────────────
         let fiber_indices: Vec<usize> = (0..m0)
             .map(|j| base_index + j * n_next)
             .collect();
@@ -1933,13 +1972,61 @@ fn stir_prove_proximity_queries<E: TowerField>(
 
         let f0_packed_opening = f0_tree.open(base_index);
 
+        // f_next_val / layer1_opening kept for backward field-shape
+        // compatibility (the layer-0→layer-1 fold check still uses
+        // them); the full chain is carried in `layer_openings`.
         let (f_next_val, layer1_opening) = if L >= 2 {
-            let tree = layer1_tree.as_ref().unwrap();
+            let tree = layer_trees[1].as_ref().unwrap();
             let opening = tree.open(base_index);
             (st.f_layers_ext[1][base_index], Some(opening))
         } else {
             (E::zero(), None)
         };
+
+        // ── Layers 1..L: open every folded layer per query ─────────
+        //
+        // Fold the coset base position through all remaining layers.
+        // At layer ell the coset base is `pos` ∈ 0..(n_ell/m_ell); the
+        // fiber lives at {pos + j·n_next_ell}; the fold output is
+        // f_{ell+1}[pos], whose layer is reached with the recursion
+        // pos_{ell+1} = pos_ell % (n_{ell+1}/m_{ell+1}).
+        let mut layer_openings: Vec<StirLayerOpening<E>> = Vec::with_capacity(L.saturating_sub(1));
+        if L >= 2 {
+            // Position at layer 1 = base_index (layer 0 fold output index).
+            let mut pos = base_index;
+            for ell in 1..L {
+                let n_ell = st.transcript.layers[ell].n;
+                let m_ell = st.transcript.schedule[ell];
+                let n_next_ell = n_ell / m_ell;
+
+                let cur_base = pos % n_next_ell;
+
+                let f_indices: Vec<usize> = (0..m_ell)
+                    .map(|j| cur_base + j * n_next_ell)
+                    .collect();
+
+                let f_vals: Vec<E> = f_indices
+                    .iter()
+                    .map(|&idx| st.f_layers_ext[ell][idx])
+                    .collect();
+
+                let tree = layer_trees[ell].as_ref().unwrap();
+                let f_openings: Vec<MerkleOpening> = f_indices
+                    .iter()
+                    .map(|&idx| tree.open(idx))
+                    .collect();
+
+                layer_openings.push(StirLayerOpening {
+                    base_index: cur_base,
+                    fiber_indices: f_indices,
+                    fiber_vals: f_vals,
+                    fiber_openings: f_openings,
+                });
+
+                // Fold output is f_{ell+1}[cur_base]; recurse the position.
+                pos = cur_base;
+            }
+        }
 
         payloads.push(StirProximityPayload {
             base_index,
@@ -1949,6 +2036,7 @@ fn stir_prove_proximity_queries<E: TowerField>(
             f0_packed_opening,
             f_next_val,
             layer1_opening,
+            layer_openings,
         });
     }
 
@@ -2152,6 +2240,18 @@ pub fn deep_fri_proof_size_bytes<E: TowerField>(proof: &DeepFriProof<E>, stir: b
                     bytes += HASH_BYTES;
                     for level in &l1_open.path {
                         bytes += level.len() * HASH_BYTES;
+                    }
+                }
+
+                // Per-layer openings for folded layers ≥ 1: each carries
+                // m_ell fiber values (ext) plus m_ell Merkle openings.
+                for lo in &pq.layer_openings {
+                    bytes += lo.fiber_vals.len() * ext_bytes;
+                    for opening in &lo.fiber_openings {
+                        bytes += HASH_BYTES;
+                        for level in &opening.path {
+                            bytes += level.len() * HASH_BYTES;
+                        }
                     }
                 }
             }
@@ -2519,6 +2619,8 @@ pub fn deep_fri_verify<E: TowerField>(
             }
 
             if L >= 2 {
+                // ── Layer-0 → layer-1 fold (binds f0 packed fiber to
+                //    the layer-1 opened value) ──────────────────────
                 let layer1_opening = match pq.layer1_opening {
                     Some(ref o) => o,
                     None => {
@@ -2562,6 +2664,160 @@ pub fn deep_fri_verify<E: TowerField>(
                         qi, fold_val, pq.f_next_val,
                     );
                     return false;
+                }
+
+                // ── Layers 1..L: fold the chain through EVERY layer ──
+                //
+                // Round-by-round soundness requires that each folded
+                // layer be queried in the in-domain commitment.  We
+                // recompute the coset fold at each layer, verify all
+                // m_ell fiber Merkle openings against roots[ell], and
+                // require the fold to equal the opened value at the next
+                // layer (or the final polynomial at the terminal layer).
+                if pq.layer_openings.len() != L - 1 {
+                    eprintln!(
+                        "[FAIL][STIR LAYER OPENINGS COUNT] qi={} expected={} got={}",
+                        qi, L - 1, pq.layer_openings.len()
+                    );
+                    return false;
+                }
+
+                // `prev_val` is the fold output that must match this
+                // layer's opened value at the carried (full) position.
+                // Entering layer 1 it is the layer-0 fold output
+                // (f_next_val == fold_val), opened at index `base_index`.
+                let mut prev_val = pq.f_next_val;
+                let mut pos = base_index; // full position at layer 1
+
+                for k in 0..(L - 1) {
+                    let ell = k + 1;
+                    let m_ell = params.schedule[ell];
+                    let n_ell = sizes[ell];
+                    let n_next_ell = n_ell / m_ell;
+                    let omega_ell = omega_per_layer[ell];
+                    let zeta_ell = omega_ell.pow([n_next_ell as u64]);
+                    let alpha_ell = alpha_layers[ell];
+                    let alpha_pows_ell = build_ext_pows(alpha_ell, m_ell);
+
+                    let lo = &pq.layer_openings[k];
+
+                    // Carried full position `pos` decomposes into the
+                    // coset base `cur_base` and the element index
+                    // `j_link` within that coset.
+                    let cur_base = pos % n_next_ell;
+                    let j_link = pos / n_next_ell;
+                    if lo.base_index != cur_base {
+                        eprintln!(
+                            "[FAIL][STIR LAYER BASE INDEX] qi={} ell={} expected={} got={}",
+                            qi, ell, cur_base, lo.base_index
+                        );
+                        return false;
+                    }
+
+                    if lo.fiber_indices.len() != m_ell
+                        || lo.fiber_vals.len() != m_ell
+                        || lo.fiber_openings.len() != m_ell
+                    {
+                        eprintln!("[FAIL][STIR LAYER FIBER LEN] qi={} ell={}", qi, ell);
+                        return false;
+                    }
+
+                    let arity = pick_arity_for_layer(n_ell, m_ell).max(2);
+                    let depth = merkle_depth(n_ell, arity);
+                    let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
+
+                    // The fold input that bound layer-0→1 (and each
+                    // previous layer's output) must equal the opened
+                    // value at the carried element index `j_link`.
+                    let mut matched_prev = false;
+
+                    for j in 0..m_ell {
+                        let expected_idx = cur_base + j * n_next_ell;
+                        if lo.fiber_indices[j] != expected_idx {
+                            eprintln!(
+                                "[FAIL][STIR LAYER FIBER IDX] qi={} ell={} j={} expected={} got={}",
+                                qi, ell, j, expected_idx, lo.fiber_indices[j]
+                            );
+                            return false;
+                        }
+
+                        let opening = &lo.fiber_openings[j];
+                        if !MerkleTreeChannel::verify_opening(
+                            &cfg,
+                            proof.roots[ell],
+                            opening,
+                            &trace_hash,
+                        ) {
+                            eprintln!("[FAIL][STIR LAYER MERKLE] qi={} ell={} j={}", qi, ell, j);
+                            return false;
+                        }
+                        if opening.index != expected_idx {
+                            eprintln!(
+                                "[FAIL][STIR LAYER MERKLE INDEX] qi={} ell={} j={} expected={} got={}",
+                                qi, ell, j, expected_idx, opening.index
+                            );
+                            return false;
+                        }
+
+                        let leaf_fields = stir_leaf_fields(lo.fiber_vals[j]);
+                        let expected_leaf = compute_leaf_hash(&cfg, opening.index, &leaf_fields);
+                        if expected_leaf != opening.leaf {
+                            eprintln!("[FAIL][STIR LAYER LEAF BIND] qi={} ell={} j={}", qi, ell, j);
+                            return false;
+                        }
+
+                        if j == j_link {
+                            // Chain link: the value entering this layer
+                            // (output of the previous fold) must equal
+                            // the committed fiber value at element
+                            // index `j_link`.
+                            if lo.fiber_vals[j_link] != prev_val {
+                                eprintln!(
+                                    "[FAIL][STIR CHAIN LINK] qi={} ell={} j_link={}\n  prev_val={:?}\n  opened={:?}",
+                                    qi, ell, j_link, prev_val, lo.fiber_vals[j_link]
+                                );
+                                return false;
+                            }
+                            matched_prev = true;
+                        }
+                    }
+                    debug_assert!(matched_prev);
+
+                    // Recompute the coset fold at this layer.
+                    let omega_b = omega_ell.pow([cur_base as u64]);
+                    let coeff_tuple = interpolate_coset_ext::<E>(
+                        &lo.fiber_vals,
+                        omega_b,
+                        zeta_ell,
+                        m_ell,
+                    );
+                    let mut next_fold = E::zero();
+                    for kk in 0..m_ell {
+                        next_fold = next_fold + coeff_tuple[kk] * alpha_pows_ell[kk];
+                    }
+
+                    let is_terminal = ell == L - 1;
+                    if is_terminal {
+                        // Fold output must equal the final polynomial at
+                        // the folded point ω_final^{cur_base}.
+                        let x_final = E::from_fp(omega_final.pow([cur_base as u64]));
+                        let expected_final = eval_final_poly_ext(
+                            &proof.final_poly_coeffs,
+                            x_final,
+                        );
+                        if next_fold != expected_final {
+                            eprintln!(
+                                "[FAIL][STIR FINAL FOLD] qi={} ell={}\n  fold={:?}\n  poly_eval={:?}",
+                                qi, ell, next_fold, expected_final,
+                            );
+                            return false;
+                        }
+                    }
+
+                    // Carry the fold output into the next layer.  The
+                    // next layer's base value (index j=0) must equal it.
+                    prev_val = next_fold;
+                    pos = cur_base;
                 }
             } else {
                 let x_final = E::from_fp(omega_final.pow([base_index as u64]));
@@ -3494,6 +3750,81 @@ mod tests {
     #[test]
     fn test_stir_fold_consistency_mixed() {
         test_stir_fold_consistency_mixed_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    /// **Regression test for the STIR under-opening soundness gap.**
+    ///
+    /// Before the fix, the STIR verifier opened only layer 0 and layer 1
+    /// per query and checked only the layer-0→layer-1 fold; layers ≥ 2
+    /// were committed but never opened/folded per query (bound only by
+    /// the OOD coset evals in Fiat–Shamir).  A prover could therefore
+    /// substitute an arbitrary value in an intermediate folded layer and
+    /// still verify.  After the fix, every folded layer is opened and the
+    /// fold is checked at each layer terminating at the final polynomial,
+    /// so corrupting an intermediate layer (ell ≥ 2) MUST be rejected.
+    fn test_stir_intermediate_layer_tamper_rejected_for<E: TowerField>() {
+        let mut rng = StdRng::seed_from_u64(424242);
+        let n = 256usize;
+        // schedule length 4 ⇒ folded layers 1,2,3; corrupt layer 2 (≥ 2).
+        let schedule = vec![2usize, 2, 2, 2];
+        let degree = n / 32 - 1;
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let evals = dom.fft(poly.coeffs());
+
+        let domain0 = FriDomain::new_radix2(n);
+
+        let final_size: usize = n / schedule.iter().product::<usize>();
+        let d_final = final_size / 2;
+
+        let params = DeepFriParams::new(schedule, 4, 42)
+            .with_stir()
+            .with_s0(8)
+            .with_d_final(d_final);
+
+        // 1) Honest proof verifies.
+        let proof: DeepFriProof<E> = deep_fri_prove(evals, domain0, &params);
+        assert!(
+            deep_fri_verify(&params, &proof),
+            "honest STIR proof must verify before tampering"
+        );
+
+        // 2) Corrupt an INTERMEDIATE layer (ell = 2, i.e. layer_openings[1])
+        //    opened fiber value of the first query.  `layer_openings[k]`
+        //    corresponds to layer ell = k + 1, so index 1 ⇒ layer 2.
+        let mut tampered = proof;
+        {
+            let pqs = tampered
+                .stir_proximity_queries
+                .as_mut()
+                .expect("STIR proof must carry proximity queries");
+            assert!(!pqs.is_empty(), "need at least one proximity query");
+
+            let lo = &mut pqs[0].layer_openings;
+            assert!(
+                lo.len() >= 2,
+                "schedule length 4 ⇒ at least layers 1..3 opened (got {})",
+                lo.len()
+            );
+
+            // Layer 2 = layer_openings[1]; flip its base fiber value.
+            let layer2 = &mut lo[1];
+            layer2.fiber_vals[0] = layer2.fiber_vals[0] + E::one();
+        }
+
+        // 3) Tampered proof MUST be rejected.  (Before the fix the
+        //    intermediate layer was never opened/checked, so this passed.)
+        assert!(
+            !deep_fri_verify(&params, &tampered),
+            "tampered intermediate-layer (ell=2) STIR proof MUST be rejected — \
+             closes the under-opening soundness gap"
+        );
+    }
+
+    #[test]
+    fn test_stir_intermediate_layer_tamper_rejected() {
+        test_stir_intermediate_layer_tamper_rejected_for::<CubeExt<GoldilocksCubeConfig>>();
     }
 
     fn test_no_stir_backward_compat_for<E: TowerField>() {
