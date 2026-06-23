@@ -99,22 +99,30 @@ impl LdtMode {
     }
 }
 
-/// Folding schedule mirroring `default_schedule` in the original API:
-///   STIR: arity-8 + residual to land at size 1
-///   FRI : arity-2 binary fold
+/// Folding schedule.
+///   FRI : arity-2 binary fold (one layer per bit of `log_n0`).
+///   STIR: uniform arity-4 fold + residual.  Empirically (Apple M4,
+///         `arity_pareto_bench`, Fibonacci and SHA-256 AIRs, |H_0| from
+///         2^14 to 2^25) arity-4 is the proof-size optimum for the
+///         DAM-merge construction: the per-round k-coset leaf grows
+///         linearly in the arity k while the round count only drops
+///         logarithmically, so size grows monotonically for k>=4, while
+///         k=2 (binary FRI) is worse the other way (round count).  This
+///         sits BELOW the FRI industry norm of arity 8/16 precisely
+///         because of the merge's k-coset leaf; proof size is
+///         width-independent (a DAM-merge property), so the optimum holds
+///         across narrow and wide AIRs.  The arity x blowup Pareto is the
+///         STIR paper's empirical contribution.
 pub fn make_schedule(n0: usize, ldt: LdtMode) -> Vec<usize> {
     assert!(n0.is_power_of_two(), "n0 must be a power of 2");
     let log_n0 = n0.trailing_zeros() as usize;
     if !ldt.is_stir() {
         return vec![2usize; log_n0];
     }
-    let log_arity = 3usize;
-    let full_folds = log_n0 / log_arity;
-    let remainder_log = log_n0 % log_arity;
-    let mut s = vec![8usize; full_folds];
-    if remainder_log > 0 {
-        s.push(1usize << remainder_log);
-    }
+    let mut rem = log_n0;
+    let mut s = Vec::new();
+    while rem >= 2 { s.push(4usize); rem -= 2; } // arity 4 = 2^2 (optimum)
+    if rem > 0 { s.push(1usize << rem); }        // residual fold (2)
     s
 }
 
