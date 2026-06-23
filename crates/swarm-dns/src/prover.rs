@@ -10,6 +10,8 @@ use ark_serialize::{CanonicalSerialize, Compress};
 use deep_ali::{
     air_workloads::{
         build_execution_trace, build_hash_rollup_trace, build_nsec3_chain_trace,
+        build_nsec3_nodata_trace, build_nsec3_optout_trace, build_lex_lt_trace,
+        nsec3_type_present,
         ed25519_zsk_ksk_default_layout, pack_hash_to_leaves, AirType,
     },
     binding_cells_commit::Ext as DaExt,
@@ -480,6 +482,798 @@ pub fn prove_nsec3_completeness(
         root_f0: proof.root_f0,
         proof_blob,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  NSEC3 NODATA non-coverage prover  (N2 gadget)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Companion to `prove_nsec3_completeness`.  The completeness proof gives the
+// NXDOMAIN side of authenticated denial-of-existence (a queried name either
+// matches a committed owner-hash or is provably bracketed between two adjacent
+// records — no namespace gaps).  This proves the NODATA side: a name that
+// EXISTS (its hashed owner matches a committed NSEC3 record) has the queried
+// RR TYPE ABSENT from that record's RFC 4034 §4.1.2 type bitmap.
+//
+// In-circuit (STARK-sound, `AirType::Nsec3NoData`): the committed bitmap is a
+// Boolean vector and the selected bit is zero (non-coverage).  Bound into the
+// Fiat–Shamir public input — so a proof for one (owner, bitmap, qtype) cannot
+// be replayed for another — are the owner-hash (name-exists), the full 32-byte
+// bitmap, and the queried type code.  This mirrors the in-circuit-core +
+// pi_hash-bound-public-values split used by the DS→KSK and RSA/ECDSA verifiers.
+
+/// One NSEC3 record carrying the RFC 4034 §4.1.2 type bitmap (window 0,
+/// types 0..255) needed for the NODATA / NXDOMAIN distinction.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Nsec3TypedRecord {
+    pub owner_hash:  [u8; 32],
+    pub next_hash:   [u8; 32],
+    /// Window-0 type bitmap: bit `t` (MSB-first within byte `t>>3`) is 1
+    /// iff RR type `t` is present at the owner name.
+    pub type_bitmap: [u8; 32],
+}
+
+/// Outcome of a successful NODATA prove + local verify.
+#[derive(Clone, Debug)]
+pub struct Nsec3NoDataOutput {
+    /// Commitment binding owner_hash, next_hash, the 32-byte type bitmap,
+    /// the queried type code, the salt, the proof's f0 commitment, and the
+    /// FS binding tag.  Reproduced by the verifier from public inputs.
+    pub pi_hash:         [u8; 32],
+    /// The queried RR type proven absent.
+    pub qtype:           u16,
+    /// Trace height (fixed at 256 — one row per window-0 type code).
+    pub n_trace:         usize,
+    pub proof_bytes:     usize,
+    pub prove_ms:        f64,
+    pub local_verify_ms: f64,
+    pub root_f0:         [u8; HASH_BYTES],
+    pub proof_blob:      Vec<u8>,
+}
+
+/// Reasons a NODATA proof can be rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nsec3NoDataError {
+    /// Queried type is outside window 0 (only 0..255 supported here).
+    TypeOutOfWindow,
+    /// The record's owner-hash does not match the queried name hash —
+    /// this is not a name-exists (NODATA) case.
+    NameMismatch,
+    /// The queried type IS present in the bitmap — this is a positive
+    /// answer, not NODATA.
+    TypePresent,
+    /// The STARK proof failed `deep_fri_verify`.
+    StarkProofInvalid,
+    /// The reproduced pi_hash did not match the proof's commitment.
+    PiHashMismatch,
+}
+
+/// FS public input for a NODATA proof: binds the record identity, bitmap,
+/// and queried type into the Fiat–Shamir transcript.
+fn nsec3_nodata_fs_pub(
+    record:        &Nsec3TypedRecord,
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-NODATA-FS-V1");
+    Digest::update(&mut h, &record.owner_hash);
+    Digest::update(&mut h, &record.next_hash);
+    Digest::update(&mut h, &record.type_bitmap);
+    Digest::update(&mut h, &qtype.to_le_bytes());
+    Digest::update(&mut h, salt);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+/// External commitment recipe: the FS public input folded with the proof's
+/// f0 commitment.  Reproducible by the verifier from public information.
+fn nsec3_nodata_pi_hash(
+    fs_pub:   &[u8; 32],
+    root_f0:  &[u8; HASH_BYTES],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-NODATA-PIHASH-V1");
+    Digest::update(&mut h, fs_pub);
+    Digest::update(&mut h, root_f0);
+    Digest::finalize(h).into()
+}
+
+/// Prove and locally verify a NODATA fact: `record` exists (its owner-hash
+/// equals `qname_hash`) but RR type `qtype` is absent from its type bitmap.
+///
+/// Panics if the inputs do not describe a valid NODATA case (type out of
+/// window 0, owner mismatch, or the type is actually present) — a worker
+/// must never emit a pi_hash for a statement that is not true.
+pub fn prove_nsec3_nodata(
+    record:        &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3NoDataOutput {
+    assert!(qtype < 256, "qtype {qtype} outside NSEC3 window 0 (0..255)");
+    assert_eq!(&record.owner_hash, qname_hash,
+        "NODATA requires the queried name to exist: owner_hash != H(qname)");
+    assert!(!nsec3_type_present(&record.type_bitmap, qtype as u8),
+        "type {qtype} is present in the bitmap — this is a positive answer, not NODATA");
+
+    let n_trace = 256usize; // one row per window-0 type code
+    let n0      = n_trace * BLOWUP;
+    let domain  = FriDomain::new_radix2(n0);
+
+    let fs_pub = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
+
+    let trace = build_nsec3_nodata_trace(n_trace, qtype, &record.type_bitmap);
+    let lde   = lde_trace_columns(&trace, n_trace, BLOWUP).expect("nodata LDE failed");
+    let coeffs = comb_coeffs(AirType::Nsec3NoData.num_constraints());
+    let (c_eval, _) = deep_ali_merge_general(
+        &lde, &coeffs, AirType::Nsec3NoData, domain.omega, n_trace, BLOWUP,
+    );
+
+    let params = DeepFriParams {
+        schedule: make_schedule(n0, ldt),
+        r: NUM_QUERIES, seed_z: SEED_Z,
+        coeff_commit_final: true, d_final: 1,
+        stir: ldt.is_stir(), s0: NUM_QUERIES,
+        public_inputs_hash: Some(fs_pub),
+    };
+
+    let t_prove = Instant::now();
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+
+    let t_verify = Instant::now();
+    let ok = deep_fri_verify::<Ext>(&params, &proof);
+    let local_verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+    assert!(ok, "worker self-verify failed for NSEC3 NODATA");
+
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+    let mut proof_blob = Vec::with_capacity(proof_bytes);
+    proof.serialize_with_mode(&mut proof_blob, Compress::Yes)
+        .expect("nodata proof serialise (compressed) must not fail");
+
+    let pi_hash = nsec3_nodata_pi_hash(&fs_pub, &proof.root_f0);
+
+    Nsec3NoDataOutput {
+        pi_hash, qtype, n_trace,
+        proof_bytes, prove_ms, local_verify_ms,
+        root_f0: proof.root_f0,
+        proof_blob,
+    }
+}
+
+/// Verify a NODATA proof against the asserted record + query, the way an
+/// edge resolver would: native re-checks (name exists, type absent),
+/// `deep_fri_verify` on the STARK, and pi_hash reproduction.
+pub fn verify_nsec3_nodata(
+    output:        &Nsec3NoDataOutput,
+    record:        &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Result<(), Nsec3NoDataError> {
+    use ark_serialize::{CanonicalDeserialize, Validate};
+
+    if qtype >= 256 { return Err(Nsec3NoDataError::TypeOutOfWindow); }
+    if &record.owner_hash != qname_hash { return Err(Nsec3NoDataError::NameMismatch); }
+    if nsec3_type_present(&record.type_bitmap, qtype as u8) {
+        return Err(Nsec3NoDataError::TypePresent);
+    }
+
+    let fs_pub = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
+    let n0 = output.n_trace * BLOWUP;
+    let params = DeepFriParams {
+        schedule: make_schedule(n0, ldt),
+        r: NUM_QUERIES, seed_z: SEED_Z,
+        coeff_commit_final: true, d_final: 1,
+        stir: ldt.is_stir(), s0: NUM_QUERIES,
+        public_inputs_hash: Some(fs_pub),
+    };
+
+    let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        output.proof_blob.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|_| Nsec3NoDataError::StarkProofInvalid)?;
+
+    if !deep_fri_verify::<Ext>(&params, &proof) {
+        return Err(Nsec3NoDataError::StarkProofInvalid);
+    }
+
+    let pi_hash = nsec3_nodata_pi_hash(&fs_pub, &proof.root_f0);
+    if pi_hash != output.pi_hash {
+        return Err(Nsec3NoDataError::PiHashMismatch);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Lexicographic NSEC3 interval cover (shared by N1 / N3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Does the NSEC3 record `(owner, next)` strictly cover hash `q` under the
+/// cyclic ordering of the hash space?  `owner < q < next` for a normal
+/// interval, or `q > owner ∨ q < next` for the wrap interval
+/// (`next ≤ owner`).  Comparison is full-width lexicographic on the 32-byte
+/// hashes (`[u8; 32]: Ord`).  This is the bracketing primitive an offline
+/// resolver applies against the completeness-committed chain; the N1/N3
+/// provers bind the operands into `pi_hash`.
+pub fn nsec3_covers(owner: &[u8; 32], next: &[u8; 32], q: &[u8; 32]) -> bool {
+    if owner < next {
+        owner < q && q < next
+    } else {
+        // Wrap interval (or degenerate owner == next): covers everything but
+        // the endpoints.
+        q > owner || q < next
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  NSEC3 Opt-Out prover  (N3 gadget)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Proves that an unsigned (insecure) delegation is legitimately elided from
+// the NSEC3 chain: the delegation's hash is covered by an NSEC3 record whose
+// Opt-Out flag is SET (RFC 5155 §3.1.2.1).  In-circuit (`Nsec3OptOut` AIR):
+// the covering record's Flags octet is Boolean and its Opt-Out bit is 1.
+// Bound into the FS public input: the covering owner/next hashes, the Flags
+// octet, the elided delegation's hash, and the Opt-Out bit index.
+
+/// Opt-Out bit index in the NSEC3 Flags octet (RFC 5155: the Opt-Out flag,
+/// wire value `0x01`, i.e. bit 0 LSB-first).
+pub const NSEC3_OPTOUT_BIT: usize = 0;
+
+#[derive(Clone, Debug)]
+pub struct Nsec3OptOutOutput {
+    pub pi_hash:         [u8; 32],
+    pub n_trace:         usize,
+    pub proof_bytes:     usize,
+    pub prove_ms:        f64,
+    pub local_verify_ms: f64,
+    pub root_f0:         [u8; HASH_BYTES],
+    pub proof_blob:      Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nsec3OptOutError {
+    /// The covering record does not bracket the delegation hash.
+    NotCovered,
+    /// The covering record's Opt-Out flag is clear — elision is unauthorised.
+    OptOutClear,
+    StarkProofInvalid,
+    PiHashMismatch,
+}
+
+#[inline]
+fn optout_set(flags: u8) -> bool { ((flags >> NSEC3_OPTOUT_BIT) & 1) == 1 }
+
+fn nsec3_optout_fs_pub(
+    owner: &[u8; 32], next: &[u8; 32], flags: u8,
+    deleg_hash: &[u8; 32], salt: &[u8; 16], fs_binding_32: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-OPTOUT-FS-V1");
+    Digest::update(&mut h, owner);
+    Digest::update(&mut h, next);
+    Digest::update(&mut h, [flags]);
+    Digest::update(&mut h, deleg_hash);
+    Digest::update(&mut h, salt);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+fn nsec3_optout_pi_hash(fs_pub: &[u8; 32], root_f0: &[u8; HASH_BYTES]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-OPTOUT-PIHASH-V1");
+    Digest::update(&mut h, fs_pub);
+    Digest::update(&mut h, root_f0);
+    Digest::finalize(h).into()
+}
+
+/// Prove and locally verify that the insecure delegation `deleg_hash` is
+/// legitimately elided: it is covered by the NSEC3 record `(owner, next)`
+/// whose `flags` octet has the Opt-Out bit set.
+///
+/// Panics if the inputs do not describe a valid opt-out elision (record
+/// does not cover the delegation, or Opt-Out clear).
+pub fn prove_nsec3_optout(
+    owner:         &[u8; 32],
+    next:          &[u8; 32],
+    flags:         u8,
+    deleg_hash:    &[u8; 32],
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3OptOutOutput {
+    assert!(nsec3_covers(owner, next, deleg_hash),
+        "covering NSEC3 record does not bracket the delegation hash");
+    assert!(optout_set(flags),
+        "Opt-Out flag is clear — elision of this delegation is unauthorised");
+
+    let n_trace = 8usize; // 8 Flags-octet bits
+    let n0      = n_trace * BLOWUP;
+    let domain  = FriDomain::new_radix2(n0);
+
+    let fs_pub = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
+
+    let trace = build_nsec3_optout_trace(n_trace, NSEC3_OPTOUT_BIT, flags);
+    let lde   = lde_trace_columns(&trace, n_trace, BLOWUP).expect("optout LDE failed");
+    let coeffs = comb_coeffs(AirType::Nsec3OptOut.num_constraints());
+    let (c_eval, _) = deep_ali_merge_general(
+        &lde, &coeffs, AirType::Nsec3OptOut, domain.omega, n_trace, BLOWUP,
+    );
+
+    let params = build_params(n0, &fs_pub, ldt);
+
+    let t_prove = Instant::now();
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+
+    let t_verify = Instant::now();
+    let ok = deep_fri_verify::<Ext>(&params, &proof);
+    let local_verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+    assert!(ok, "worker self-verify failed for NSEC3 Opt-Out");
+
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+    let mut proof_blob = Vec::with_capacity(proof_bytes);
+    proof.serialize_with_mode(&mut proof_blob, Compress::Yes)
+        .expect("optout proof serialise (compressed) must not fail");
+
+    let pi_hash = nsec3_optout_pi_hash(&fs_pub, &proof.root_f0);
+
+    Nsec3OptOutOutput {
+        pi_hash, n_trace, proof_bytes, prove_ms, local_verify_ms,
+        root_f0: proof.root_f0, proof_blob,
+    }
+}
+
+/// Verify an Opt-Out elision proof: native cover + flag checks, STARK
+/// verify, pi_hash reproduction.
+pub fn verify_nsec3_optout(
+    output:        &Nsec3OptOutOutput,
+    owner:         &[u8; 32],
+    next:          &[u8; 32],
+    flags:         u8,
+    deleg_hash:    &[u8; 32],
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Result<(), Nsec3OptOutError> {
+    use ark_serialize::{CanonicalDeserialize, Validate};
+
+    if !nsec3_covers(owner, next, deleg_hash) { return Err(Nsec3OptOutError::NotCovered); }
+    if !optout_set(flags) { return Err(Nsec3OptOutError::OptOutClear); }
+
+    let fs_pub = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
+    let n0 = output.n_trace * BLOWUP;
+    let params = build_params(n0, &fs_pub, ldt);
+
+    let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        output.proof_blob.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|_| Nsec3OptOutError::StarkProofInvalid)?;
+    if !deep_fri_verify::<Ext>(&params, &proof) {
+        return Err(Nsec3OptOutError::StarkProofInvalid);
+    }
+    if nsec3_optout_pi_hash(&fs_pub, &proof.root_f0) != output.pi_hash {
+        return Err(Nsec3OptOutError::PiHashMismatch);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  NSEC3 wildcard-synthesis closure prover  (N1 gadget)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A queried name that triggers NXDOMAIN must additionally be shown not to be
+// answerable by a wildcard `*.<closest-encloser>`.  Two cases:
+//
+//   * Wildcard ABSENT — `H(*.CE)` is bracketed (provably absent) by the
+//     completeness-committed chain.  Established by `nsec3_covers` against
+//     the covering record, bound to the same signed package; no new STARK.
+//     Use [`wildcard_absent_covered`].
+//
+//   * Wildcard PRESENT but does not cover the queried type — proven
+//     in-circuit by [`prove_nsec3_wildcard_closure`], which reuses the N2
+//     `Nsec3NoData` non-coverage AIR over the wildcard record's type bitmap,
+//     binding the closest-encloser hash and the original queried name into
+//     `pi_hash`.
+//
+// Together with the closest-encloser/next-closer NSEC3 proofs, this closes
+// the wildcard-synthesis hole in authenticated denial-of-existence.
+
+/// Wildcard-ABSENT case: is the wildcard owner `H(*.CE)` provably bracketed
+/// (absent) by the covering NSEC3 record?  The no-gaps guarantee of the
+/// completeness chain (`prove_nsec3_completeness`) makes this a sound proof
+/// of non-synthesis.
+pub fn wildcard_absent_covered(
+    cover_owner: &[u8; 32], cover_next: &[u8; 32], wildcard_hash: &[u8; 32],
+) -> bool {
+    nsec3_covers(cover_owner, cover_next, wildcard_hash)
+}
+
+#[derive(Clone, Debug)]
+pub struct Nsec3WildcardOutput {
+    pub pi_hash:         [u8; 32],
+    pub qtype:           u16,
+    pub n_trace:         usize,
+    pub proof_bytes:     usize,
+    pub prove_ms:        f64,
+    pub local_verify_ms: f64,
+    pub root_f0:         [u8; HASH_BYTES],
+    pub proof_blob:      Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nsec3WildcardError {
+    TypeOutOfWindow,
+    /// The wildcard record's owner hash does not match `H(*.CE)`.
+    WildcardMismatch,
+    /// The queried type IS present in the wildcard bitmap — it WOULD
+    /// synthesise an answer, so closure does not hold.
+    TypePresent,
+    StarkProofInvalid,
+    PiHashMismatch,
+}
+
+fn nsec3_wildcard_fs_pub(
+    ce_hash: &[u8; 32], wildcard: &Nsec3TypedRecord, qname_hash: &[u8; 32],
+    qtype: u16, salt: &[u8; 16], fs_binding_32: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-WILDCARD-FS-V1");
+    Digest::update(&mut h, ce_hash);
+    Digest::update(&mut h, &wildcard.owner_hash);
+    Digest::update(&mut h, &wildcard.type_bitmap);
+    Digest::update(&mut h, qname_hash);
+    Digest::update(&mut h, &qtype.to_le_bytes());
+    Digest::update(&mut h, salt);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+fn nsec3_wildcard_pi_hash(fs_pub: &[u8; 32], root_f0: &[u8; HASH_BYTES]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-WILDCARD-PIHASH-V1");
+    Digest::update(&mut h, fs_pub);
+    Digest::update(&mut h, root_f0);
+    Digest::finalize(h).into()
+}
+
+/// Wildcard-PRESENT closure: prove the wildcard record `*.CE` (owner hash
+/// `wildcard.owner_hash`) does not cover the queried RR type `qtype`, so it
+/// cannot synthesise an answer for the queried name.  `ce_hash` is the
+/// closest-encloser hash and `qname_hash` the original queried name's hash;
+/// both are bound into the proof's public input.
+///
+/// Reuses the N2 `Nsec3NoData` non-coverage AIR.  Panics if the wildcard
+/// actually covers the queried type (closure would not hold).
+pub fn prove_nsec3_wildcard_closure(
+    ce_hash:       &[u8; 32],
+    wildcard:      &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3WildcardOutput {
+    assert!(qtype < 256, "qtype {qtype} outside NSEC3 window 0 (0..255)");
+    assert!(!nsec3_type_present(&wildcard.type_bitmap, qtype as u8),
+        "wildcard covers type {qtype} — it WOULD synthesise; closure fails");
+
+    let n_trace = 256usize;
+    let n0      = n_trace * BLOWUP;
+    let domain  = FriDomain::new_radix2(n0);
+
+    let fs_pub = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
+
+    let trace = build_nsec3_nodata_trace(n_trace, qtype, &wildcard.type_bitmap);
+    let lde   = lde_trace_columns(&trace, n_trace, BLOWUP).expect("wildcard LDE failed");
+    let coeffs = comb_coeffs(AirType::Nsec3NoData.num_constraints());
+    let (c_eval, _) = deep_ali_merge_general(
+        &lde, &coeffs, AirType::Nsec3NoData, domain.omega, n_trace, BLOWUP,
+    );
+
+    let params = build_params(n0, &fs_pub, ldt);
+
+    let t_prove = Instant::now();
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+
+    let t_verify = Instant::now();
+    let ok = deep_fri_verify::<Ext>(&params, &proof);
+    let local_verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+    assert!(ok, "worker self-verify failed for NSEC3 wildcard closure");
+
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+    let mut proof_blob = Vec::with_capacity(proof_bytes);
+    proof.serialize_with_mode(&mut proof_blob, Compress::Yes)
+        .expect("wildcard proof serialise (compressed) must not fail");
+
+    let pi_hash = nsec3_wildcard_pi_hash(&fs_pub, &proof.root_f0);
+
+    Nsec3WildcardOutput {
+        pi_hash, qtype, n_trace, proof_bytes, prove_ms, local_verify_ms,
+        root_f0: proof.root_f0, proof_blob,
+    }
+}
+
+/// Verify a wildcard-closure proof (present case): native checks (wildcard
+/// owner matches, queried type absent), STARK verify, pi_hash reproduction.
+pub fn verify_nsec3_wildcard_closure(
+    output:        &Nsec3WildcardOutput,
+    ce_hash:       &[u8; 32],
+    wildcard:      &Nsec3TypedRecord,
+    expected_wildcard_hash: &[u8; 32],
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Result<(), Nsec3WildcardError> {
+    use ark_serialize::{CanonicalDeserialize, Validate};
+
+    if qtype >= 256 { return Err(Nsec3WildcardError::TypeOutOfWindow); }
+    if &wildcard.owner_hash != expected_wildcard_hash {
+        return Err(Nsec3WildcardError::WildcardMismatch);
+    }
+    if nsec3_type_present(&wildcard.type_bitmap, qtype as u8) {
+        return Err(Nsec3WildcardError::TypePresent);
+    }
+
+    let fs_pub = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
+    let n0 = output.n_trace * BLOWUP;
+    let params = build_params(n0, &fs_pub, ldt);
+
+    let proof = deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        output.proof_blob.as_slice(), Compress::Yes, Validate::Yes,
+    ).map_err(|_| Nsec3WildcardError::StarkProofInvalid)?;
+    if !deep_fri_verify::<Ext>(&params, &proof) {
+        return Err(Nsec3WildcardError::StarkProofInvalid);
+    }
+    if nsec3_wildcard_pi_hash(&fs_pub, &proof.root_f0) != output.pi_hash {
+        return Err(Nsec3WildcardError::PiHashMismatch);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  In-circuit lexicographic cover  (F1 gadget)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `prove_lex_lt` proves a < b for two 256-bit hashes entirely in-circuit
+// (LexLt AIR, subtraction-with-borrow).  `prove_nsec3_cover` composes two
+// LexLt proofs to establish that a queried hash falls strictly inside an
+// NSEC3 interval (owner, next) under the cyclic ordering — WITHOUT the
+// verifier performing any native byte comparison (the previous
+// `nsec3_covers` step).  Three cover modes, each a pair of LexLt proofs
+// over specific operand roles:
+//
+//   Interior : owner < q  ∧  q < next          (normal interval, q inside)
+//   WrapUpper: next < owner ∧ owner < q         (wrap interval, q above owner)
+//   WrapLower: next < owner ∧ q < next          (wrap interval, q below next)
+//
+// Each soundly implies q ∈ (owner, next) cyclically; the verifier only
+// checks the two sub-proofs and that the (role, mode) pattern is valid.
+
+/// Big-endian 32-byte hash → 8 little-endian 32-bit limbs (limb 0 is the
+/// least-significant 32 bits, i.e. bytes[28..32]).  Lexicographic byte
+/// order of the hash equals integer order of this value.
+fn be32_to_limbs(h: &[u8; 32]) -> [u64; 8] {
+    let mut limbs = [0u64; 8];
+    for k in 0..8 {
+        let off = (7 - k) * 4;
+        limbs[k] = ((h[off] as u64) << 24)
+            | ((h[off + 1] as u64) << 16)
+            | ((h[off + 2] as u64) << 8)
+            | (h[off + 3] as u64);
+    }
+    limbs
+}
+
+#[derive(Clone, Debug)]
+pub struct LexLtOutput {
+    pub pi_hash:         [u8; 32],
+    pub n_trace:         usize,
+    pub proof_bytes:     usize,
+    pub prove_ms:        f64,
+    pub local_verify_ms: f64,
+    pub root_f0:         [u8; HASH_BYTES],
+    pub proof_blob:      Vec<u8>,
+}
+
+fn lex_lt_fs_pub(a: &[u8; 32], b: &[u8; 32], fs_binding_32: &[u8; 32]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-LEXLT-FS-V1");
+    Digest::update(&mut h, a);
+    Digest::update(&mut h, b);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+fn lex_lt_pi_hash(fs_pub: &[u8; 32], root_f0: &[u8; HASH_BYTES]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-LEXLT-PIHASH-V1");
+    Digest::update(&mut h, fs_pub);
+    Digest::update(&mut h, root_f0);
+    Digest::finalize(h).into()
+}
+
+const LEXLT_N_TRACE: usize = 8;
+
+/// Prove and locally verify `a < b` (lexicographic / big-endian integer)
+/// fully in-circuit.  Panics if `a >= b`.
+pub fn prove_lex_lt(
+    a:             &[u8; 32],
+    b:             &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> LexLtOutput {
+    assert!(a < b, "prove_lex_lt requires a < b lexicographically");
+
+    let n_trace = LEXLT_N_TRACE;
+    let n0      = n_trace * BLOWUP;
+    let domain  = FriDomain::new_radix2(n0);
+
+    let fs_pub = lex_lt_fs_pub(a, b, fs_binding_32);
+
+    let trace = build_lex_lt_trace(n_trace, be32_to_limbs(a), be32_to_limbs(b));
+    let lde   = lde_trace_columns(&trace, n_trace, BLOWUP).expect("lexlt LDE failed");
+    let coeffs = comb_coeffs(AirType::LexLt.num_constraints());
+    let (c_eval, _) = deep_ali_merge_general(
+        &lde, &coeffs, AirType::LexLt, domain.omega, n_trace, BLOWUP,
+    );
+
+    let params = build_params(n0, &fs_pub, ldt);
+
+    let t_prove = Instant::now();
+    let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+    let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+
+    let t_verify = Instant::now();
+    let ok = deep_fri_verify::<Ext>(&params, &proof);
+    let local_verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+    assert!(ok, "worker self-verify failed for LexLt");
+
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+    let mut proof_blob = Vec::with_capacity(proof_bytes);
+    proof.serialize_with_mode(&mut proof_blob, Compress::Yes)
+        .expect("lexlt proof serialise (compressed) must not fail");
+
+    let pi_hash = lex_lt_pi_hash(&fs_pub, &proof.root_f0);
+
+    LexLtOutput {
+        pi_hash, n_trace, proof_bytes, prove_ms, local_verify_ms,
+        root_f0: proof.root_f0, proof_blob,
+    }
+}
+
+/// Verify an `a < b` proof.  Performs NO native byte comparison — the
+/// strict-less-than is established by the in-circuit STARK; only the
+/// operands `a, b` are bound (via the recomputed FS public input).
+pub fn verify_lex_lt(
+    output:        &LexLtOutput,
+    a:             &[u8; 32],
+    b:             &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> bool {
+    use ark_serialize::{CanonicalDeserialize, Validate};
+    let fs_pub = lex_lt_fs_pub(a, b, fs_binding_32);
+    let n0 = output.n_trace * BLOWUP;
+    let params = build_params(n0, &fs_pub, ldt);
+    let proof = match deep_ali::fri::DeepFriProof::<Ext>::deserialize_with_mode(
+        output.proof_blob.as_slice(), Compress::Yes, Validate::Yes,
+    ) { Ok(p) => p, Err(_) => return false };
+    if !deep_fri_verify::<Ext>(&params, &proof) { return false; }
+    lex_lt_pi_hash(&fs_pub, &proof.root_f0) == output.pi_hash
+}
+
+/// Cyclic-cover mode: which pair of LexLt proofs establishes coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CoverMode {
+    /// owner < q ∧ q < next   (normal interval interior)
+    Interior,
+    /// next < owner ∧ owner < q   (wrap interval, q above owner)
+    WrapUpper,
+    /// next < owner ∧ q < next   (wrap interval, q below next)
+    WrapLower,
+}
+
+#[derive(Clone, Debug)]
+pub struct Nsec3CoverProof {
+    pub mode:    CoverMode,
+    pub lt1:     LexLtOutput,
+    pub lt2:     LexLtOutput,
+    pub pi_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nsec3CoverError {
+    /// A constituent LexLt sub-proof failed to verify.
+    SubProofInvalid,
+    PiHashMismatch,
+}
+
+fn nsec3_cover_pi_hash(
+    owner: &[u8; 32], q: &[u8; 32], next: &[u8; 32],
+    mode: CoverMode, lt1_pi: &[u8; 32], lt2_pi: &[u8; 32],
+    fs_binding_32: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-COVER-PIHASH-V1");
+    Digest::update(&mut h, owner);
+    Digest::update(&mut h, q);
+    Digest::update(&mut h, next);
+    Digest::update(&mut h, [mode as u8]);
+    Digest::update(&mut h, lt1_pi);
+    Digest::update(&mut h, lt2_pi);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+/// The (a, b) operand pairs the two sub-proofs must prove for each mode.
+fn cover_roles<'a>(
+    mode: CoverMode, owner: &'a [u8; 32], q: &'a [u8; 32], next: &'a [u8; 32],
+) -> ((&'a [u8; 32], &'a [u8; 32]), (&'a [u8; 32], &'a [u8; 32])) {
+    match mode {
+        CoverMode::Interior  => ((owner, q), (q, next)),
+        CoverMode::WrapUpper => ((next, owner), (owner, q)),
+        CoverMode::WrapLower => ((next, owner), (q, next)),
+    }
+}
+
+/// Prove that `q` is strictly covered by the NSEC3 interval `(owner, next)`
+/// under the cyclic ordering, fully in-circuit.  Panics if `q` is not in
+/// fact covered (caller bug).  The prover uses native comparison only to
+/// SELECT the mode; the verifier does none.
+pub fn prove_nsec3_cover(
+    owner:         &[u8; 32],
+    q:             &[u8; 32],
+    next:          &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3CoverProof {
+    let mode = if owner < next {
+        assert!(owner < q && q < next, "q not inside normal interval (owner, next)");
+        CoverMode::Interior
+    } else {
+        // wrap (next <= owner)
+        if q > owner { CoverMode::WrapUpper }
+        else if q < next { CoverMode::WrapLower }
+        else { panic!("q not covered by wrap interval (owner, next)"); }
+    };
+    let ((a1, b1), (a2, b2)) = cover_roles(mode, owner, q, next);
+    let lt1 = prove_lex_lt(a1, b1, fs_binding_32, ldt);
+    let lt2 = prove_lex_lt(a2, b2, fs_binding_32, ldt);
+    let pi_hash = nsec3_cover_pi_hash(owner, q, next, mode, &lt1.pi_hash, &lt2.pi_hash, fs_binding_32);
+    Nsec3CoverProof { mode, lt1, lt2, pi_hash }
+}
+
+/// Verify a cyclic-cover proof: check both LexLt sub-proofs for the
+/// mode's operand roles and reproduce the cover pi_hash.  Performs NO
+/// native byte comparison.
+pub fn verify_nsec3_cover(
+    proof:         &Nsec3CoverProof,
+    owner:         &[u8; 32],
+    q:             &[u8; 32],
+    next:          &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Result<(), Nsec3CoverError> {
+    let ((a1, b1), (a2, b2)) = cover_roles(proof.mode, owner, q, next);
+    if !verify_lex_lt(&proof.lt1, a1, b1, fs_binding_32, ldt) {
+        return Err(Nsec3CoverError::SubProofInvalid);
+    }
+    if !verify_lex_lt(&proof.lt2, a2, b2, fs_binding_32, ldt) {
+        return Err(Nsec3CoverError::SubProofInvalid);
+    }
+    let pi = nsec3_cover_pi_hash(
+        owner, q, next, proof.mode, &proof.lt1.pi_hash, &proof.lt2.pi_hash, fs_binding_32);
+    if pi != proof.pi_hash { return Err(Nsec3CoverError::PiHashMismatch); }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3015,5 +3809,337 @@ mod ds_ksk_tests {
         let out = prove_ds_ksk_binding(&dnskey, &parent, &fs_bind, LdtMode::Stir);
         assert_eq!(out.n_blocks, 2);
         assert_eq!(out.asserted_digest, parent);
+    }
+}
+
+#[cfg(test)]
+mod nsec3_nodata_tests {
+    use super::*;
+
+    // The five tests that call `prove_nsec3_nodata` go through
+    // `deep_fri_prove`, which hits the ark-ff 0.4.2 `index too small`
+    // debug-assert in debug builds (a debug-only invariant, not a
+    // soundness bug — see the project memory note).  They are marked
+    // `#[ignore]` to keep `cargo test --workspace` (debug) green, matching
+    // the `ds_ksk_tests` convention; run them with
+    //   cargo test --release -p swarm-dns --lib -- --ignored nodata
+    // The AIR-level constraint tests live in `deep_ali::air_workloads`
+    // and run in debug.
+
+    const SALT: [u8; 16] = *b"swarm-test-zone1";
+    const FS:   [u8; 32] = [0xC3; 32];
+
+    /// Build a window-0 type bitmap with the given RR types set.
+    fn bitmap_with(types: &[u8]) -> [u8; 32] {
+        let mut bm = [0u8; 32];
+        for &t in types {
+            bm[(t >> 3) as usize] |= 1 << (7 - (t & 7));
+        }
+        bm
+    }
+
+    /// A name that exists with A(1), RRSIG(46), NSEC3(50) but no AAAA(28).
+    fn sample_record() -> Nsec3TypedRecord {
+        let owner = [0x11u8; 32];
+        Nsec3TypedRecord {
+            owner_hash:  owner,
+            next_hash:   [0x22u8; 32],
+            type_bitmap: bitmap_with(&[1, 46, 50]),
+        }
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn nodata_roundtrip_stir() {
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        // Query AAAA (28) — present? no → NODATA.
+        let out = prove_nsec3_nodata(&rec, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        assert_eq!(out.qtype, 28);
+        assert_eq!(out.n_trace, 256);
+        assert!(out.proof_bytes > 0);
+        verify_nsec3_nodata(&out, &rec, &qname, 28, &SALT, &FS, LdtMode::Stir)
+            .expect("honest NODATA proof must verify");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn nodata_roundtrip_fri() {
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        let out = prove_nsec3_nodata(&rec, &qname, 28, &SALT, &FS, LdtMode::Fri);
+        verify_nsec3_nodata(&out, &rec, &qname, 28, &SALT, &FS, LdtMode::Fri)
+            .expect("honest NODATA proof must verify under FRI");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn verify_rejects_present_type() {
+        // Prove NODATA for AAAA, then a malicious verifier claims the same
+        // proof denies A(1) — but A IS present, so the native check fires.
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        let out = prove_nsec3_nodata(&rec, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        let err = verify_nsec3_nodata(&out, &rec, &qname, 1, &SALT, &FS, LdtMode::Stir)
+            .unwrap_err();
+        assert_eq!(err, Nsec3NoDataError::TypePresent);
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn verify_rejects_name_mismatch() {
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        let out = prove_nsec3_nodata(&rec, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        let wrong_name = [0x99u8; 32];
+        let err = verify_nsec3_nodata(&out, &rec, &wrong_name, 28, &SALT, &FS, LdtMode::Stir)
+            .unwrap_err();
+        assert_eq!(err, Nsec3NoDataError::NameMismatch);
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn verify_rejects_tampered_proof() {
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        let mut out = prove_nsec3_nodata(&rec, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        // Flip a byte deep in the proof blob.
+        let mid = out.proof_blob.len() / 2;
+        out.proof_blob[mid] ^= 0xFF;
+        let err = verify_nsec3_nodata(&out, &rec, &qname, 28, &SALT, &FS, LdtMode::Stir)
+            .unwrap_err();
+        assert!(matches!(err,
+            Nsec3NoDataError::StarkProofInvalid | Nsec3NoDataError::PiHashMismatch));
+    }
+
+    #[test]
+    #[should_panic(expected = "present in the bitmap")]
+    fn prove_panics_on_present_type() {
+        // Asking to prove NODATA for a type that IS present is a caller bug.
+        let rec = sample_record();
+        let qname = rec.owner_hash;
+        let _ = prove_nsec3_nodata(&rec, &qname, 1, &SALT, &FS, LdtMode::Stir);
+    }
+}
+
+#[cfg(test)]
+mod nsec3_optout_tests {
+    use super::*;
+
+    const SALT: [u8; 16] = *b"swarm-test-zone1";
+    const FS:   [u8; 32] = [0xD4; 32];
+
+    // owner < deleg < next so the record covers the delegation.
+    fn fixture() -> ([u8; 32], [u8; 32], [u8; 32]) {
+        let mut owner = [0u8; 32]; owner[0] = 0x10;
+        let mut deleg = [0u8; 32]; deleg[0] = 0x40;
+        let mut next  = [0u8; 32]; next[0]  = 0x80;
+        (owner, deleg, next)
+    }
+
+    #[test]
+    fn covers_normal_and_wrap() {
+        let (o, d, n) = fixture();
+        assert!(nsec3_covers(&o, &n, &d));
+        // wrap interval: next < owner
+        assert!(nsec3_covers(&n, &o, &{ let mut x = [0u8; 32]; x[0] = 0x90; x }));
+        assert!(nsec3_covers(&n, &o, &{ let mut x = [0u8; 32]; x[0] = 0x05; x }));
+        assert!(!nsec3_covers(&o, &n, &{ let mut x = [0u8; 32]; x[0] = 0x90; x }));
+    }
+
+    #[test]
+    fn optout_set_helper() {
+        assert!(optout_set(0x01));
+        assert!(optout_set(0x03));
+        assert!(!optout_set(0x00));
+        assert!(!optout_set(0x80));
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn optout_roundtrip() {
+        let (o, d, n) = fixture();
+        let out = prove_nsec3_optout(&o, &n, 0x01, &d, &SALT, &FS, LdtMode::Stir);
+        verify_nsec3_optout(&out, &o, &n, 0x01, &d, &SALT, &FS, LdtMode::Stir)
+            .expect("honest opt-out proof must verify");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn optout_verify_rejects_not_covered() {
+        let (o, d, n) = fixture();
+        let out = prove_nsec3_optout(&o, &n, 0x01, &d, &SALT, &FS, LdtMode::Stir);
+        let outside = { let mut x = [0u8; 32]; x[0] = 0x90; x }; // > next
+        let err = verify_nsec3_optout(&out, &o, &n, 0x01, &outside, &SALT, &FS, LdtMode::Stir)
+            .unwrap_err();
+        assert_eq!(err, Nsec3OptOutError::NotCovered);
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn optout_verify_rejects_tamper() {
+        let (o, d, n) = fixture();
+        let mut out = prove_nsec3_optout(&o, &n, 0x01, &d, &SALT, &FS, LdtMode::Stir);
+        let mid = out.proof_blob.len() / 2;
+        out.proof_blob[mid] ^= 0xFF;
+        assert!(verify_nsec3_optout(&out, &o, &n, 0x01, &d, &SALT, &FS, LdtMode::Stir).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Opt-Out flag is clear")]
+    fn prove_panics_on_clear_flag() {
+        let (o, d, n) = fixture();
+        let _ = prove_nsec3_optout(&o, &n, 0x00, &d, &SALT, &FS, LdtMode::Stir);
+    }
+}
+
+#[cfg(test)]
+mod nsec3_wildcard_tests {
+    use super::*;
+
+    const SALT: [u8; 16] = *b"swarm-test-zone1";
+    const FS:   [u8; 32] = [0xE5; 32];
+
+    fn bitmap_with(types: &[u8]) -> [u8; 32] {
+        let mut bm = [0u8; 32];
+        for &t in types { bm[(t >> 3) as usize] |= 1 << (7 - (t & 7)); }
+        bm
+    }
+
+    /// A wildcard `*.CE` record carrying A(1) and RRSIG(46) but not AAAA(28).
+    fn wildcard() -> Nsec3TypedRecord {
+        Nsec3TypedRecord {
+            owner_hash:  [0x55u8; 32],
+            next_hash:   [0x66u8; 32],
+            type_bitmap: bitmap_with(&[1, 46]),
+        }
+    }
+
+    #[test]
+    fn wildcard_absent_bracketing() {
+        let mut owner = [0u8; 32]; owner[0] = 0x10;
+        let mut next  = [0u8; 32]; next[0]  = 0x80;
+        let mut wh    = [0u8; 32]; wh[0]    = 0x40; // H(*.CE) bracketed → absent
+        assert!(wildcard_absent_covered(&owner, &next, &wh));
+        let mut present = [0u8; 32]; present[0] = 0x90;
+        assert!(!wildcard_absent_covered(&owner, &next, &present));
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn wildcard_present_nocover_roundtrip() {
+        let wc = wildcard();
+        let ce = [0x77u8; 32];
+        let qname = [0x12u8; 32];
+        // Query AAAA(28): wildcard lacks it → would NOT synthesise → closure holds.
+        let out = prove_nsec3_wildcard_closure(&ce, &wc, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        verify_nsec3_wildcard_closure(
+            &out, &ce, &wc, &wc.owner_hash, &qname, 28, &SALT, &FS, LdtMode::Stir)
+            .expect("honest wildcard closure must verify");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn wildcard_verify_rejects_wrong_owner() {
+        let wc = wildcard();
+        let ce = [0x77u8; 32];
+        let qname = [0x12u8; 32];
+        let out = prove_nsec3_wildcard_closure(&ce, &wc, &qname, 28, &SALT, &FS, LdtMode::Stir);
+        let err = verify_nsec3_wildcard_closure(
+            &out, &ce, &wc, &[0x00u8; 32], &qname, 28, &SALT, &FS, LdtMode::Stir)
+            .unwrap_err();
+        assert_eq!(err, Nsec3WildcardError::WildcardMismatch);
+    }
+
+    #[test]
+    #[should_panic(expected = "WOULD synthesise")]
+    fn prove_panics_when_wildcard_covers_type() {
+        let wc = wildcard();
+        let ce = [0x77u8; 32];
+        let qname = [0x12u8; 32];
+        // Query A(1): wildcard HAS it → would synthesise → closure cannot hold.
+        let _ = prove_nsec3_wildcard_closure(&ce, &wc, &qname, 1, &SALT, &FS, LdtMode::Stir);
+    }
+}
+
+#[cfg(test)]
+mod lex_cover_tests {
+    use super::*;
+
+    const FS: [u8; 32] = [0xF6; 32];
+
+    fn h(msb0: u8, lsb31: u8) -> [u8; 32] {
+        let mut x = [0u8; 32]; x[0] = msb0; x[31] = lsb31; x
+    }
+
+    #[test]
+    fn be32_limbs_ordering_matches_lexicographic() {
+        // a has its most-significant byte set; b only its least-significant.
+        let a = h(0x01, 0x00);
+        let b = h(0x00, 0x01);
+        assert!(a > b, "lexicographic: a (MSB set) > b (LSB set)");
+        let al = super::be32_to_limbs(&a);
+        let bl = super::be32_to_limbs(&b);
+        assert_eq!(al[7], 0x0100_0000, "MSB byte lands in the most-significant limb");
+        assert_eq!(bl[0], 1, "LSB byte lands in limb 0");
+        // integer order matches: a's top limb nonzero, b's only limb0.
+        assert!(al[7] > bl[7] || (al[7] == bl[7] && al[0] >= bl[0]));
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn lex_lt_roundtrip_and_operand_binding() {
+        let a = h(0x10, 0x00);
+        let b = h(0x20, 0x00);
+        let out = prove_lex_lt(&a, &b, &FS, LdtMode::Stir);
+        assert!(verify_lex_lt(&out, &a, &b, &FS, LdtMode::Stir), "honest a<b must verify");
+        // Operand binding: verifying with swapped operands recomputes a
+        // different FS public input → reject.
+        assert!(!verify_lex_lt(&out, &b, &a, &FS, LdtMode::Stir),
+            "proof for (a,b) must not verify as (b,a)");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn cover_interior_roundtrip() {
+        let owner = h(0x10, 0); let q = h(0x40, 0); let next = h(0x80, 0);
+        let p = prove_nsec3_cover(&owner, &q, &next, &FS, LdtMode::Stir);
+        assert_eq!(p.mode, CoverMode::Interior);
+        verify_nsec3_cover(&p, &owner, &q, &next, &FS, LdtMode::Stir)
+            .expect("interior cover must verify");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn cover_wrap_upper_and_lower() {
+        // wrap interval: next < owner
+        let owner = h(0x80, 0); let next = h(0x20, 0);
+        let q_upper = h(0x90, 0); // q > owner
+        let p1 = prove_nsec3_cover(&owner, &q_upper, &next, &FS, LdtMode::Stir);
+        assert_eq!(p1.mode, CoverMode::WrapUpper);
+        verify_nsec3_cover(&p1, &owner, &q_upper, &next, &FS, LdtMode::Stir).unwrap();
+
+        let q_lower = h(0x10, 0); // q < next
+        let p2 = prove_nsec3_cover(&owner, &q_lower, &next, &FS, LdtMode::Stir);
+        assert_eq!(p2.mode, CoverMode::WrapLower);
+        verify_nsec3_cover(&p2, &owner, &q_lower, &next, &FS, LdtMode::Stir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn cover_verify_rejects_tampered_subproof() {
+        let owner = h(0x10, 0); let q = h(0x40, 0); let next = h(0x80, 0);
+        let mut p = prove_nsec3_cover(&owner, &q, &next, &FS, LdtMode::Stir);
+        let mid = p.lt1.proof_blob.len() / 2;
+        p.lt1.proof_blob[mid] ^= 0xFF;
+        assert!(verify_nsec3_cover(&p, &owner, &q, &next, &FS, LdtMode::Stir).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "not inside normal interval")]
+    fn cover_prove_panics_when_not_covered() {
+        // owner < next (normal) but q outside (q > next).
+        let owner = h(0x10, 0); let next = h(0x40, 0); let q = h(0x90, 0);
+        let _ = prove_nsec3_cover(&owner, &q, &next, &FS, LdtMode::Stir);
     }
 }

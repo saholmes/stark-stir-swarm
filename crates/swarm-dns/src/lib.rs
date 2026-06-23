@@ -5,6 +5,7 @@
 
 pub mod dns;
 pub mod dns_authority;
+pub mod fast_track;
 pub mod prover;
 pub mod se_epoch_package;
 

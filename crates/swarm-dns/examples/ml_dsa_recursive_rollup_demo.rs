@@ -145,7 +145,7 @@ fn main() {
         // Recursive STARK wrap.
         let t = Instant::now();
         let rec = prove_v2_all_subairs_composed_recursive(
-            &v2_proof, &w, blowup, recursive_r, /*stir=*/false,
+            &v2_proof, &w, inner_blowup, blowup, recursive_r, /*stir=*/false,
         ).expect("recursive STARK wrap must succeed");
         let rec_prove_ms = t.elapsed().as_secs_f64() * 1000.0;
         total_recursive_prove_ms += rec_prove_ms;
