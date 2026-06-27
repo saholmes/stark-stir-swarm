@@ -101,6 +101,24 @@ pub struct NiUpdate {
     /// forming an append-only chain that, anchored to an external public log,
     /// prevents backdating.
     pub prev_proof_hash: [u8; 32],
+    /// Proof of time: a trusted time authority's signature over
+    /// `(attested_time ‖ proof_hash)`, making `created_at` authority-attested
+    /// rather than owner-claimed (empty `time_sig` = unattested).
+    pub attested_time: u64,
+    pub time_authority_pk: Vec<u8>,
+    pub time_sig: Vec<u8>,
+}
+
+/// The message a time authority signs to attest a proof's existence at a time.
+/// Using the proof hash as the time-server \emph{nonce} means the signature
+/// proves the proof existed at/before `attested_time` (one cannot sign over a
+/// nonce that does not yet exist).
+pub fn time_attest_msg(attested_time: u64, proof_hash: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(24 + 8 + 32);
+    m.extend_from_slice(b"stark-dns/time-attest/v1");
+    m.extend_from_slice(&attested_time.to_le_bytes());
+    m.extend_from_slice(proof_hash);
+    m
 }
 
 impl NiUpdate {
@@ -115,6 +133,18 @@ impl NiUpdate {
             &self.owner_pk, &self.name, &self.merkle_root, self.serial,
             self.created_at, &self.prev_proof_hash,
         )
+    }
+
+    /// Attach a proof of time: a trusted time service `authority` signs
+    /// `(attested_time ‖ proof_hash)`.  In deployment `attested_time` is the
+    /// authority's observed clock; the signature is an ML-DSA (or, for a
+    /// Roughtime/RFC-3161 service, Ed25519/RSA/ECDSA) signature verifiable
+    /// in-circuit by the same signature AIR used for DNSSEC RRSIGs.
+    pub fn attach_time_attestation(&mut self, authority: &AuthorityKeypair) {
+        let t = self.created_at;
+        self.attested_time = t;
+        self.time_authority_pk = authority.pk_bytes();
+        self.time_sig = authority.sign(&time_attest_msg(t, &self.proof_hash()));
     }
 }
 
@@ -182,6 +212,9 @@ pub fn build_ni_update(
         owner_sig,
         created_at,
         prev_proof_hash: prev_hash,
+        attested_time: 0,
+        time_authority_pk: Vec::new(),
+        time_sig: Vec::new(),
     }
 }
 
@@ -210,6 +243,9 @@ pub enum NiReject {
     BadChainLink,
     /// The creation timestamp predates the chain head (time ran backwards).
     Backdated,
+    /// A trusted time authority is required but the proof carries no valid
+    /// time attestation (self-claimed / manipulated timestamp).
+    TimeUnattested,
 }
 
 /// Registrar acceptance: enforces the triple binding + freshness.  Returns
@@ -219,6 +255,7 @@ pub fn accept_ni_update(
     registry: &NameKeyRegistry,
     chain: &NiChainState,
     crqc_cutoff: u64,
+    trusted_time_authority_pk: Option<&[u8]>,
     update: &NiUpdate,
     ldt: LdtMode,
 ) -> Result<(), NiReject> {
@@ -283,6 +320,23 @@ pub fn accept_ni_update(
     let params = build_params(n0, &fs, ldt);
     if !deep_ali::fri::deep_fri_verify::<Ext>(&params, &proof) {
         return Err(NiReject::StarkInvalid);
+    }
+
+    // Proof of time: when a trusted time authority is configured, the creation
+    // time must be authority-attested (not self-claimed).  The attestation is
+    // the authority's signature over (attested_time ‖ proof_hash); a deployed
+    // verifier checks it in-circuit via the same ML-DSA signature AIR.
+    if let Some(ta_pk) = trusted_time_authority_pk {
+        if update.attested_time != update.created_at
+            || update.time_authority_pk.as_slice() != ta_pk
+            || !ml_dsa_verify_pk_bytes(
+                &update.time_authority_pk,
+                &time_attest_msg(update.attested_time, &update.proof_hash()),
+                &update.time_sig,
+            )
+        {
+            return Err(NiReject::TimeUnattested);
+        }
     }
 
     Ok(())
