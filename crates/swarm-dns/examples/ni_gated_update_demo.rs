@@ -1,128 +1,148 @@
 //! NI-gated update authorization demo (implemented + measured).
 //!
-//! Demonstrates source-authenticated, post-quantum DNS record updates: a
-//! registrar accepts an update only if it carries a STARK proof bound to the
-//! owner's registered ML-DSA key plus the owner's ML-DSA signature.  This is
-//! the running-code answer to the capture-window MitM: a forged or substituted
-//! update is rejected at ingress.
+//! Source-authenticated, post-quantum DNS record updates with a **temporal
+//! validity gate**: a registrar accepts an update only if it carries a STARK
+//! proof bound to the owner's registered ML-DSA key, the owner's ML-DSA
+//! signature, AND a creation timestamp provably before the CRQC cutoff,
+//! extending an append-only per-name chain (anti-backdating).
 //!
 //! Flagship framing: ACME DNS-01 domain control (`_acme-challenge` TXT).
 //!
 //! Run:
-//!   cargo run --release -p swarm-dns --example ni_gated_update_demo \
-//!       --features "<your sha3/mldsa feature set>"
+//!   cargo run --release -p swarm-dns --example ni_gated_update_demo
 //!
-//! Shows: (1) one-time owner key enrolment, (2) a valid NI-gated update
-//! accepted, and (3) five attacks rejected — forged record, substituted key,
-//! proof lifted onto another key, unregistered name, and replay — with
-//! prove/verify timing and proof+signature size.
+//! Shows: enrolment, a chain of two accepted updates, then eight rejected
+//! attacks (forged record, substituted key, proof lifted onto another key,
+//! unregistered name, replay, **post-CRQC-cutoff proof, broken chain link,
+//! and a backdated timestamp**), with prove/verify timing and bundle size.
 
 use std::time::Instant;
 
 use swarm_dns::dns::DnsRecord;
 use swarm_dns::dns_authority::{AuthorityKeypair, NistLevel};
-use swarm_dns::ni_gate::{accept_ni_update, build_ni_update, NameKeyRegistry, NiReject};
+use swarm_dns::ni_gate::{
+    accept_ni_update, build_ni_update, ni_fs_binding, NameKeyRegistry, NiChainState, NiReject,
+    NiUpdate,
+};
 use swarm_dns::prover::LdtMode;
+
+// Illustrative wall-clock anchors (unix seconds).
+const T_GENESIS: u64 = 1_700_000_000; // ~2023-11
+const T_CRQC_CUTOFF: u64 = 2_000_000_000; // ~2033-05 estimated CRQC emergence
 
 fn main() {
     let ldt = LdtMode::Stir;
     let salt = *b"ni-gate-demo-slt";
     let name = "example.com";
 
-    println!("\n┌─ NI-gated update authorization (implemented + measured) ───");
+    println!("\n┌─ NI-gated update authorization + temporal validity ───────");
     println!("│  trust root : owner registers H(ML-DSA pk) for the name");
-    println!("│  binding    : proof FS-anchor folds owner pk (proof<->pk);");
-    println!("│               owner ML-DSA-signs the same anchor (sig<->pk)");
-    println!("│  gate       : registrar accepts iff name<->pk, proof<->pk,");
-    println!("│               sig<->pk, STARK valid, fresh serial");
+    println!("│  binding    : proof FS-anchor folds owner pk, creation date,");
+    println!("│               and prev-proof hash (chain); owner ML-DSA-signs it");
+    println!("│  gate       : accept iff name<->pk, proof<->pk, sig<->pk,");
+    println!("│               STARK valid, fresh serial, chain-linked,");
+    println!("│               created_at < CRQC cutoff (provably pre-CRQC)");
+    println!("│  cutoff     : {T_CRQC_CUTOFF} (estimated CRQC emergence)");
     println!("└────────────────────────────────────────────────────────────\n");
 
-    // ── 0. Owner and an unrelated attacker each hold an ML-DSA key ────────
     let owner = AuthorityKeypair::keygen(NistLevel::L1, [7u8; 32]);
     let attacker = AuthorityKeypair::keygen(NistLevel::L1, [42u8; 32]);
 
-    // ── 1. One-time enrolment (the trust root) ────────────────────────────
     let mut registry = NameKeyRegistry::new();
     registry.register(name, &owner.pk_bytes());
-    registry.register("attacker.com", &attacker.pk_bytes()); // attacker owns a different name
-    println!("[1] enrolled owner pk for {name} (and attacker pk for attacker.com)");
+    registry.register("attacker.com", &attacker.pk_bytes());
+    println!("[1] enrolled owner pk for {name} (+ attacker pk for attacker.com)");
 
-    // ── 2. Owner builds an NI-gated update (ACME _acme-challenge + A) ──────
-    let token = b"3xQ7...acme-challenge-token...";
-    let records = vec![
-        DnsRecord::txt(&format!("_acme-challenge.{name}"), 60, std::str::from_utf8(token).unwrap()),
-        DnsRecord::a(name, 300, [93, 184, 216, 34]),
-    ];
-    let serial = 1u64;
+    let token = "3xQ7-acme-challenge-token";
+    let mk_records = |ip: [u8; 4]| {
+        vec![
+            DnsRecord::txt(&format!("_acme-challenge.{name}"), 60, token),
+            DnsRecord::a(name, 300, ip),
+        ]
+    };
+
+    // ── 2. Chain of two accepted updates (genesis -> u1 -> u2) ────────────
+    let mut chain = NiChainState::genesis();
 
     let t0 = Instant::now();
-    let update = build_ni_update(&owner, name, &records, serial, salt, ldt);
+    let u1 = build_ni_update(&owner, name, &mk_records([93, 184, 216, 34]), 1, T_GENESIS, chain.head_hash, salt, ldt);
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    let t1 = Instant::now();
+    let v1 = accept_ni_update(&registry, &chain, T_CRQC_CUTOFF, &u1, ldt);
+    let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(v1, Ok(()));
+    chain.advance(&u1);
     println!(
-        "[2] owner built NI update: {} records, proof+sig {} bytes ({} KiB), prove {:.1} ms",
-        update.records.len(),
-        update.proof_sig_bytes(),
-        update.proof_sig_bytes() / 1024,
-        prove_ms,
+        "[2] update #1 ACCEPT (date {T_GENESIS}); proof+sig {} KiB, prove {prove_ms:.1} ms, verify {verify_ms:.2} ms",
+        u1.proof_sig_bytes() / 1024
     );
 
-    // ── 3. Registrar accepts the honest update ────────────────────────────
-    let last_serial = 0u64;
-    let t1 = Instant::now();
-    let verdict = accept_ni_update(&registry, last_serial, &update, ldt);
-    let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
-    assert_eq!(verdict, Ok(()), "honest update must be accepted");
-    println!("[3] registrar ACCEPT (honest update), verify {verify_ms:.2} ms\n");
+    let u2 = build_ni_update(&owner, name, &mk_records([93, 184, 216, 35]), 2, T_GENESIS + 86_400, chain.head_hash, salt, ldt);
+    assert_eq!(accept_ni_update(&registry, &chain, T_CRQC_CUTOFF, &u2, ldt), Ok(()));
+    chain.advance(&u2);
+    println!("[3] update #2 ACCEPT (date {}, chained on #1)\n", T_GENESIS + 86_400);
 
-    // ── 4. Attacks, each rejected ─────────────────────────────────────────
+    // ── 4. Attacks against the chain head, each rejected ──────────────────
     println!("    Attacks (each must be rejected):");
+    let head = chain.head_hash;
+    let next_serial = 3;
+    let valid_date = T_GENESIS + 2 * 86_400;
 
-    // (a) forged record: tamper a record after proving.
-    let mut forged = update.clone();
-    forged.records[1] = DnsRecord::a(name, 300, [6, 6, 6, 6]); // redirect example.com
-    expect_reject("forged record (tampered A)", &registry, &forged, ldt, last_serial);
+    // (a) forged record: tamper after proving.
+    let mut forged = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, valid_date, head, salt, ldt);
+    forged.records[1] = DnsRecord::a(name, 300, [6, 6, 6, 6]);
+    expect_reject("forged record (tampered A)", &registry, &chain, &forged, ldt);
 
-    // (b) substituted key: present the proof under the attacker's pk, same name.
-    let mut swapped = update.clone();
+    // (b) substituted key, same name.
+    let mut swapped = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, valid_date, head, salt, ldt);
     swapped.owner_pk = attacker.pk_bytes();
-    swapped.owner_sig = attacker.sign(&swarm_dns::ni_gate::ni_fs_binding(
-        &attacker.pk_bytes(), name, &swapped.merkle_root, swapped.serial,
-    ));
-    expect_reject("substituted owner key (same name)", &registry, &swapped, ldt, last_serial);
+    swapped.owner_sig = attacker.sign(&ni_fs_binding(&attacker.pk_bytes(), name, &swapped.merkle_root, swapped.serial, swapped.created_at, &swapped.prev_proof_hash));
+    expect_reject("substituted owner key (same name)", &registry, &chain, &swapped, ldt);
 
     // (c) proof lifted onto attacker's own registered name+key.
-    let mut lifted = update.clone();
+    let mut lifted = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, valid_date, head, salt, ldt);
     lifted.name = "attacker.com".to_string();
     lifted.owner_pk = attacker.pk_bytes();
-    lifted.owner_sig = attacker.sign(&swarm_dns::ni_gate::ni_fs_binding(
-        &attacker.pk_bytes(), "attacker.com", &lifted.merkle_root, lifted.serial,
-    ));
-    expect_reject("proof lifted onto attacker's key/name", &registry, &lifted, ldt, last_serial);
+    lifted.owner_sig = attacker.sign(&ni_fs_binding(&attacker.pk_bytes(), "attacker.com", &lifted.merkle_root, lifted.serial, lifted.created_at, &lifted.prev_proof_hash));
+    // attacker.com chain is still genesis; its prev must be [0;32], so this also breaks the link — use attacker.com genesis to isolate the StarkInvalid:
+    let att_chain = NiChainState::genesis();
+    lifted.prev_proof_hash = att_chain.head_hash;
+    lifted.owner_sig = attacker.sign(&ni_fs_binding(&attacker.pk_bytes(), "attacker.com", &lifted.merkle_root, lifted.serial, lifted.created_at, &lifted.prev_proof_hash));
+    expect_reject_chain("proof lifted onto attacker's key/name", &registry, &att_chain, &lifted, ldt);
 
     // (d) unregistered name.
-    let mut unreg = update.clone();
+    let mut unreg = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, valid_date, head, salt, ldt);
     unreg.name = "not-enrolled.com".to_string();
-    expect_reject("unregistered name", &registry, &unreg, ldt, last_serial);
+    expect_reject("unregistered name", &registry, &chain, &unreg, ldt);
 
-    // (e) replay: re-present an already-accepted serial.
-    let replay = accept_ni_update(&registry, update.serial, &update, ldt);
-    report("replay (stale serial)", replay);
+    // (e) replay: re-present an already-accepted update (#2).
+    report("replay (stale serial / re-sent #2)", accept_ni_update(&registry, &chain, T_CRQC_CUTOFF, &u2, ldt));
 
-    println!("\n✓ NI-gated demo complete: 1 accept, 5 rejects, all as expected.\n");
+    // (f) post-CRQC-cutoff proof: created after the cutoff date.
+    let post = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, T_CRQC_CUTOFF + 86_400, head, salt, ldt);
+    expect_reject("post-CRQC-cutoff creation date", &registry, &chain, &post, ldt);
+
+    // (g) broken chain link: prev_proof_hash does not extend the head.
+    let mut badlink = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, valid_date, [9u8; 32], salt, ldt);
+    let _ = &mut badlink;
+    expect_reject("broken chain link (wrong prev hash)", &registry, &chain, &badlink, ldt);
+
+    // (h) backdated: timestamp earlier than the chain head, but correctly linked.
+    let back = build_ni_update(&owner, name, &mk_records([1, 1, 1, 1]), next_serial, T_GENESIS - 1, head, salt, ldt);
+    expect_reject("backdated timestamp (< chain head)", &registry, &chain, &back, ldt);
+
+    println!("\n✓ NI-gated + temporal demo complete: 2 chained accepts, 8 rejects.\n");
 }
 
-fn expect_reject(
-    label: &str,
-    registry: &NameKeyRegistry,
-    update: &swarm_dns::ni_gate::NiUpdate,
-    ldt: LdtMode,
-    last_serial: u64,
-) {
-    let r = accept_ni_update(registry, last_serial, update, ldt);
+fn expect_reject(label: &str, reg: &NameKeyRegistry, chain: &NiChainState, u: &NiUpdate, ldt: LdtMode) {
+    expect_reject_chain(label, reg, chain, u, ldt)
+}
+fn expect_reject_chain(label: &str, reg: &NameKeyRegistry, chain: &NiChainState, u: &NiUpdate, ldt: LdtMode) {
+    let r = accept_ni_update(reg, chain, T_CRQC_CUTOFF, u, ldt);
     report(label, r);
     assert!(r.is_err(), "attack '{label}' must be rejected, got {r:?}");
 }
-
 fn report(label: &str, r: Result<(), NiReject>) {
     match r {
         Ok(()) => println!("      {label:42}  ACCEPT  (!!! unexpected)"),

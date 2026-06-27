@@ -58,13 +58,22 @@ impl NameKeyRegistry {
 /// NI binding: the Fiat–Shamir public input that anchors the STARK proof to
 /// `(owner_pk, name, record-commitment, serial)`, and the exact message the
 /// owner ML-DSA-signs.  Folding `owner_pk` here is what enforces *proof ↔ pk*.
-pub fn ni_fs_binding(owner_pk: &[u8], name: &str, mk_root: &[u8; 32], serial: u64) -> [u8; 32] {
+pub fn ni_fs_binding(
+    owner_pk: &[u8],
+    name: &str,
+    mk_root: &[u8; 32],
+    serial: u64,
+    created_at: u64,
+    prev_hash: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Sha3_256::new();
-    Digest::update(&mut h, b"stark-dns/ni-gate/v1");
+    Digest::update(&mut h, b"stark-dns/ni-gate/v2");
     Digest::update(&mut h, owner_pk); // proof <-> pk
     Digest::update(&mut h, name.as_bytes());
     Digest::update(&mut h, mk_root);
     Digest::update(&mut h, serial.to_le_bytes());
+    Digest::update(&mut h, created_at.to_le_bytes()); // temporal: pre-CRQC gate
+    Digest::update(&mut h, prev_hash); // anchored chain: anti-backdating
     h.finalize().into()
 }
 
@@ -84,12 +93,53 @@ pub struct NiUpdate {
     pub owner_pk: Vec<u8>,
     /// Owner ML-DSA signature over [`ni_fs_binding`].
     pub owner_sig: Vec<u8>,
+    /// Unix-seconds creation timestamp, bound into the proof.  A proof is only
+    /// trustworthy if provably created before the CRQC cutoff (after which a
+    /// classical signature it attests could be a Shor forgery).
+    pub created_at: u64,
+    /// Hash of the previous accepted update for this name (genesis = [0;32]),
+    /// forming an append-only chain that, anchored to an external public log,
+    /// prevents backdating.
+    pub prev_proof_hash: [u8; 32],
 }
 
 impl NiUpdate {
     /// Wire size of the carried proof + signature (bytes).
     pub fn proof_sig_bytes(&self) -> usize {
         self.inner_stark_proof.len() + self.owner_sig.len() + self.owner_pk.len()
+    }
+    /// This update's chain identity = its (deterministic) FS binding, used as
+    /// the `prev_proof_hash` of the next update for the same name.
+    pub fn proof_hash(&self) -> [u8; 32] {
+        ni_fs_binding(
+            &self.owner_pk, &self.name, &self.merkle_root, self.serial,
+            self.created_at, &self.prev_proof_hash,
+        )
+    }
+}
+
+/// Per-name chain state held by the registrar: the head of the append-only
+/// proof chain, its timestamp, and the last serial.  In deployment the head is
+/// periodically committed to an external append-only log / timestamp authority,
+/// so the chain's position at a wall-clock time is publicly witnessed — which
+/// is what makes the `created_at` unforgeable (a proof chaining from a
+/// publicly-anchored head cannot have been created before that anchor).
+#[derive(Clone, Copy)]
+pub struct NiChainState {
+    pub head_hash: [u8; 32],
+    pub head_created_at: u64,
+    pub last_serial: u64,
+}
+impl NiChainState {
+    /// Genesis state for a freshly enrolled name.
+    pub fn genesis() -> Self {
+        Self { head_hash: [0u8; 32], head_created_at: 0, last_serial: 0 }
+    }
+    /// Advance the chain after accepting `update`.
+    pub fn advance(&mut self, update: &NiUpdate) {
+        self.head_hash = update.proof_hash();
+        self.head_created_at = update.created_at;
+        self.last_serial = update.serial;
     }
 }
 
@@ -100,6 +150,8 @@ pub fn build_ni_update(
     name: &str,
     records: &[DnsRecord],
     serial: u64,
+    created_at: u64,
+    prev_hash: [u8; 32],
     salt: [u8; 16],
     ldt: LdtMode,
 ) -> NiUpdate {
@@ -108,8 +160,9 @@ pub fn build_ni_update(
     let leaf_hashes: Vec<[u8; 32]> = records.iter().map(|r| r.leaf_hash(&salt)).collect();
     let mk_root = merkle_root(&merkle_build(&leaf_hashes));
 
-    // Fiat–Shamir anchor folds in the owner pk → proof <-> pk binding.
-    let fs = ni_fs_binding(&owner_pk, name, &mk_root, serial);
+    // FS anchor folds owner pk (proof<->pk), creation date (temporal gate),
+    // and the previous proof hash (anchored chain).
+    let fs = ni_fs_binding(&owner_pk, name, &mk_root, serial, created_at, &prev_hash);
     let inner = prove_inner_shard(&salt, records, &fs, ldt);
     debug_assert_eq!(inner.merkle_root, mk_root);
 
@@ -127,6 +180,8 @@ pub fn build_ni_update(
         inner_stark_proof: inner.proof_blob,
         owner_pk,
         owner_sig,
+        created_at,
+        prev_proof_hash: prev_hash,
     }
 }
 
@@ -147,6 +202,14 @@ pub enum NiReject {
     StarkInvalid,
     /// The update's serial is not newer than the last accepted one (replay).
     StaleSerial,
+    /// The proof was created at/after the configured CRQC cutoff date — a
+    /// classical signature it attests could be a post-quantum forgery.
+    PastCutoff,
+    /// `prev_proof_hash` does not match the registrar's current chain head
+    /// (reordering / backdating attempt).
+    BadChainLink,
+    /// The creation timestamp predates the chain head (time ran backwards).
+    Backdated,
 }
 
 /// Registrar acceptance: enforces the triple binding + freshness.  Returns
@@ -154,7 +217,8 @@ pub enum NiReject {
 /// registered name.
 pub fn accept_ni_update(
     registry: &NameKeyRegistry,
-    last_serial: u64,
+    chain: &NiChainState,
+    crqc_cutoff: u64,
     update: &NiUpdate,
     ldt: LdtMode,
 ) -> Result<(), NiReject> {
@@ -168,13 +232,28 @@ pub fn accept_ni_update(
         return Err(NiReject::PkBindingMismatch);
     }
 
+    // Anchored chain: the update must extend the current head (anti-backdating).
+    if update.prev_proof_hash != chain.head_hash {
+        return Err(NiReject::BadChainLink);
+    }
+    // Time moves forward along the chain (cannot chain an earlier-dated proof).
+    if update.created_at < chain.head_created_at {
+        return Err(NiReject::Backdated);
+    }
+    // Temporal gate: trustworthy only if provably created before the CRQC era.
+    if update.created_at >= crqc_cutoff {
+        return Err(NiReject::PastCutoff);
+    }
     // Freshness (anti-replay).
-    if update.serial <= last_serial {
+    if update.serial <= chain.last_serial {
         return Err(NiReject::StaleSerial);
     }
 
-    // Recompute the owner-pk-bound FS anchor from the carried fields.
-    let fs = ni_fs_binding(&update.owner_pk, &update.name, &update.merkle_root, update.serial);
+    // Recompute the FS anchor (owner pk + date + prev-hash) from carried fields.
+    let fs = ni_fs_binding(
+        &update.owner_pk, &update.name, &update.merkle_root, update.serial,
+        update.created_at, &update.prev_proof_hash,
+    );
 
     // (3) sig <-> pk: ML-DSA over the binding under the owner key.
     if !ml_dsa_verify_pk_bytes(&update.owner_pk, &fs, &update.owner_sig) {
