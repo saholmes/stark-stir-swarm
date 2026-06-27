@@ -70,6 +70,32 @@ fn main() {
     println!("│  this is the expensive statement justifying swarm delegation");
     println!("└────────────────────────────────────────────────────────────\n");
 
+    // ── [0] Validation-soundness: an invalid chain yields NO proof ─────────
+    // The validation predicate (unlike HashRollup) attests RRSIG validity, so
+    // a record whose leaf signature does not verify cannot be proved at all:
+    // the honest prover refuses at the native check, before any STARK work.
+    // This is the rejection HashRollup structurally cannot make.
+    {
+        let mut bad = rrsig;
+        bad[0] ^= 0x01; // corrupt the leaf RRSIG
+        assert!(
+            !verify_zsk_ksk_native_v2(&dnskey_pubkey, &bad, signed_rrset, &fs, &merkle_root)
+                .verified,
+            "corrupted RRSIG must fail validation"
+        );
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_zsk_ksk_binding_v2(&dnskey_pubkey, &bad, signed_rrset, &fs, &merkle_root, 256, ldt)
+        }))
+        .is_ok();
+        std::panic::set_hook(prev);
+        assert!(!produced, "prover must NOT emit a proof for an unvalidatable chain");
+        println!(
+            "[0] REJECT invalid DNSSEC chain -> NO verifying proof exists (validation-soundness)\n"
+        );
+    }
+
     // ── Prove: the leaf RRSIG verifies IN-CIRCUIT, bound to the NI anchor ──
     println!("[*] proving in-circuit Ed25519 leaf-RRSIG verification (K=256)…");
     let t0 = Instant::now();
