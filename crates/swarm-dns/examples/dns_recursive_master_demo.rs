@@ -35,10 +35,10 @@ use deep_ali::ml_dsa_transcript;
 use deep_ali::ml_dsa_verify_air_v2_orchestration::{
     prove_v2_real, synthesize_demo_witness, verify_v2_real,
 };
-use wrapper_stark::recursive_prover::RecursiveStarkProof;
+use wrapper_stark::recursive_prover::{verify_recursive_stark, RecursiveStarkProof};
 use wrapper_stark::master_recursion_bridge::{
     extract_fri_merkle_openings, prove_master_with_fri_merkle_binding,
-    verify_master_with_fri_merkle_binding,
+    rederive_master_outer_pi_hash, verify_master_with_fri_merkle_binding,
 };
 use wrapper_stark::v2_recursion_bridge::prove_v2_all_subairs_composed_recursive;
 
@@ -113,6 +113,34 @@ fn main() {
     let ok = verify_master_with_fri_merkle_binding(&bundle, &inners[..], Some(&subset));
     let t_verify = t.elapsed().as_secs_f64() * 1e3;
     assert!(ok, "master+binding bundle must verify end-to-end");
+
+    // ── Decompose the verify: edge (merge-only) vs audit pieces ────────────
+    // Piece 1 — MASTER-ONLY FRI verify: this is exactly what the deployed
+    // merge-only edge runs (one bundle, full STARK soundness via the LDT
+    // chain, NO per-inner binding checks).  Median of a few reps to damp noise.
+    let mut t_master_only = f64::INFINITY;
+    for _ in 0..5 {
+        let t = Instant::now();
+        let mok = verify_recursive_stark(&bundle.master);
+        let dt = t.elapsed().as_secs_f64() * 1e3;
+        assert!(mok, "master-only verify must hold");
+        if dt < t_master_only { t_master_only = dt; }
+    }
+    // Piece 3a — re-derivation cross-check (audit-only): rebuild the master
+    // outer pi-hash from the N supplied inners.
+    let mut t_rederive = f64::INFINITY;
+    for _ in 0..5 {
+        let t = Instant::now();
+        let _ = rederive_master_outer_pi_hash(&inners[..], bundle.master.public.n_trace_max);
+        let dt = t.elapsed().as_secs_f64() * 1e3;
+        if dt < t_rederive { t_rederive = dt; }
+    }
+    // Piece 2 (binding loop) ≈ full 3-piece − master-only − rederive.
+    let t_binding_loop = (t_verify - t_master_only - t_rederive).max(0.0);
+    println!(
+        "    DECOMP N={n}: master-only(edge)={t_master_only:.3} ms | rederive={t_rederive:.3} ms | \
+         binding-loop={t_binding_loop:.3} ms | full(3-piece)={t_verify:.3} ms"
+    );
 
     let mut master_bytes = Vec::new();
     use ark_serialize::CanonicalSerialize;

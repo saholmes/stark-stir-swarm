@@ -240,11 +240,38 @@ pub mod constraint_composition_verifier {
         }
     }
 
+    /// O(1)-lookup variant of [`LookupTrace`].  The flat-slice scan above is
+    /// O(|column_values|) per access, which makes constraint synthesis
+    /// O(n_total^2) on the master composition (n_total grows with the number
+    /// of aggregated inners).  Building the index once is bit-for-bit
+    /// equivalent --- duplicate keys keep the FIRST value, matching the
+    /// linear scan's "first match wins" --- but reduces synthesis to
+    /// O(n_total).
+    pub struct HashLookupTrace<F: Field> {
+        pub map: std::collections::HashMap<CellRef, F>,
+    }
+
+    impl<F: Field> HashLookupTrace<F> {
+        pub fn from_pairs(pairs: &[(CellRef, F)]) -> Self {
+            let mut map = std::collections::HashMap::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                map.entry(*k).or_insert(*v); // first match wins (matches LookupTrace)
+            }
+            Self { map }
+        }
+    }
+
+    impl<F: Field> FieldTraceAccess<F> for HashLookupTrace<F> {
+        fn get_cell_f(&self, cell: CellRef) -> F {
+            self.map.get(&cell).copied().unwrap_or_else(F::zero)
+        }
+    }
+
     /// Native reference: compute Σ α_j · Φ_j(values) for the claim.
     /// Returns the actual composed value (which equals `expected` iff
     /// the claim is true).
     pub fn composition_eval_native<F: Field>(claim: &CompositionClaim<F>) -> F {
-        let trace = LookupTrace { map: &claim.column_values };
+        let trace = HashLookupTrace::from_pairs(&claim.column_values);
         let mut acc = F::zero();
         for (j, c) in claim.constraints.iter().enumerate() {
             let phi = c.eval_field(&trace);
@@ -313,7 +340,7 @@ pub mod constraint_composition_verifier {
         /// reference; the AIR's constraints validate this trace.
         pub fn synthesise(claim: &CompositionClaim<F>) -> Self {
             let n = claim.constraints.len();
-            let trace_oracle = LookupTrace { map: &claim.column_values };
+            let trace_oracle = HashLookupTrace::from_pairs(&claim.column_values);
             let mut alpha = Vec::with_capacity(n);
             let mut phi = Vec::with_capacity(n);
             let mut partial_sum = Vec::with_capacity(n);
