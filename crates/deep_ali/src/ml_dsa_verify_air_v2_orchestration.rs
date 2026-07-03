@@ -1192,6 +1192,388 @@ pub fn prove_v2_real_from_traces(
     }
 }
 
+// ─── Low-memory (streaming) v2 prover ─────────────────────────────
+//
+// `prove_v2_real` / `prove_v2_real_from_traces` build ALL sub-traces
+// up front (via `fill_v2_traces`) and then, inside the body, capture
+// FOUR sub-AIR LDEs (v17_lde, decompose_lde, use_hint_lde,
+// w1_encode_lde) into function-scope `let` bindings.  Because Rust
+// drops those at end of scope, all four LDEs — plus every resident
+// sub-trace, plus the wide 11520-column TRANSCRIPT LDE built last —
+// are alive simultaneously at the peak.  At ML-DSA-87 (L5) that peak
+// measured 1667 MiB (> 1 GB per compute element).
+//
+// The F2b seams do NOT require the LDEs to be held together: each
+// `commit_binding_cells` reads only ITS OWN sub-AIR's LDE, and the
+// cross-checks `verify_ood_consistency` / `verify_ood_against_public_
+// trace_col` run at VERIFY time from the SMALL `BindingCellsCommit`s.
+// So the prover can process ONE sub-AIR at a time: fill its trace,
+// prove it, make every BCC that reads its LDE, then drop its trace +
+// LDE + tree before moving to the next sub-AIR.  Peak then collapses
+// to the LARGEST SINGLE sub-AIR's prove footprint instead of the
+// all-at-once sum.
+//
+// The resulting `V2ProofReal` is **byte-identical** to
+// `prove_v2_real`'s: every sub-proof's Fiat-Shamir transcript is
+// seeded only by `pi_hash` (+ its own trace_root) and each BCC is a
+// deterministic function of its own LDE column + `pi_hash` +
+// `domain_sep`, so memory sequencing cannot change any emitted byte.
+// Field arithmetic is exact (associative), so rayon reduction order
+// is irrelevant.  See `v2_lowmem_byte_identical_and_sound`.
+
+// Per-sub-AIR trace builders — each replicates exactly the
+// corresponding block of `fill_v2_traces`, so the traces (hence
+// LDEs, proofs, and BCCs) are identical to the all-at-once path.
+
+fn fill_v17_trace_only(w: &V2Witness) -> Vec<Vec<F>> {
+    let mut v17_trace: Vec<Vec<F>> = (0..v17_dim::N_COLS)
+        .map(|_| vec![F::zero(); v17_dim::N_ROWS_POW2]).collect();
+    v17::fill_trace(
+        &mut v17_trace, v17_dim::N_ROWS_POW2,
+        &w.a_ntt, &w.z_ntt, &w.c_ntt, &w.t1d_ntt, &w.w_approx_ntt, &w.z_cleartext,
+    );
+    v17_trace
+}
+
+fn fill_intt_trace_only(w: &V2Witness, k: usize) -> Vec<Vec<F>> {
+    let intt_n = (t7::BUTTERFLIES_PER_NTT + 16).next_power_of_two();
+    let mut sub: Vec<Vec<F>> = (0..intt::N_COLS)
+        .map(|_| vec![F::zero(); intt_n]).collect();
+    t7::fill_trace(&mut sub, intt_n, &w.w_approx[k]);
+    sub
+}
+
+fn fill_transcript_trace_only(w: &V2Witness) -> Vec<Vec<F>> {
+    let transcript_layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
+    let n = transcript::N_ROWS_POW2;
+    let mut t: Vec<Vec<F>> = (0..transcript::N_COLS)
+        .map(|_| vec![F::zero(); n]).collect();
+    crate::ml_dsa_shake_absorb_multi_air::fill_trace(&mut t, n, &transcript_layout);
+    t
+}
+
+fn fill_decompose_trace_only(w: &V2Witness) -> Vec<Vec<F>> {
+    let n_coeffs = K * N;
+    let coeff_n = n_coeffs.next_power_of_two();
+    let mut w_approx_flat = Vec::with_capacity(n_coeffs);
+    for k in 0..K { for i in 0..N { w_approx_flat.push(w.w_approx[k][i]); } }
+    let mut t: Vec<Vec<F>> = (0..ml_dsa_decompose_air::WIDTH)
+        .map(|_| vec![F::zero(); coeff_n]).collect();
+    ml_dsa_decompose_air::fill_trace(&mut t, coeff_n, &w_approx_flat);
+    t
+}
+
+fn fill_use_hint_trace_only(w: &V2Witness) -> Vec<Vec<F>> {
+    let n_coeffs = K * N;
+    let coeff_n = n_coeffs.next_power_of_two();
+    let mut use_hint_inputs: Vec<(u32, u32, u32)> = Vec::with_capacity(n_coeffs);
+    for k in 0..K {
+        for i in 0..N {
+            let r = w.w_approx[k][i];
+            let (r1, _r0) = ml_dsa_decompose::decompose(r);
+            let (_, r0_lifted) = ml_dsa_decompose::decompose(r);
+            let r0_sign: u32 = if r0_lifted != 0 && r0_lifted <= crate::ml_dsa::params::Q / 2 {
+                1
+            } else {
+                0
+            };
+            let h = w.h[k][i];
+            use_hint_inputs.push((r1, r0_sign, h));
+        }
+    }
+    let mut t: Vec<Vec<F>> = (0..ml_dsa_use_hint_air::WIDTH)
+        .map(|_| vec![F::zero(); coeff_n]).collect();
+    ml_dsa_use_hint_air::fill_trace(&mut t, coeff_n, &use_hint_inputs);
+    t
+}
+
+fn fill_w1_encode_trace_only(w: &V2Witness) -> Vec<Vec<F>> {
+    let n_coeffs = K * N;
+    let coeff_n = n_coeffs.next_power_of_two();
+    let mut adjusted_flat: Vec<u32> = Vec::with_capacity(n_coeffs);
+    for k in 0..K { for i in 0..N { adjusted_flat.push(w.adjusted_r1[k][i]); } }
+    let mut t: Vec<Vec<F>> = (0..ml_dsa_w1_encode_air::WIDTH)
+        .map(|_| vec![F::zero(); coeff_n]).collect();
+    ml_dsa_w1_encode_air::fill_trace(&mut t, coeff_n, &adjusted_flat);
+    t
+}
+
+/// **Low-memory production v2 prover.**  Byte-for-byte equivalent to
+/// `prove_v2_real`, but proves the sub-AIRs ONE AT A TIME and drops
+/// each sub-AIR's trace + LDE + Merkle tree before building the next,
+/// so peak RSS is the largest single sub-AIR's prove footprint rather
+/// than the all-at-once sum.  Intended for ≤1 GB-per-element compute.
+pub fn prove_v2_real_lowmem(
+    w: &V2Witness,
+    c_tilde_bytes: &[u8; crate::ml_dsa::params::C_TILDE_BYTES],
+    blowup: usize,
+) -> V2ProofReal {
+    let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
+    let coeff_n_trace_local = (K * N).next_power_of_two();
+
+    // ── V17 (proves + F2b L5 EQ-region BCCs), then drop its LDE ──
+    let (fri_v17, l5_v17_eq_bccs): (Vec<u8>, Vec<Vec<u8>>) = {
+        let v17_trace = fill_v17_trace_only(w);
+        let v17_n_trace_local = v17_trace[0].len();
+        let (v17_proof, v17_lde, _v17_tree) =
+            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                &v17_trace, v17_n_trace_local, blowup, pi_hash,
+                b"v17",
+                crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_ml_dsa_v17(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+        drop(v17_trace);
+        let fri_v17 = crate::sub_air_with_trace::serialize_proof(&v17_proof);
+        drop(v17_proof);
+        let mut bccs = Vec::with_capacity(L + 3);
+        let eq_base = crate::ml_dsa_verify_air_v17::EQ_BASE;
+        for ll in 0..L {
+            let col_idx = eq_base + crate::ml_dsa_verify_air::col_a_ntt(ll);
+            let domain_sep = format!("l5_v17_a_ntt_{ll}").into_bytes();
+            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
+                &domain_sep, |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            bccs.push(commit.to_bytes());
+        }
+        for (col_fn, ds) in [
+            (crate::ml_dsa_verify_air::col_c_ntt(), b"l5_v17_c_ntt" as &[u8]),
+            (crate::ml_dsa_verify_air::col_t1d_ntt(), b"l5_v17_t1d_ntt"),
+            (crate::ml_dsa_verify_air::col_w_approx_ntt(), b"l5_v17_w_approx_ntt"),
+        ] {
+            let col_idx = eq_base + col_fn;
+            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
+                ds, |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            bccs.push(commit.to_bytes());
+        }
+        (fri_v17, bccs)
+    };
+
+    // ── INTT × K (each: prove + L0/L1 openings), drop per instance ──
+    let mut fri_intt: Vec<Vec<u8>> = Vec::with_capacity(K);
+    let mut intt_l0_openings: Vec<Vec<u8>> = Vec::with_capacity(K);
+    let mut intt_l1_openings: Vec<Vec<u8>> = Vec::with_capacity(K);
+    for k in 0..K {
+        let intt_trace = fill_intt_trace_only(w, k);
+        let mut tag = b"intt:".to_vec();
+        tag.push(k as u8);
+        let (proof, lde, tree) =
+            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                &intt_trace, intt_trace[0].len(), blowup, pi_hash,
+                &tag,
+                crate::ml_dsa_ntt_chained_air::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t7_chained_ntt(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+        drop(intt_trace);
+        let l0_opening = crate::sub_air_with_trace::open_trace_row_at_raw_position(
+            &lde, &tree, crate::ml_dsa_ntt_chained_air::BUTTERFLIES_PER_NTT, blowup,
+        );
+        let l1_opening = crate::sub_air_with_trace::open_trace_row_at_raw_position(
+            &lde, &tree, 0, blowup,
+        );
+        let mut l0_bytes = Vec::new();
+        l0_opening.serialize_with_mode(&mut l0_bytes, ark_serialize::Compress::Yes)
+            .expect("L0 opening serialize");
+        let mut l1_bytes = Vec::new();
+        l1_opening.serialize_with_mode(&mut l1_bytes, ark_serialize::Compress::Yes)
+            .expect("L1 INTT opening serialize");
+        intt_l0_openings.push(l0_bytes);
+        intt_l1_openings.push(l1_bytes);
+        fri_intt.push(crate::sub_air_with_trace::serialize_proof(&proof));
+        drop(lde);
+        drop(tree);
+    }
+
+    // ── COEFF Decompose (prove + L2a + L1 BCCs), drop its LDE ──
+    let (fri_decompose, l2a_decompose_bcc, l1_decompose_bcc): (Vec<u8>, Vec<u8>, Vec<u8>) = {
+        let decompose_trace = fill_decompose_trace_only(w);
+        let (decompose_proof, decompose_lde, _decompose_tree) =
+            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                &decompose_trace, decompose_trace[0].len(), blowup, pi_hash,
+                b"decompose",
+                crate::ml_dsa_decompose_air::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t_decompose(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+        drop(decompose_trace);
+        let fri_decompose = crate::sub_air_with_trace::serialize_proof(&decompose_proof);
+        let l2a_decompose_bcc = {
+            let (commit, _packed) = crate::binding_cells_commit::commit_binding_cells(
+                &decompose_lde, &[crate::ml_dsa_decompose_air::col_r1()],
+                coeff_n_trace_local, blowup, pi_hash, b"l2a_decompose",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        let l1_decompose_bcc = {
+            let (commit, _packed) = crate::binding_cells_commit::commit_binding_cells(
+                &decompose_lde, &[crate::ml_dsa_decompose_air::col_r()],
+                coeff_n_trace_local, blowup, pi_hash, b"l1_decompose_r",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        (fri_decompose, l2a_decompose_bcc, l1_decompose_bcc)
+    };
+
+    // ── COEFF UseHint (prove + L2a/L3/L2c/L2b BCCs), drop its LDE ──
+    let (fri_use_hint, l2a_use_hint_bcc, l3_use_hint_bcc, l2c_use_hint_bcc, l2b_use_hint_bcc):
+        (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = {
+        let use_hint_trace = fill_use_hint_trace_only(w);
+        let (use_hint_proof, use_hint_lde, _use_hint_tree) =
+            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                &use_hint_trace, use_hint_trace[0].len(), blowup, pi_hash,
+                b"use_hint",
+                crate::ml_dsa_use_hint_air::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t_use_hint(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+        drop(use_hint_trace);
+        let fri_use_hint = crate::sub_air_with_trace::serialize_proof(&use_hint_proof);
+        let l2a_use_hint_bcc = {
+            let (commit, _packed) = crate::binding_cells_commit::commit_binding_cells(
+                &use_hint_lde, &[crate::ml_dsa_use_hint_air::COL_R1],
+                coeff_n_trace_local, blowup, pi_hash, b"l2a_use_hint",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        let l3_use_hint_bcc = {
+            let (commit, _packed) = crate::binding_cells_commit::commit_binding_cells(
+                &use_hint_lde, &[crate::ml_dsa_use_hint_air::COL_ADJUSTED_R1],
+                coeff_n_trace_local, blowup, pi_hash, b"l3_use_hint_adj",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        let l2c_use_hint_bcc = {
+            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                &use_hint_lde, &[crate::ml_dsa_use_hint_air::COL_H],
+                coeff_n_trace_local, blowup, pi_hash, b"l2c_use_hint_h",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        let l2b_use_hint_bcc = {
+            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                &use_hint_lde, &[crate::ml_dsa_use_hint_air::COL_R0_SIGN],
+                coeff_n_trace_local, blowup, pi_hash, b"l2b_use_hint_r0_sign",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        (fri_use_hint, l2a_use_hint_bcc, l3_use_hint_bcc, l2c_use_hint_bcc, l2b_use_hint_bcc)
+    };
+
+    // ── COEFF W1Encode (prove + L3 + L4 BCCs), drop its LDE ──
+    let (fri_w1_encode, l3_w1_encode_bcc, l4_w1_encode_bccs): (Vec<u8>, Vec<u8>, Vec<Vec<u8>>) = {
+        let w1_encode_trace = fill_w1_encode_trace_only(w);
+        let (w1_encode_proof, w1_encode_lde, _w1_encode_tree) =
+            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                &w1_encode_trace, w1_encode_trace[0].len(), blowup, pi_hash,
+                b"w1_encode",
+                crate::ml_dsa_w1_encode_air::NUM_CONSTRAINTS,
+                |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t_w1_encode(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+        drop(w1_encode_trace);
+        let fri_w1_encode = crate::sub_air_with_trace::serialize_proof(&w1_encode_proof);
+        let l3_w1_encode_bcc = {
+            let (commit, _packed) = crate::binding_cells_commit::commit_binding_cells(
+                &w1_encode_lde, &[crate::ml_dsa_w1_encode_air::col_r1()],
+                coeff_n_trace_local, blowup, pi_hash, b"l3_w1_encode_r1",
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            );
+            commit.to_bytes()
+        };
+        let l4_w1_encode_bccs: Vec<Vec<u8>> = {
+            use crate::ml_dsa::params::W1_BITS_PER_COEF;
+            let mut bccs = Vec::with_capacity(W1_BITS_PER_COEF);
+            for b in 0..W1_BITS_PER_COEF {
+                let col_idx = crate::ml_dsa_w1_encode_air::col_bit(b);
+                let domain_sep = format!("l4_w1_encode_bit_{b}").into_bytes();
+                let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                    &w1_encode_lde, &[col_idx],
+                    coeff_n_trace_local, blowup, pi_hash,
+                    &domain_sep, |n0, ph| v2_fri_params(n0, blowup, ph),
+                );
+                bccs.push(commit.to_bytes());
+            }
+            bccs
+        };
+        (fri_w1_encode, l3_w1_encode_bcc, l4_w1_encode_bccs)
+    };
+
+    // ── TRANSCRIPT (prove + extract c̃'), drop its LDE ──
+    let (fri_transcript, c_tilde_prime): (Vec<u8>, [u8; crate::ml_dsa::params::C_TILDE_BYTES]) = {
+        let transcript_trace = fill_transcript_trace_only(w);
+        let transcript_layout = ml_dsa_transcript::build_layout(&w.mu_bytes, &w.w1bytes);
+        let c_tilde_prime = ml_dsa_transcript::extract_c_tilde_prime_from_trace(
+            &transcript_trace, &transcript_layout,
+        );
+        let layout_for_closure = transcript_layout.clone();
+        let transcript_num_constraints =
+            ml_dsa_shake_absorb_multi_air::num_constraints(&layout_for_closure);
+        let fri_transcript = crate::sub_air_with_trace::serialize_proof(
+            &crate::sub_air_with_trace::prove_one_sub_air_with_trace(
+                &transcript_trace, transcript_trace[0].len(), blowup, pi_hash,
+                b"transcript",
+                transcript_num_constraints,
+                move |lde, n_trace, blowup, comb_coeffs| {
+                    crate::deep_ali_merge_t_transcript(
+                        lde, comb_coeffs, F::zero(), n_trace, blowup, &layout_for_closure,
+                    ).0
+                },
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            )
+        );
+        (fri_transcript, c_tilde_prime)
+    };
+
+    // L5 / Decompose / UseHint / W1Encode inclusion-proof Vecs were
+    // removed 2026-05-12 (superseded by OOD); empty Vecs preserve the
+    // wire format exactly as `prove_v2_real_from_traces` does.
+    let v17_l5_openings: Vec<Vec<u8>> = Vec::new();
+    let decompose_l1_openings: Vec<Vec<u8>> = Vec::new();
+    let use_hint_openings: Vec<Vec<u8>> = Vec::new();
+    let w1_encode_openings: Vec<Vec<u8>> = Vec::new();
+
+    V2ProofReal {
+        pi_hash, c_tilde_prime,
+        fri_v17, fri_intt, fri_decompose, fri_use_hint, fri_w1_encode,
+        fri_transcript,
+        intt_l0_openings,
+        intt_l1_openings,
+        decompose_l1_openings,
+        use_hint_openings,
+        w1_encode_openings,
+        v17_l5_openings,
+        l2a_decompose_bcc,
+        l2a_use_hint_bcc,
+        l3_use_hint_bcc,
+        l3_w1_encode_bcc,
+        l2c_use_hint_bcc,
+        l5_v17_eq_bccs,
+        l1_decompose_bcc,
+        l4_w1_encode_bccs,
+        l2b_use_hint_bcc,
+    }
+}
+
 /// **Production v2 verifier.**  Recomputes `pi_hash`, runs 10 FRI
 /// sub-verifies, checks `c̃' == c̃` final boundary.  Returns `Ok(())`
 /// iff every check passes.
@@ -2844,5 +3226,145 @@ mod tests {
 
         assert_eq!(traces.transcript.len(), transcript::N_COLS);
         assert_eq!(traces.transcript[0].len(), transcript::N_ROWS_POW2);
+    }
+
+    /// **STEP 1 diagnostic.**  Prints per-sub-AIR trace dims + LDE
+    /// footprint at the active NIST level and `BENCH_BLOWUP` (default
+    /// 4).  Identifies which single sub-AIR dominates the low-mem
+    /// prover's peak.  Cheap (compile-time consts only).
+    ///
+    /// Run: `cargo test --release -p deep_ali --no-default-features \
+    ///   --features "parallel sha3-512 mldsa-87" v2_diag_breakdown \
+    ///   -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn v2_diag_breakdown() {
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let level = crate::stark_level::NIST_LEVEL;
+        let scheme = crate::ml_dsa::params::SCHEME_NAME;
+        let mib = |cells: usize| (cells * 8) as f64 / 1024.0 / 1024.0;
+
+        eprintln!("[v2_diag] level=L{level} scheme={scheme} blowup={blowup} K={K} L={L} N={N}");
+        eprintln!("[v2_diag] per-sub-AIR trace (width x rows) and LDE cells / MiB @ this blowup:");
+
+        // V17
+        let v17_w = v17_dim::N_COLS;
+        let v17_r = v17_dim::N_ROWS_POW2;
+        let v17_lde = v17_w * v17_r * blowup;
+        eprintln!("  V17        : {v17_w:>6} x {v17_r:>6}  active={:>6}  LDE={v17_lde:>11} ({:.1} MiB)",
+            v17_dim::N_ROWS_ACTIVE, mib(v17_lde));
+
+        // INTT (one instance; K proven one-at-a-time)
+        let intt_w = intt::N_COLS;
+        let intt_r = (t7::BUTTERFLIES_PER_NTT + 16).next_power_of_two();
+        let intt_lde = intt_w * intt_r * blowup;
+        eprintln!("  INTT (1/{K}) : {intt_w:>6} x {intt_r:>6}                LDE={intt_lde:>11} ({:.1} MiB)",
+            mib(intt_lde));
+
+        // COEFF sub-AIRs
+        let coeff_r = (K * N).next_power_of_two();
+        for (name, w) in [
+            ("Decompose", ml_dsa_decompose_air::WIDTH),
+            ("UseHint  ", ml_dsa_use_hint_air::WIDTH),
+            ("W1Encode ", ml_dsa_w1_encode_air::WIDTH),
+        ] {
+            let lde = w * coeff_r * blowup;
+            eprintln!("  {name}  : {w:>6} x {coeff_r:>6}                LDE={lde:>11} ({:.1} MiB)",
+                mib(lde));
+        }
+
+        // TRANSCRIPT
+        let tr_w = transcript::N_COLS;
+        let tr_r = transcript::N_ROWS_POW2;
+        let tr_lde = tr_w * tr_r * blowup;
+        eprintln!("  TRANSCRIPT : {tr_w:>6} x {tr_r:>6}                LDE={tr_lde:>11} ({:.1} MiB)",
+            mib(tr_lde));
+
+        let all_traces = v17_w*v17_r + K*intt_w*intt_r
+            + (ml_dsa_decompose_air::WIDTH + ml_dsa_use_hint_air::WIDTH + ml_dsa_w1_encode_air::WIDTH)*coeff_r
+            + tr_w*tr_r;
+        let held_ldes = v17_lde
+            + (ml_dsa_decompose_air::WIDTH + ml_dsa_use_hint_air::WIDTH + ml_dsa_w1_encode_air::WIDTH)*coeff_r*blowup;
+        eprintln!("[v2_diag] all-at-once resident traces = {:.1} MiB", mib(all_traces));
+        eprintln!("[v2_diag] simultaneously-held LDEs (v17+3 coeff, orig path) = {:.1} MiB", mib(held_ldes));
+        eprintln!("[v2_diag] low-mem peak target = MAX single sub-AIR LDE = {:.1} MiB (+FRI/tree overhead)",
+            mib([v17_lde, intt_lde, tr_lde,
+                 ml_dsa_decompose_air::WIDTH*coeff_r*blowup].into_iter().max().unwrap()));
+    }
+
+    /// **SOUNDNESS GUARD for the low-mem prover.**  Runs at L1 (fast).
+    /// Asserts:
+    ///  (a) the low-mem proof is BYTE-IDENTICAL to `prove_v2_real`'s
+    ///      (so every existing F2b tamper/regression test applies to
+    ///      it verbatim),
+    ///  (b) the honest low-mem proof VERIFIES, and
+    ///  (c) a one-byte tamper of the low-mem V17 sub-proof is REJECTED.
+    #[test]
+    fn v2_lowmem_byte_identical_and_sound() {
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let blowup = 4;
+
+        let proof_std = prove_v2_real(&w, &c_tilde_bytes, blowup);
+        let proof_low = prove_v2_real_lowmem(&w, &c_tilde_bytes, blowup);
+
+        // (a) Byte-identity: strongest equivalence + soundness argument.
+        assert_eq!(
+            proof_std.to_bytes(), proof_low.to_bytes(),
+            "low-mem proof must be byte-identical to prove_v2_real's proof"
+        );
+
+        // (b) Honest-accept on the low-mem path.
+        verify_v2_real(&w, &c_tilde_bytes, &proof_low, blowup)
+            .expect("low-mem: honest proof must verify");
+
+        // (c) Tamper-reject on the low-mem path.
+        let mut tampered = proof_low.clone();
+        tampered.fri_v17[100] ^= 0xFF;
+        assert!(
+            verify_v2_real(&w, &c_tilde_bytes, &tampered, blowup).is_err(),
+            "low-mem: tampered V17 sub-proof must be rejected"
+        );
+    }
+
+    /// **Low-memory ML-DSA-87 (L5) prover measurement harness.**
+    /// Runs ONLY `prove_v2_real_lowmem` (never the all-at-once path,
+    /// which would double peak RSS) + 1 verify.  Measure peak with:
+    ///
+    /// ```
+    /// cargo test --release -p deep_ali --no-default-features \
+    ///   --features "parallel sha3-512 mldsa-87" --no-run
+    /// RAYON_NUM_THREADS=4 /usr/bin/time -l \
+    ///   target/release/deps/deep_ali-<hash> v2_bench_lowmem --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn v2_bench_lowmem() {
+        use std::time::Instant;
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let blowup: usize = std::env::var("BENCH_BLOWUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let level = crate::stark_level::NIST_LEVEL;
+        let scheme = crate::ml_dsa::params::SCHEME_NAME;
+        #[cfg(feature = "parallel")]
+        let rayon_threads = rayon::current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let rayon_threads = 1usize;
+
+        eprintln!("[v2_bench_lowmem] level=L{level} scheme={scheme} blowup={blowup} threads={rayon_threads}");
+        let t0 = Instant::now();
+        let proof = prove_v2_real_lowmem(&w, &c_tilde_bytes, blowup);
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let proof_kib = proof.to_bytes().len() as f64 / 1024.0;
+        eprintln!("[v2_bench_lowmem] prove_ms={prove_ms:.1} proof_kib={proof_kib:.1}");
+
+        verify_v2_real(&w, &c_tilde_bytes, &proof, blowup)
+            .expect("low-mem L5 proof must verify");
+        println!(
+            "v2_bench_lowmem level=L{level} scheme={scheme} blowup={blowup} \
+             threads={rayon_threads} prove_ms={prove_ms:.0} proof_kib={proof_kib:.1}"
+        );
     }
 }
