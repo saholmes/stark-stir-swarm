@@ -1650,6 +1650,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "once_cell",
+ "p256",
  "poseidon",
  "rand 0.8.5",
  "rayon",

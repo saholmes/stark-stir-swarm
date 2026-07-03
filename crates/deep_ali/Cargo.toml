@@ -83,6 +83,9 @@ blake3 = "1.5"
 once_cell = "1.19"
 hex = "0.4"
 sha2 = "0.10"
+# Real P256 signatures for the ECDSA verify bound bench (no wrapper-stark
+# dependency, so it builds at L5/Fp8 unlike the swarm-dns copy).
+p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
 # Reference implementation for F_{2^255 - 19} arithmetic — used to
 # cross-check the in-circuit `ed25519_field` gadget gadgets.
 curve25519-dalek = "4.1"

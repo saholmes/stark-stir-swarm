@@ -279,6 +279,27 @@ pub fn ecdsa_verify_v2_constraints(layout: &EcdsaVerifyV2Layout) -> usize {
         + ecdsa_verify_v2_row0_boundary_constraints()
 }
 
+/// Combined per-row constraint vector with the row-0 boundary gated by a
+/// `trace_row == 0` step (instead of the Lagrange `row0_indicator` the
+/// streaming merge uses).  This makes the evaluator consistent with the
+/// generic `sub_air_with_trace` verifier (which only knows the trace row),
+/// enabling witness-binding for the single-row ECDSA-P256 v2 AIR.  Pair
+/// with `crate::deep_ali_merge_p256_ecdsa_v2_rowgated_streaming`.
+pub fn eval_ecdsa_verify_v2_rowgated_per_row(
+    cur: &[F],
+    trace_row: usize,
+    layout: &EcdsaVerifyV2Layout,
+) -> Vec<F> {
+    let mut out = eval_ecdsa_verify_v2_row_uniform(cur, layout);
+    let boundary = eval_ecdsa_verify_v2_row0_boundary(cur, layout);
+    if trace_row == 0 {
+        out.extend(boundary);
+    } else {
+        out.extend(core::iter::repeat(F::from(0u64)).take(boundary.len()));
+    }
+    out
+}
+
 /// Read a `FieldElement` from `NUM_LIMBS` adjacent trace cells.
 fn read_fe_from(trace: &[Vec<F>], row: usize, base: usize) -> FieldElement {
     use ark_ff::PrimeField;

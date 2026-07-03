@@ -40,14 +40,16 @@ pub type Ext = DaExt;
 /// shrinks proofs but reduces per-query soundness; higher blowup
 /// inflates them without adding bits at the Johnson capacity ceiling.
 pub const BLOWUP: usize = 32;
-/// FRI query count.  Production calibration:
-///   r=54  → ~135 unconditional bits  (NIST PQ Level 1, ≥128 bits required)
-///   r=79  → ~197 unconditional bits  (NIST PQ Level 3, ≥192 bits required)
-///   r=105 → ~262 unconditional bits  (NIST PQ Level 5, ≥256 bits required)
-/// We deploy at r=54 — the lowest count that clears L1, which the
-/// .se HNPL paper requires.  L3/L5 retain the same code path with
-/// only this constant bumped + a re-run.
-pub const NUM_QUERIES: usize = 54;
+/// FRI query count.  Slack Johnson calibration (ISC 2026), blowup=32:
+///   r=55  → ~133.6 unconditional bits  (NIST PQ Level 1, ≥128 required)
+///   r=81  → ~196.8 unconditional bits  (NIST PQ Level 3, ≥192 required)
+///   r=108 → ~262.4 unconditional bits  (NIST PQ Level 5, ≥256 required)
+/// Sourced from the canonical `deep_ali::stark_level` so the DNS prover
+/// and the signature sub-AIRs share one soundness table.  This is the
+/// blowup=32 production value; when varying blowup (low-mem / IoT
+/// streaming) call `deep_ali::stark_level::num_queries_for_blowup(BLOWUP)`
+/// so `r` tracks the slack rate and κ_IT stays ≥ the NIST target.
+pub const NUM_QUERIES: usize = deep_ali::stark_level::NUM_QUERIES_LEVEL;
 pub const SEED_Z: u64 = 0xDEEF_BAAD;
 
 /// One-line description of the deployed soundness configuration,
@@ -56,12 +58,12 @@ pub const SEED_Z: u64 = 0xDEEF_BAAD;
 /// are running at boot — STIR-STARK reviewers asked for explicit
 /// banners after the v2 soundness audit (see paper §V).
 pub fn soundness_banner() -> String {
-    // Johnson regime, unconditional: per-query bits = ½·log₂(blowup)
-    // (BCIKS / STIR Thm. 1).  The constant "2.5" is the SPECIAL CASE
-    // at blowup=32; at any other blowup r must scale to maintain the
-    // same total bits.  See `deep_ali::stark_level` for the canonical
-    // formula.
-    let bits_per_q = 0.5_f64 * (BLOWUP as f64).log2();
+    // Slack Johnson regime, unconditional (ISC 2026): per-query bits =
+    // ½·log₂(blowup) − log₂(1.05) (η-included floor, BCIKS / STIR Thm. 1).
+    // = 2.43 b/q at blowup=32; at any other blowup r must scale to hold
+    // the same total bits.  See `deep_ali::stark_level` for the canonical
+    // formula (`num_queries_for_blowup`).
+    let bits_per_q = 0.5_f64 * (BLOWUP as f64).log2() - 1.05_f64.log2();
     let bits = (NUM_QUERIES as f64 * bits_per_q) as usize;
     let level = if bits >= 256 { "NIST PQ Level 5 (≥256 bits)" }
         else if bits >= 192 { "NIST PQ Level 3 (≥192 bits)" }

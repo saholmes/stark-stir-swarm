@@ -108,7 +108,7 @@ use crate::p256_field_air::{
 
 /// Allocate cells for one mul gadget instance.  Updates `cursor` to
 /// the next free cell after the gadget's owned block.
-fn alloc_mul_layout(
+pub(crate) fn alloc_mul_layout(
     cursor: &mut usize,
     a_limbs_base: usize,
     b_limbs_base: usize,
@@ -136,7 +136,7 @@ fn alloc_mul_layout(
 }
 
 /// Allocate cells for one add gadget instance.
-fn alloc_add_layout(
+pub(crate) fn alloc_add_layout(
     cursor: &mut usize,
     a_limbs_base: usize,
     b_limbs_base: usize,
@@ -186,7 +186,7 @@ fn alloc_sub_layout(
 }
 
 /// Allocate cells for one freeze gadget instance.
-fn alloc_freeze_layout(
+pub(crate) fn alloc_freeze_layout(
     cursor: &mut usize,
     a_limbs_base: usize,
 ) -> FreezeGadgetLayout {

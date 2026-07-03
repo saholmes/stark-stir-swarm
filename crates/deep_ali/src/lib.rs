@@ -16,32 +16,40 @@ pub mod trace_import;
 /// query count needed to reach the target NIST PQ Level's IT
 /// soundness) and `NIST_LEVEL` (the named level: 1, 3, or 5).
 ///
-/// The Johnson-regime per-query rate is ½·log₂(1/ρ_0) ≈ 2.5 bits at
-/// ρ_0 = 1/32 (BCIKS / STIR Theorem 1, both proven unconditionally).
-/// The capacity-regime rate (~5 bits/query) is conjectural and not
-/// used here; see `feedback_stir_johnson_unconditional_only.md`.
+/// The per-query rate is the **slack** Johnson yield (ISC 2026):
+/// `−log₂(√ρ_0 + η_0)` with ρ_0 = 1/32 and η_0 ≤ √ρ_0/20, i.e.
+/// `½·log₂(1/ρ_0) − log₂(1.05) ≈ 2.43` bits/query (BCIKS / STIR
+/// Theorem 1, unconditional).  This supersedes the ESORICS ideal η=0
+/// figure (2.5 b/q, r=54/79/105): the slack floor spends a few extra
+/// queries per level to *provably* clear each NIST target under the
+/// η-included proximity gap.  Capacity-regime (~5 b/q) is conjectural
+/// and not used; see `feedback_stir_johnson_unconditional_only.md`.
 ///
 /// |  Active feature  | NUM_QUERIES_LEVEL | NIST_LEVEL | IT bits |
 /// |------------------|--------------------|------------|----------|
-/// |  sha3-256        |  54                |  1         | 135      |
-/// |  sha3-384        |  79                |  3         | 197.5    |
-/// |  sha3-512        |  105               |  5         | 262.5    |
+/// |  sha3-256        |  55                |  1         | 133.6    |
+/// |  sha3-384        |  81                |  3         | 196.8    |
+/// |  sha3-512        |  108               |  5         | 262.4    |
 ///
 /// Downstream callers (mmiyc-prover/verifier) just write
 /// `const NUM_QUERIES: usize = deep_ali::stark_level::NUM_QUERIES_LEVEL;`
 /// and the right value flows through from the workspace Cargo.toml's
 /// `deep_ali = { features = [...] }` line.
 pub mod stark_level {
-    /// Per-query soundness bits at ρ_0 = 1/32, Johnson regime
-    /// (unconditional, both FRI under BCIKS and STIR Theorem 1).
-    pub const PER_QUERY_BITS_JOHNSON: f64 = 2.5;
+    /// Per-query soundness bits at ρ_0 = 1/32, **slack** Johnson regime
+    /// (ISC 2026): the η-included yield −log₂(√ρ_0 + η_0), η_0 ≤ √ρ_0/20,
+    /// = ½·log₂(1/ρ_0) − log₂(1.05) ≈ 2.43 (unconditional, BCIKS / STIR
+    /// Theorem 1).  Supersedes the ESORICS ideal η=0 rate (2.5 b/q).
+    pub const PER_QUERY_BITS_JOHNSON: f64 = 2.43;
 
+    // Slack Johnson production query counts at blowup=32 (ISC 2026):
+    // r·2.43 = 133.6 / 196.8 / 262.4 IT bits ≥ 128 / 192 / 256 targets.
     #[cfg(feature = "sha3-256")]
-    pub const NUM_QUERIES_LEVEL: usize = 54;
+    pub const NUM_QUERIES_LEVEL: usize = 55;
     #[cfg(feature = "sha3-384")]
-    pub const NUM_QUERIES_LEVEL: usize = 79;
+    pub const NUM_QUERIES_LEVEL: usize = 81;
     #[cfg(feature = "sha3-512")]
-    pub const NUM_QUERIES_LEVEL: usize = 105;
+    pub const NUM_QUERIES_LEVEL: usize = 108;
 
     #[cfg(feature = "sha3-256")]
     pub const NIST_LEVEL: u8 = 1;
@@ -61,36 +69,42 @@ pub mod stark_level {
     #[cfg(feature = "sha3-512")]
     pub const TARGET_IT_BITS: usize = 256;
 
-    /// Compute the minimum FRI query count `r` to reach the active
-    /// NIST PQ Level's IT-soundness at a given `blowup` (LDE rate
-    /// denominator).  Uses the unconditional Johnson formula
-    /// `bits/query = ½·log₂(blowup)` (BCIKS / STIR Thm. 1).
+    /// Compute the FRI query count `r` to reach the active NIST PQ
+    /// Level's IT soundness at a given `blowup`, in the **slack** Johnson
+    /// regime (ISC 2026).  Per-query yield is the η-included floor
+    /// `−log₂(√ρ_0 + η_0)` with ρ_0 = 1/blowup and η_0 ≤ √ρ_0/20, i.e.
+    /// `½·log₂(blowup) − log₂(1.05)` (= 2.43 b/q at blowup=32).
     ///
-    /// Returns `r = ⌈TARGET_IT_BITS / (½·log₂(blowup))⌉` with a
-    /// small constant safety margin of +2 (mirrors `NUM_QUERIES_LEVEL`'s
-    /// +7-ish margin at blowup=32).
+    /// The count is *anchored* on the level's production value
+    /// `NUM_QUERIES_LEVEL` (which holds at the canonical blowup=32) and
+    /// scaled inversely with the per-query yield, so it returns exactly
+    /// `NUM_QUERIES_LEVEL` at blowup=32 and provably delivers at least
+    /// the same IT bits (`NUM_QUERIES_LEVEL · 2.43 ≥ TARGET_IT_BITS`) at
+    /// every blowup.
     ///
-    /// Examples (sha3-256, TARGET_IT_BITS=128):
-    ///   blowup= 4 → r = 130 (½·log₂(4) = 1.0 b/q, ⌈128/1.0⌉ + 2)
-    ///   blowup= 8 → r =  88 (1.5 b/q, ⌈128/1.5⌉ + 2)
-    ///   blowup=16 → r =  66 (2.0 b/q, ⌈128/2.0⌉ + 2)
-    ///   blowup=32 → r =  54 (2.5 b/q, ⌈128/2.5⌉ + 2, matches NUM_QUERIES_LEVEL)
-    ///   blowup=64 → r =  45 (3.0 b/q)
+    /// Examples (sha3-256, NUM_QUERIES_LEVEL=55, ≈133.6 IT bits):
+    ///   blowup= 4 → r = 144  (0.93 b/q)
+    ///   blowup= 8 → r =  94  (1.43 b/q)
+    ///   blowup=16 → r =  70  (1.93 b/q)
+    ///   blowup=32 → r =  55  (2.43 b/q, = NUM_QUERIES_LEVEL)
+    ///   blowup=64 → r =  46  (2.93 b/q)
     ///
-    /// Used by `v2_fri_params` so the v2 sub-AIRs stay at L1 even when
-    /// callers pass a non-32 inner blowup (smoke iteration / scaling
-    /// studies).  Returns a value that, multiplied by ½·log₂(blowup),
-    /// is at least `TARGET_IT_BITS`.
+    /// Callers that VARY blowup (low-mem / IoT streaming, scaling
+    /// studies) MUST use this instead of the fixed `NUM_QUERIES_LEVEL`
+    /// so `r` tracks the rate change and κ_IT stays ≥ the NIST target.
     pub fn num_queries_for_blowup(blowup: usize) -> usize {
-        // Guard against blowup ≤ 1 — Johnson rate is 0 there.
+        // Guard against blowup ≤ 1 — the proximity yield is ≤ 0 there.
         if blowup < 2 {
             return usize::MAX; // unreachable in practice; fail loud
         }
-        let bits_per_q = 0.5_f64 * (blowup as f64).log2();
-        // Minimum r to clear TARGET_IT_BITS, plus a small margin so a
-        // single rounding error doesn't drop below the threshold.
-        let r_min = (TARGET_IT_BITS as f64 / bits_per_q).ceil() as usize;
-        r_min + 2
+        // Slack Johnson per-query yield −log₂(√ρ_0 · 1.05), ρ_0 = 1/blowup:
+        // η_0 = √ρ_0/20 inflates the proximity radius by 5% (log₂ 1.05).
+        let slack = 1.05_f64.log2();
+        let bits_per_q = |b: usize| 0.5_f64 * (b as f64).log2() - slack;
+        // Anchor on the production (blowup=32) IT bits so r(32) is exactly
+        // NUM_QUERIES_LEVEL and r·bits_per_q ≥ that at every blowup.
+        let anchor_bits = NUM_QUERIES_LEVEL as f64 * bits_per_q(32);
+        (anchor_bits / bits_per_q(blowup)).ceil() as usize
     }
 
     /// Target collision-resistance bits (matches `min(n_out, c)` of
@@ -597,10 +611,24 @@ pub fn deep_ali_merge_sha256(
     // ── Step 1: evaluate constraints on the LDE domain ──
     let mut constraint_evals = vec![vec![F::zero(); n]; SHA_K];
     for i in 0..n {
+        // Gate the final trace row's contribution to zero, matching the
+        // verifier's `trace_row >= n_trace-1` skip in
+        // `sub_air_with_trace::verify_one_sub_air_with_trace`.  The wrap
+        // transition row (n_trace-1 → 0) is not a real AIR transition
+        // (the SHA-256 digest-state row does not equal the IV row), so its
+        // constraint residual is intentionally unenforced.  Without this
+        // gate the merge bakes a nonzero residual at the last H-row into
+        // phi, phi fails to vanish on H, `poly_div_zh` drops a remainder,
+        // and the witness-binding identity `c_eval·Z_H = phi` then fails at
+        // OTHER (off-H) query points.  (The bare low-degree path never
+        // re-evaluated constraints off-H, so it was unaffected.)
+        let trace_row = i / blowup;
+        if trace_row == n_trace - 1 {
+            continue;
+        }
         let cur: Vec<F> = (0..SHA_W).map(|c| trace_evals_on_lde[c][i]).collect();
         let nxt_idx = (i + blowup) % n;
         let nxt: Vec<F> = (0..SHA_W).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
-        let trace_row = i / blowup;
         let cvals = crate::sha256_air::eval_sha256_constraints(
             &cur, &nxt, trace_row, n_blocks,
         );
@@ -1158,7 +1186,13 @@ pub fn deep_ali_merge_per_row_no_layout(
     blowup: usize,
     width: usize,
     num_constraints: usize,
-    eval_per_row: fn(&[F], &[F], usize) -> Vec<F>,
+    // `impl Fn + Sync` (not a bare `fn` pointer) so callers can pass a
+    // closure that *captures public values* — used by the witness-binding
+    // bound provers to append public-input PIN constraints (cell − public)
+    // to the AIR's own constraints, while sharing the identical eval with the
+    // verifier.  `fn` pointers still coerce, so existing callers are
+    // unaffected.
+    eval_per_row: impl Fn(&[F], &[F], usize) -> Vec<F> + Sync,
 ) -> (Vec<F>, CompositionInfo) {
     let n = n_trace * blowup;
     assert_eq!(trace_evals_on_lde.len(), width);
@@ -1498,6 +1532,115 @@ pub fn deep_ali_merge_rsa_stacked_streaming(
     (c_eval, info)
 }
 
+/// Composition merge for the **compact** RSA-2048 exp-chain AIR
+/// (`rsa2048_exp_air`, 17 active rows, `n_trace = 32`).  This is the
+/// short-wide layout the paper reports (`n0 = 1024`); the stacked
+/// variant above is the tall-narrow bit-serial layout.  Identical
+/// IFFT -> Z_H -> FFT pipeline to
+/// [`deep_ali_merge_rsa_stacked_streaming`]; only the per-row
+/// constraint evaluator and layout type differ, so soundness carries
+/// (every transition + the row-16 boundary constraint enters `c_eval`).
+pub fn deep_ali_merge_rsa_exp_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::rsa2048_exp_air::RsaExpMultirowLayout,
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::rsa2048_exp_air::{
+        eval_rsa_exp_multirow_per_row, rsa_exp_multirow_constraints,
+    };
+
+    let _ = omega;
+    let n = n_trace * blowup;
+    let w = layout.width;
+    let k = rsa_exp_multirow_constraints(layout);
+
+    assert_eq!(trace_evals_on_lde.len(), w);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let build_chunk = |base: usize| -> Vec<Vec<F>> {
+        #[cfg(feature = "parallel")]
+        {
+            (0..blowup)
+                .into_par_iter()
+                .map(|idx| (0..w).map(|c| trace_evals_on_lde[c][base + idx]).collect())
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..blowup)
+                .map(|idx| (0..w).map(|c| trace_evals_on_lde[c][base + idx]).collect())
+                .collect()
+        }
+    };
+
+    let mut phi_eval = vec![F::zero(); n];
+    let mut cur_chunk = build_chunk(0);
+    let chunk0_for_wrap = cur_chunk.clone();
+
+    for r in 0..n_trace {
+        let nxt_chunk: Vec<Vec<F>> = if r + 1 < n_trace {
+            build_chunk((r + 1) * blowup)
+        } else {
+            chunk0_for_wrap.clone()
+        };
+        let base = r * blowup;
+        let trace_row = r;
+        let chunk_phi: Vec<F>;
+        #[cfg(feature = "parallel")]
+        {
+            chunk_phi = (0..blowup)
+                .into_par_iter()
+                .map(|idx| {
+                    let cur: &[F] = &cur_chunk[idx];
+                    let nxt: &[F] = &nxt_chunk[idx];
+                    let cvals = eval_rsa_exp_multirow_per_row(cur, nxt, trace_row, n_trace, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                    acc
+                })
+                .collect();
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            chunk_phi = (0..blowup)
+                .map(|idx| {
+                    let cur: &[F] = &cur_chunk[idx];
+                    let nxt: &[F] = &nxt_chunk[idx];
+                    let cvals = eval_rsa_exp_multirow_per_row(cur, nxt, trace_row, n_trace, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                    acc
+                })
+                .collect();
+        }
+        for (idx, v) in chunk_phi.into_iter().enumerate() { phi_eval[base + idx] = v; }
+        cur_chunk = nxt_chunk;
+    }
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Streaming P-256 ECDSA verify merge — paper §IV-A Step 2b S_ic path.
 //  Wraps the ported `p256_ecdsa_air::eval_ecdsa_verify_demo` AIR (10 116
@@ -1716,6 +1859,189 @@ pub fn deep_ali_merge_p256_ecdsa_v2_streaming(
     (c_eval, info)
 }
 
+/// Witness-binding-compatible merge for the single-row ECDSA-P256 v2 AIR.
+/// Gates the row-0 boundary by a `trace_row == 0` step (via
+/// [`crate::p256_ecdsa_air_v2::eval_ecdsa_verify_v2_rowgated_per_row`])
+/// instead of the Lagrange `row0_indicator` of
+/// [`deep_ali_merge_p256_ecdsa_v2_streaming`], so the prover's `c_eval`
+/// and the generic `sub_air_with_trace` verifier (which re-checks the
+/// same per-row evaluator at query openings) agree.  Enables an
+/// end-to-end witness-binding ECDSA verifier.
+pub fn deep_ali_merge_p256_ecdsa_v2_rowgated_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_air_v2::EcdsaVerifyV2Layout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_air_v2::{
+        ecdsa_verify_v2_constraints, eval_ecdsa_verify_v2_rowgated_per_row,
+    };
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_verify_v2_constraints(layout);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+        let cvals = eval_ecdsa_verify_v2_rowgated_per_row(&cur, i / blowup, layout);
+        let mut acc = F::zero();
+        for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi_eval: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
+/// Composition merge for the **narrow multi-row** P256 ECDSA double-scalar-mult
+/// AIR (`p256_ecdsa_double_multirow_air`): one scalar-mult step per row, ~256
+/// narrow rows, accumulator threaded row-to-row by transition constraints
+/// (the StarkWare-style layout).  This is the width-efficient, bindable form:
+/// per-row width is one step (not the entire unrolled chain), so
+/// `sub_air_with_trace` openings (`r × per-row-width`) stay small.  The
+/// evaluator reads `cur` AND `nxt` (transition), so the FULL binding (with
+/// next-row openings) is required.
+pub fn deep_ali_merge_ecdsa_double_multirow_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_double_multirow_air::EcdsaDoubleMultirowLayout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_double_multirow_air::{
+        ecdsa_double_multirow_constraints, eval_ecdsa_double_multirow_per_row,
+    };
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_double_multirow_constraints(layout);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_ecdsa_double_multirow_per_row(&cur, &nxt, i / blowup, n_trace, layout);
+        let mut acc = F::zero();
+        for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi_eval: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
+/// Composition merge for the END-TO-END **multi-row P256 ECDSA verify**
+/// AIR (`p256_ecdsa_verify_multirow_air`): the narrow double-scalar-mult
+/// kernel (rows 0..K-1) plus the verify TAIL (row K) — group_add, the
+/// inverse-free cross-multiply `R.X ≡ {r, r+n}·R.Z (mod p)`, and the
+/// final equality.  Transition-aware (`cur` AND `nxt`), so the FULL
+/// witness-binding path (with next-row openings) is required.
+pub fn deep_ali_merge_ecdsa_verify_multirow_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_verify_multirow_air::EcdsaVerifyMultirowLayout,
+    pub_inputs: &crate::p256_ecdsa_verify_multirow_air::EcdsaVerifyPublicInputs,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_verify_multirow_air::{
+        ecdsa_verify_multirow_constraints, eval_ecdsa_verify_multirow_per_row,
+    };
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_verify_multirow_constraints(layout);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, i / blowup, n_trace, layout, pub_inputs);
+        let mut acc = F::zero();
+        for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi_eval: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Legacy single-constraint merge (Fibonacci: Φ̃ = a·s + e − t)
 // ═══════════════════════════════════════════════════════════════════
@@ -1847,6 +2173,9 @@ pub mod p256_scalar_mul_multirow_air;
 pub mod p256_fermat_air;
 pub mod p256_fp_fermat_air;
 pub mod p256_ecdsa_double_multirow_air;
+pub mod p256_ecdsa_verify_multirow_air;
+pub mod ecdsa_verify_stranded;
+pub mod ecdsa_verify_stranded_gway;
 pub mod p256_ecdsa;
 pub mod p256_ecdsa_air;
 pub mod p256_ecdsa_air_v2;
