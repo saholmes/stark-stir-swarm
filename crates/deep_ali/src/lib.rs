@@ -2146,6 +2146,7 @@ pub mod ed25519_scalar_air;
 pub mod ed25519_scalar_mult_air;
 pub mod ed25519_verify;
 pub mod ed25519_verify_air;
+pub mod ed25519_verify_stranded_gway;
 pub mod ed25519_air;
 // Ported from the stark-dns fork of deep_ali (2026-05-07): RSA-2048-
 // SHA256 PKCS#1 v1.5 native verifier + AIR scaffolding for the
