@@ -32,6 +32,12 @@ pub mod b256_prove;
 // (`PermutationTable` above) is unchanged.
 pub mod b256_keccak;
 
+// M3 (kappa_FS) — the M2a/M2c SHA-3 sponge ported onto `B256TowerFamily` so the
+// IN-CIRCUIT SHA3-256/384/512 hashes prove AND verify over the 256-bit challenge
+// field at NIST L1/L3 Fiat–Shamir security. Reuses `b256_keccak`'s tower-family
+// prove wiring + `sha3_variants`' field-agnostic padding/squeeze. Additive.
+pub mod b256_sha3;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 
