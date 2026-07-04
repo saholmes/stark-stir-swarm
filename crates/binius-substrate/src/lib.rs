@@ -28,6 +28,10 @@ pub mod sha3_root_boundary;
 // segment (aggregation / master-binds-inner-root; additive).
 pub mod sha3_join;
 
+// Bench: separately-timed prove/verify harness over the M2a SHA3-256 gadget, for
+// the prove-time / peak-RSS scaling table (additive; no soundness surface).
+pub mod bench;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;
