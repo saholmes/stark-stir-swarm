@@ -16,6 +16,9 @@ pub mod sha3_gadget;
 // M2b-1: sound single-block padding binding (additive; builds on M2a's gadget).
 pub mod sha3_binding;
 
+// M2b-2: sound in-circuit binding seam between two SHA3-256 hashes (additive).
+pub mod sha3_seam;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;
