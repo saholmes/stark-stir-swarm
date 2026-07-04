@@ -16,6 +16,15 @@
 // local tower family — does NOT touch the default CanonicalTowerFamily path).
 pub mod b256_field;
 
+// M3 (kappa_FS) Phase-1b: the packing machinery (local packed subfield types over
+// U256 + ProverTowerFamily) that lets Binius's constraint_system::prove/verify run
+// over the 256-bit challenge field. Additive; no Binius file is modified.
+pub mod b256_packed;
+
+// M3 (kappa_FS) Phase-1b: a REAL end-to-end proof over B256 at NIST L1 (minimal
+// non-Keccak circuit; see module docs for the Keccak-gadget wall). Additive.
+pub mod b256_prove;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 
