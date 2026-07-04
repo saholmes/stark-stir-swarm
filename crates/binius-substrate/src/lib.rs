@@ -10,6 +10,9 @@
 // change vs. that example is the three hash type-parameters to prove/verify
 // (Groestl256 -> Sha256), which is exactly the swap the design relies on.
 
+// M2a lives in its own module (additive; does not touch the M1 items below).
+pub mod sha3_gadget;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;
