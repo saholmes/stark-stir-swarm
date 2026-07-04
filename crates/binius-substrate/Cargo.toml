@@ -1,0 +1,36 @@
+# binius-substrate — M1 of the Binius port (STARK-Binius-SWARM).
+#
+# DELIBERATELY STANDALONE: this crate carries its own `[workspace]` table and
+# `rust-toolchain.toml` so it is NOT a member of the parent stark-binius-swarm
+# workspace.  Rationale: Binius pins nightly-2025-04-24 and pulls a large dep
+# tree; keeping this spike detached leaves the sound-signature crates pristine
+# on stable and out of Binius's dependency graph until the port is proven out.
+#
+# Goal (M1 "substrate up"): demonstrate that Binius's in-circuit Keccak-f gadget
+# proves AND verifies with a SHA-256 (FIPS 180-4) Merkle commitment + SHA-256
+# Fiat–Shamir challenger — i.e. the FIPS instantiation is real, with no
+# Groestl/Vision/Poseidon on the soundness-critical path.
+
+[package]
+name = "binius-substrate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent workspace (explicit empty workspace root).
+[workspace]
+
+[dependencies]
+# Binius (local checkout, path deps — see rust-toolchain.toml for the pinned nightly).
+binius_core     = { path = "../../../binius/crates/core" }
+binius_field    = { path = "../../../binius/crates/field" }
+binius_hash     = { path = "../../../binius/crates/hash" }
+binius_m3       = { path = "../../../binius/crates/m3" }
+binius_hal      = { path = "../../../binius/crates/hal" }
+binius_circuits = { path = "../../../binius/crates/circuits" }
+
+# External deps pinned to Binius's versions to avoid duplicate builds / trait mismatches.
+anyhow  = "1.0.81"
+bumpalo = { version = "3.16.0", features = ["collections"] }
+rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] }
+sha2    = "0.10.8"

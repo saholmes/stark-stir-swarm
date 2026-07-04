@@ -1,0 +1,5 @@
+# Match Binius's pinned toolchain (binius/rust-toolchain.toml).
+# Scoped to this standalone crate only; the parent stark-binius-swarm workspace
+# stays on stable.
+[toolchain]
+channel = "nightly-2025-04-24"
