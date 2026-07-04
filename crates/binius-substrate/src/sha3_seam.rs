@@ -81,21 +81,22 @@ use crate::sha3_gadget::digest_from_state;
 /// Concrete packed field used throughout (same as M1/M2a/M2b-1).
 pub(crate) type P = PackedType<OptimalUnderlier, B128>;
 
-const LANE_BITS: usize = 512; // PackedLane8 = 8 tracks * 64 bits.
+pub(crate) const LANE_BITS: usize = 512; // PackedLane8 = 8 tracks * 64 bits.
 const LOG_LANE_BITS: usize = 9; // log2(512)
 const OUT_TRACK_SHIFT: usize = 7 * 64; // track 7 -> track 0 (LogicalRight by 448)
-const OUT_TRACK_INDEX: usize = 7; // the digest lives on track 7 of packed_state_out()
-const LANE64_BITS: usize = 64; // one Keccak lane, extracted as a Col<B1,64> block
+pub(crate) const OUT_TRACK_INDEX: usize = 7; // the digest lives on track 7 of packed_state_out()
+pub(crate) const IN_TRACK_INDEX: usize = 0; // the permutation input lives on track 0 of packed_state_in()
+pub(crate) const LANE64_BITS: usize = 64; // one Keccak lane, extracted as a Col<B1,64> block
 
 // Track-0 constant patterns (interior tracks 1..7 are always 0, so round states
 // are never constrained).
-const MASK_FULL: u64 = u64::MAX;
-const TARGET_LANE8: u64 = 0x0000_0000_0000_0006; // byte 64 (lane 8, byte 0) = 0x06 domain sep
-const TARGET_LANE16: u64 = 0x8000_0000_0000_0000; // byte 135 (lane 16, byte 7) = 0x80 pad10*1 close
+pub(crate) const MASK_FULL: u64 = u64::MAX;
+pub(crate) const TARGET_LANE8: u64 = 0x0000_0000_0000_0006; // byte 64 (lane 8, byte 0) = 0x06 domain sep
+pub(crate) const TARGET_LANE16: u64 = 0x8000_0000_0000_0000; // byte 135 (lane 16, byte 7) = 0x80 pad10*1 close
 
 /// Build a `[B1; 512]` constant whose track 0 (bits 0..64) carries `track0` and
 /// whose interior tracks (bits 64..512) are all zero.
-fn track0_pattern(track0: u64) -> [B1; LANE_BITS] {
+pub(crate) fn track0_pattern(track0: u64) -> [B1; LANE_BITS] {
 	std::array::from_fn(|pos| {
 		if pos < 64 {
 			B1::from(((track0 >> pos) & 1) as u8)
@@ -108,7 +109,7 @@ fn track0_pattern(track0: u64) -> [B1; LANE_BITS] {
 /// Build the FIPS-202-padded single-block state for a 64-byte message
 /// `first32 ‖ second32` (SHA3-256, rate 136). `corrupt` optionally mangles the
 /// padding for the adversarial padding gate; it never touches the message bytes.
-fn padded_state_64(
+pub(crate) fn padded_state_64(
 	first32: &[u8; 32],
 	second32: &[u8; 32],
 	corrupt: Option<PadCorruption>,
@@ -430,7 +431,7 @@ impl SeamTable {
 
 /// Write a track-0 constant `val` (interior tracks 0) into every row of a
 /// `Col<B1,512>` witness buffer, viewed as 8 u64 tracks per row.
-fn fill_track0_const(
+pub(crate) fn fill_track0_const(
 	seg: &mut binius_m3::builder::TableWitnessSegment<P>,
 	col: Col<B1, LANE_BITS>,
 	val: u64,

@@ -23,6 +23,11 @@ pub mod sha3_seam;
 // + Statement.boundaries pull (additive; builds on M2b-2's SeamTable).
 pub mod sha3_root_boundary;
 
+// M2b-4: in-circuit CROSS-TABLE channel join — a CHILD table pushes its SHA3-256
+// root to a shared channel and a PARENT table PULLs it as its own hash-input
+// segment (aggregation / master-binds-inner-root; additive).
+pub mod sha3_join;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;
