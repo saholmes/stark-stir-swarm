@@ -33,7 +33,9 @@ binius_circuits = { path = "../../../binius/crates/circuits" }
 anyhow  = "1.0.81"
 bumpalo = { version = "3.16.0", features = ["collections"] }
 rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] }
-sha2    = "0.10.8"
+# `compress` exposes sha2::{compress256, compress512}; binius_hash already enables
+# this feature on the same sha2 version, so unifying it here adds no lock churn.
+sha2    = { version = "0.10.8", features = ["compress"] }
 
 [dev-dependencies]
 # Native SHA3-256 reference (FIPS 202) used only by tests to gate the in-circuit

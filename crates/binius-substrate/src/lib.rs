@@ -33,6 +33,12 @@ pub mod sha3_root_boundary;
 // segment (aggregation / master-binds-inner-root; additive).
 pub mod sha3_join;
 
+// M2d: SHA-384 / SHA-512 OUTER Merkle + Fiat–Shamir compression, so the OUTER
+// commitment can run at NIST L3/L5 binding strength (completes kappa_bind for
+// the outer commitment; M2c did the in-circuit hash). Additive; mirrors Binius'
+// `Sha256Compression` for our LOCAL structs (Binius checkout unmodified).
+pub mod sha_outer;
+
 // Bench: separately-timed prove/verify harness over the M2a SHA3-256 gadget, for
 // the prove-time / peak-RSS scaling table (additive; no soundness surface).
 pub mod bench;
