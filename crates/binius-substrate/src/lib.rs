@@ -10,6 +10,12 @@
 // change vs. that example is the three hash type-parameters to prove/verify
 // (Groestl256 -> Sha256), which is exactly the swap the design relies on.
 
+// M3 (kappa_FS): a 256-bit binary tower field giving Binius a >2^128 challenge/
+// extension field, so FRI/sumcheck error terms poly(N)/|F| are over 2^256 and the
+// verifier's `calculate_n_test_queries` succeeds at NIST L1/L3 (additive; a new,
+// local tower family — does NOT touch the default CanonicalTowerFamily path).
+pub mod b256_field;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 

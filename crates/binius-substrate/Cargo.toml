@@ -28,6 +28,12 @@ binius_hash     = { path = "../../../binius/crates/hash" }
 binius_m3       = { path = "../../../binius/crates/m3" }
 binius_hal      = { path = "../../../binius/crates/hal" }
 binius_circuits = { path = "../../../binius/crates/circuits" }
+# Needed by the M3 (kappa_FS) B256 tower field: SerializeBytes/DeserializeBytes
+# (Field super-traits) live in binius_utils; bytemuck/subtle for the local 256-bit
+# underlier's UnderlierType super-traits. Versions pinned to Binius's Cargo.lock.
+binius_utils    = { path = "../../../binius/crates/utils" }
+bytemuck = { version = "1.18.0", features = ["derive", "min_const_generics"] }
+subtle   = "2.5.0"
 
 # External deps pinned to Binius's versions to avoid duplicate builds / trait mismatches.
 anyhow  = "1.0.81"
