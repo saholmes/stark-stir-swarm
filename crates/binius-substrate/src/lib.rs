@@ -19,6 +19,10 @@ pub mod sha3_binding;
 // M2b-2: sound in-circuit binding seam between two SHA3-256 hashes (additive).
 pub mod sha3_seam;
 
+// M2b-3: expose the depth-2 chain root as a PUBLIC boundary via a channel push
+// + Statement.boundaries pull (additive; builds on M2b-2's SeamTable).
+pub mod sha3_root_boundary;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;

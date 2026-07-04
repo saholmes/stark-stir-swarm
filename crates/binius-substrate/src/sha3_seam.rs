@@ -62,10 +62,11 @@
 // ============================================================================
 
 use anyhow::Result;
+use binius_core::constraint_system::channel::ChannelId;
 use binius_core::oracle::ShiftVariant;
 use binius_field::{arch::OptimalUnderlier, as_packed_field::PackedType};
 use binius_m3::{
-	builder::{Col, ConstraintSystem, Statement, TableId, WitnessIndex, B1, B128},
+	builder::{Col, ConstraintSystem, Statement, TableId, WitnessIndex, B1, B128, B64},
 	gadgets::hash::keccak::{self, Keccakf, StateMatrix},
 };
 
@@ -78,11 +79,13 @@ use sha2::Sha256;
 use crate::sha3_gadget::digest_from_state;
 
 /// Concrete packed field used throughout (same as M1/M2a/M2b-1).
-type P = PackedType<OptimalUnderlier, B128>;
+pub(crate) type P = PackedType<OptimalUnderlier, B128>;
 
 const LANE_BITS: usize = 512; // PackedLane8 = 8 tracks * 64 bits.
 const LOG_LANE_BITS: usize = 9; // log2(512)
 const OUT_TRACK_SHIFT: usize = 7 * 64; // track 7 -> track 0 (LogicalRight by 448)
+const OUT_TRACK_INDEX: usize = 7; // the digest lives on track 7 of packed_state_out()
+const LANE64_BITS: usize = 64; // one Keccak lane, extracted as a Col<B1,64> block
 
 // Track-0 constant patterns (interior tracks 1..7 are always 0, so round states
 // are never constrained).
@@ -140,7 +143,7 @@ pub enum PadCorruption {
 /// The two children hashed by g2's prefix can be forged; this selects whether g2
 /// receives g1's real digest or an attacker-chosen 32-byte prefix.
 #[derive(Clone, Copy, Debug)]
-enum SeamMode {
+pub(crate) enum SeamMode {
 	/// Honest: g2 input = g1_digest ‖ C.
 	Honest,
 	/// Forged: g2 input = `forged` ‖ C, with `forged` != g1_digest, but g2 is
@@ -166,10 +169,28 @@ pub struct SeamTable {
 	mask_full: Col<B1, LANE_BITS>,
 	target_lane8: Col<B1, LANE_BITS>,
 	target_lane16: Col<B1, LANE_BITS>,
+	// M2b-3: when the root is exposed as a public boundary, these 4 `Col<B1,64>`
+	// columns hold the g2 digest lanes 0..3 (track-7 block of `g2.state_out`),
+	// packed to B64 and PUSHED to a channel so a `Statement.boundaries` PULL
+	// enforces the claimed root. `None` for the plain (non-boundary) seam so the
+	// existing M2b-2 flow keeps an empty channel set and stays balanced.
+	root_sel: Option<[Col<B1, LANE64_BITS>; 4]>,
 }
 
 impl SeamTable {
+	/// M2b-2: the plain depth-2 seam (no public root boundary).
 	pub fn new(cs: &mut ConstraintSystem) -> Self {
+		Self::build(cs, None)
+	}
+
+	/// M2b-3: the seam PLUS the g2 digest (root) packed to B64 and pushed to
+	/// `root_channel`, so an outer `Statement.boundaries` PULL enforces the
+	/// claimed root as a public output. See `prove_verify_seam_root_boundary`.
+	pub(crate) fn new_with_root_boundary(cs: &mut ConstraintSystem, root_channel: ChannelId) -> Self {
+		Self::build(cs, Some(root_channel))
+	}
+
+	fn build(cs: &mut ConstraintSystem, root_channel: Option<ChannelId>) -> Self {
 		let mut table = cs.add_table("SHA3-256 depth-2 binding seam (M2b-2)");
 
 		// ---- g1 gadget (namespace "g1") ----
@@ -259,6 +280,32 @@ impl SeamTable {
 			);
 		}
 
+		// ---- M2b-3 ROOT-AS-PUBLIC-BOUNDARY (only when a channel is supplied) ----
+		// The root = g2's SHA3-256 digest = g2 output lanes 0..3, which sit on
+		// track 7 of `g2.packed_state_out()` (STATE_OUT_TRACK). We extract that
+		// 64-bit track as a `Col<B1,64>` block (`add_selected_block`, a virtual
+		// oracle structurally derived from g2's committed output — the prover
+		// cannot decouple it from g2's real digest), pack each to a `Col<B64,1>`
+		// (`add_packed` aliases the same bits), and PUSH the 4 lanes to the
+		// channel. An outer `Statement.boundaries` PULL of the claimed root then
+		// balances the channel iff the claimed root equals g2's genuine digest.
+		let root_sel: Option<[Col<B1, LANE64_BITS>; 4]> = root_channel.map(|ch| {
+			let g2_out = g2.packed_state_out();
+			let g2_out_inner = g2_out.as_inner();
+			let sel: [Col<B1, LANE64_BITS>; 4] = std::array::from_fn(|i| {
+				table.add_selected_block::<B1, LANE_BITS, LANE64_BITS>(
+					format!("root_sel[{i}]"),
+					g2_out_inner[i],
+					OUT_TRACK_INDEX,
+				)
+			});
+			let root_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| {
+				table.add_packed::<B1, LANE64_BITS, B64, 1>(format!("root_b64[{i}]"), sel[i])
+			});
+			table.push(ch, root_b64);
+			sel
+		});
+
 		Self {
 			table_id: table.id(),
 			g1,
@@ -269,12 +316,13 @@ impl SeamTable {
 			mask_full,
 			target_lane8,
 			target_lane16,
+			root_sel,
 		}
 	}
 
 	/// Populate one full-table witness for a batch of chains. Returns the g1 and
 	/// g2 (root) digests read witness-side, per row.
-	fn populate(
+	pub(crate) fn populate(
 		&self,
 		seg: &mut binius_m3::builder::TableWitnessSegment<P>,
 		children: &[(([u8; 32], [u8; 32]), [u8; 32])],
@@ -322,11 +370,11 @@ impl SeamTable {
 			.collect();
 		self.g2.populate_state_in(seg, &g2_states)?;
 		self.g2.populate(seg)?;
-		let g2_digests: Vec<[u8; 32]> = self
-			.g2
-			.read_state_outs(seg)?
-			.map(|s| digest_from_state(&s))
-			.collect();
+		// Read g2 output states (track 7) — owned, borrow ends here. Keep the raw
+		// lanes so the M2b-3 root-boundary columns can be filled below.
+		let g2_out_states: Vec<StateMatrix<u64>> = self.g2.read_state_outs(seg)?.collect();
+		let g2_digests: Vec<[u8; 32]> =
+			g2_out_states.iter().map(digest_from_state).collect();
 
 		// 3) Seam realignment columns: g1_out_lo[i] track0 = g1 digest lane i,
 		//    interior tracks 0 — exactly LogicalRight_448(g1.state_out[i]).
@@ -363,6 +411,18 @@ impl SeamTable {
 		fill_track0_const(seg, self.mask_full, MASK_FULL)?;
 		fill_track0_const(seg, self.target_lane8, TARGET_LANE8)?;
 		fill_track0_const(seg, self.target_lane16, TARGET_LANE16)?;
+
+		// 6) M2b-3: fill the root-boundary selection columns with g2's genuine
+		//    digest lanes 0..3 (one u64 per row for a 64-bit cell). The packed
+		//    B64 view aliases these bits and is what gets pushed to the channel.
+		if let Some(root_sel) = &self.root_sel {
+			for (i, &col) in root_sel.iter().enumerate() {
+				let mut d: std::cell::RefMut<'_, [u64]> = seg.get_mut_as(col)?;
+				for (k, cell) in d.iter_mut().take(children.len()).enumerate() {
+					*cell = g2_out_states[k].as_inner()[i];
+				}
+			}
+		}
 
 		Ok((g1_digests, g2_digests))
 	}
