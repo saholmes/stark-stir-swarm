@@ -237,6 +237,7 @@ dependencies = [
  "sha2",
  "sha3",
  "subtle",
+ "tiny-keccak",
 ]
 
 [[package]]

@@ -25,6 +25,13 @@ pub mod b256_packed;
 // non-Keccak circuit; see module docs for the Keccak-gadget wall). Additive.
 pub mod b256_prove;
 
+// M3 (kappa_FS) Phase B: the REAL m3 Keccak-f[1600] gadget proving AND verifying
+// over the 256-bit challenge/extension field `B256TowerFamily` at NIST L1/L3, made
+// possible by generalizing binius_m3's `Keccakf` gadget (top field B128 -> generic
+// `F: TowerField`) on the fork branch. Additive; the stock B128 M1 path
+// (`PermutationTable` above) is unchanged.
+pub mod b256_keccak;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 

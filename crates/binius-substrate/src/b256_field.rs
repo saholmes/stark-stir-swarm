@@ -50,7 +50,7 @@ use binius_utils::{
 	bytes::{Buf, BufMut},
 	DeserializeBytes, SerializationError, SerializationMode, SerializeBytes,
 };
-use bytemuck::{NoUninit, Zeroable};
+use bytemuck::{NoUninit, Pod, Zeroable};
 use rand::{
 	distributions::{Distribution, Standard},
 	Rng, RngCore,
@@ -287,6 +287,16 @@ impl fmt::Display for B256 {
 // SAFETY: B256 is repr(transparent) over U256, whose all-zero bit pattern is the
 // field ZERO. (Required: WithUnderlier: Zeroable.)
 unsafe impl Zeroable for B256 {}
+
+// SAFETY: B256 is repr(transparent) over U256 = [u128; 2] — 32 contiguous bytes
+// with no padding and no uninitialised bits, and EVERY 256-bit pattern is a valid
+// field element (a binary tower field has no invalid encodings), so B256 is Pod.
+// binius_m3's `TableWitnessSegment::get_mut_as::<u64,..>` (used by the Keccak-f
+// gadget's `populate`) requires the top field `F` to be `Pod`, because it
+// reinterprets a column's `F`-scalar backing store as `u64` lanes via
+// `must_cast_slice`. `Pod` also yields the `NoUninit`/`AnyBitPattern` that cast
+// needs, via bytemuck's blanket impls.
+unsafe impl Pod for B256 {}
 
 unsafe impl WithUnderlier for B256 {
 	type Underlier = U256;
