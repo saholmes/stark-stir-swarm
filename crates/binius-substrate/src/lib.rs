@@ -13,6 +13,9 @@
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 
+// M2b-1: sound single-block padding binding (additive; builds on M2a's gadget).
+pub mod sha3_binding;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;
