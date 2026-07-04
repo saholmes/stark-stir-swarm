@@ -610,4 +610,71 @@ mod tests {
 			 broadcast/interleave/unzip all agree with Binius canonical 256-bit packed types."
 		);
 	}
+
+	// STEP 0 — THE RING-SWITCH LANDMINE GATE.
+	//
+	// The ring-switch PCS transpose (`TensorAlgebra::transpose` -> `square_transpose`)
+	// operates on `FE::cast_bases_mut(&mut [FE])`, i.e. it reinterprets a slice of
+	// the width-1 top field `B256` as `PackedExtension::<S>::PackedSubfield = Sub256<S>`
+	// and treats lane `i` of that packed subfield as the `i`-th tower-basis coordinate
+	// of the `B256` scalar. For the transpose (hence the whole small-field opening) to
+	// be SOUND, `Sub256<S>::get(i)` MUST equal `<B256 as ExtensionField<S>>::iter_bases()[i]`
+	// for every subfield `S`. A width or byte-layout error here would make the transpose
+	// silently emit a WRONG tensor element -> a proof that verifies a WRONG evaluation.
+	//
+	// This gate checks that invariant DIRECTLY (independent of the ops cross-check above,
+	// which only compares Sub256 against Binius's canonical packed types fed the same
+	// scalars; it does NOT tie the scalar `B256`'s own `iter_bases` to the packed lanes).
+	#[test]
+	fn b256_packed_extension_transpose_roundtrip() {
+		use binius_field::{ExtensionField, Field, PackedExtension};
+		let mut rng = StdRng::from_seed([29u8; 32]);
+		macro_rules! check_bx {
+			($S:ty, $expect_width:expr) => {{
+				assert_eq!(
+					<B256 as ExtensionField<$S>>::DEGREE,
+					$expect_width,
+					"ExtensionField degree (== PackedSubfield width) for {}bit subfield",
+					<$S as BinaryField>::N_BITS
+				);
+				assert_eq!(
+					<Sub256<$S>>::width(),
+					$expect_width,
+					"Sub256 packed width for {}bit subfield",
+					<$S as BinaryField>::N_BITS
+				);
+				for _ in 0..500 {
+					let x = <B256 as Field>::random(&mut rng);
+					// Tower-basis subfield coordinates of the SCALAR B256.
+					let bases: Vec<$S> =
+						<B256 as ExtensionField<$S>>::iter_bases(&x).collect();
+					assert_eq!(bases.len(), $expect_width);
+					// The exact cast the PCS transpose uses: width-1 B256 -> Sub256<S>.
+					let packed: Sub256<$S> = <B256 as PackedExtension<$S>>::cast_base(x);
+					for i in 0..$expect_width {
+						assert_eq!(
+							packed.get(i),
+							bases[i],
+							"lane {} mismatch for {}bit subfield (PCS transpose would be WRONG)",
+							i,
+							<$S as BinaryField>::N_BITS
+						);
+					}
+					// Round-trip: cast back up recovers the exact B256.
+					let back: B256 = <B256 as PackedExtension<$S>>::cast_ext(packed);
+					assert_eq!(back, x, "cast_base/cast_ext round-trip");
+				}
+			}};
+		}
+		check_bx!(B1, 256);
+		check_bx!(B8, 32);
+		check_bx!(B16, 16);
+		check_bx!(B32, 8);
+		check_bx!(B64, 4);
+		println!(
+			"b256_packed_extension_transpose_roundtrip: for S in B1/B8/B16/B32/B64, \
+			 Sub256<S>::get(i) == <B256 as ExtensionField<S>>::iter_bases()[i] and cast round-trips; \
+			 PackedSubfield widths 256/32/16/8/4 as required by square_transpose."
+		);
+	}
 }
