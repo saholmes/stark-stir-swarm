@@ -2201,6 +2201,7 @@ pub mod ml_dsa_verify_air;
 pub mod ml_dsa_verify_air_v15;
 pub mod ml_dsa_ntt_chained_air;
 pub mod ml_dsa_verify_air_v17;
+pub mod ml_dsa_v17_stranded;
 pub mod ml_dsa_codec;
 pub mod keccak_f1600;
 pub mod keccak_f1600_air;

@@ -1311,48 +1311,60 @@ pub fn prove_v2_real_lowmem(
     let pi_hash = compute_pi_hash_v2(w, c_tilde_bytes);
     let coeff_n_trace_local = (K * N).next_power_of_two();
 
-    // ── V17 (proves + F2b L5 EQ-region BCCs), then drop its LDE ──
-    let (fri_v17, l5_v17_eq_bccs): (Vec<u8>, Vec<Vec<u8>>) = {
-        let v17_trace = fill_v17_trace_only(w);
-        let v17_n_trace_local = v17_trace[0].len();
-        let (v17_proof, v17_lde, _v17_tree) =
-            crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
-                &v17_trace, v17_n_trace_local, blowup, pi_hash,
-                b"v17",
-                crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
-                |lde, n_trace, blowup, comb_coeffs| {
-                    crate::deep_ali_merge_ml_dsa_v17(lde, comb_coeffs, F::zero(), n_trace, blowup).0
-                },
-                |n0, ph| v2_fri_params(n0, blowup, ph),
-            );
-        drop(v17_trace);
-        let fri_v17 = crate::sub_air_with_trace::serialize_proof(&v17_proof);
-        drop(v17_proof);
-        let mut bccs = Vec::with_capacity(L + 3);
-        let eq_base = crate::ml_dsa_verify_air_v17::EQ_BASE;
-        for ll in 0..L {
-            let col_idx = eq_base + crate::ml_dsa_verify_air::col_a_ntt(ll);
-            let domain_sep = format!("l5_v17_a_ntt_{ll}").into_bytes();
-            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
-                &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
-                &domain_sep, |n0, ph| v2_fri_params(n0, blowup, ph),
-            );
-            bccs.push(commit.to_bytes());
-        }
-        for (col_fn, ds) in [
-            (crate::ml_dsa_verify_air::col_c_ntt(), b"l5_v17_c_ntt" as &[u8]),
-            (crate::ml_dsa_verify_air::col_t1d_ntt(), b"l5_v17_t1d_ntt"),
-            (crate::ml_dsa_verify_air::col_w_approx_ntt(), b"l5_v17_w_approx_ntt"),
-        ] {
-            let col_idx = eq_base + col_fn;
-            let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
-                &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
-                ds, |n0, ph| v2_fri_params(n0, blowup, ph),
-            );
-            bccs.push(commit.to_bytes());
-        }
-        (fri_v17, bccs)
-    };
+    // ── V17 STRANDED (proves TOP strand + L NTT instances one-at-a-time,
+    //    + byte-identical F2b L5 EQ-region BCCs), collapsing the V17 peak.
+    //    The single 341-col @ 16384 V17 FRI (the low-mem prover's memory
+    //    floor) is replaced by a narrow TOP strand (selectors + EQ + NORM,
+    //    still @ 16384 so the L5 binding is byte-identical) plus the NTT
+    //    region proven as its L natural chained-NTT instances @ 2048.  See
+    //    `ml_dsa_v17_stranded` for the cut + soundness argument. ──
+    // A/B measurement gate: `BENCH_MONOLITH_V17=1` proves the OLD single
+    // 341-col V17 sub-AIR (the pre-stranding memory floor) so the two prover
+    // peaks can be compared in one binary.  Default = stranded.
+    let (fri_v17, l5_v17_eq_bccs): (Vec<u8>, Vec<Vec<u8>>) =
+        if std::env::var("BENCH_MONOLITH_V17").ok().as_deref() == Some("1") {
+            let v17_trace = fill_v17_trace_only(w);
+            let v17_n_trace_local = v17_trace[0].len();
+            let (v17_proof, v17_lde, _v17_tree) =
+                crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                    &v17_trace, v17_n_trace_local, blowup, pi_hash, b"v17",
+                    crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+                    |lde, n_trace, blowup, comb_coeffs| {
+                        crate::deep_ali_merge_ml_dsa_v17(lde, comb_coeffs, F::zero(), n_trace, blowup).0
+                    },
+                    |n0, ph| v2_fri_params(n0, blowup, ph),
+                );
+            drop(v17_trace);
+            let fri_v17 = crate::sub_air_with_trace::serialize_proof(&v17_proof);
+            drop(v17_proof);
+            let mut bccs = Vec::with_capacity(L + 3);
+            let eq_base = crate::ml_dsa_verify_air_v17::EQ_BASE;
+            for ll in 0..L {
+                let col_idx = eq_base + crate::ml_dsa_verify_air::col_a_ntt(ll);
+                let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                    &v17_lde, &[col_idx], v17_n_trace_local, blowup, pi_hash,
+                    &format!("l5_v17_a_ntt_{ll}").into_bytes(), |n0, ph| v2_fri_params(n0, blowup, ph),
+                );
+                bccs.push(commit.to_bytes());
+            }
+            for (col_fn, ds) in [
+                (crate::ml_dsa_verify_air::col_c_ntt(), b"l5_v17_c_ntt" as &[u8]),
+                (crate::ml_dsa_verify_air::col_t1d_ntt(), b"l5_v17_t1d_ntt"),
+                (crate::ml_dsa_verify_air::col_w_approx_ntt(), b"l5_v17_w_approx_ntt"),
+            ] {
+                let (commit, _) = crate::binding_cells_commit::commit_binding_cells(
+                    &v17_lde, &[eq_base + col_fn], v17_n_trace_local, blowup, pi_hash,
+                    ds, |n0, ph| v2_fri_params(n0, blowup, ph),
+                );
+                bccs.push(commit.to_bytes());
+            }
+            (fri_v17, bccs)
+        } else {
+            crate::ml_dsa_v17_stranded::prove_v17_stranded(
+                &w.a_ntt, &w.z_ntt, &w.c_ntt, &w.t1d_ntt, &w.w_approx_ntt, &w.z_cleartext,
+                pi_hash, blowup, |n0, ph| v2_fri_params(n0, blowup, ph),
+            )
+        };
 
     // ── INTT × K (each: prove + L0/L1 openings), drop per instance ──
     let mut fri_intt: Vec<Vec<u8>> = Vec::with_capacity(K);
@@ -1606,20 +1618,32 @@ pub fn verify_v2_real(
     let v17_n_trace = crate::ml_dsa_verify_air_v17::VERIFY_AIR_V17_ACTIVE_ROWS.next_power_of_two();
     let v17_n_lde = v17_n_trace * blowup;
     {
-        let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_v17)?;
-        crate::sub_air_with_trace::verify_one_sub_air_with_trace(
-            &p, v17_n_trace, blowup, pi_hash,
-            b"v17",
-            crate::ml_dsa_verify_air_v17::WIDTH,
-            crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
-            |cur, nxt, row| crate::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
-            |n0, ph| v2_fri_params(n0, blowup, ph),
-        ).map_err(|e| format!("v2 V17: {e}"))?;
+        // V17 is proven either MONOLITHICALLY (`prove_v2_real`) or STRANDED
+        // (`prove_v2_real_lowmem`: TOP strand + L NTT instances).  Dispatch
+        // on the magic prefix.  Either way the L5 EQ-region OOD binding
+        // (step 11) is UNCHANGED — its BCCs are byte-identical.
+        if crate::ml_dsa_v17_stranded::is_stranded(&proof.fri_v17) {
+            crate::ml_dsa_v17_stranded::verify_v17_stranded(
+                &proof.fri_v17, pi_hash, blowup,
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            ).map_err(|e| format!("v2 V17: {e}"))?;
+            let _ = v17_n_lde;
+        } else {
+            let p = crate::sub_air_with_trace::deserialize_proof(&proof.fri_v17)?;
+            crate::sub_air_with_trace::verify_one_sub_air_with_trace(
+                &p, v17_n_trace, blowup, pi_hash,
+                b"v17",
+                crate::ml_dsa_verify_air_v17::WIDTH,
+                crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+                |cur, nxt, row| crate::ml_dsa_verify_air_v17::eval_per_row(cur, nxt, row),
+                |n0, ph| v2_fri_params(n0, blowup, ph),
+            ).map_err(|e| format!("v2 V17: {e}"))?;
 
-        // F2b L5 inclusion proofs REMOVED 2026-05-12 — L5 OOD
-        // binding (Session 7-8) supersedes K·N V17 row openings.
-        // `v17_n_lde`, `p.trace_root` no longer needed here.
-        let _ = (v17_n_lde, &p.trace_root);
+            // F2b L5 inclusion proofs REMOVED 2026-05-12 — L5 OOD
+            // binding (Session 7-8) supersedes K·N V17 row openings.
+            // `v17_n_lde`, `p.trace_root` no longer needed here.
+            let _ = (v17_n_lde, &p.trace_root);
+        }
     }
 
     // 4. INTT × K sub-proofs.
@@ -3294,12 +3318,15 @@ mod tests {
     }
 
     /// **SOUNDNESS GUARD for the low-mem prover.**  Runs at L1 (fast).
-    /// Asserts:
-    ///  (a) the low-mem proof is BYTE-IDENTICAL to `prove_v2_real`'s
-    ///      (so every existing F2b tamper/regression test applies to
-    ///      it verbatim),
-    ///  (b) the honest low-mem proof VERIFIES, and
-    ///  (c) a one-byte tamper of the low-mem V17 sub-proof is REJECTED.
+    /// The low-mem path now STRANDS V17 (TOP strand + L NTT instances) to
+    /// collapse its peak RSS, so its proof is NO LONGER byte-identical to
+    /// `prove_v2_real`'s monolithic V17.  Instead it asserts:
+    ///  (a) every NON-V17 sub-proof + binding is byte-identical to
+    ///      `prove_v2_real`'s (so every existing F2b regression applies to
+    ///      the low-mem path verbatim), and the L5 EQ-region BCCs are
+    ///      byte-identical (the stranding re-points them losslessly),
+    ///  (b) the honest low-mem (stranded-V17) proof VERIFIES, and
+    ///  (c) a one-byte tamper of the low-mem stranded-V17 blob is REJECTED.
     #[test]
     fn v2_lowmem_byte_identical_and_sound() {
         let w = synthesize_witness();
@@ -3309,23 +3336,96 @@ mod tests {
         let proof_std = prove_v2_real(&w, &c_tilde_bytes, blowup);
         let proof_low = prove_v2_real_lowmem(&w, &c_tilde_bytes, blowup);
 
-        // (a) Byte-identity: strongest equivalence + soundness argument.
-        assert_eq!(
-            proof_std.to_bytes(), proof_low.to_bytes(),
-            "low-mem proof must be byte-identical to prove_v2_real's proof"
+        // (a) V17 is stranded (structural change); everything ELSE is
+        // byte-identical to the monolithic path.
+        assert!(
+            crate::ml_dsa_v17_stranded::is_stranded(&proof_low.fri_v17),
+            "low-mem V17 must be stranded (magic prefix)"
         );
+        assert!(
+            !crate::ml_dsa_v17_stranded::is_stranded(&proof_std.fri_v17),
+            "all-at-once V17 must be monolithic"
+        );
+        // L5 EQ-region BCCs re-pointed losslessly → byte-identical.
+        assert_eq!(
+            proof_std.l5_v17_eq_bccs, proof_low.l5_v17_eq_bccs,
+            "low-mem L5 EQ BCCs must be byte-identical to the monolith's"
+        );
+        // Every other sub-proof + F2b binding is byte-identical.
+        assert_eq!(proof_std.fri_intt, proof_low.fri_intt);
+        assert_eq!(proof_std.fri_decompose, proof_low.fri_decompose);
+        assert_eq!(proof_std.fri_use_hint, proof_low.fri_use_hint);
+        assert_eq!(proof_std.fri_w1_encode, proof_low.fri_w1_encode);
+        assert_eq!(proof_std.fri_transcript, proof_low.fri_transcript);
+        assert_eq!(proof_std.intt_l0_openings, proof_low.intt_l0_openings);
+        assert_eq!(proof_std.intt_l1_openings, proof_low.intt_l1_openings);
+        assert_eq!(proof_std.decompose_l1_openings, proof_low.decompose_l1_openings);
 
-        // (b) Honest-accept on the low-mem path.
+        // (b) Honest-accept on the low-mem (stranded-V17) path.
         verify_v2_real(&w, &c_tilde_bytes, &proof_low, blowup)
-            .expect("low-mem: honest proof must verify");
+            .expect("low-mem: honest stranded-V17 proof must verify");
 
-        // (c) Tamper-reject on the low-mem path.
+        // (c) Tamper-reject: flip a byte in the stranded-V17 blob (well
+        // past the 4-byte magic, inside the TOP-strand FRI proof).
         let mut tampered = proof_low.clone();
-        tampered.fri_v17[100] ^= 0xFF;
+        tampered.fri_v17[200] ^= 0xFF;
         assert!(
             verify_v2_real(&w, &c_tilde_bytes, &tampered, blowup).is_err(),
-            "low-mem: tampered V17 sub-proof must be rejected"
+            "low-mem: tampered stranded-V17 blob must be rejected"
         );
+    }
+
+    /// **Per-strand + L5 tamper guards for the STRANDED V17.**  Runs at L1.
+    /// Confirms the low-mem (stranded) path rejects: a tampered TOP-strand
+    /// sub-proof, a tampered NTT-instance sub-proof, and a tampered L5
+    /// EQ-region BCC — i.e. the F2b binding survives the stranding.
+    #[test]
+    fn v2_lowmem_stranded_v17_tamper_guards() {
+        use crate::ml_dsa_v17_stranded::V17StrandedProof;
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let blowup = 4;
+        let proof = prove_v2_real_lowmem(&w, &c_tilde_bytes, blowup);
+
+        // Honest accepts.
+        verify_v2_real(&w, &c_tilde_bytes, &proof, blowup)
+            .expect("honest stranded-V17 must verify");
+
+        // Tamper the TOP strand sub-proof.
+        {
+            let mut bundle = V17StrandedProof::from_blob(&proof.fri_v17).unwrap();
+            let idx = bundle.top.len() / 2;
+            bundle.top[idx] ^= 0xFF;
+            let mut bad = proof.clone();
+            bad.fri_v17 = bundle.to_blob();
+            assert!(
+                verify_v2_real(&w, &c_tilde_bytes, &bad, blowup).is_err(),
+                "tampered TOP strand must reject"
+            );
+        }
+        // Tamper EACH NTT instance sub-proof.
+        for l in 0..crate::ml_dsa::params::L {
+            let mut bundle = V17StrandedProof::from_blob(&proof.fri_v17).unwrap();
+            let idx = bundle.ntt[l].len() / 2;
+            bundle.ntt[l][idx] ^= 0xFF;
+            let mut bad = proof.clone();
+            bad.fri_v17 = bundle.to_blob();
+            assert!(
+                verify_v2_real(&w, &c_tilde_bytes, &bad, blowup).is_err(),
+                "tampered NTT instance {l} must reject"
+            );
+        }
+        // Tamper an L5 EQ-region BCC → L5 OOD binding rejects.
+        {
+            let mut bad = proof.clone();
+            let last = bad.l5_v17_eq_bccs.len() - 1;
+            let idx = bad.l5_v17_eq_bccs[last].len() / 2;
+            bad.l5_v17_eq_bccs[last][idx] ^= 0xFF;
+            assert!(
+                verify_v2_real(&w, &c_tilde_bytes, &bad, blowup).is_err(),
+                "tampered L5 EQ BCC must reject"
+            );
+        }
     }
 
     /// **Low-memory ML-DSA-87 (L5) prover measurement harness.**
@@ -3360,11 +3460,98 @@ mod tests {
         let proof_kib = proof.to_bytes().len() as f64 / 1024.0;
         eprintln!("[v2_bench_lowmem] prove_ms={prove_ms:.1} proof_kib={proof_kib:.1}");
 
+        // PROVER memory is the deliverable.  `BENCH_PROVE_ONLY=1` drops the
+        // proof + skips verify so /usr/bin/time -l reports the prover's peak
+        // in isolation (verify holds the whole proof + re-checks every
+        // sub-AIR, which can dominate an in-process prove+verify measurement).
+        if std::env::var("BENCH_PROVE_ONLY").ok().as_deref() == Some("1") {
+            let sz = proof.to_bytes().len();
+            drop(proof);
+            eprintln!("[v2_bench_lowmem] PROVE_ONLY (verify skipped); proof was {sz} bytes");
+            println!(
+                "v2_bench_lowmem level=L{level} scheme={scheme} blowup={blowup} \
+                 threads={rayon_threads} prove_ms={prove_ms:.0} proof_kib={proof_kib:.1} prove_only=1"
+            );
+            return;
+        }
+
         verify_v2_real(&w, &c_tilde_bytes, &proof, blowup)
             .expect("low-mem L5 proof must verify");
         println!(
             "v2_bench_lowmem level=L{level} scheme={scheme} blowup={blowup} \
              threads={rayon_threads} prove_ms={prove_ms:.0} proof_kib={proof_kib:.1}"
+        );
+    }
+
+    /// **Isolated V17 prover-memory harness.**  Measures ONLY the V17
+    /// prove (the low-mem prover's memory floor) — no other sub-AIRs, no
+    /// accumulated proof — so `/usr/bin/time -l` reports the V17 prove's
+    /// working set in isolation, free of the whole-proof accumulation and
+    /// cross-sub-AIR allocator retention that confound `v2_bench_lowmem`.
+    /// `BENCH_MONOLITH_V17=1` selects the OLD single 341-col V17 prove;
+    /// default selects the STRANDED prove.  Repeats `BENCH_ITERS` times
+    /// (default 3), dropping each result, so the reported peak is stable.
+    ///
+    /// ```
+    /// RAYON_NUM_THREADS=4 /usr/bin/time -l <bin> v2_bench_v17_only --ignored --nocapture           # stranded
+    /// RAYON_NUM_THREADS=4 BENCH_MONOLITH_V17=1 /usr/bin/time -l <bin> v2_bench_v17_only --ignored   # monolith
+    /// ```
+    #[test]
+    #[ignore]
+    fn v2_bench_v17_only() {
+        use std::time::Instant;
+        let w = synthesize_witness();
+        let c_tilde_bytes = ml_dsa_transcript::compute_c_tilde_prime_native(&w.mu_bytes, &w.w1bytes);
+        let blowup: usize = std::env::var("BENCH_BLOWUP").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let pi_hash = compute_pi_hash_v2(&w, &c_tilde_bytes);
+        let monolith = std::env::var("BENCH_MONOLITH_V17").ok().as_deref() == Some("1");
+        let level = crate::stark_level::NIST_LEVEL;
+        eprintln!(
+            "[v2_bench_v17_only] level=L{level} mode={} iters={iters} blowup={blowup}",
+            if monolith { "MONOLITH" } else { "STRANDED" }
+        );
+        let mut last_blob = 0usize;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            if monolith {
+                let v17_trace = fill_v17_trace_only(&w);
+                let n = v17_trace[0].len();
+                let (proof, lde, _tree) =
+                    crate::sub_air_with_trace::prove_one_sub_air_with_trace_capturing(
+                        &v17_trace, n, blowup, pi_hash, b"v17",
+                        crate::ml_dsa_verify_air_v17::NUM_CONSTRAINTS,
+                        |lde, nt, bw, cc| {
+                            crate::deep_ali_merge_ml_dsa_v17(lde, cc, F::zero(), nt, bw).0
+                        },
+                        |n0, ph| v2_fri_params(n0, blowup, ph),
+                    );
+                drop(v17_trace);
+                let bytes = crate::sub_air_with_trace::serialize_proof(&proof);
+                // Build the L5 BCCs too (fair comparison — both paths do).
+                let eq_base = crate::ml_dsa_verify_air_v17::EQ_BASE;
+                let mut nb = bytes.len();
+                for ll in 0..L {
+                    let (c, _) = crate::binding_cells_commit::commit_binding_cells(
+                        &lde, &[eq_base + crate::ml_dsa_verify_air::col_a_ntt(ll)], n, blowup, pi_hash,
+                        &format!("l5_v17_a_ntt_{ll}").into_bytes(), |n0, ph| v2_fri_params(n0, blowup, ph),
+                    );
+                    nb += c.to_bytes().len();
+                }
+                last_blob = nb;
+                drop(lde);
+            } else {
+                let (blob, bccs) = crate::ml_dsa_v17_stranded::prove_v17_stranded(
+                    &w.a_ntt, &w.z_ntt, &w.c_ntt, &w.t1d_ntt, &w.w_approx_ntt, &w.z_cleartext,
+                    pi_hash, blowup, |n0, ph| v2_fri_params(n0, blowup, ph),
+                );
+                last_blob = blob.len() + bccs.iter().map(|b| b.len()).sum::<usize>();
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!(
+            "v2_bench_v17_only level=L{level} mode={} v17_ms={ms:.0} v17_bytes={last_blob}",
+            if monolith { "MONOLITH" } else { "STRANDED" }
         );
     }
 }
