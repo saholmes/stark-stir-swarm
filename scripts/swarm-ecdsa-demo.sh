@@ -128,13 +128,40 @@ echo "  Σ per-strand prove time (naive sequential) : ${sum_prove_s} s"
 echo "  swarm worker-phase wall clock (POOL=$POOL) : ${PARALLEL_WALL} s   (~${batches} batches)"
 echo "  observed speedup                           : ${speedup}×"
 
-# ── verify: splice + check + tamper-reject ──
+# ── splice (prover-side): assemble the G strand sub-proofs into proof.bin ──
 echo
-SWARM_ROLE=verify "$BIN"
+splice_out="$(SWARM_ROLE=splice "$BIN")"
+echo "$splice_out" | grep -v '^SPLICE '
+SPLICE_MS="$(echo "$splice_out" | awk -F'splice_ms=' '/^SPLICE /{print $2}' | awk '{print $1}')"
+PROOF_BYTES="$(echo "$splice_out" | awk -F'proof_bytes=' '/^SPLICE /{print $2}')"
+PROOF_MIB="$(awk -v b="$PROOF_BYTES" 'BEGIN{printf "%.1f", b/1048576}')"
+
+# ── verify (consumer-side): read proof.bin, check, tamper-reject ──
+echo
+verify_out="$(SWARM_ROLE=verify "$BIN")"
+echo "$verify_out" | grep -v '^VERIFY '
+VERIFY_MS="$(echo "$verify_out" | awk -F'verify_ms=' '/^VERIFY /{print $2}')"
+
+# ── deployment cost breakdown: prover vs consumer ──
+TOTAL_PROVER="$(awk -v w="$PARALLEL_WALL" -v s="$SPLICE_MS" 'BEGIN{printf "%.1f", w + s/1000}')"
+echo
+echo "────────────────────────────────────────────────────────────────────────"
+echo " Deployment cost breakdown  (prover-side production vs consumer verify)"
+echo "────────────────────────────────────────────────────────────────────────"
+printf "  PROVER : parallel worker-prove wall  = %s s\n" "$PARALLEL_WALL"
+printf "         + splice (assemble+write)     = %s s  (%s ms)\n" \
+  "$(awk -v s="$SPLICE_MS" 'BEGIN{printf "%.1f", s/1000}')" "$SPLICE_MS"
+printf "         ─────────────────────────────────────────\n"
+printf "         = TOTAL PROVER               = %s s\n" "$TOTAL_PROVER"
+echo
+printf "  VERIFY : consumer one-shot           = %s s  (%s ms)\n" \
+  "$(awk -v v="$VERIFY_MS" 'BEGIN{printf "%.1f", v/1000}')" "$VERIFY_MS"
+echo
+printf "  PROOF  : proof.bin on disk           = %s MiB\n" "$PROOF_MIB"
 
 echo
 echo "════════════════════════════════════════════════════════════════════════"
 echo " DONE — a swarm of ≤1 GB independent processes proved a real ECDSA sig."
 echo "════════════════════════════════════════════════════════════════════════"
 
-rm -rf "$SWARM_DIR"   # success → clean up (~3 GB of strand files)
+rm -rf "$SWARM_DIR"   # success → clean up (~3-4 GB of strand files + proof.bin)

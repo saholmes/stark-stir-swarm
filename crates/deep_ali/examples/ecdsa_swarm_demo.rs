@@ -249,6 +249,35 @@ fn deserialize_strand(
     Ok((proof, seam))
 }
 
+/// Serialize a full spliced `StrandedProofG` to ONE artifact:
+///   [u32 G][ lp(strand_0) ][ lp(strand_1) ] … [ lp(strand_{G-1}) ]
+/// (each strand = its sub-proof bytes + seam-commit bytes, per
+/// `serialize_strand`).  Strands are in `compute_gway_cut` order.
+fn serialize_stranded(proof: &StrandedProofG) -> Vec<u8> {
+    let g = proof.proofs.len();
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(g as u32).to_le_bytes());
+    for s in 0..g {
+        let sb = serialize_strand(&proof.proofs[s], &proof.seam_commits[s]);
+        write_lp(&mut buf, &sb);
+    }
+    buf
+}
+
+fn deserialize_stranded(bytes: &[u8]) -> Result<StrandedProofG, String> {
+    let mut cur = bytes;
+    let g = read_u32(&mut cur)? as usize;
+    let mut proofs: Vec<SubAirProofWithTrace> = Vec::with_capacity(g);
+    let mut seam_commits: Vec<Vec<(usize, Vec<BindingCellsCommit>)>> = Vec::with_capacity(g);
+    for _ in 0..g {
+        let sb = read_lp(&mut cur)?;
+        let (p, c) = deserialize_strand(&sb)?;
+        proofs.push(p);
+        seam_commits.push(c);
+    }
+    Ok(StrandedProofG { proofs, seam_commits })
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Manifest (job.json) — shared, deterministic case definition
 // ═══════════════════════════════════════════════════════════════════
@@ -409,16 +438,15 @@ fn role_worker() {
     );
 }
 
-fn role_verify() {
+/// PROVER-SIDE splice: the coordinator collects the G independently-produced
+/// strand sub-proofs + F2b binding commits and ASSEMBLES them into ONE proof
+/// artifact `proof.bin` on disk.  This is proof PRODUCTION (no verification
+/// here — honest assembly), so its cost is charged to the prover.
+fn role_splice() {
     let job = read_job();
-    let n_trace = (job.k + 1).next_power_of_two();
-    let r = deep_ali::stark_level::num_queries_for_blowup(job.blowup);
-    let case = derive_case(&job.key, &job.msg, job.k);
-    let (layout, _total) = build_ecdsa_verify_multirow_layout(0, job.k);
-    let cut = compute_gway_cut(&layout, job.k, job.g);
-    let params = |n0: usize, ph: [u8; 32]| mk_params(n0, r, ph);
 
-    // ── collect the G independently-produced strand files, in cut order ──
+    // Collect worker outputs (I/O; deserialization of each worker's file).
+    // Not part of the timed splice — this is worker-output ingestion.
     let mut proofs: Vec<SubAirProofWithTrace> = Vec::with_capacity(job.g);
     let mut seam_commits: Vec<Vec<(usize, Vec<BindingCellsCommit>)>> = Vec::with_capacity(job.g);
     for s in 0..job.g {
@@ -430,25 +458,72 @@ fn role_verify() {
         proofs.push(p);
         seam_commits.push(c);
     }
+
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║  VERIFY — splice {g} independently-produced strands & check        ║", g = job.g);
+    println!("║  SPLICE (prover-side) — assemble {g} strands → one proof.bin       ║", g = job.g);
     println!("╚══════════════════════════════════════════════════════════════════╝");
 
+    // ── TIMED: assemble StrandedProofG + serialize + write to disk ──
+    let t = Instant::now();
     let proof = StrandedProofG { proofs, seam_commits };
+    let bytes = serialize_stranded(&proof);
+    let out = format!("{}/proof.bin", dir());
+    std::fs::write(&out, &bytes).expect("write proof.bin");
+    let splice_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let fri_total: usize = proof.proofs.iter().map(|p| p.fri_proof_bytes.len()).sum();
+    println!(
+        "  assembled {} strand sub-proofs + F2b seam commits → proof.bin",
+        job.g
+    );
+    println!(
+        "  splice_ms      : {splice_ms:.1} ms   (assemble + serialize + write)"
+    );
+    println!(
+        "  proof.bin size : {:.1} MiB   (FRI portion {} KiB)",
+        bytes.len() as f64 / (1024.0 * 1024.0),
+        fri_total / 1024,
+    );
+    // machine-readable line for the orchestrator report.
+    println!("SPLICE splice_ms={splice_ms:.1} proof_bytes={}", bytes.len());
+}
+
+/// CONSUMER-SIDE verify: a relying party reads `proof.bin` and checks it
+/// (per-strand FRI + F2b OOD seam consistency).  Only the cryptographic
+/// verification is timed.
+fn role_verify() {
+    let job = read_job();
+    let n_trace = (job.k + 1).next_power_of_two();
+    let r = deep_ali::stark_level::num_queries_for_blowup(job.blowup);
+    let case = derive_case(&job.key, &job.msg, job.k);
+    let (layout, _total) = build_ecdsa_verify_multirow_layout(0, job.k);
+    let cut = compute_gway_cut(&layout, job.k, job.g);
+    let params = |n0: usize, ph: [u8; 32]| mk_params(n0, r, ph);
+
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║  VERIFY (consumer-side) — read proof.bin & check                   ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+
+    // Read the ONE spliced artifact from disk (I/O; not the timed check).
+    let art = format!("{}/proof.bin", dir());
+    let raw = std::fs::read(&art).expect("read proof.bin — run splice first");
+    let proof = deserialize_stranded(&raw).expect("deserialize proof.bin");
     let fri_total: usize = proof.proofs.iter().map(|p| p.fri_proof_bytes.len()).sum();
 
+    // ── TIMED: the cryptographic verification only ──
     let t = Instant::now();
     let honest = verify_stranded_g(
         &proof, &cut, &layout, &case.pub_inputs, n_trace, job.blowup, case.pi_hash, params,
     );
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let honest_ok = honest.is_ok();
+
     println!("  verified public statement:");
     println!("     h(m)=e : {}", hx(&case.e_bytes));
     println!("     PK  Qx : {}", hx(&case.qx_bytes));
     println!("     PK  Qy : {}", hx(&case.qy_bytes));
     println!(
-        "  spliced verify : {}   ({verify_ms:.1} ms, FRI total {} KiB across {} strands)",
+        "  verify : {}   ({verify_ms:.1} ms, FRI total {} KiB across {} strands)",
         if honest_ok { "PASS ✓" } else { "FAIL ✗" },
         fri_total / 1024,
         job.g,
@@ -457,65 +532,50 @@ fn role_verify() {
         println!("  ERROR: {:?}", honest.err());
         std::process::exit(1);
     }
+    // machine-readable line for the orchestrator report.
+    println!("VERIFY verify_ms={verify_ms:.1}");
 
-    // ── NEGATIVE CHECK: corrupt one strand's committed data → must REJECT.
+    // ── NEGATIVE CHECK: corrupt the spliced proof.bin → must REJECT.
     //    Proves the splice cryptographically binds the INDEPENDENTLY-produced
-    //    strands: no strand's trace can be altered without detection.
-    //
-    //    We corrupt the strand's `trace_root` — the Merkle commitment to its
-    //    trace LDE.  It feeds `augment_pi_hash` (so every FRI/seam FS
-    //    challenge shifts) AND every per-query Merkle path checks against it,
-    //    so a single flipped byte breaks the strand proof unconditionally. ──
+    //    strands: no strand's data can be altered without detection.  We
+    //    corrupt the strand's `trace_root` (feeds `augment_pi_hash` → shifts
+    //    every FRI/seam FS challenge AND every per-query Merkle path). ──
     let victim = 0usize;
     let helper = |mutate: &dyn Fn(&mut SubAirProofWithTrace)| -> bool {
-        let mut proofs2: Vec<SubAirProofWithTrace> = Vec::with_capacity(job.g);
-        let mut seam2: Vec<Vec<(usize, Vec<BindingCellsCommit>)>> = Vec::with_capacity(job.g);
-        for s in 0..job.g {
-            let (mut p, c) =
-                deserialize_strand(&std::fs::read(format!("{}/strand_{s}.bin", dir())).unwrap())
-                    .unwrap();
-            if s == victim {
-                mutate(&mut p);
-            }
-            proofs2.push(p);
-            seam2.push(c);
-        }
+        let mut p = deserialize_stranded(&raw).unwrap();
+        mutate(&mut p.proofs[victim]);
         verify_stranded_g(
-            &StrandedProofG { proofs: proofs2, seam_commits: seam2 },
-            &cut, &layout, &case.pub_inputs, n_trace, job.blowup, case.pi_hash, params,
+            &p, &cut, &layout, &case.pub_inputs, n_trace, job.blowup, case.pi_hash, params,
         )
         .is_err()
     };
     let rej_root = helper(&|p: &mut SubAirProofWithTrace| p.trace_root[0] ^= 0x01);
-    // Second, independent tamper: alter one opened trace CELL value in the
-    // victim strand — its committed leaf hash no longer matches, so the
-    // per-query trace-opening check rejects.
+    // Independent tamper: alter one opened trace CELL value — its committed
+    // leaf hash no longer matches → per-query trace-opening check rejects.
     let rej_cell = helper(&|p: &mut SubAirProofWithTrace| {
         p.openings_cur[0].cells[0] += F::from(1u64);
     });
-    // Third: raw on-disk corruption of the strand file (truncate to half) —
-    // the deserializer / verifier must refuse it.
-    let path = format!("{}/strand_{victim}.bin", dir());
-    let raw = std::fs::read(&path).expect("read victim strand");
-    let raw_rej = deserialize_strand(&raw[..raw.len() / 2]).is_err();
+    // Raw on-disk corruption of proof.bin (truncate to half) — the
+    // deserializer / verifier must refuse it.
+    let raw_rej = deserialize_stranded(&raw[..raw.len() / 2]).is_err();
 
     println!(
-        "  tamper strand {victim} (flip trace_root)  : {}",
+        "  tamper proof.bin (flip strand {victim} trace_root)  : {}",
         if rej_root { "REJECT ✓" } else { "ACCEPTED ✗ (BUG!)" }
     );
     println!(
-        "  tamper strand {victim} (alter trace cell) : {}",
+        "  tamper proof.bin (alter strand {victim} trace cell) : {}",
         if rej_cell { "REJECT ✓" } else { "ACCEPTED ✗ (BUG!)" }
     );
     println!(
-        "  tamper strand {victim} (truncate .bin)    : {}",
+        "  tamper proof.bin (truncate artifact)          : {}",
         if raw_rej { "REJECT ✓" } else { "ACCEPTED ✗ (BUG!)" }
     );
 
     let pass = case.native_ok && honest_ok && rej_root && rej_cell && raw_rej;
     println!();
     if pass {
-        println!("=> SWARM PROVED A REAL ECDSA SIGNATURE: honest splice ACCEPTS; tamper REJECTS");
+        println!("=> SWARM PROVED A REAL ECDSA SIGNATURE: honest proof ACCEPTS; tamper REJECTS");
         let _ = std::io::stdout().flush();
     } else {
         println!("=> FAILED");
@@ -527,9 +587,10 @@ fn main() {
     match std::env::var("SWARM_ROLE").as_deref() {
         Ok("coordinator") => role_coordinator(),
         Ok("worker") => role_worker(),
+        Ok("splice") => role_splice(),
         Ok("verify") => role_verify(),
         other => {
-            eprintln!("SWARM_ROLE must be coordinator|worker|verify (got {other:?})");
+            eprintln!("SWARM_ROLE must be coordinator|worker|splice|verify (got {other:?})");
             std::process::exit(2);
         }
     }
