@@ -16,6 +16,11 @@ pub mod sha3_gadget;
 // M2b-1: sound single-block padding binding (additive; builds on M2a's gadget).
 pub mod sha3_binding;
 
+// M2c: in-circuit SHA3-384 / SHA3-512 single-block gadgets + sound padding
+// binding (kappa_bind for NIST L3/L5; additive, generalises M2a/M2b-1 over a
+// Sha3Variant enum).
+pub mod sha3_variants;
+
 // M2b-2: sound in-circuit binding seam between two SHA3-256 hashes (additive).
 pub mod sha3_seam;
 
