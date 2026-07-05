@@ -23,8 +23,12 @@ use binius_circuits::builder::types::U;
 use binius_core::fiat_shamir::HasherChallenger;
 use binius_field::tower::CanonicalTowerFamily;
 use binius_hash::sha2::Sha256Compression;
+use binius_m3::gadgets::hash::keccak::{Keccakf, StateMatrix};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::Sha256;
 
+use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+use crate::b512_field::{B512TowerFamily, B512 as OurB512, U512};
 use crate::sha3_gadget::{padded_state, Sha3SingleBlockTable};
 
 /// Concrete packed field used throughout (same as M1 / M2a).
@@ -120,6 +124,196 @@ pub fn bench_sha3_256(n: usize, log_inv_rate: usize, security_bits: usize) -> Re
 	Ok(BenchResult {
 		n,
 		log_inv_rate,
+		prove_ms,
+		verify_ms,
+		proof_bytes,
+	})
+}
+
+// =============================================================================
+// PART 1 (RSS baseline at NIST) — timed prove/verify of a batch of raw Keccak-f
+// permutations over the NIST tower fields B256 (L1, security_bits=128) and B512
+// (L5, security_bits=256), with peak RSS measured by the wrapping shell script.
+//
+// This is the concrete "<1 GB per proof?" datapoint that sets the per-level
+// strand granularity G for the S-strand signature-AIR port. The prove path is
+// byte-for-byte the FIPS wiring already gated by b256_keccak/b512_keccak (SHA-256
+// Merkle commitment + SHA-256 Fiat-Shamir), only with `prove`/`verify` timed
+// separately and the proof size returned. Each row = one full Keccak-f[1600]
+// permutation regardless of the (random, fixed-seed) input content.
+// =============================================================================
+
+/// One row of the B256/B512 RSS scaling table: for a batch of `n` raw Keccak-f
+/// permutations at `log_inv_rate` (blowup = 2^log_inv_rate) and `security_bits`,
+/// the separately-timed prove/verify wall-times (ms) and the proof size (bytes).
+/// Peak RSS is captured out-of-process by `/usr/bin/time -l` in the shell wrapper.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchKeccakResult {
+	pub n: usize,
+	pub log_inv_rate: usize,
+	pub security_bits: usize,
+	pub prove_ms: u128,
+	pub verify_ms: u128,
+	pub proof_bytes: usize,
+}
+
+/// Reproducible batch of `n` random 25-lane Keccak-f inputs (fixed seed so the
+/// bench is deterministic; any 25-lane input is a valid permutation input and the
+/// content does not change prover cost — every row is one full Keccak-f[1600]).
+fn keccak_bench_inputs(n: usize) -> Vec<StateMatrix<u64>> {
+	let mut rng = StdRng::from_seed([13u8; 32]);
+	(0..n)
+		.map(|_| StateMatrix::from_fn(|_| rng.next_u64()))
+		.collect()
+}
+
+/// PART 1 — prove+verify `n` raw Keccak-f permutations over `B256TowerFamily`
+/// (NIST L1 challenge field, 2^256) under the FIPS SHA-256 commitment/transcript,
+/// timing prove and verify separately. `n` is rounded up to a power of two (the
+/// m3 table requires it); the returned `n` reflects the actual batch size.
+pub fn bench_keccak_b256(
+	n: usize,
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<BenchKeccakResult> {
+	assert!(n > 0, "bench_keccak_b256 needs at least one permutation");
+	let n = n.next_power_of_two();
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut table = cs.add_table("keccak-f[1600] over B256 (bench)");
+	let state_in = StateMatrix::from_fn(|(x, y)| table.add_committed(format!("in[{x},{y}]")));
+	let keccakf = Keccakf::new(&mut table, state_in);
+	let table_id = table.id();
+
+	let statement = Statement {
+		boundaries: vec![],
+		table_sizes: vec![n],
+	};
+	let inputs = keccak_bench_inputs(n);
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let table_witness = witness.init_table(table_id, n)?;
+		let mut segment = table_witness.full_segment();
+		keccakf.populate_state_in(&mut segment, inputs.iter())?;
+		keccakf.populate(&mut segment)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	let backend = binius_hal::make_portable_backend();
+
+	let t_prove = Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(
+		&ccs,
+		log_inv_rate,
+		security_bits,
+		&statement.boundaries,
+		witness,
+		&backend,
+	)?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let proof_bytes = proof.get_proof_size();
+
+	let t_verify = Instant::now();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof)?;
+	let verify_ms = t_verify.elapsed().as_millis();
+
+	Ok(BenchKeccakResult {
+		n,
+		log_inv_rate,
+		security_bits,
+		prove_ms,
+		verify_ms,
+		proof_bytes,
+	})
+}
+
+/// PART 1 — prove+verify `n` raw Keccak-f permutations over `B512TowerFamily`
+/// (NIST L5 challenge field, tower level 9, 2^512) under the FIPS SHA-256
+/// commitment/transcript, timing prove and verify separately. `n` is rounded up
+/// to a power of two; the returned `n` reflects the actual batch size. This path
+/// is ~16x heavier per row than B256 (512-bit vs 256-bit backing store).
+pub fn bench_keccak_b512(
+	n: usize,
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<BenchKeccakResult> {
+	assert!(n > 0, "bench_keccak_b512 needs at least one permutation");
+	let n = n.next_power_of_two();
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB512>::new();
+	let mut table = cs.add_table("keccak-f[1600] over B512 (bench)");
+	let state_in = StateMatrix::from_fn(|(x, y)| table.add_committed(format!("in[{x},{y}]")));
+	let keccakf = Keccakf::new(&mut table, state_in);
+	let table_id = table.id();
+
+	let statement = Statement {
+		boundaries: vec![],
+		table_sizes: vec![n],
+	};
+	let inputs = keccak_bench_inputs(n);
+
+	let mut witness = WitnessIndex::<OurB512>::new(&cs, &allocator);
+	{
+		let table_witness = witness.init_table(table_id, n)?;
+		let mut segment = table_witness.full_segment();
+		keccakf.populate_state_in(&mut segment, inputs.iter())?;
+		keccakf.populate(&mut segment)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	let backend = binius_hal::make_portable_backend();
+
+	let t_prove = Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U512,
+		B512TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(
+		&ccs,
+		log_inv_rate,
+		security_bits,
+		&statement.boundaries,
+		witness,
+		&backend,
+	)?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let proof_bytes = proof.get_proof_size();
+
+	let t_verify = Instant::now();
+	binius_core::constraint_system::verify::<
+		U512,
+		B512TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof)?;
+	let verify_ms = t_verify.elapsed().as_millis();
+
+	Ok(BenchKeccakResult {
+		n,
+		log_inv_rate,
+		security_bits,
 		prove_ms,
 		verify_ms,
 		proof_bytes,
