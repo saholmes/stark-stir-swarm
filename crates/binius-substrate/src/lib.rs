@@ -70,6 +70,24 @@ pub mod b256_binding;
 // add_shifted/add_selected_block/add_packed/push/pull + generic Boundary<F>).
 pub mod b256_recursion;
 
+// M3 (kappa_FS) NIST L5 — the M2a/M2c SHA-3 sponge ported onto `B512TowerFamily`
+// (tower level 9) so the IN-CIRCUIT SHA3-256/384/512 hashes prove AND verify over
+// the 512-bit challenge field at NIST L5 (security_bits=256) Fiat–Shamir security.
+// Mirrors `b256_sha3` one tower level up. Additive.
+pub mod b512_sha3;
+
+// M2b-1 over B512 (NIST L5): the SOUND single-block SHA3-256 padding binding ported
+// onto `B512TowerFamily` so the load-bearing kappa_bind soundness primitive proves
+// AND verifies at security_bits=256 with its bad-padding / bad-capacity adversarial
+// rejects firing, isolated to the binding constraint. Mirrors `b256_binding`. Additive.
+pub mod b512_binding;
+
+// M2b-2/3/4 over B512 (NIST L5): the seam, root-boundary and cross-table channel-join
+// recursion-binding primitives ported onto `B512TowerFamily` so they prove AND verify
+// at security_bits=256 with their adversarial rejects firing (forged-link / wrong-root
+// / forged-inner-root). Mirrors `b256_recursion`. Additive.
+pub mod b512_recursion;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 
