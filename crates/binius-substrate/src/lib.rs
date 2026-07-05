@@ -25,6 +25,25 @@ pub mod b256_packed;
 // non-Keccak circuit; see module docs for the Keccak-gadget wall). Additive.
 pub mod b256_prove;
 
+// M3 (kappa_FS) NIST L5: a 512-bit binary tower field (T_9, tower level 9) mirroring
+// b256_field one level up, so `calculate_n_test_queries` succeeds at security_bits=256
+// (where BOTH B128 and B256 error). Additive; a new, local tower family.
+pub mod b512_field;
+
+// M3 (kappa_FS) NIST L5 packing: local packed subfield types `Sub512<S>` over U512 +
+// `ProverTowerFamily for B512TowerFamily`, cross-validated against Binius's canonical
+// 512-bit packed types. Additive; no Binius file is modified.
+pub mod b512_packed;
+
+// M3 (kappa_FS) NIST L5 proofs: a REAL end-to-end Binius proof over the 512-bit
+// challenge field `B512TowerFamily` at security_bits=256 (ring-switch square circuit +
+// kappa-9 tensor transpose gate + tamper rejection). Additive.
+pub mod b512_prove;
+
+// M3 (kappa_FS) NIST L5 Keccak: the m3 Keccak-f[1600] gadget proving AND verifying
+// over `B512TowerFamily` at security_bits=256. Additive.
+pub mod b512_keccak;
+
 // M3 (kappa_FS) Phase B: the REAL m3 Keccak-f[1600] gadget proving AND verifying
 // over the 256-bit challenge/extension field `B256TowerFamily` at NIST L1/L3, made
 // possible by generalizing binius_m3's `Keccakf` gadget (top field B128 -> generic
