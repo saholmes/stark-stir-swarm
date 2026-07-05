@@ -38,6 +38,19 @@ pub mod b256_keccak;
 // prove wiring + `sha3_variants`' field-agnostic padding/squeeze. Additive.
 pub mod b256_sha3;
 
+// M2b-1 over B256: the SOUND single-block SHA3-256 padding binding ported onto
+// `B256TowerFamily` so the load-bearing kappa_bind soundness primitive proves AND
+// verifies at NIST L1/L3 over the 256-bit challenge field (additive; reuses the
+// generic m3 assert_zero/add_constant surface + the b256_keccak prove wiring).
+pub mod b256_binding;
+
+// M2b-2/3/4 over B256: the seam, root-boundary and cross-table channel-join
+// recursion-binding primitives ported onto `B256TowerFamily` so they prove AND
+// verify at NIST L1/L3 with their adversarial rejects firing over the 256-bit
+// challenge field (additive; reuses the field-agnostic seam helpers + generic m3
+// add_shifted/add_selected_block/add_packed/push/pull + generic Boundary<F>).
+pub mod b256_recursion;
+
 // M2a lives in its own module (additive; does not touch the M1 items below).
 pub mod sha3_gadget;
 
