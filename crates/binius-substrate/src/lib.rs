@@ -121,6 +121,15 @@ pub mod sha_outer;
 // the prove-time / peak-RSS scaling table (additive; no soundness surface).
 pub mod bench;
 
+// S0 (signature-AIR port): a NON-NATIVE modular-multiply gadget `a*b mod m` built
+// from hand-rolled shift-and-add over B1 bit-columns (NO fork change), proving AND
+// verifying over `B256TowerFamily` at NIST L1. The prover supplies quotient `q` and
+// remainder `r`; the circuit enforces the big-integer identity `a*b == q*m + r` and
+// the soundness-critical strict reduction `0 <= r < m`. This is the arithmetic
+// substrate S1 (ML-DSA verify over Z_q, q = 8380417) is built on. Additive; reuses
+// `b256_keccak`'s tower-family prove wiring. See module docs for the construction.
+pub mod nonnative;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;

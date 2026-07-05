@@ -51,3 +51,9 @@ sha3    = "0.10.8"
 # Independent native Keccak-f[1600] reference for the B256 in-circuit gadget's
 # `keccak_b256_matches_native` gate (test-only; isolated to this detached crate's lock).
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+# Independent big-integer reference for the S0 non-native modular-multiply gadget's
+# `nonnative_modmul_matches_num_bigint_*` gates. The gadget itself does NOT use this
+# crate (its witness arithmetic is hand-rolled bit-vectors); num-bigint is only the
+# INDEPENDENT oracle the tests check against, so "matches num-bigint" is a real
+# cross-check, not a tautology. Version pinned to Binius's Cargo.lock (0.4.6).
+num-bigint = "0.4.6"
