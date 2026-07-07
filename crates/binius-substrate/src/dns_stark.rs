@@ -1,0 +1,510 @@
+// D (DNS-STARK realized over Binius) — the CAPSTONE. Each DNSSEC record's RRSIG
+// verification is proven by the matching signature AIR (ML-DSA→S1, Ed25519/ECDSA→S2,
+// RSA→S3) over the forked Binius pipeline at NIST L1/L3/L5; the per-record proofs are
+// aggregated by R (Tier-A batched Merkle over inner roots) into ONE epoch/zone artifact
+// with constant consumer (resolver) verify. This is the binary-field realization of the
+// STARK-DNS system (ACNS) whose Goldilocks design + soundness already exist
+// (see [[project_starkdns_ndss2027_submitted]], [[project_mixed_zone_rollup]],
+// [[project_se_zone_hnpl]]).
+//
+// ── THE PIPELINE (per record → zone artifact) ──────────────────────────────────────
+//   record R with RRSIG over an RRset, signed by a DNSKEY (ZSK) of algorithm alg:
+//     1. signing_input = RRSIG_RDATA(without signature) ‖ canonical RRset   [RFC 4034 §3.1.8.1]
+//     2. dispatch(alg) → the S-slice AIR that proves "sig verifies over signing_input under
+//        the DNSKEY":  8/10 → RSA/S3,  13 → ECDSA-P256/S2,  14 → ECDSA-P384/S2,
+//        15 → Ed25519/S2,  <ML-DSA codepoint> → ML-DSA/S1.
+//     3. the S-slice proof exposes its PCS/Merkle root r_R as a boundary.
+//   zone/epoch:
+//     4. R Tier-A: pull all r_R via the join channel, batched Merkle → epoch root R*
+//        (public Boundary). Ships {r_R} (N×32 B) + one master proof.  [O(N²)→O(N) fix]
+//   chain-of-trust (also each an S-slice verify, aggregated the same way):
+//     • DS(parent) → DNSKEY(child KSK)   [delegation hash, RFC 4034 §5]
+//     • KSK signs the DNSKEY RRset;  ZSK signs the zone RRsets.
+//   denial of existence: NSEC3 (hashed owner names) proven + aggregated identically.
+//   resolver: verifies the ONE master proof + R*, then answers queries with O(1) checks
+//     against the shipped record roots (the offline/edge resolver model).
+//
+// ── WHAT D ADDS (it is the assembly of assemblies) ─────────────────────────────────
+//   * the canonical RRSIG signing-input construction (the exact bytes the S-slice hashes),
+//   * the algorithm → S-slice dispatch,
+//   * the DNSKEY key-tag (RFC 4034 App B) linking an RRSIG to its DNSKEY,
+//   * the zone/epoch aggregation wiring (R Tier-A over the per-record roots),
+//   * the chain-of-trust + NSEC3 composition (design).
+//   Everything below the dispatch is S1/S2/S3 (drafted) and R (drafted); D is the DNSSEC
+//   semantics + the wiring.
+//
+// ── SOUNDNESS BOUNDARY ────────────────────────────────────────────────────────────
+//   IN-CIRCUIT: each per-record proof is a sound S-slice verify over the canonical
+//   signing_input (a tampered record ⇒ signing_input changes ⇒ the S-slice's sig-verify
+//   equality fails ⇒ no witness). The epoch root R* soundly commits to the exact multiset
+//   of record roots (R Tier-A). A tampered zone (added/removed/edited record) ⇒ some r_R
+//   changes or the multiset changes ⇒ R* ≠ claimed ⇒ reject. This is the STARK-DNS
+//   integrity guarantee over Binius at NIST L1/L3/L5.
+//   TRUST NOT RE-EXECUTED IN-MASTER (Tier A): that each shipped r_R corresponds to a
+//   VERIFYING inner proof — discharged by the resolver checking the (small, shipped) inner
+//   proofs, exactly as the ACNS rollup specifies; Tier-B (R) would fold this in-circuit.
+//   The DNSSEC chain-of-trust root (DS at the trust anchor) is the external root of trust,
+//   unchanged from classical DNSSEC (see [[project_ni_gated_distributed_proving]]).
+//   OUTER COMMITMENT SHA-256; challenge field carries FS security at all three levels.
+// ============================================================================
+//
+// DRAFT STATUS (D, in progress): the DNSSEC reference layer (canonical signing-input,
+// key-tag, algorithm dispatch, zone aggregation via R's merkle_root_sha3) is implemented
+// + gated, cross-checked with Python. The in-circuit assembly (per-record S-slice AIRs +
+// R Tier-A master) is specified above and wired LAST, after S1/S2/S3/R prove paths land.
+// Heavy prove gates `#[ignore]`.
+
+/// DNSSEC signature algorithm numbers (IANA), mapped to the S-slice that proves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnssecAlgorithm {
+	/// 8 — RSA/SHA-256 (also 5/7/10 RSA variants) → S3.
+	RsaSha256,
+	/// 13 — ECDSA P-256/SHA-256 → S2.
+	EcdsaP256Sha256,
+	/// 14 — ECDSA P-384/SHA-384 → S2.
+	EcdsaP384Sha384,
+	/// 15 — Ed25519 → S2.
+	Ed25519,
+	/// ML-DSA (post-quantum, private/experimental codepoint) → S1.
+	MlDsa,
+}
+
+/// Which S-slice AIR proves a given DNSSEC algorithm's RRSIG verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SSlice {
+	S1MlDsa,
+	S2Ec,
+	S3Rsa,
+}
+
+impl DnssecAlgorithm {
+	/// The IANA algorithm number.
+	pub const fn iana(self) -> u8 {
+		match self {
+			DnssecAlgorithm::RsaSha256 => 8,
+			DnssecAlgorithm::EcdsaP256Sha256 => 13,
+			DnssecAlgorithm::EcdsaP384Sha384 => 14,
+			DnssecAlgorithm::Ed25519 => 15,
+			DnssecAlgorithm::MlDsa => 17, // illustrative PQ codepoint
+		}
+	}
+
+	/// Dispatch to the S-slice AIR that verifies this algorithm.
+	pub const fn s_slice(self) -> SSlice {
+		match self {
+			DnssecAlgorithm::RsaSha256 => SSlice::S3Rsa,
+			DnssecAlgorithm::EcdsaP256Sha256
+			| DnssecAlgorithm::EcdsaP384Sha384
+			| DnssecAlgorithm::Ed25519 => SSlice::S2Ec,
+			DnssecAlgorithm::MlDsa => SSlice::S1MlDsa,
+		}
+	}
+}
+
+/// Canonical wire-format DNS name (RFC 1035 §3.1): length-prefixed labels, root 0x00.
+/// (Canonical form for DNSSEC uses lowercase labels; caller lowercases.)
+pub fn wire_name(name: &str) -> Vec<u8> {
+	let mut out = Vec::new();
+	for label in name.trim_end_matches('.').split('.') {
+		if label.is_empty() {
+			continue;
+		}
+		out.push(label.len() as u8);
+		out.extend_from_slice(label.as_bytes());
+	}
+	out.push(0);
+	out
+}
+
+/// RFC 4034 Appendix B — DNSKEY key tag (for algorithms ≠ 1): a 16-bit checksum over the
+/// DNSKEY RDATA. Links an RRSIG (which carries the key tag) to the signing DNSKEY.
+pub fn dnskey_key_tag(rdata: &[u8]) -> u16 {
+	let mut ac: u32 = 0;
+	for (i, &b) in rdata.iter().enumerate() {
+		ac += if i & 1 == 1 { b as u32 } else { (b as u32) << 8 };
+	}
+	ac += (ac >> 16) & 0xFFFF;
+	(ac & 0xFFFF) as u16
+}
+
+/// One resource record in canonical form for the RRSIG signing input (RFC 4034 §3.1.8.1):
+/// canonical owner name ‖ type ‖ class ‖ original TTL ‖ RDLENGTH ‖ canonical RDATA.
+pub struct CanonicalRr {
+	pub name: String,
+	pub rr_type: u16,
+	pub class: u16,
+	pub orig_ttl: u32,
+	pub rdata: Vec<u8>,
+}
+
+impl CanonicalRr {
+	fn encode(&self) -> Vec<u8> {
+		let mut v = wire_name(&self.name.to_lowercase());
+		v.extend_from_slice(&self.rr_type.to_be_bytes());
+		v.extend_from_slice(&self.class.to_be_bytes());
+		v.extend_from_slice(&self.orig_ttl.to_be_bytes());
+		v.extend_from_slice(&(self.rdata.len() as u16).to_be_bytes());
+		v.extend_from_slice(&self.rdata);
+		v
+	}
+}
+
+/// The RRSIG RDATA fields (RFC 4034 §3.1), WITHOUT the trailing signature — this prefix is
+/// the first part of the signing input.
+pub struct RrsigFields {
+	pub type_covered: u16,
+	pub algorithm: u8,
+	pub labels: u8,
+	pub orig_ttl: u32,
+	pub sig_expiration: u32,
+	pub sig_inception: u32,
+	pub key_tag: u16,
+	pub signer_name: String,
+}
+
+impl RrsigFields {
+	fn encode_no_sig(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		v.extend_from_slice(&self.type_covered.to_be_bytes());
+		v.push(self.algorithm);
+		v.push(self.labels);
+		v.extend_from_slice(&self.orig_ttl.to_be_bytes());
+		v.extend_from_slice(&self.sig_expiration.to_be_bytes());
+		v.extend_from_slice(&self.sig_inception.to_be_bytes());
+		v.extend_from_slice(&self.key_tag.to_be_bytes());
+		v.extend_from_slice(&wire_name(&self.signer_name.to_lowercase()));
+		v
+	}
+}
+
+/// RFC 4034 §3.1.8.1 — the exact byte string a DNSSEC signature is computed over:
+/// RRSIG_RDATA(without signature) ‖ RR(1) ‖ RR(2) ‖ … (RRs in canonical order). This is
+/// the message the dispatched S-slice AIR proves the signature verifies against.
+pub fn rrsig_signing_input(rrsig: &RrsigFields, rrset: &[CanonicalRr]) -> Vec<u8> {
+	let mut out = rrsig.encode_no_sig();
+	for rr in rrset {
+		out.extend_from_slice(&rr.encode());
+	}
+	out
+}
+
+/// Aggregate a zone/epoch's per-record inner-proof roots into ONE epoch root via R's
+/// batched Merkle (Tier-A). A tampered/added/removed record changes some r_R ⇒ epoch root
+/// changes ⇒ reject. The shipped {r_R} + one master proof = the edge artifact.
+pub fn zone_epoch_root(record_roots: &[[u8; 32]]) -> [u8; 32] {
+	crate::recursion::merkle_root_sha3(record_roots)
+}
+
+/// A parent DS record's binding fields (RFC 4034 §5.1): key tag, algorithm, digest type,
+/// and digest — the delegation commitment to a child zone's DNSKEY (KSK).
+pub struct DsRecord {
+	pub key_tag: u16,
+	pub algorithm: u8,
+	pub digest_type: u8,
+	pub digest: Vec<u8>,
+}
+
+/// RFC 4034 §5.1.4 — the DS digest H(canonical owner name ‖ DNSKEY RDATA); digest_type 2 =
+/// SHA-256 (the DNSSEC default). Reuses the SHA-256 message-hash gadget (`sha256_ref`).
+pub fn ds_digest_sha256(owner_name: &str, dnskey_rdata: &[u8]) -> [u8; 32] {
+	let mut input = wire_name(&owner_name.to_lowercase());
+	input.extend_from_slice(dnskey_rdata);
+	crate::sha512_gadget::sha256_ref(&input)
+}
+
+/// RFC 4034 §5.2 — verify a DS record binds a child DNSKEY: the DS key tag == the DNSKEY's,
+/// the algorithm matches, digest_type is SHA-256, and DS.digest == H(owner ‖ DNSKEY RDATA).
+/// THIS is the DS→DNSKEY delegation link of the chain of trust; in-circuit it is the key-tag
+/// gadget + the SHA-256 gadget + a digest byte-equality, aggregated into the epoch R* like any
+/// other record. The parent's DS is itself covered by the parent's RRSIG (a separate S-slice),
+/// so the whole chain up to the trust anchor is bound.
+pub fn ds_binds_dnskey(ds: &DsRecord, owner_name: &str, dnskey_rdata: &[u8]) -> bool {
+	dnskey_rdata.len() >= 4
+		&& ds.key_tag == dnskey_key_tag(dnskey_rdata)
+		&& ds.algorithm == dnskey_rdata[3]
+		&& ds.digest_type == 2
+		&& ds.digest == ds_digest_sha256(owner_name, dnskey_rdata)
+}
+
+/// RFC 5155 §5 — the NSEC3 owner-name hash: iterated salted SHA-1 of the canonical name.
+/// IH(salt,x,0) = SHA-1(x ‖ salt); IH(salt,x,k) = SHA-1(IH(salt,x,k−1) ‖ salt). Reuses the
+/// SHA-1 gadget. (SHA-1 appears ONLY here — mandated by NSEC3 — never on a signature path.)
+pub fn nsec3_hash(name: &str, salt: &[u8], iterations: usize) -> [u8; 20] {
+	let mut input = wire_name(&name.to_lowercase());
+	input.extend_from_slice(salt);
+	let mut x = crate::sha512_gadget::sha1_ref(&input);
+	for _ in 0..iterations {
+		let mut nx = x.to_vec();
+		nx.extend_from_slice(salt);
+		x = crate::sha512_gadget::sha1_ref(&nx);
+	}
+	x
+}
+
+/// Whether a hashed name `hq` falls STRICTLY in the gap (owner, next) of an NSEC3 record, with
+/// circular wrap for the last record in the sorted chain (owner > next).
+pub fn nsec3_covers(hq: &[u8; 20], owner: &[u8; 20], next: &[u8; 20]) -> bool {
+	if owner < next {
+		owner < hq && hq < next
+	} else {
+		hq > owner || hq < next // wrap-around
+	}
+}
+
+/// NSEC3 denial of existence: the query name's iterated hash falls in the gap of the given
+/// NSEC3 record ⇒ the name provably does NOT exist. In-circuit = the iterated SHA-1 gadget +
+/// two S0-carry range comparisons (with the wrap selector); the NSEC3 record is itself
+/// RRSIG-signed (a separate S-slice), aggregated into the epoch R*.
+pub fn nsec3_denies(query: &str, salt: &[u8], iterations: usize, owner: &[u8; 20], next: &[u8; 20]) -> bool {
+	nsec3_covers(&nsec3_hash(query, salt, iterations), owner, next)
+}
+
+/// The message an RRSIG signature covers for the SHA-256 algorithms (RSA 8/10, ECDSA-P256
+/// 13): SHA-256 of the canonical signing input. Because signing_input = RRSIG_RDATA(no sig) ‖
+/// canonical RRset, this digest is a FAITHFUL function of the record — any change to the
+/// RRset or the RRSIG fields changes it, so the signature (verified by the dispatched S-slice)
+/// binds the exact record. Reuses the SHA-256 gadget.
+pub fn rrsig_sha256_message(rrsig: &RrsigFields, rrset: &[CanonicalRr]) -> [u8; 32] {
+	crate::sha512_gadget::sha256_ref(&rrsig_signing_input(rrsig, rrset))
+}
+
+/// Which (S-slice, hash) an RRSIG algorithm dispatches to for signature verification over the
+/// signing input — the per-record verify route.
+pub fn rrsig_verify_route(algorithm: u8) -> (SSlice, &'static str) {
+	match algorithm {
+		8 | 10 => (SSlice::S3Rsa, "SHA-256"),                              // RSA/SHA-256
+		13 => (SSlice::S2Ec, "SHA-256"),                                  // ECDSA-P256
+		14 => (SSlice::S2Ec, "SHA-384"),                                  // ECDSA-P384
+		15 => (SSlice::S2Ec, "Ed25519(message=signing_input)"),          // EdDSA
+		17 => (SSlice::S1MlDsa, "SHAKE-256"),                             // ML-DSA
+		_ => (SSlice::S2Ec, "unsupported"),
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────
+//  IN-CIRCUIT ASSEMBLY (wired last — see DRAFT STATUS)
+// ──────────────────────────────────────────────────────────────────────────────────
+//
+// per-record table: dispatch(alg) selects the S-slice AIR (S1 ML-DSA / S2 EC / S3 RSA);
+//   its public boundary is (DNSKEY pubkey, signing_input, signature); it proves the sig
+//   verifies; it exposes r_R. The signing_input is itself constrained: RRSIG_RDATA and the
+//   canonical RRset are bit-decomposed public columns, and the S-slice's hash gadget
+//   (SHA-256 for alg 8/13, SHA-512 for Ed25519, SHAKE for ML-DSA) consumes them — so a
+//   tampered record cannot match.
+// epoch master: R Tier-A batched Merkle over {r_R} → R* Boundary; strands = subtrees.
+// chain-of-trust: DS→DNSKEY (a hash-equality S-slice) and KSK/ZSK RRSIG proofs are records
+//   too, aggregated into the same R*; the trust anchor DS is the external boundary.
+// NSEC3: the hashed-owner denial is an S-slice (SHA-1/SHA-256 hash + range proof over the
+//   NSEC3 chain), aggregated identically.
+//
+// TAMPERED-ZONE-REJECTS (D headline gate): a genuine zone (mixed RSA/ECDSA/Ed25519/ML-DSA
+// records) aggregates to R*; any of {edit an RRset, swap a signature, drop a record, forge
+// a DNSKEY} ⇒ the offending S-slice has no witness OR the multiset/R* changes ⇒ reject.
+
+#[cfg(test)]
+mod tests {
+	use sha2::{Digest, Sha256};
+
+	use super::*;
+
+	/// GATE ref-D-1 — algorithm → S-slice dispatch is total and correct (RSA→S3, EC/Ed→S2,
+	/// ML-DSA→S1), and IANA numbers are right.
+	#[test]
+	fn algorithm_dispatch() {
+		assert_eq!(DnssecAlgorithm::RsaSha256.s_slice(), SSlice::S3Rsa);
+		assert_eq!(DnssecAlgorithm::EcdsaP256Sha256.s_slice(), SSlice::S2Ec);
+		assert_eq!(DnssecAlgorithm::EcdsaP384Sha384.s_slice(), SSlice::S2Ec);
+		assert_eq!(DnssecAlgorithm::Ed25519.s_slice(), SSlice::S2Ec);
+		assert_eq!(DnssecAlgorithm::MlDsa.s_slice(), SSlice::S1MlDsa);
+		assert_eq!(DnssecAlgorithm::RsaSha256.iana(), 8);
+		assert_eq!(DnssecAlgorithm::EcdsaP256Sha256.iana(), 13);
+		assert_eq!(DnssecAlgorithm::Ed25519.iana(), 15);
+		println!("GATE ref-D-1: DNSSEC alg → S-slice dispatch total (8→S3, 13/14/15→S2, ML-DSA→S1)");
+	}
+
+	/// GATE ref-D-2 — DNSKEY key tag matches the RFC 4034 App B algorithm (cross-checked
+	/// against Python for a sample KSK RDATA).
+	#[test]
+	fn key_tag_matches_reference() {
+		// flags=257 (KSK), proto=3, alg=13, then a 64-byte P-256 key = bytes 0..64
+		let mut rdata = vec![0x01, 0x01, 0x03, 0x0d];
+		rdata.extend(0u8..64u8);
+		assert_eq!(dnskey_key_tag(&rdata), 59409, "key tag != RFC 4034 App B reference");
+		println!("GATE ref-D-2: DNSKEY key tag (RFC 4034 App B) == 59409 for the sample KSK");
+	}
+
+	/// GATE ref-D-3 — the RRSIG signing input is the canonical RFC 4034 §3.1.8.1 byte
+	/// string (length + SHA-256 cross-checked against Python).
+	#[test]
+	fn signing_input_canonical() {
+		let key_tag = {
+			let mut rdata = vec![0x01, 0x01, 0x03, 0x0d];
+			rdata.extend(0u8..64u8);
+			dnskey_key_tag(&rdata)
+		};
+		let rrsig = RrsigFields {
+			type_covered: 1, // A
+			algorithm: 13,
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_700_000_000,
+			sig_inception: 1_690_000_000,
+			key_tag,
+			signer_name: "example.com".into(),
+		};
+		let rr = CanonicalRr {
+			name: "www.example.com".into(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: vec![1, 2, 3, 4],
+		};
+		let si = rrsig_signing_input(&rrsig, &[rr]);
+		assert_eq!(si.len(), 62, "signing input length != canonical");
+		let digest = Sha256::digest(&si);
+		let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+		assert_eq!(hex, "e2b7f6a62e989ee5", "signing input SHA-256 != Python reference");
+		println!("GATE ref-D-3: RRSIG signing input canonical (62 B, SHA-256 e2b7f6a6…) == Python");
+	}
+
+	/// GATE ref-D-4 — zone/epoch aggregation: a mixed zone of N record roots reduces to one
+	/// epoch root; tampering ANY record (edit/swap/drop) changes it. Reuses R Tier-A.
+	#[test]
+	fn zone_aggregation_and_tamper() {
+		let leaf = |b: u8| -> [u8; 32] {
+			let mut h = Sha256::new();
+			h.update([b]);
+			h.finalize().into()
+		};
+		// 3-record mixed zone (e.g. RSA + Ed25519 + ML-DSA)
+		let roots: Vec<[u8; 32]> = (0..3).map(leaf).collect();
+		let epoch = zone_epoch_root(&roots);
+		assert_eq!(epoch.len(), 32);
+		// edit a record
+		let mut bad = roots.clone();
+		bad[1] = leaf(0xEE);
+		assert_ne!(zone_epoch_root(&bad), epoch, "edited record did not change epoch root");
+		// drop a record
+		assert_ne!(zone_epoch_root(&roots[..2]), epoch, "dropped record did not change epoch root");
+		println!("GATE ref-D-4: zone → epoch root via R Tier-A; edit/drop record ⇒ different epoch");
+	}
+
+	/// GATE ref-D-5 (chain-of-trust DS→DNSKEY) — a DS record binds its child DNSKEY (key tag
+	/// + algorithm + SHA-256(owner‖DNSKEY) digest); a tampered key tag, a changed DNSKEY (which
+	/// breaks BOTH the key tag and the digest), and a wrong owner name all reject. This is the
+	/// delegation link that ties the chain of trust up to the trust anchor.
+	#[test]
+	fn ds_dnskey_chain_of_trust() {
+		// DNSKEY RDATA: flags=257 (KSK), protocol=3, algorithm=13 (ECDSA-P256), 64-byte key.
+		let mut dnskey = vec![0x01u8, 0x01, 0x03, 0x0d];
+		dnskey.extend(0u8..64u8);
+		let owner = "example.com";
+		let ds = DsRecord {
+			key_tag: dnskey_key_tag(&dnskey),
+			algorithm: 13,
+			digest_type: 2,
+			digest: ds_digest_sha256(owner, &dnskey).to_vec(),
+		};
+		assert!(ds_binds_dnskey(&ds, owner, &dnskey), "honest DS must bind its DNSKEY");
+		let hex: String = ds.digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+		assert_eq!(hex, "186ea634d4cf62f2", "DS digest != Python reference");
+
+		let bad_tag = DsRecord {
+			key_tag: ds.key_tag ^ 1,
+			algorithm: 13,
+			digest_type: 2,
+			digest: ds.digest.clone(),
+		};
+		assert!(!ds_binds_dnskey(&bad_tag, owner, &dnskey), "bad key tag must reject");
+
+		let mut dnskey2 = dnskey.clone();
+		dnskey2[10] ^= 1; // flip a key byte ⇒ key tag AND digest change
+		assert!(!ds_binds_dnskey(&ds, owner, &dnskey2), "changed DNSKEY must reject");
+		assert!(!ds_binds_dnskey(&ds, "evil.com", &dnskey), "wrong owner must reject");
+		println!("GATE ref-D-5: DS→DNSKEY (key_tag + SHA-256(owner‖DNSKEY)) binds; tampered key/owner/tag reject");
+	}
+
+	/// GATE ref-D-6 (NSEC3 denial of existence) — a non-existent name (whose iterated SHA-1
+	/// hash falls in a gap between two sorted NSEC3 hashes) is provably denied, an EXISTING
+	/// name (hash == an owner) is NOT covered, and the circular wrap-around case is handled.
+	#[test]
+	fn nsec3_denial_of_existence() {
+		let salt = [0xAAu8, 0xBB];
+		let iters = 5;
+		let ha = nsec3_hash("a.example.com", &salt, iters);
+		let hb = nsec3_hash("z.example.com", &salt, iters);
+		let (owner, next) = if ha < hb { (ha, hb) } else { (hb, ha) };
+		// a non-existent name hashing into the (owner,next) gap is deniable
+		let hq = nsec3_hash("nonexistent.example.com", &salt, iters);
+		assert!(
+			nsec3_covers(&hq, &owner, &next) || nsec3_covers(&hq, &next, &owner),
+			"a name hashing into a gap must be deniable"
+		);
+		// an existing name (hash == owner) is NOT strictly covered ⇒ not falsely denied
+		assert!(!nsec3_covers(&owner, &owner, &next), "an existing name must not be covered");
+
+		// explicit range + wrap cases
+		assert!(nsec3_covers(&[0x80; 20], &[0x00; 20], &[0xFF; 20]), "normal gap");
+		let (owner_w, next_w) = ([0xF0u8; 20], [0x10u8; 20]); // wrap (owner > next)
+		assert!(nsec3_covers(&[0xFE; 20], &owner_w, &next_w), "wrap-around: hq>owner covered");
+		assert!(nsec3_covers(&[0x05; 20], &owner_w, &next_w), "wrap-around: hq<next covered");
+		assert!(!nsec3_covers(&[0x50; 20], &owner_w, &next_w), "wrap: middle (existing) not covered");
+		println!("GATE ref-D-6: NSEC3 (iterated salted SHA-1 + gap coverage w/ wrap) denies non-existent, not existing");
+	}
+
+	/// GATE ref-D-7 (RRSIG signature-to-record binding) — the signed message is SHA-256 of the
+	/// canonical signing input, so it BINDS the record: any change to the RRset RDATA or an
+	/// RRSIG field yields a different signed message (⇒ the dispatched S-slice's signature
+	/// check fails on a tampered record). Also checks the algorithm → S-slice verify routes.
+	#[test]
+	fn rrsig_record_binding() {
+		let mk_rr = |rdata: Vec<u8>| CanonicalRr {
+			name: "www.example.com".into(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata,
+		};
+		let mk_rrsig = |ttl: u32| RrsigFields {
+			type_covered: 1,
+			algorithm: 13,
+			labels: 3,
+			orig_ttl: ttl,
+			sig_expiration: 1_700_000_000,
+			sig_inception: 1_690_000_000,
+			key_tag: 12345,
+			signer_name: "example.com".into(),
+		};
+		let base = rrsig_sha256_message(&mk_rrsig(3600), &[mk_rr(vec![1, 2, 3, 4])]);
+		// tamper the RRset RDATA ⇒ different signed message (record binding)
+		assert_ne!(
+			rrsig_sha256_message(&mk_rrsig(3600), &[mk_rr(vec![1, 2, 3, 5])]),
+			base,
+			"changed record RDATA must change the signed message"
+		);
+		// tamper an RRSIG field (original TTL) ⇒ different signed message
+		assert_ne!(
+			rrsig_sha256_message(&mk_rrsig(7200), &[mk_rr(vec![1, 2, 3, 4])]),
+			base,
+			"changed RRSIG field must change the signed message"
+		);
+		// dispatch routes to the right S-slice per algorithm
+		assert_eq!(rrsig_verify_route(8).0, SSlice::S3Rsa);
+		assert_eq!(rrsig_verify_route(13).0, SSlice::S2Ec);
+		assert_eq!(rrsig_verify_route(15).0, SSlice::S2Ec);
+		assert_eq!(rrsig_verify_route(17).0, SSlice::S1MlDsa);
+		println!("GATE ref-D-7: RRSIG signed message = SHA-256(signing_input) binds record (tamper RRset/RRSIG ⇒ different); routes to S1/S2/S3");
+	}
+
+	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
+	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
+	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
+	#[test]
+	#[ignore = "D end-to-end not wired — needs S1/S2/S3 S-slice AIRs + R Tier-A master"]
+	fn dns_zone_proves_over_b256() {
+		unimplemented!(
+			"per-record S-slice verify over canonical signing_input + R Tier-A batched Merkle \
+			 → epoch R* boundary; tampered-zone rejects (mixed RSA/ECDSA/Ed25519/ML-DSA)"
+		);
+	}
+}

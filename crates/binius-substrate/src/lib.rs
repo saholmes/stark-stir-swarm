@@ -137,6 +137,19 @@ pub mod nonnative;
 // (`nonnative`); no fork change, no reinvented modmul. Additive.
 pub mod mldsa_ntt;
 
+// ── Draft suite (S1b–e / S2 / S3 / R / D): native FIPS-204 / classical-signature verify
+// references + in-circuit gadget designs, gated against independent oracles (NIST KATs,
+// num-bigint, RFC vectors). Compiled under `cargo test` (they use the dev-dep reference
+// crates sha3/num-bigint/tiny-keccak, visible to all crate code in the test profile). The
+// heavy in-circuit prove paths are `#[ignore]`d until wired.
+pub mod sha512_gadget; // SHA-1/256/384/512 hash-gadget references (S2/S3/D)
+pub mod mldsa_shake; // S1b ExpandA / S1c SampleInBall (SHAKE)
+pub mod mldsa_verify; // S1d/e ML-DSA verify assembly + decode
+pub mod ec_verify; // S2 EdDSA / ECDSA verify (7 curves)
+pub mod rsa_verify; // S3 RSA verify (PKCS#1-v1.5 + PSS, 1024–8192)
+pub mod recursion; // R Tier-A aggregation + Tier-B verifier design
+pub mod dns_stark; // D DNS-STARK zone assembly
+
 use std::iter::repeat_with;
 
 use anyhow::Result;

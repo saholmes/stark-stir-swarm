@@ -149,7 +149,7 @@ fn forward_groups(n: usize) -> Vec<(usize, usize, u64)> {
 // ─────────────────────── independent num-bigint references ───────────────────────
 
 #[cfg(test)]
-mod reference {
+pub mod reference {
 	use super::*;
 	use num_bigint::BigUint;
 
