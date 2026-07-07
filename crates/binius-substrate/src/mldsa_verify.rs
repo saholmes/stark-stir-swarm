@@ -1546,6 +1546,393 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-4b (Phase-3, S1d) — the FIPS-204 UseHint digit gadget over B256. Given a hint
+	/// bit h, the HighBits r1, and the sign sp = [r0 > 0], UseHint returns w1 = r1 (h=0), or
+	/// (r1±1) mod m by sign(r0) (h=1). The whole case table collapses to ONE non-negative modular
+	/// identity: `w1 + m + h = r1 + 2·hs + Q'·m`, where hs = h·sp and Q' ∈ {0,1,2} is the modular
+	/// wrap quotient, with the range w1 ∈ [0, m). Honest UseHint values PROVE+VERIFY over B256 at
+	/// NIST L1 across every (h, sp) case incl. the wraps r1=m−1→0 and r1=0→m−1; a tampered w1 is
+	/// REJECTED (the identity no longer closes for any valid Q').
+	#[test]
+	fn use_hint_gadget_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const M: u32 = 44; // (q−1)/α at L1
+		const W: usize = 8;
+		const WLOG: usize = 3;
+
+		fn bits8(x: u32) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arr8 = |x: u32| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+
+		// (r1, h, sp): every (h,sp) case + wraps (r1=43 up, r1=0 down).
+		let cases: [(u32, u32, u32); 8] = [
+			(5, 0, 0), (5, 1, 1), (5, 1, 0), (43, 1, 1), (0, 1, 0), (0, 0, 1), (43, 0, 0), (20, 1, 1),
+		];
+		let n = cases.len();
+		// native UseHint → (w1, hs, Q').
+		let rows: Vec<(u32, u32, u32, u32)> = cases
+			.iter()
+			.map(|&(r1, h, sp)| {
+				let hs = h * sp;
+				let w1 = if h == 0 {
+					r1
+				} else if sp == 1 {
+					(r1 + 1) % M
+				} else {
+					(r1 + M - 1) % M
+				};
+				let qp = (w1 as i64 + M as i64 + h as i64 - r1 as i64 - 2 * hs as i64) / M as i64;
+				assert!((0..=2).contains(&qp), "Q' out of range: {qp}");
+				(w1, hs, qp as u32, r1)
+			})
+			.collect();
+
+		let m_arr = arr8(M);
+		let m2_arr = arr8(2 * M);
+		let mask_hi = {
+			// bits 1..7 set (bit 0 clear) → forces a committed value into {0,1}.
+			let b: Vec<bool> = (0..W).map(|k| k != 0).collect();
+			(b.clone(), std::array::from_fn::<B1, W, _>(|k| if b[k] { B1::ONE } else { B1::ZERO }))
+		};
+		let c_w1_bits = two_pow_w_minus(&bits8(M)); // 2^8 − 44  (w1 < 44)
+		let c_w1_arr: [B1; W] =
+			std::array::from_fn(|k| if c_w1_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_q_bits = two_pow_w_minus(&bits8(3)); // 2^8 − 3   (Q' < 3)
+		let c_q_arr: [B1; W] =
+			std::array::from_fn(|k| if c_q_bits[k] { B1::ONE } else { B1::ZERO });
+
+		let run = |w1_override: Option<(usize, u32)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA UseHint digit gadget over B256");
+			let r1 = t.add_committed::<B1, W>("r1");
+			let h = t.add_committed::<B1, W>("h");
+			let sp = t.add_committed::<B1, W>("sp");
+			let hs = t.add_committed::<B1, W>("hs");
+			let w1 = t.add_committed::<B1, W>("w1");
+			let qp = t.add_committed::<B1, W>("qp"); // Q'
+			let mask = t.add_constant("mask_hi", mask_hi.1);
+			// h, sp ∈ {0,1}.
+			t.assert_zero("h_bit", h * mask);
+			t.assert_zero("sp_bit", sp * mask);
+			// hs = h·sp.
+			t.assert_zero("hs_def", hs - h * sp);
+			// 2·hs.
+			let hs2 = t.add_shifted("hs2", hs, WLOG, 1, ShiftVariant::LogicalLeft);
+			// Q'·m = qp[0]·m + qp[1]·2m (Q' ∈ {0,1,2}).
+			let qp0 = t.add_selected("qp0", qp, 0);
+			let qp1 = t.add_selected("qp1", qp, 1);
+			let bc0 = t.add_committed::<B1, W>("bc0");
+			let bc0_rot = t.add_shifted("bc0_rot", bc0, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("bc0_eq", bc0 - bc0_rot);
+			let bc0_l0 = t.add_selected("bc0_l0", bc0, 0);
+			t.assert_zero("bc0_bind", bc0_l0 - qp0);
+			let m_c = t.add_constant("m_c", m_arr);
+			let pp0 = t.add_computed("pp0", bc0 * m_c);
+			let bc1 = t.add_committed::<B1, W>("bc1");
+			let bc1_rot = t.add_shifted("bc1_rot", bc1, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("bc1_eq", bc1 - bc1_rot);
+			let bc1_l0 = t.add_selected("bc1_l0", bc1, 0);
+			t.assert_zero("bc1_bind", bc1_l0 - qp1);
+			let m2_c = t.add_constant("m2_c", m2_arr);
+			let pp1 = t.add_computed("pp1", bc1 * m2_c);
+			let qm = Adder::<W>::build(&mut t, pp0, pp1, "qm");
+
+			// LHS = w1 + m + h.
+			let m_c2 = t.add_constant("m_c2", m_arr);
+			let l1 = Adder::<W>::build(&mut t, w1, m_c2, "l1");
+			let lhs = Adder::<W>::build(&mut t, l1.sum, h, "lhs");
+			// RHS = r1 + 2hs + Q'm.
+			let r1a = Adder::<W>::build(&mut t, r1, hs2, "r1a");
+			let rhs = Adder::<W>::build(&mut t, r1a.sum, qm.sum, "rhs");
+			t.assert_zero("identity", lhs.sum - rhs.sum);
+
+			// ranges: w1 < 44, Q' < 3.
+			let cw = t.add_constant("c_w1", c_w1_arr);
+			let w_cout = t.add_committed::<B1, W>("w_cout");
+			let w_cin = t.add_shifted("w_cin", w_cout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("w_carry", (w1 + w_cin) * (cw + w_cin) + w_cin - w_cout);
+			let w_fc = t.add_selected("w_fc", w_cout, W - 1);
+			t.assert_zero("w1_lt_m", w_fc * B1::ONE);
+			let cq = t.add_constant("c_q", c_q_arr);
+			let q_cout = t.add_committed::<B1, W>("q_cout");
+			let q_cin = t.add_shifted("q_cin", q_cout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("q_carry", (qp + q_cin) * (cq + q_cin) + q_cin - q_cout);
+			let q_fc = t.add_selected("q_fc", q_cout, W - 1);
+			t.assert_zero("qp_lt_3", q_fc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (r1v, hv, spv) = cases[row];
+					let (mut w1v, hsv, qpv, _) = rows[row];
+					if let Some((rr, v)) = w1_override {
+						if rr == row {
+							w1v = v;
+						}
+					}
+					write_col::<W>(&mut seg, r1, row, &bits8(r1v)).unwrap();
+					write_col::<W>(&mut seg, h, row, &bits8(hv)).unwrap();
+					write_col::<W>(&mut seg, sp, row, &bits8(spv)).unwrap();
+					write_col::<W>(&mut seg, hs, row, &bits8(hsv)).unwrap();
+					write_col::<W>(&mut seg, w1, row, &bits8(w1v)).unwrap();
+					write_col::<W>(&mut seg, qp, row, &bits8(qpv)).unwrap();
+					write_col::<W>(&mut seg, mask, row, &mask_hi.0).unwrap();
+					let hs2v = shl(&bits8(hsv), 1);
+					write_col::<W>(&mut seg, hs2, row, &hs2v).unwrap();
+					// Q'·m columns
+					let q0 = (qpv) & 1 == 1;
+					let q1 = (qpv >> 1) & 1 == 1;
+					write_bit(&mut seg, qp0, row, q0).unwrap();
+					write_bit(&mut seg, qp1, row, q1).unwrap();
+					write_col::<W>(&mut seg, bc0, row, &vec![q0; W]).unwrap();
+					write_col::<W>(&mut seg, bc0_rot, row, &vec![q0; W]).unwrap();
+					write_bit(&mut seg, bc0_l0, row, q0).unwrap();
+					write_col::<W>(&mut seg, m_c, row, &bits8(M)).unwrap();
+					let pp0v = if q0 { bits8(M) } else { vec![false; W] };
+					write_col::<W>(&mut seg, pp0, row, &pp0v).unwrap();
+					write_col::<W>(&mut seg, bc1, row, &vec![q1; W]).unwrap();
+					write_col::<W>(&mut seg, bc1_rot, row, &vec![q1; W]).unwrap();
+					write_bit(&mut seg, bc1_l0, row, q1).unwrap();
+					write_col::<W>(&mut seg, m2_c, row, &bits8(2 * M)).unwrap();
+					let pp1v = if q1 { bits8(2 * M) } else { vec![false; W] };
+					write_col::<W>(&mut seg, pp1, row, &pp1v).unwrap();
+					let qmv = qm.populate(&mut seg, row, &pp0v, &pp1v).unwrap();
+					// LHS
+					write_col::<W>(&mut seg, m_c2, row, &bits8(M)).unwrap();
+					let l1v = l1.populate(&mut seg, row, &bits8(w1v), &bits8(M)).unwrap();
+					let _ = lhs.populate(&mut seg, row, &l1v, &bits8(hv)).unwrap();
+					// RHS
+					let r1av = r1a.populate(&mut seg, row, &bits8(r1v), &hs2v).unwrap();
+					let _ = rhs.populate(&mut seg, row, &r1av, &qmv).unwrap();
+					// ranges
+					write_col::<W>(&mut seg, cw, row, &c_w1_bits).unwrap();
+					let (_s, wco) = ripple_add(&bits8(w1v), &c_w1_bits);
+					write_col::<W>(&mut seg, w_cout, row, &wco).unwrap();
+					write_col::<W>(&mut seg, w_cin, row, &shl(&wco, 1)).unwrap();
+					write_bit(&mut seg, w_fc, row, wco[W - 1]).unwrap();
+					write_col::<W>(&mut seg, cq, row, &c_q_bits).unwrap();
+					let (_s2, qco) = ripple_add(&bits8(qpv), &c_q_bits);
+					write_col::<W>(&mut seg, q_cout, row, &qco).unwrap();
+					write_col::<W>(&mut seg, q_cin, row, &shl(&qco, 1)).unwrap();
+					write_bit(&mut seg, q_fc, row, qco[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest UseHint failed validate_witness: {verr}");
+		assert!(verify_ok, "honest UseHint must PROVE+VERIFY over B256");
+
+		// Tamper: on the (5,1,1)→6 row, claim w1=7 → no valid Q' closes the identity → REJECT.
+		let bad = run(Some((1, 7)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a wrong UseHint output was ACCEPTED");
+
+		println!(
+			"GATE prove-4b: ML-DSA UseHint digit gadget PROVEN+VERIFIED over B256 @L1(128); {n} cases incl. r1=43→0 / r1=0→43 wraps, identity w1+m+h=r1+2hs+Q'm + w1<44 + Q'<3; wrong w1 REJECTED"
+		);
+	}
+
+	/// GATE prove-4c (Phase-3, S1d) — the FIPS-204 w1Encode bit-pack gadget over B256. At L1 each
+	/// w1 coefficient is 6 bits (m=44 < 64); w1Encode packs them little-endian into the byte
+	/// stream that feeds c̃' = SHAKE-256(μ ‖ w1Encode(w1)). The pack of a 4-coeff group is the
+	/// shifted sum `packed = c0 + (c1<<6) + (c2<<12) + (c3<<18)` (add_shifted + Adder), with each
+	/// coefficient range-checked < 44 so it fits its 6-bit slot without corrupting its neighbour.
+	/// Honest packings PROVE+VERIFY over B256 at NIST L1; a tampered packed word is REJECTED.
+	#[test]
+	fn w1_encode_gadget_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const M: u32 = 44;
+		const W: usize = 32;
+		const WLOG: usize = 5;
+		const BL: usize = 6; // bits per w1 coefficient at L1
+
+		fn bitsw(x: u32) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arrw = |x: u32| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+
+		// 4-coefficient groups (each < 44) with their little-endian 6-bit packing.
+		let groups: [[u32; 4]; 4] =
+			[[0, 1, 2, 3], [43, 43, 43, 43], [5, 40, 17, 33], [0, 0, 0, 43]];
+		let n = groups.len();
+		let pack = |g: &[u32; 4]| -> u32 {
+			g[0] | (g[1] << BL) | (g[2] << (2 * BL)) | (g[3] << (3 * BL))
+		};
+
+		let c_bits = two_pow_w_minus(&bitsw(M)); // 2^32 − 44
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_bits[k] { B1::ONE } else { B1::ZERO });
+
+		let run = |packed_override: Option<(usize, u32)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA w1Encode bit-pack over B256");
+			let c: [_; 4] = std::array::from_fn(|j| t.add_committed::<B1, W>(format!("c{j}")));
+			let packed = t.add_committed::<B1, W>("packed");
+			// shifted coefficients c_j << (6j).
+			let sh1 = t.add_shifted("sh1", c[1], WLOG, BL, ShiftVariant::LogicalLeft);
+			let sh2 = t.add_shifted("sh2", c[2], WLOG, 2 * BL, ShiftVariant::LogicalLeft);
+			let sh3 = t.add_shifted("sh3", c[3], WLOG, 3 * BL, ShiftVariant::LogicalLeft);
+			let a1 = Adder::<W>::build(&mut t, c[0], sh1, "a1");
+			let a2 = Adder::<W>::build(&mut t, a1.sum, sh2, "a2");
+			let a3 = Adder::<W>::build(&mut t, a2.sum, sh3, "a3");
+			t.assert_zero("pack_def", packed - a3.sum);
+			// each coefficient < 44 (fits its 6-bit slot).
+			let mut ranges = Vec::new();
+			for j in 0..4 {
+				let cc = t.add_constant(format!("cc{j}"), c_arr);
+				let cout = t.add_committed::<B1, W>(format!("cout{j}"));
+				let cin = t.add_shifted(format!("cin{j}"), cout, WLOG, 1, ShiftVariant::LogicalLeft);
+				t.assert_zero(format!("carry{j}"), (c[j] + cin) * (cc + cin) + cin - cout);
+				let fc = t.add_selected(format!("fc{j}"), cout, W - 1);
+				t.assert_zero(format!("c{j}_lt_m"), fc * B1::ONE);
+				ranges.push((cc, cout, cin, fc));
+			}
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let g = groups[row];
+					let mut pk = pack(&g);
+					if let Some((rr, v)) = packed_override {
+						if rr == row {
+							pk = v;
+						}
+					}
+					for j in 0..4 {
+						write_col::<W>(&mut seg, c[j], row, &bitsw(g[j])).unwrap();
+					}
+					write_col::<W>(&mut seg, packed, row, &bitsw(pk)).unwrap();
+					let s1 = shl(&bitsw(g[1]), BL);
+					let s2 = shl(&bitsw(g[2]), 2 * BL);
+					let s3 = shl(&bitsw(g[3]), 3 * BL);
+					write_col::<W>(&mut seg, sh1, row, &s1).unwrap();
+					write_col::<W>(&mut seg, sh2, row, &s2).unwrap();
+					write_col::<W>(&mut seg, sh3, row, &s3).unwrap();
+					let v1 = a1.populate(&mut seg, row, &bitsw(g[0]), &s1).unwrap();
+					let v2 = a2.populate(&mut seg, row, &v1, &s2).unwrap();
+					let _ = a3.populate(&mut seg, row, &v2, &s3).unwrap();
+					for (j, &(cc, cout, cin, fc)) in ranges.iter().enumerate() {
+						write_col::<W>(&mut seg, cc, row, &c_bits).unwrap();
+						let (_s, co) = ripple_add(&bitsw(g[j]), &c_bits);
+						write_col::<W>(&mut seg, cout, row, &co).unwrap();
+						write_col::<W>(&mut seg, cin, row, &shl(&co, 1)).unwrap();
+						write_bit(&mut seg, fc, row, co[W - 1]).unwrap();
+					}
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest w1Encode failed validate_witness: {verr}");
+		assert!(verify_ok, "honest w1Encode must PROVE+VERIFY over B256");
+
+		// Tamper: flip a bit of the packed word → packed ≠ shifted-sum → REJECT.
+		let bad = run(Some((0, pack(&groups[0]) ^ 1)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a wrong w1Encode packing was ACCEPTED");
+
+		println!(
+			"GATE prove-4c: ML-DSA w1Encode bit-pack PROVEN+VERIFIED over B256 @L1(128); {n} 4-coeff groups (6-bit LE pack) + each coeff<44; tampered packing REJECTED"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
