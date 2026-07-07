@@ -1511,12 +1511,149 @@ mod tests {
 		);
 	}
 
-	/// GATE prove-3 (PENDING, S1c) — SampleInBall proves over B256; the in-circuit c
-	/// equals sample_in_ball(c̃,τ) with weight τ; a smuggled j>i draw or a mis-placed
-	/// sign is REJECTED (Fisher–Yates carry + permutation-argument soundness gate).
+	/// GATE prove-3a (Phase-3, S1c) — the SampleInBall `j ≤ i` ACCEPT-DECISION gadget over B256.
+	/// Fisher–Yates draws a byte j at step i (i ∈ [256−τ, 255]) and accepts iff j ≤ i. The bound
+	/// `2^8 − (i+1) = 255 − i = NOT(i)` (8-bit), so reject = (j > i) = carry-out of `j + NOT(i)`
+	/// (W=8) — the S0 carry trick with the per-step bound DERIVED as the bit-complement of the
+	/// committed i (bound == NOT i, enforced). `reject` is a COMMITTED bit BOUND to that carry;
+	/// accept = NOT reject. Honest decisions PROVE+VERIFY over B256 at NIST L1; a tampered accept
+	/// (smuggle a j>i draw as in-range, or drop a valid j≤i) is REJECTED, isolated to reject_bind.
 	#[test]
-	#[ignore = "S1c Fisher–Yates gadget not wired yet — enable after S1a full_256 frees the target"]
-	fn sample_in_ball_proves_and_tamper_rejected() {
-		unimplemented!("Fisher–Yates over S0's j≤i carry + permutation_argument memory trace — next wiring step");
+	fn sample_in_ball_accept_decision_proves_and_tamper_rejected() {
+		use crate::nonnative::{ripple_add, shl, write_bit, write_col};
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+
+		const W: usize = 8;
+		const LOGW: usize = 3;
+		fn bits8(x: u8) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// 16 Fisher–Yates (i, j) draws (i ∈ [256−τ, 255] with τ=39 → i ∈ [217,255]); mix of
+		// j≤i (accept) and j>i (reject), incl. boundaries j=i (accept) and j=i+1 (reject).
+		let pairs: [(u8, u8); 16] = [
+			(255, 0), (255, 255), (217, 217), (217, 218), (250, 200), (230, 240), (255, 128),
+			(240, 255), (219, 219), (219, 220), (255, 254), (217, 0), (218, 219), (245, 245),
+			(245, 246), (255, 1),
+		];
+		let n = pairs.len();
+		let native_reject: Vec<bool> = pairs.iter().map(|&(i, j)| j > i).collect();
+
+		let ones_arr: [B1; W] = std::array::from_fn(|_| B1::ONE);
+		let ones_bits = vec![true; W];
+
+		let run = |reject_override: Option<(usize, bool)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut table = cs.add_table("SampleInBall j<=i accept-decision over B256");
+			let icol = table.add_committed::<B1, W>("i");
+			let jcol = table.add_committed::<B1, W>("j");
+			let bound = table.add_committed::<B1, W>("bound"); // = NOT(i) = 255 − i
+			let ones = table.add_constant("ones", ones_arr);
+			// bound == NOT(i): bound + i + 1 == 0 per bit.
+			table.assert_zero("bound_is_not_i", bound + icol + ones);
+			let cout = table.add_committed::<B1, W>("cout");
+			let cin = table.add_shifted("cin", cout, LOGW, 1, ShiftVariant::LogicalLeft);
+			// carry of j + bound: cout = maj(j, bound, cin).
+			table.assert_zero("le_carry", (jcol + cin) * (bound + cin) + cin - cout);
+			let final_carry = table.add_selected("final_carry", cout, W - 1);
+			let reject = table.add_committed::<B1, 1>("reject");
+			// reject == final_carry (= carry-out of j + NOT(i)) == (j > i). accept = NOT reject.
+			table.assert_zero("reject_bind", reject - final_carry);
+			let table_id = table.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(table_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for (row, &(iv, jv)) in pairs.iter().enumerate() {
+					let i_b = bits8(iv);
+					let j_b = bits8(jv);
+					let not_i: Vec<bool> = i_b.iter().map(|&b| !b).collect();
+					write_col::<W>(&mut seg, icol, row, &i_b).unwrap();
+					write_col::<W>(&mut seg, jcol, row, &j_b).unwrap();
+					write_col::<W>(&mut seg, bound, row, &not_i).unwrap();
+					write_col::<W>(&mut seg, ones, row, &ones_bits).unwrap();
+					let (_s, co) = ripple_add(&j_b, &not_i);
+					write_col::<W>(&mut seg, cout, row, &co).unwrap();
+					write_col::<W>(&mut seg, cin, row, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, final_carry, row, co[W - 1]).unwrap();
+					let rej = match reject_override {
+						Some((r, v)) if r == row => v,
+						_ => jv > iv,
+					};
+					write_bit(&mut seg, reject, row, rej).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest: validate + full B256 prove/verify ACCEPT.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest j<=i decision failed validate_witness: {verr}");
+		assert!(verify_ok, "honest j<=i decision must PROVE+VERIFY over B256");
+
+		// (b) LOAD-BEARING: on a valid draw (j≤i, reject=0) force reject=1 (drop a valid draw) —
+		// must reject at reject_bind.
+		let ok_row = native_reject.iter().position(|&r| !r).unwrap();
+		let (vok2, verr2, _) = run(Some((ok_row, true)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: forged reject on a valid j<=i draw was ACCEPTED");
+		assert!(verr2.contains("reject_bind"), "tampered reject (j<=i) not isolated to reject_bind (got: {verr2})");
+
+		// (c) LOAD-BEARING: on an out-of-range draw (j>i, reject=1) force reject=0 (smuggle j>i as
+		// in-range) — must reject at reject_bind.
+		let bad_row = native_reject.iter().position(|&r| r).unwrap();
+		let (vok3, verr3, _) = run(Some((bad_row, false)), false);
+		assert!(!vok3, "SOUNDNESS FAILURE: smuggled j>i draw was ACCEPTED");
+		assert!(verr3.contains("reject_bind"), "tampered accept (j>i) not isolated to reject_bind (got: {verr3})");
+
+		let n_ok = native_reject.iter().filter(|&&r| !r).count();
+		println!(
+			"GATE prove-3a: SampleInBall j<=i accept-decision PROVEN+VERIFIED over B256 @L1(128); {n} draws, {n_ok} valid (j<=i); tampered decision BOTH directions REJECTED, isolated to reject_bind"
+		);
+	}
+
+	/// GATE prove-3b (PENDING, S1c) — the SampleInBall array-swap offline MEMORY-CHECK: the 256-slot
+	/// c array's read/write history (read c[j]; write c[i]=c[j]; write c[j]=±1) is bound by a
+	/// grand-product/channel permutation so the final c equals sample_in_ball(c̃,τ) with weight τ
+	/// and coeffs ∈ {−1,0,1}; a tampered swap / out-of-history read / mis-placed sign is REJECTED.
+	#[test]
+	#[ignore = "S1c array-swap memory-check not wired yet — next increment (reuses the counter/selector channel machinery)"]
+	fn sample_in_ball_swap_memcheck_proves_and_tamper_rejected() {
+		unimplemented!("offline memory-checking for the Fisher–Yates swap over the placement/counter channel — next wiring step");
 	}
 }
