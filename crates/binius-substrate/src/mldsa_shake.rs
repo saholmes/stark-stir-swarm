@@ -1348,6 +1348,169 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-2c (Phase-3) — pin `rank == scan-order prefix-sum` via a counter channel, the
+	/// ordering refinement that makes the prove-2b placement pin â to the accepted z's in EXACT
+	/// scan order (not just as a set). A single `count` channel carries `(pos, count)` tuples:
+	/// each candidate row PULLS `(pos_in, rank_in)` and PUSHES `(pos_in+1, rank_in+accept)`, with
+	/// the increments enforced by the nonnative ripple adder (`rank_out = rank_in + accept`,
+	/// `pos_out = pos_in + 1`). Statement boundaries seed `(0,0)` and drain `(N, total)`. The
+	/// channel balances iff the positions chain 0→N and each `rank` is the running accept count —
+	/// so `rank_in[t]` is forced to equal the number of accepts strictly before row t. An
+	/// inconsistent (non-prefix-sum) rank UNBALANCES the channel and is REJECTED.
+	#[test]
+	fn expand_a_rank_is_prefix_sum_over_b256() {
+		use crate::nonnative::{write_col, Adder};
+		use binius_field::Field;
+		use binius_m3::builder::{Boundary, FlushDirection, B32};
+
+		const W: usize = 32;
+		fn bits(x: u32) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// A mixed accept pattern over N=16 rows (interspersed accepts/rejects → non-trivial
+		// prefix sum). accept[t] ∈ {0,1}; rank_in[t] = #accepts in rows 0..t-1.
+		let accept: [bool; 16] = [
+			true, false, true, true, false, false, true, false, true, true, true, false, false,
+			true, false, true,
+		];
+		let n = accept.len();
+		let mut rank_in = vec![0u32; n];
+		let mut running = 0u32;
+		for t in 0..n {
+			rank_in[t] = running;
+			if accept[t] {
+				running += 1;
+			}
+		}
+		let total = running; // = 9
+
+		// mask with bits 1..31 set (bit0 = 0): forces accept_ext ∈ {0,1}.
+		let mask_hi_bits: Vec<bool> = (0..W).map(|k| k != 0).collect();
+		let mask_hi_arr: [B1; W] =
+			std::array::from_fn(|k| if mask_hi_bits[k] { B1::ONE } else { B1::ZERO });
+		let one_bits = bits(1);
+		let one_arr: [B1; W] = std::array::from_fn(|k| if one_bits[k] { B1::ONE } else { B1::ZERO });
+
+		let b32 = |v: u32| OurB256::from(B32::new(v));
+
+		// `rank_override` tampers one row's committed rank_in (breaking the prefix-sum chain).
+		let run = |rank_override: Option<(usize, u32)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let cnt = cs.add_channel("count");
+
+			let mut ct = cs.add_table("ExpandA prefix-sum counter over B256");
+			let rank_in_c = ct.add_committed::<B1, W>("rank_in");
+			let accept_ext = ct.add_committed::<B1, W>("accept_ext"); // 0/1 in bit 0
+			let pos_in = ct.add_committed::<B1, W>("pos_in");
+			let one_col = ct.add_constant("one", one_arr);
+			let mask_hi = ct.add_constant("mask_hi", mask_hi_arr);
+			// accept_ext ∈ {0,1}: all bits above bit 0 are zero.
+			ct.assert_zero("accept_is_bit", accept_ext * mask_hi);
+			// rank_out = rank_in + accept ; pos_out = pos_in + 1.
+			let rank_add = Adder::<W>::build(&mut ct, rank_in_c, accept_ext, "radd");
+			let pos_add = Adder::<W>::build(&mut ct, pos_in, one_col, "padd");
+			let rank_in_b32 = ct.add_packed::<B1, W, B32, 1>("rank_in_b32", rank_in_c);
+			let rank_out_b32 = ct.add_packed::<B1, W, B32, 1>("rank_out_b32", rank_add.sum);
+			let pos_in_b32 = ct.add_packed::<B1, W, B32, 1>("pos_in_b32", pos_in);
+			let pos_out_b32 = ct.add_packed::<B1, W, B32, 1>("pos_out_b32", pos_add.sum);
+			ct.pull(cnt, [pos_in_b32, rank_in_b32]);
+			ct.push(cnt, [pos_out_b32, rank_out_b32]);
+			let ct_id = ct.id();
+
+			// Boundaries: PUSH (0,0) seeds the chain (matches row 0's pull at pos 0 → rank_in[0]=0);
+			// PULL (N,total) drains it (matches row N-1's push at pos N → rank_out[N-1]=total).
+			let statement = Statement {
+				boundaries: vec![
+					Boundary {
+						values: vec![b32(0), b32(0)],
+						channel_id: cnt,
+						direction: FlushDirection::Push,
+						multiplicity: 1,
+					},
+					Boundary {
+						values: vec![b32(n as u32), b32(total)],
+						channel_id: cnt,
+						direction: FlushDirection::Pull,
+						multiplicity: 1,
+					},
+				],
+				table_sizes: vec![n],
+			};
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(ct_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for t in 0..n {
+					let riv = match rank_override {
+						Some((r, v)) if r == t => v,
+						_ => rank_in[t],
+					};
+					let acc_bits: Vec<bool> = (0..W).map(|k| k == 0 && accept[t]).collect();
+					write_col::<W>(&mut seg, rank_in_c, t, &bits(riv)).unwrap();
+					write_col::<W>(&mut seg, accept_ext, t, &acc_bits).unwrap();
+					write_col::<W>(&mut seg, pos_in, t, &bits(t as u32)).unwrap();
+					write_col::<W>(&mut seg, one_col, t, &one_bits).unwrap();
+					write_col::<W>(&mut seg, mask_hi, t, &mask_hi_bits).unwrap();
+					// adder columns (cout/cin/sum) — the inputs rank_in/accept_ext/pos_in/one are
+					// already written above.
+					// Adder::populate fills each adder's cout/cin/sum from the operand bit-vectors.
+					let _ = rank_add.populate(&mut seg, t, &bits(riv), &acc_bits).unwrap();
+					let _ = pos_add.populate(&mut seg, t, &bits(t as u32), &one_bits).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest prefix-sum: validate + full B256 prove/verify ACCEPT.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest prefix-sum failed validate_witness: {verr}");
+		assert!(verify_ok, "honest prefix-sum counter must PROVE+VERIFY over B256");
+
+		// (b) Tamper: set rank_in[6] to a wrong (non-prefix-sum) value → the pos-6 pull no longer
+		// matches the pos-6 push from row 5 → channel UNBALANCED → REJECT.
+		let bad = rank_in[6] + 1;
+		let (vok2, _e2, _) = run(Some((6, bad)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: an inconsistent (non-prefix-sum) rank was ACCEPTED");
+
+		println!(
+			"GATE prove-2c: ExpandA rank==prefix-sum PROVEN+VERIFIED over B256 @L1(128); N={n}, total={total} accepts, counter channel pins each rank to the running accept count; inconsistent rank REJECTED (channel unbalanced)"
+		);
+	}
+
 	/// GATE prove-3 (PENDING, S1c) — SampleInBall proves over B256; the in-circuit c
 	/// equals sample_in_ball(c̃,τ) with weight τ; a smuggled j>i draw or a mis-placed
 	/// sign is REJECTED (Fisher–Yates carry + permutation-argument soundness gate).
