@@ -702,6 +702,40 @@ mod tests {
 		println!("GATE ref-S3-12: RSA-8192 PKCS1-v1.5 verify (256-limb schoolbook, emLen=1024) accepts genuine, rejects sig/msg tamper");
 	}
 
+	/// GATE xcheck-rsa (Phase-2) — my S3 RSA-2048 PKCS#1-v1.5 signature is verified by the
+	/// `rsa` (RustCrypto) crate AND by my own `rsa_pkcs1_sha256_verify`: both agree it's valid.
+	#[test]
+	fn rsa2048_matches_rsa_crate() {
+		use rsa::{Pkcs1v15Sign, RsaPublicKey};
+		let n_big = n();
+		let sig_big = sig();
+
+		// build the RustCrypto public key from (n, e) and verify MY signature with it
+		let n_rsa = rsa::BigUint::from_bytes_be(&n_big.to_bytes_be());
+		let e_rsa = rsa::BigUint::from(RSA_E);
+		let pk = RsaPublicKey::new(n_rsa, e_rsa).expect("rsa pubkey");
+		let digest = sha256(MSG);
+		let mut sig_bytes = {
+			let b = sig_big.to_bytes_be();
+			let mut out = vec![0u8; RSA_K - b.len()];
+			out.extend_from_slice(&b);
+			out
+		};
+		assert!(
+			pk.verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &digest, &sig_bytes).is_ok(),
+			"the rsa crate must verify my S3 RSA-2048 signature"
+		);
+		// my own verifier agrees
+		assert!(rsa_pkcs1_sha256_verify(&n_big, RSA_E, MSG, &sig_big), "my rsa_pkcs1_sha256_verify agrees");
+		// a tampered signature is rejected by the rsa crate too
+		sig_bytes[200] ^= 1;
+		assert!(
+			pk.verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &digest, &sig_bytes).is_err(),
+			"the rsa crate must reject a tampered signature"
+		);
+		println!("GATE xcheck-rsa: my S3 RSA-2048 sig verified by the rsa crate AND rsa_pkcs1_sha256_verify; tampered rejected");
+	}
+
 	/// GATE prove-S3-1 (PENDING) — RSA-2048 PKCS1-v1.5 verify proves over B256; genuine
 	/// `rsa`-crate sig accepts, tampered sig/msg/padding reject (isolated to the EM byte-
 	/// equality). Needs the limb MulUU32 + bigint schoolbook + S0 limb reduction + modexp

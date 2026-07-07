@@ -1732,6 +1732,54 @@ mod tests {
 		println!("GATE ref-S2-21: ECDSA malleability — (r,s)+(r,n−s) both verify; low-s check (s≤(n−1)/2) rejects high-s (BIP-62/EIP-2)");
 	}
 
+	/// GATE xcheck-p256 (Phase-2) — my `ecdsa_p256_verify` accepts a signature produced by the
+	/// `p256` (RustCrypto) crate, and rejects it under a tampered message.
+	#[test]
+	fn ecdsa_p256_matches_p256_crate() {
+		use p256::ecdsa::signature::{Signer, Verifier};
+		use p256::ecdsa::{Signature, SigningKey};
+
+		let sk = SigningKey::from_slice(&unhex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")).expect("key");
+		let vk = sk.verifying_key();
+		let msg = b"p256 crate cross-check";
+		let sig: Signature = sk.sign(msg); // RFC 6979 deterministic
+		assert!(vk.verify(msg, &sig).is_ok(), "p256 crate self-verify sanity");
+
+		let ep = vk.to_encoded_point(false);
+		let q = Some((
+			BigUint::from_bytes_be(ep.x().unwrap()),
+			BigUint::from_bytes_be(ep.y().unwrap()),
+		));
+		let sb = sig.to_bytes(); // r ‖ s, 64 bytes big-endian
+		let r = BigUint::from_bytes_be(&sb[..32]);
+		let s = BigUint::from_bytes_be(&sb[32..]);
+		let n = order(S2Curve::P256);
+		let e = BigUint::from_bytes_be(&crate::sha512_gadget::sha256_ref(msg)) % &n;
+
+		assert!(ecdsa_p256_verify(&e, &q, &r, &s), "my ecdsa_p256_verify must accept a p256-crate sig");
+		let e_bad = BigUint::from_bytes_be(&crate::sha512_gadget::sha256_ref(b"other")) % &n;
+		assert!(!ecdsa_p256_verify(&e_bad, &q, &r, &s), "wrong message must reject");
+		println!("GATE xcheck-p256: ecdsa_p256_verify agrees with the p256 crate (accept genuine, reject wrong-msg)");
+	}
+
+	/// GATE xcheck-ed25519 (Phase-2) — my `ed25519_verify` accepts a signature produced by the
+	/// `ed25519-dalek` crate, and rejects it under a tampered message.
+	#[test]
+	fn ed25519_matches_dalek() {
+		use ed25519_dalek::{Signer, SigningKey};
+
+		let sk = SigningKey::from_bytes(&unhex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20").try_into().unwrap());
+		let vk = sk.verifying_key();
+		let msg = b"ed25519-dalek cross-check";
+		let sig = sk.sign(msg);
+		let pk_bytes: [u8; 32] = vk.to_bytes();
+		let sig_bytes: [u8; 64] = sig.to_bytes();
+
+		assert!(ed25519_verify(&pk_bytes, msg, &sig_bytes), "my ed25519_verify must accept a dalek sig");
+		assert!(!ed25519_verify(&pk_bytes, b"other", &sig_bytes), "wrong message must reject");
+		println!("GATE xcheck-ed25519: ed25519_verify agrees with ed25519-dalek (accept genuine, reject wrong-msg)");
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.

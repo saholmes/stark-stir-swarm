@@ -1136,6 +1136,48 @@ mod tests {
 		);
 	}
 
+	/// GATE xcheck-fips204 (Phase-2) — the DEFINITIVE ML-DSA validation, the one Python could
+	/// not do: `verify_ref` must ACCEPT a genuine ML-DSA-44 signature produced by the `fips204`
+	/// crate, and REJECT a tampered one. Passing this confirms the whole verify assembly end to
+	/// end — pkDecode/sigDecode parse the FIPS byte layout, μ = H(H(pk)‖0x00‖0x00‖M) matches,
+	/// AND (crucially) ExpandA's raw NTT-domain output aligns with `ntt_ref`'s convention in the
+	/// Â∘ẑ matrix-vector product.
+	#[test]
+	fn mldsa_verify_matches_fips204() {
+		use fips204::ml_dsa_44;
+		use fips204::traits::{SerDes, Signer, Verifier};
+
+		let (pk, sk) = ml_dsa_44::try_keygen().expect("fips204 keygen");
+		let msg = b"ML-DSA verify cross-check against fips204";
+		let sig = sk.try_sign(msg, b"").expect("fips204 sign");
+		assert!(pk.verify(msg, &sig, b""), "fips204 self-verify sanity");
+
+		let pk_bytes = pk.into_bytes();
+		let vp = verify_params(MlDsaParam::MlDsa44);
+		let pk_dec = pk_decode(&pk_bytes, &vp).expect("my pk_decode must parse the fips204 pk");
+		let sig_dec = sig_decode(&sig, &vp).expect("my sig_decode must parse the fips204 sig");
+
+		// μ = SHAKE-256( SHAKE-256(pk,64) ‖ 0x00 ‖ 0x00 ‖ M, 64 )  (external variant, empty ctx)
+		let tr = crate::mldsa_shake::shake256_xof(&pk_bytes, 64);
+		let mut minput = tr;
+		minput.push(0x00);
+		minput.push(0x00);
+		minput.extend_from_slice(msg);
+		let mu = crate::mldsa_shake::shake256_xof(&minput, 64);
+
+		assert!(verify_ref(&pk_dec, &sig_dec, &mu), "verify_ref must ACCEPT a genuine fips204 signature");
+
+		// tamper a signature byte ⇒ verify_ref must reject (or the decode fails, also a reject)
+		let mut bad = sig;
+		bad[200] ^= 1;
+		let rejected = match sig_decode(&bad, &vp) {
+			Some(bad_dec) => !verify_ref(&pk_dec, &bad_dec, &mu),
+			None => true,
+		};
+		assert!(rejected, "a tampered signature must be rejected");
+		println!("GATE xcheck-fips204: verify_ref ACCEPTS genuine fips204 ML-DSA-44 sig, REJECTS tampered — full assembly validated");
+	}
+
 	/// GATE ref-9 (S1e) — pk / σ lengths match the FIPS 204 standard sizes exactly, and
 	/// the z / t1 / hint bit-widths are correct.
 	#[test]

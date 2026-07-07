@@ -41,9 +41,16 @@ bumpalo = { version = "3.16.0", features = ["collections"] }
 rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] }
 # `compress` exposes sha2::{compress256, compress512}; binius_hash already enables
 # this feature on the same sha2 version, so unifying it here adds no lock churn.
-sha2    = { version = "0.10.8", features = ["compress"] }
+sha2    = { version = "0.10.8", features = ["compress", "oid"] }
 
 [dev-dependencies]
+# Phase-2 cross-check crates (RustCrypto / fips204): the canonical implementations our
+# hand-written native references are gated against, alongside the NIST/RFC vectors. Added
+# incrementally; versions kept conservative for the pinned nightly-2025-04-24 (rustc 1.88).
+p256    = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = "2.1"
+rsa     = "0.9"
+fips204 = "0.4"
 # Native SHA3-256 reference (FIPS 202) used only by tests to gate the in-circuit
 # sponge against NIST vectors. Version pinned to Binius's Cargo.lock (0.10.8) to
 # avoid any transitive lock churn.
