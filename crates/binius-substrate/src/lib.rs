@@ -130,6 +130,13 @@ pub mod bench;
 // `b256_keccak`'s tower-family prove wiring. See module docs for the construction.
 pub mod nonnative;
 
+// S1a (ML-DSA / FIPS 204 verify port): the R_q = Z_q[X]/(X^256+1) polynomial-arithmetic
+// layer over q = 8380417 — sound modular add/sub, modular multiply-by-public-twiddle
+// ζ·v, and the forward/inverse negacyclic 256-point NTT — proving AND verifying over
+// `B256TowerFamily` at NIST L1. Built ENTIRELY on S0's audited `Adder`/reduction recipe
+// (`nonnative`); no fork change, no reinvented modmul. Additive.
+pub mod mldsa_ntt;
+
 use std::iter::repeat_with;
 
 use anyhow::Result;

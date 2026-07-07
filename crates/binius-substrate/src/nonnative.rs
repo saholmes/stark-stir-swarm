@@ -99,13 +99,17 @@ use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 // ---------------------------------------------------------------------------------
 
 /// `x << s`, truncated to `x.len()` bits (little-endian, bit k = value 2^k).
-fn shl(x: &[bool], s: usize) -> Vec<bool> {
+///
+/// `pub(crate)` so the S1a ML-DSA R_q NTT layer (`mldsa_ntt`) can reuse the exact
+/// same sound bit-vector arithmetic used to fill this gadget's witness — the NTT
+/// gadgets do NOT reinvent the adder/shift recipe, they call these directly.
+pub(crate) fn shl(x: &[bool], s: usize) -> Vec<bool> {
 	let w = x.len();
 	(0..w).map(|k| if k >= s { x[k - s] } else { false }).collect()
 }
 
 /// `x >> s` (logical), truncated to `x.len()` bits.
-fn shr(x: &[bool], s: usize) -> Vec<bool> {
+pub(crate) fn shr(x: &[bool], s: usize) -> Vec<bool> {
 	let w = x.len();
 	(0..w).map(|k| if k + s < w { x[k + s] } else { false }).collect()
 }
@@ -113,7 +117,7 @@ fn shr(x: &[bool], s: usize) -> Vec<bool> {
 /// Ripple-carry add of two W-bit little-endian numbers. Returns `(sum, cout)` where
 /// `sum = (x + y) mod 2^W` and `cout[k]` is the carry OUT of bit position `k` (i.e. the
 /// carry INTO bit `k+1`) — exactly the `cout` column the in-circuit adder commits.
-fn ripple_add(x: &[bool], y: &[bool]) -> (Vec<bool>, Vec<bool>) {
+pub(crate) fn ripple_add(x: &[bool], y: &[bool]) -> (Vec<bool>, Vec<bool>) {
 	let w = x.len();
 	let mut sum = vec![false; w];
 	let mut cout = vec![false; w];
@@ -129,7 +133,7 @@ fn ripple_add(x: &[bool], y: &[bool]) -> (Vec<bool>, Vec<bool>) {
 
 /// `2^W - m` as a W-bit little-endian constant (`m > 0`, `m < 2^W`): the addend whose
 /// carry-out decides `r < m`.
-fn two_pow_w_minus(m_bits: &[bool]) -> Vec<bool> {
+pub(crate) fn two_pow_w_minus(m_bits: &[bool]) -> Vec<bool> {
 	let w = m_bits.len();
 	let mut c: Vec<bool> = m_bits.iter().map(|&x| !x).collect(); // ~m
 	let mut carry = true; // + 1
@@ -155,7 +159,7 @@ pub struct ModMulRow {
 // ---------------------------------------------------------------------------------
 
 /// Write a length-W LE bit vector into `col` at logical row `row`.
-fn write_col<const W: usize>(
+pub(crate) fn write_col<const W: usize>(
 	seg: &mut TableWitnessSegment<OurB256>,
 	col: Col<B1, W>,
 	row: usize,
@@ -169,7 +173,7 @@ fn write_col<const W: usize>(
 }
 
 /// Write a single bit into a `Col<B1, 1>` (a selected column) at logical row `row`.
-fn write_bit(
+pub(crate) fn write_bit(
 	seg: &mut TableWitnessSegment<OurB256>,
 	col: Col<B1, 1>,
 	row: usize,
@@ -181,7 +185,7 @@ fn write_bit(
 }
 
 /// Read a length-W LE bit vector out of `col` at logical row `row`.
-fn read_col<const W: usize>(
+pub(crate) fn read_col<const W: usize>(
 	seg: &TableWitnessSegment<OurB256>,
 	col: Col<B1, W>,
 	row: usize,
@@ -197,15 +201,19 @@ fn read_col<const W: usize>(
 
 /// A width-W adder `sum = xin + yin` — the sound generalization of `U32Add`'s carry
 /// recipe. `cin == cout << 1`; per lane `cout = xy + cin(x+y) = maj(x,y,cin)`.
+///
+/// `pub(crate)` so `mldsa_ntt` builds its modular add/sub/mul-by-constant gadgets on
+/// this exact adder — the R_q layer reuses the S0 carry recipe verbatim rather than
+/// hand-rolling a second (unaudited) adder.
 #[derive(Clone, Copy)]
-struct Adder<const W: usize> {
-	cout: Col<B1, W>,
-	cin: Col<B1, W>,
-	sum: Col<B1, W>,
+pub(crate) struct Adder<const W: usize> {
+	pub(crate) cout: Col<B1, W>,
+	pub(crate) cin: Col<B1, W>,
+	pub(crate) sum: Col<B1, W>,
 }
 
 impl<const W: usize> Adder<W> {
-	fn build(
+	pub(crate) fn build(
 		table: &mut TableBuilder<OurB256>,
 		xin: Col<B1, W>,
 		yin: Col<B1, W>,
@@ -223,7 +231,7 @@ impl<const W: usize> Adder<W> {
 	}
 
 	/// Fill `cout`, `cin`, `sum` for one row from operand bit-vectors; return `sum`.
-	fn populate(
+	pub(crate) fn populate(
 		&self,
 		seg: &mut TableWitnessSegment<OurB256>,
 		row: usize,
