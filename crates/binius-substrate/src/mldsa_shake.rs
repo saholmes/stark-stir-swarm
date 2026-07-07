@@ -1647,13 +1647,208 @@ mod tests {
 		);
 	}
 
-	/// GATE prove-3b (PENDING, S1c) — the SampleInBall array-swap offline MEMORY-CHECK: the 256-slot
-	/// c array's read/write history (read c[j]; write c[i]=c[j]; write c[j]=±1) is bound by a
-	/// grand-product/channel permutation so the final c equals sample_in_ball(c̃,τ) with weight τ
-	/// and coeffs ∈ {−1,0,1}; a tampered swap / out-of-history read / mis-placed sign is REJECTED.
+	/// GATE prove-3b (Phase-3, S1c) — the SampleInBall array-swap OFFLINE MEMORY-CHECK over B256.
+	/// The Fisher–Yates swap mutates the c array (read c[j]; write c[i]=c[j]; write c[j]=±1). Its
+	/// read/write history is bound by Blum-style offline memory checking: a `mem` channel carries
+	/// `(addr, value, timestamp)` tuples — each access PULLS the cell's last write and PUSHES its
+	/// new value with the current timestamp; `Statement` boundaries seed the initial state (ts 0)
+	/// and drain the final state. A `posc` pos-counter channel pins each row's timestamp to a
+	/// GLOBALLY MONOTONE value (the proven prove-2c mechanism), and every access enforces
+	/// `ts_prev < ts_now` by carry (bound = the in-circuit negation of the row's timestamp) — the
+	/// two conditions (multiset balance + read-timestamp < now) that make the history consistent.
+	/// Without the timestamp ordering the multiset alone is UNSOUND (a read could be reordered
+	/// before its write to return a stale value); together they force every read to return the
+	/// cell's latest write. Honest histories PROVE+VERIFY over B256 at NIST L1; a stale read
+	/// (reading a value the cell no longer holds) UNBALANCES the channel and is REJECTED. Values
+	/// here are demo integers — the mechanism is identical for the SampleInBall coeffs ∈ {−1,0,1};
+	/// wiring the actual 256-slot swap sequence + sign writes is the assembly step.
 	#[test]
-	#[ignore = "S1c array-swap memory-check not wired yet — next increment (reuses the counter/selector channel machinery)"]
 	fn sample_in_ball_swap_memcheck_proves_and_tamper_rejected() {
-		unimplemented!("offline memory-checking for the Fisher–Yates swap over the placement/counter channel — next wiring step");
+		use crate::nonnative::{ripple_add, write_col, Adder};
+		use binius_field::Field;
+		use binius_m3::builder::{Boundary, FlushDirection, B32};
+
+		const W: usize = 32;
+		fn bits(x: u32) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// A tiny consistent access history over a 4-cell array (init all 0, ts 0). Each row is one
+		// access: (addr, val_read = cell's current value, val_write = new value, ts_prev = ts of
+		// that cell's last write). Timestamps 1..K are pinned monotone by the posc counter.
+		//   row0 ts1: WRITE c[2]=5   (read old 0 @ts0)
+		//   row1 ts2: WRITE c[1]=6   (read old 0 @ts0)
+		//   row2 ts3: READ  c[2]=5   (read 5 @ts1, rewrite same)
+		//   row3 ts4: WRITE c[2]=7   (read old 5 @ts3)
+		// final state: c = [0, 6, 7, 0].
+		struct Acc {
+			addr: u32,
+			val_read: u32,
+			val_write: u32,
+			ts_prev: u32,
+		}
+		let accesses = [
+			Acc { addr: 2, val_read: 0, val_write: 5, ts_prev: 0 },
+			Acc { addr: 1, val_read: 0, val_write: 6, ts_prev: 0 },
+			Acc { addr: 2, val_read: 5, val_write: 5, ts_prev: 1 },
+			Acc { addr: 2, val_read: 5, val_write: 7, ts_prev: 3 },
+		];
+		let k = accesses.len(); // 4
+		let base_ts = 1u32; // access timestamps are base_ts .. base_ts+k-1  (init writes are ts 0)
+		let m = 4usize; // addresses 0..3
+		let final_state: [(u32, u32, u32); 4] =
+			[(0, 0, 0), (1, 6, 2), (2, 7, 4), (3, 0, 0)]; // (addr, final value, ts of last write)
+
+		let one_arr: [B1; W] = std::array::from_fn(|kk| if kk == 0 { B1::ONE } else { B1::ZERO });
+		let one_bits = bits(1);
+		let b32 = |v: u32| OurB256::from(B32::new(v));
+
+		// `read_override` tampers one access's val_read (a stale read) → channel unbalanced.
+		let run = |read_override: Option<(usize, u32)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mem = cs.add_channel("mem"); // (addr, value, timestamp)
+			let posc = cs.add_channel("posc"); // (pos) — pins the monotone timestamp
+
+			let mut ct = cs.add_table("SampleInBall swap offline memory-check over B256");
+			ct.require_power_of_two_size();
+			let addr = ct.add_committed::<B1, W>("addr");
+			let val_read = ct.add_committed::<B1, W>("val_read");
+			let val_write = ct.add_committed::<B1, W>("val_write");
+			let ts_prev = ct.add_committed::<B1, W>("ts_prev");
+			let pos_in = ct.add_committed::<B1, W>("pos_in"); // = ts_now
+			let neg_pos = ct.add_committed::<B1, W>("neg_pos"); // = 2^32 − pos_in
+			let one_col = ct.add_constant("one", one_arr);
+			// pin neg_pos = −pos_in : pos_in + neg_pos ≡ 0 (mod 2^32).
+			let neg_add = Adder::<W>::build(&mut ct, pos_in, neg_pos, "negadd");
+			ct.assert_zero("neg_is_two_pow_minus_pos", neg_add.sum * B1::ONE);
+			// pos_out = pos_in + 1 (drives the posc chain that pins pos_in to the row index).
+			let pos_add = Adder::<W>::build(&mut ct, pos_in, one_col, "posadd");
+			// ts_prev < pos_in : carry-out of ts_prev + (2^32 − pos_in) must be 0.
+			let ts_add = Adder::<W>::build(&mut ct, ts_prev, neg_pos, "tsadd");
+			let ts_fc = ct.add_selected("ts_fc", ts_add.cout, W - 1);
+			ct.assert_zero("ts_order", ts_fc * B1::ONE);
+
+			let addr_b32 = ct.add_packed::<B1, W, B32, 1>("addr_b32", addr);
+			let vr_b32 = ct.add_packed::<B1, W, B32, 1>("vr_b32", val_read);
+			let vw_b32 = ct.add_packed::<B1, W, B32, 1>("vw_b32", val_write);
+			let tp_b32 = ct.add_packed::<B1, W, B32, 1>("tp_b32", ts_prev);
+			let pos_in_b32 = ct.add_packed::<B1, W, B32, 1>("pos_in_b32", pos_in);
+			let pos_out_b32 = ct.add_packed::<B1, W, B32, 1>("pos_out_b32", pos_add.sum);
+			// memory: pull the last write (addr, val_read, ts_prev); push the new (addr, val_write, ts_now).
+			ct.pull(mem, [addr_b32, vr_b32, tp_b32]);
+			ct.push(mem, [addr_b32, vw_b32, pos_in_b32]);
+			// pos counter: pull (pos_in), push (pos_in+1) — pins pos_in to base_ts..base_ts+k-1.
+			ct.pull(posc, [pos_in_b32]);
+			ct.push(posc, [pos_out_b32]);
+			let ct_id = ct.id();
+
+			let mut boundaries = Vec::new();
+			// mem init writes (ts 0) and final reads.
+			for a in 0..m as u32 {
+				boundaries.push(Boundary {
+					values: vec![b32(a), b32(0), b32(0)],
+					channel_id: mem,
+					direction: FlushDirection::Push,
+					multiplicity: 1,
+				});
+			}
+			for &(a, v, t) in &final_state {
+				boundaries.push(Boundary {
+					values: vec![b32(a), b32(v), b32(t)],
+					channel_id: mem,
+					direction: FlushDirection::Pull,
+					multiplicity: 1,
+				});
+			}
+			// posc seed (base_ts) and drain (base_ts + k).
+			boundaries.push(Boundary {
+				values: vec![b32(base_ts)],
+				channel_id: posc,
+				direction: FlushDirection::Push,
+				multiplicity: 1,
+			});
+			boundaries.push(Boundary {
+				values: vec![b32(base_ts + k as u32)],
+				channel_id: posc,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			});
+			let statement = Statement { boundaries, table_sizes: vec![k] };
+
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(ct_id, k).unwrap();
+				let mut seg = tw.full_segment();
+				for (t, acc) in accesses.iter().enumerate() {
+					let pos = base_ts + t as u32;
+					let neg = pos.wrapping_neg();
+					let vr = match read_override {
+						Some((r, v)) if r == t => v,
+						_ => acc.val_read,
+					};
+					write_col::<W>(&mut seg, addr, t, &bits(acc.addr)).unwrap();
+					write_col::<W>(&mut seg, val_read, t, &bits(vr)).unwrap();
+					write_col::<W>(&mut seg, val_write, t, &bits(acc.val_write)).unwrap();
+					write_col::<W>(&mut seg, ts_prev, t, &bits(acc.ts_prev)).unwrap();
+					write_col::<W>(&mut seg, pos_in, t, &bits(pos)).unwrap();
+					write_col::<W>(&mut seg, neg_pos, t, &bits(neg)).unwrap();
+					write_col::<W>(&mut seg, one_col, t, &one_bits).unwrap();
+					let _ = neg_add.populate(&mut seg, t, &bits(pos), &bits(neg)).unwrap();
+					let _ = pos_add.populate(&mut seg, t, &bits(pos), &one_bits).unwrap();
+					let _ = ts_add.populate(&mut seg, t, &bits(acc.ts_prev), &bits(neg)).unwrap();
+					// ts_fc (add_selected) is not auto-derived — write the top carry bit.
+					let (_s, co) = ripple_add(&bits(acc.ts_prev), &bits(neg));
+					crate::nonnative::write_bit(&mut seg, ts_fc, t, co[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest consistent history: validate + full B256 prove/verify ACCEPT.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest memory history failed validate_witness: {verr}");
+		assert!(verify_ok, "honest memory history must PROVE+VERIFY over B256");
+
+		// (b) Tamper: make row2's READ return a STALE value (0 instead of the cell's current 5) →
+		// the pulled (2,0,·) token was never written → channel UNBALANCED → REJECT.
+		let (vok2, _e2, _) = run(Some((2, 0)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: a stale read (value the cell no longer holds) was ACCEPTED");
+
+		println!(
+			"GATE prove-3b: SampleInBall swap offline memory-check PROVEN+VERIFIED over B256 @L1(128); {k} accesses over {m} cells, (addr,val,ts) channel + monotone-ts counter + ts_prev<ts_now carry; stale read REJECTED (channel unbalanced)"
+		);
 	}
 }
