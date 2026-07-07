@@ -1288,6 +1288,264 @@ mod tests {
 		println!("GATE ref-11: HintBitUnpack ⊥ on {{non-incr, >ω, non-monotone, pad≠0}}; wrong-len σ ⊥");
 	}
 
+	/// GATE prove-4a (Phase-3, S1d) — the FIPS-204 Decompose digit gadget over B256. Verifies a
+	/// hinted (r1, r0) for r: the identity `r + γ2 = r1·α + v0 + s·q` (v0 = r0+γ2 ∈ [1,α], s∈{0,1},
+	/// α=2γ2) with `r1·α` built by S0's bcast conditional-add multiply, plus the two range checks
+	/// that pin the UNIQUE decomposition (r1 < m=44, v0 ∈ [1,α]). Honest decompositions
+	/// PROVE+VERIFY over B256 at NIST L1; the LOAD-BEARING tamper (r1+1, r0−α) — which preserves
+	/// the identity but pushes v0 out of [1,α] — is REJECTED by the v0 range, exactly the S0 r<m
+	/// pattern lifted to the centered digit.
+	#[test]
+	fn decompose_gadget_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const Q: u32 = 8_380_417;
+		const GAMMA2: u32 = (Q - 1) / 88; // 95232
+		const ALPHA: u32 = 2 * GAMMA2; // 190464
+		const M: u32 = 44; // (q−1)/α
+		const W: usize = 32;
+		const WLOG: usize = 5;
+		const R1W: usize = 8;
+		const R1LOG: usize = 3;
+		const R1_BITS: usize = 6; // r1 < 44 < 64
+
+		fn bitsw(x: u32, w: usize) -> Vec<bool> {
+			(0..w).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arrw = |x: u32| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+
+		// Test values incl. boundaries; native decompose() gives (r1, r0).
+		let rs: [u32; 8] = [0, 100, ALPHA, ALPHA + GAMMA2, 2 * ALPHA - 1, 4_000_000, 8_285_184, Q - 1];
+		let n = rs.len();
+		let rows: Vec<(u32, u32, u32)> = rs
+			.iter()
+			.map(|&r| {
+				let (r1, r0) = super::decompose(r as i64, GAMMA2 as i64);
+				let v0 = (r0 + GAMMA2 as i64) as u32;
+				let s = ((r as i64 + GAMMA2 as i64 - r1 * ALPHA as i64 - v0 as i64) / Q as i64) as u32;
+				assert!(s <= 1, "s must be a bit (r={r}, r1={r1}, v0={v0}, s={s})");
+				(r1 as u32, v0, s)
+			})
+			.collect();
+
+		let gamma2_arr = arrw(GAMMA2);
+		let q_arr = arrw(Q);
+		let c_r1_bits = two_pow_w_minus(&bitsw(M, R1W)); // 2^8 − M
+		let c_r1_arr: [B1; R1W] =
+			std::array::from_fn(|k| if c_r1_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_alpha = ALPHA.wrapping_neg(); // 2^32 − α
+
+		// `tamper` = Some((row, r1', v0')) forces a row's (r1, v0); the load-bearing case
+		// (r1+1, v0−α) keeps the identity but breaks the v0 range.
+		let run = |tamper: Option<(usize, u32, u32)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA Decompose digit gadget over B256");
+			let r = t.add_committed::<B1, W>("r");
+			let v0 = t.add_committed::<B1, W>("v0");
+			let r1 = t.add_committed::<B1, R1W>("r1");
+			let s = t.add_committed::<B1, 1>("s");
+
+			// hi = r1·α via bcast conditional-add over r1's low R1_BITS bits.
+			let mut pps: Vec<Col<B1, W>> = Vec::new();
+			#[allow(clippy::type_complexity)]
+			let mut bc_cols: Vec<(
+				Col<B1, W>,
+				Col<B1, W>,
+				Col<B1, 1>,
+				Col<B1, 1>,
+				Col<B1, W>,
+				Col<B1, W>,
+			)> = Vec::new(); // (bcast, bcast_rot, bcast_l0, r1_bit, pp, ashl)
+			for k in 0..R1_BITS {
+				let r1_bit = t.add_selected(format!("r1b{k}"), r1, k);
+				let bcast = t.add_committed::<B1, W>(format!("bc{k}"));
+				let bcast_rot =
+					t.add_shifted(format!("bc{k}rot"), bcast, WLOG, 1, ShiftVariant::CircularLeft);
+				t.assert_zero(format!("bc{k}eq"), bcast - bcast_rot);
+				let bc_l0 = t.add_selected(format!("bc{k}l0"), bcast, 0);
+				t.assert_zero(format!("bc{k}bind"), bc_l0 - r1_bit);
+				let ashl = t.add_constant(format!("ashl{k}"), arrw(ALPHA << k));
+				let pp = t.add_computed(format!("pp{k}"), bcast * ashl);
+				pps.push(pp);
+				bc_cols.push((bcast, bcast_rot, bc_l0, r1_bit, pp, ashl));
+			}
+			let mut hi = pps[0];
+			let mut hi_adders = Vec::new();
+			for k in 1..R1_BITS {
+				let a = Adder::<W>::build(&mut t, hi, pps[k], &format!("hi{k}"));
+				hi = a.sum;
+				hi_adders.push(a);
+			}
+			// RHS = hi + v0 + s·q.
+			let rhs_v0 = Adder::<W>::build(&mut t, hi, v0, "rhs_v0");
+			let s_bcast = t.add_committed::<B1, W>("s_bcast");
+			let s_bcast_rot =
+				t.add_shifted("s_bcast_rot", s_bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("s_bcast_eq", s_bcast - s_bcast_rot);
+			let s_l0 = t.add_selected("s_l0", s_bcast, 0);
+			t.assert_zero("s_bind", s_l0 - s);
+			let q_col = t.add_constant("q", q_arr);
+			let sq = t.add_computed("sq", s_bcast * q_col);
+			let rhs_sq = Adder::<W>::build(&mut t, rhs_v0.sum, sq, "rhs_sq");
+			// LHS = r + γ2.
+			let g2_col = t.add_constant("gamma2", gamma2_arr);
+			let lhs = Adder::<W>::build(&mut t, r, g2_col, "lhs");
+			// identity: LHS == RHS.
+			t.assert_zero("identity", lhs.sum - rhs_sq.sum);
+
+			// range r1 < 44 : carry-out of r1 + (2^8 − 44) must be 0.
+			let c_r1 = t.add_constant("c_r1", c_r1_arr);
+			let r1_cout = t.add_committed::<B1, R1W>("r1_cout");
+			let r1_cin = t.add_shifted("r1_cin", r1_cout, R1LOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("r1_carry", (r1 + r1_cin) * (c_r1 + r1_cin) + r1_cin - r1_cout);
+			let r1_fc = t.add_selected("r1_fc", r1_cout, R1W - 1);
+			t.assert_zero("r1_lt_m", r1_fc * B1::ONE);
+
+			// range v0 ∈ [1, α] : w = v0 − 1, then carry-out of w + (2^32 − α) must be 0 (w < α).
+			let allones_col = t.add_constant("allones", arrw(u32::MAX));
+			let w_add = Adder::<W>::build(&mut t, v0, allones_col, "w"); // v0 + (2^32−1) = v0−1
+			let w = w_add.sum;
+			let c_a = t.add_constant("c_alpha", arrw(c_alpha));
+			let v_cout = t.add_committed::<B1, W>("v_cout");
+			let v_cin = t.add_shifted("v_cin", v_cout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("v_carry", (w + v_cin) * (c_a + v_cin) + v_cin - v_cout);
+			let v_fc = t.add_selected("v_fc", v_cout, W - 1);
+			t.assert_zero("v0_in_range", v_fc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (mut r1v, mut v0v, sv) = rows[row];
+					let rv = rs[row];
+					if let Some((rr, r1t, v0t)) = tamper {
+						if rr == row {
+							r1v = r1t;
+							v0v = v0t;
+						}
+					}
+					write_col::<W>(&mut seg, r, row, &bitsw(rv, W)).unwrap();
+					write_col::<W>(&mut seg, v0, row, &bitsw(v0v, W)).unwrap();
+					write_col::<R1W>(&mut seg, r1, row, &bitsw(r1v, R1W)).unwrap();
+					write_bit(&mut seg, s, row, sv == 1).unwrap();
+
+					let mut pp_bits: Vec<Vec<bool>> = Vec::new();
+					for (k, &(bcast, bcast_rot, bc_l0, r1_bit, pp, ashl)) in bc_cols.iter().enumerate() {
+						let bit = (r1v >> k) & 1 == 1;
+						let uni = vec![bit; W];
+						write_bit(&mut seg, r1_bit, row, bit).unwrap();
+						write_col::<W>(&mut seg, bcast, row, &uni).unwrap();
+						write_col::<W>(&mut seg, bcast_rot, row, &uni).unwrap();
+						write_bit(&mut seg, bc_l0, row, bit).unwrap();
+						write_col::<W>(&mut seg, ashl, row, &bitsw(ALPHA << k, W)).unwrap();
+						let ppv = if bit { bitsw(ALPHA << k, W) } else { vec![false; W] };
+						write_col::<W>(&mut seg, pp, row, &ppv).unwrap();
+						pp_bits.push(ppv);
+					}
+					let mut acc = pp_bits[0].clone();
+					for (k, a) in hi_adders.iter().enumerate() {
+						acc = a.populate(&mut seg, row, &acc, &pp_bits[k + 1]).unwrap();
+					}
+					let hi_bits = acc;
+					let rhs_v0_bits =
+						rhs_v0.populate(&mut seg, row, &hi_bits, &bitsw(v0v, W)).unwrap();
+					let s_uni = vec![sv == 1; W];
+					write_col::<W>(&mut seg, s_bcast, row, &s_uni).unwrap();
+					write_col::<W>(&mut seg, s_bcast_rot, row, &s_uni).unwrap();
+					write_bit(&mut seg, s_l0, row, sv == 1).unwrap();
+					write_col::<W>(&mut seg, q_col, row, &bitsw(Q, W)).unwrap();
+					let sq_bits = if sv == 1 { bitsw(Q, W) } else { vec![false; W] };
+					write_col::<W>(&mut seg, sq, row, &sq_bits).unwrap();
+					let _ = rhs_sq.populate(&mut seg, row, &rhs_v0_bits, &sq_bits).unwrap();
+					write_col::<W>(&mut seg, g2_col, row, &bitsw(GAMMA2, W)).unwrap();
+					let _ = lhs.populate(&mut seg, row, &bitsw(rv, W), &bitsw(GAMMA2, W)).unwrap();
+
+					write_col::<R1W>(&mut seg, c_r1, row, &c_r1_bits).unwrap();
+					let (_s1, r1co) = ripple_add(&bitsw(r1v, R1W), &c_r1_bits);
+					write_col::<R1W>(&mut seg, r1_cout, row, &r1co).unwrap();
+					write_col::<R1W>(&mut seg, r1_cin, row, &shl(&r1co, 1)).unwrap();
+					write_bit(&mut seg, r1_fc, row, r1co[R1W - 1]).unwrap();
+
+					write_col::<W>(&mut seg, allones_col, row, &bitsw(u32::MAX, W)).unwrap();
+					let w_bits =
+						w_add.populate(&mut seg, row, &bitsw(v0v, W), &bitsw(u32::MAX, W)).unwrap();
+					write_col::<W>(&mut seg, c_a, row, &bitsw(c_alpha, W)).unwrap();
+					let (_s2, vco) = ripple_add(&w_bits, &bitsw(c_alpha, W));
+					write_col::<W>(&mut seg, v_cout, row, &vco).unwrap();
+					write_col::<W>(&mut seg, v_cin, row, &shl(&vco, 1)).unwrap();
+					write_bit(&mut seg, v_fc, row, vco[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest: validate + full B256 prove/verify ACCEPT.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest Decompose failed validate_witness: {verr}");
+		assert!(verify_ok, "honest Decompose must PROVE+VERIFY over B256");
+
+		// (b) LOAD-BEARING: tamper row 1 (r=100 → r1=0, v0=γ2) to (r1+1, v0−α): the identity is
+		// preserved but v0−α wraps out of [1,α] → REJECT at v0_in_range.
+		let (r1_1, v0_1, _s1) = rows[1];
+		let bad = run(Some((1, r1_1 + 1, v0_1.wrapping_sub(ALPHA))), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: unreduced Decompose (r1+1, r0−α) was ACCEPTED");
+		assert!(
+			bad.1.contains("v0_in_range"),
+			"unreduced Decompose not isolated to v0_in_range (got: {})",
+			bad.1
+		);
+
+		println!(
+			"GATE prove-4a: ML-DSA Decompose digit gadget PROVEN+VERIFIED over B256 @L1(128); {n} values incl. boundaries, identity r+γ2=r1·α+v0+s·q + r1<44 + v0∈[1,α]; unreduced (r1+1,r0−α) REJECTED, isolated to v0_in_range"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
