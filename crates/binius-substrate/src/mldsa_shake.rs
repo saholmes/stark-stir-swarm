@@ -1014,13 +1014,158 @@ mod tests {
 		}
 	}
 
-	/// GATE prove-2 (PENDING) — an ExpandA cell proves over B256; the in-circuit â
-	/// equals rej_ntt_poly(seed); a tampered accept-bit / mis-ordered coefficient is
-	/// REJECTED (the rejection-gadget soundness gate).
+	/// GATE prove-2 (Phase-3) — the ExpandA ACCEPT-DECISION gadget over B256, the load-bearing
+	/// rejection-sampling soundness object. For each candidate 24-bit z (raw ExpandA triple
+	/// `b0 | b1<<8 | (b2&0x7f)<<16` from a real SHAKE-128 stream), accept = (z<q) is decided by
+	/// S0's carry trick: accept = NOT carry_out(z + (2^32 − q)) (W=32). `accept` is a COMMITTED
+	/// bit BOUND to the carry via `accept + final_carry + 1 == 0`. Honest accepts PROVE+VERIFY
+	/// and match z<q; a tampered accept bit (either direction) is REJECTED, isolated by
+	/// `validate_witness` to `accept_bind`. Naive rejection sampling is unsound precisely because
+	/// the accept bit is unconstrained — this is the fix, the same r_lt_m carry S0 proves.
+	/// (The ordered placement of accepted z into â — prefix-sum index + channel permutation —
+	/// is the next increment, prove-2b.)
 	#[test]
-	#[ignore = "S1b rejection gadget not wired yet — enable after S1a full_256 frees the target"]
-	fn expand_a_cell_proves_and_tamper_rejected() {
-		unimplemented!("rejection gadget over S0's z<q carry + ordering selector — next wiring step");
+	fn expand_a_accept_decision_proves_and_tamper_rejected() {
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col};
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+
+		const ACC_W: usize = 32;
+		const ACC_LOGW: usize = 5;
+		const MLDSA_Q: u32 = 8380417;
+		fn u32_bits(x: u32) -> Vec<bool> {
+			(0..ACC_W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// 16 candidate z's from a real SHAKE-128 ExpandA stream (seed ρ‖s‖r), each the raw
+		// 24-bit ExpandA triple before the <q rejection test.
+		let mut seed = vec![0u8; 34];
+		seed[32] = 2; // s = 2
+		seed[33] = 1; // r = 1  (one Â cell)
+		let stream = shake128_xof(&seed, 3 * 64);
+		let mut zs: Vec<u32> = (0..16)
+			.map(|t| {
+				let (b0, b1, b2) = (stream[3 * t], stream[3 * t + 1], stream[3 * t + 2]);
+				(b0 as u32) | ((b1 as u32) << 8) | (((b2 & 0x7f) as u32) << 16)
+			})
+			.collect();
+		// Force boundary coverage: q−1 (accept), q (reject), 0 (accept), 2^24−1 (reject).
+		zs[0] = MLDSA_Q - 1;
+		zs[1] = MLDSA_Q;
+		zs[2] = 0;
+		zs[3] = (1 << 24) - 1;
+		let n_rows = zs.len(); // 16 (power of two)
+		let native_accept: Vec<bool> = zs.iter().map(|&z| z < MLDSA_Q).collect();
+
+		let c_bits = two_pow_w_minus(&u32_bits(MLDSA_Q)); // 2^32 − q
+		let c_arr: [B1; ACC_W] =
+			std::array::from_fn(|k| if c_bits[k] { B1::ONE } else { B1::ZERO });
+
+		// Build + populate the reject table; `reject_override` forces one row's reject bit.
+		// The committed `reject` bit is BOUND to the carry-out: reject == final_carry (z≥q). The
+		// accept decision is its complement, accept = NOT reject. `full` runs the full B256
+		// prove/verify; otherwise only the deterministic `validate_witness` (which names the
+		// violated constraint) is run. Returns (validate_ok, validate_err, verify_ok).
+		let run = |reject_override: Option<(usize, bool)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut table = cs.add_table("ExpandA accept-decision (z<q via carry) over B256");
+			let z = table.add_committed::<B1, ACC_W>("z");
+			let c_col = table.add_constant("two_pow32_minus_q", c_arr);
+			let cout = table.add_committed::<B1, ACC_W>("cout");
+			let cin = table.add_shifted("cin", cout, ACC_LOGW, 1, ShiftVariant::LogicalLeft);
+			// per-lane carry: cout = maj(z, c, cin).
+			table.assert_zero("acc_carry", (z + cin) * (c_col + cin) + cin - cout);
+			let final_carry = table.add_selected("final_carry", cout, ACC_W - 1);
+			let reject = table.add_committed::<B1, 1>("reject");
+			// reject == final_carry (= carry-out of z + (2^32−q)) == (z ≥ q). accept = NOT reject.
+			table.assert_zero("reject_bind", reject - final_carry);
+			let table_id = table.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(table_id, n_rows).unwrap();
+				let mut seg = tw.full_segment();
+				for (row, &zv) in zs.iter().enumerate() {
+					write_col::<ACC_W>(&mut seg, z, row, &u32_bits(zv)).unwrap();
+					write_col::<ACC_W>(&mut seg, c_col, row, &c_bits).unwrap();
+					let (_s, co) = ripple_add(&u32_bits(zv), &c_bits);
+					write_col::<ACC_W>(&mut seg, cout, row, &co).unwrap();
+					// cin (add_shifted) and final_carry (add_selected) are NOT auto-derived here
+					// — populate them explicitly (cin[k]=cout[k-1], cin[0]=0).
+					write_col::<ACC_W>(&mut seg, cin, row, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, final_carry, row, co[ACC_W - 1]).unwrap();
+					let rej = match reject_override {
+						Some((r, v)) if r == row => v,
+						_ => zv >= MLDSA_Q,
+					};
+					write_bit(&mut seg, reject, row, rej).unwrap();
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest: validate + full B256 prove/verify must ACCEPT.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest accept-decision failed validate_witness: {verr}");
+		assert!(verify_ok, "honest accept-decision must PROVE+VERIFY over B256");
+
+		// (b) LOAD-BEARING: on an ACCEPTED row (z<q, reject=0) force reject=1 ("smuggle z≥q as
+		// out-of-range") — must reject at reject_bind.
+		let acc_row = native_accept.iter().position(|&a| a).unwrap();
+		let (vok2, verr2, _) = run(Some((acc_row, true)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: forged reject bit on z<q was ACCEPTED");
+		assert!(
+			verr2.contains("reject_bind"),
+			"tampered reject (z<q) not isolated to reject_bind (got: {verr2})"
+		);
+
+		// (c) LOAD-BEARING: on a REJECTED row (z≥q, reject=1) force reject=0 ("accept an
+		// out-of-range coefficient") — must reject at reject_bind.
+		let rej_row = native_accept.iter().position(|&a| !a).unwrap();
+		let (vok3, verr3, _) = run(Some((rej_row, false)), false);
+		assert!(!vok3, "SOUNDNESS FAILURE: forged accept on z≥q was ACCEPTED");
+		assert!(
+			verr3.contains("reject_bind"),
+			"tampered accept (z≥q) not isolated to reject_bind (got: {verr3})"
+		);
+
+		let n_acc = native_accept.iter().filter(|&&a| a).count();
+		println!(
+			"GATE prove-2: ExpandA accept-decision PROVEN+VERIFIED over B256 @L1(128); {n_rows} candidates, {n_acc} accepted (z<q); tampered decision bit BOTH directions REJECTED, isolated to reject_bind"
+		);
 	}
 
 	/// GATE prove-3 (PENDING, S1c) — SampleInBall proves over B256; the in-circuit c
