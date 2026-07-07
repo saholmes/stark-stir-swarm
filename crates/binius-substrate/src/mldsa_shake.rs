@@ -798,19 +798,28 @@ mod tests {
 	//    shared target). Placeholders assert the design contract so the module's intent
 	//    is documented as executable stubs until the prove path lands. ──
 
-	// ── S1b PROVE PATH (Phase-3): SHAKE multi-block squeeze over B256, Keccak-f gadget chain ──
+	// ── S1b PROVE PATH (Phase-3): SHAKE multi-block squeeze over B256, Keccak-f channel chain ──
+	// The multi-block squeeze binds state_out(b) == state_in(b+1) across permutations. Rather
+	// than an in-table `add_shifted` seam (wrong primitive for full-state cross-permutation
+	// chaining), we use the sha3_join CHANNEL — the NIST-validated M2b mechanism: each block is
+	// its OWN table that PUSHES its 25-lane output state (track-7) and PULLS its 25-lane input
+	// state (track-0) on ONE shared channel. The channel balances as a multiset iff every pulled
+	// input equals a pushed output, i.e. iff the chain state_out(b)==state_in(b+1) holds.
 	use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 	use binius_core::fiat_shamir::HasherChallenger;
-	use binius_core::oracle::ShiftVariant;
 	use binius_hash::sha2::Sha256Compression;
-	use binius_m3::builder::{Col, ConstraintSystem, Statement, TableId, WitnessIndex, B1};
+	use binius_m3::builder::{Col, ConstraintSystem, Statement, TableId, WitnessIndex, B1, B64};
 	use binius_m3::gadgets::hash::keccak::{Keccakf, StateMatrix};
 	use bumpalo::Bump;
 	use sha2::Sha256;
 
 	const SHAKE_LANE_BITS: usize = 512; // PackedLane8 = 8 tracks × 64 bits
-	const SHAKE_LOG_LANE_BITS: usize = 9; // log2(512)
-	const SHAKE_OUT_TRACK_SHIFT: usize = 7 * 64; // track 7 → track 0 (LogicalRight by 448)
+	const SHAKE_LANE64_BITS: usize = 64; // one lane's track = 64 bits
+	const SHAKE_IN_TRACK: usize = 0; // permutation input lives on track 0
+	const SHAKE_OUT_TRACK: usize = 7; // permutation output lives on track 7
+
+	type ShakeTbl<'a> = binius_m3::builder::TableBuilder<'a, OurB256>;
+	type ShakeSeg<'a> = binius_m3::builder::TableWitnessSegment<'a, OurB256>;
 
 	/// The full witness of the multi-block squeeze: the padded absorb state, then the running
 	/// 25-lane state after each Keccak-f (block b's output). Mirrors `shake_squeeze_blocks`.
@@ -830,58 +839,56 @@ mod tests {
 		states
 	}
 
-	/// A chain of `n_blocks` Keccak-f gadgets in ONE table over B256, with block b's input state
-	/// bound to block b−1's output state across all 25 lanes (the b256_seam realign: track-7 out
-	/// → LogicalRight-448 → track-0, then an element-wise `assert_zero`). Block b's squeeze output
-	/// = the first `rate_lanes` of gadget b's output.
-	struct ShakeChainTable {
-		table_id: TableId,
-		gadgets: Vec<Keccakf>,
-		mask_full: Col<B1, SHAKE_LANE_BITS>,
+	/// Extract the 64-bit `track` block of all 25 lanes as `Col<B1,64>` projected virtual
+	/// oracles, then pack each to a `Col<B64,1>` aliasing the same bits — the 25-tuple form
+	/// pushed to / pulled from a channel. (25-lane analogue of b256_recursion's 4-lane helper.)
+	fn track25_to_b64(
+		table: &mut ShakeTbl<'_>,
+		name: &str,
+		lanes: &[Col<B1, SHAKE_LANE_BITS>],
+		track: usize,
+	) -> ([Col<B1, SHAKE_LANE64_BITS>; 25], [Col<B64, 1>; 25]) {
+		let sel: [Col<B1, SHAKE_LANE64_BITS>; 25] = std::array::from_fn(|i| {
+			table.add_selected_block::<B1, SHAKE_LANE_BITS, SHAKE_LANE64_BITS>(
+				format!("{name}_sel[{i}]"),
+				lanes[i],
+				track,
+			)
+		});
+		let b64: [Col<B64, 1>; 25] = std::array::from_fn(|i| {
+			table.add_packed::<B1, SHAKE_LANE64_BITS, B64, 1>(format!("{name}_b64[{i}]"), sel[i])
+		});
+		(sel, b64)
 	}
-	impl ShakeChainTable {
-		fn new(cs: &mut ConstraintSystem<OurB256>, n_blocks: usize) -> Self {
-			let mut table = cs.add_table("SHAKE multi-block squeeze chain over B256");
-			let mask_full: Col<B1, SHAKE_LANE_BITS> =
-				table.add_constant("mask_full", crate::sha3_seam::track0_pattern(u64::MAX));
-			let mut gadgets = Vec::with_capacity(n_blocks);
-			let mut prev_out_lo: Option<[Col<B1, SHAKE_LANE_BITS>; 25]> = None;
-			for b in 0..n_blocks {
-				let state_in: StateMatrix<Col<B1, SHAKE_LANE_BITS>> =
-					StateMatrix::from_fn(|(x, y)| table.add_committed(format!("in{b}[{x},{y}]")));
-				let s_in: [Col<B1, SHAKE_LANE_BITS>; 25] = *state_in.as_inner();
-				// bind this block's input to the previous block's output (25-lane seam)
-				if let Some(prev_lo) = prev_out_lo {
-					for i in 0..25 {
-						table.assert_zero(
-							format!("chain_link_b{b}_lane{i}"),
-							(s_in[i] - prev_lo[i]) * mask_full,
-						);
-					}
-				}
-				let keccakf = Keccakf::new(&mut table, state_in);
-				// realign this gadget's output (track 7) down to track 0 for the next link
-				let out_inner = keccakf.packed_state_out();
-				let out_inner = out_inner.as_inner();
-				let out_lo: [Col<B1, SHAKE_LANE_BITS>; 25] = std::array::from_fn(|i| {
-					table.add_shifted(
-						format!("out_b{b}_lo[{i}]"),
-						out_inner[i],
-						SHAKE_LOG_LANE_BITS,
-						SHAKE_OUT_TRACK_SHIFT,
-						ShiftVariant::LogicalRight,
-					)
-				});
-				prev_out_lo = Some(out_lo);
-				gadgets.push(keccakf);
+
+	/// Write the genuine per-row lane values into a 25-lane projected selected-block column set.
+	fn fill_selected25(
+		seg: &mut ShakeSeg<'_>,
+		cols: &[Col<B1, SHAKE_LANE64_BITS>; 25],
+		states: &[StateMatrix<u64>],
+	) -> anyhow::Result<()> {
+		for (i, &col) in cols.iter().enumerate() {
+			let mut d: std::cell::RefMut<'_, [u64]> = seg.get_mut_as(col)?;
+			for (k, cell) in d.iter_mut().take(states.len()).enumerate() {
+				*cell = states[k].as_inner()[i];
 			}
-			Self { table_id: table.id(), gadgets, mask_full }
 		}
+		Ok(())
+	}
+
+	/// One squeeze block = one table with a Keccak-f gadget. Block b (b>0) PULLS its 25-lane
+	/// input state from the chain channel; block b (b<n-1) PUSHES its 25-lane output state.
+	struct ShakeBlockTable {
+		table_id: TableId,
+		g: Keccakf,
+		pull_sel: Option<[Col<B1, SHAKE_LANE64_BITS>; 25]>, // input track-0 lanes (pulled) if b>0
+		push_sel: Option<[Col<B1, SHAKE_LANE64_BITS>; 25]>, // output track-7 lanes (pushed) if b<n-1
 	}
 
 	/// Prove AND verify the `n_blocks`-block SHAKE squeeze over B256TowerFamily (SHA-256 commit +
-	/// challenger): a chain of Keccak-f gadgets bound state_out(b)==state_in(b+1). Returns
-	/// (proof_size, all squeezed blocks concatenated).
+	/// challenger): N Keccak-f tables joined by ONE channel so state_out(b)==state_in(b+1).
+	/// Returns (proof_size, all squeezed blocks concatenated). For n=1 there is no channel
+	/// traffic (a single self-contained permutation).
 	fn prove_shake_chain_b256(
 		variant: ShakeVariant,
 		seed: &[u8],
@@ -891,15 +898,13 @@ mod tests {
 	) -> anyhow::Result<(usize, Vec<u8>)> {
 		let allocator = Bump::new();
 		let mut cs = ConstraintSystem::<OurB256>::new();
-		let table = ShakeChainTable::new(&mut cs, n_blocks);
-		let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+		let chain = cs.add_channel("squeeze_chain");
 
 		// Witness: gadget b's INPUT is state_{b-1} (state_{-1} = padded absorb); its OUTPUT is
 		// state_b. `states[b]` = state_b = Keccak-f(state_{b-1}).
 		let states = shake_chain_states(variant, seed, n_blocks);
 		let mut inputs = Vec::with_capacity(n_blocks);
 		{
-			// input of gadget 0 = the padded absorb state
 			let rate = variant.rate_bytes();
 			let mut bytes = [0u8; 200];
 			bytes[..seed.len()].copy_from_slice(seed);
@@ -907,32 +912,59 @@ mod tests {
 			bytes[rate - 1] ^= 0x80;
 			let padded: [u64; 25] =
 				std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()));
-			inputs.push(StateMatrix::from_values(padded));
+			inputs.push(StateMatrix::from_values(padded)); // input of gadget 0 = padded absorb
 			for st in states.iter().take(n_blocks - 1) {
 				inputs.push(st.clone()); // input of gadget b (b≥1) = state_{b-1}
 			}
 		}
 
+		// Build N single-gadget tables, wiring the channel chain.
+		let mut blocks = Vec::with_capacity(n_blocks);
+		for b in 0..n_blocks {
+			let mut table = cs.add_table(format!("SHAKE squeeze block {b} over B256"));
+			let state_in: StateMatrix<Col<B1, SHAKE_LANE_BITS>> =
+				StateMatrix::from_fn(|(x, y)| table.add_committed(format!("in{b}[{x},{y}]")));
+			let g = Keccakf::new(&mut table, state_in.clone());
+			// PULL this block's input (track-0 of the permutation input) if it continues a chain.
+			let pull_sel = if b > 0 {
+				let g_in = g.packed_state_in();
+				let (sel, b64) = track25_to_b64(&mut table, &format!("in{b}"), g_in.as_inner(), SHAKE_IN_TRACK);
+				table.pull(chain, b64);
+				Some(sel)
+			} else {
+				None
+			};
+			// PUSH this block's output (track-7 of the permutation output) if a next block consumes it.
+			let push_sel = if b + 1 < n_blocks {
+				let g_out = g.packed_state_out();
+				let (sel, b64) = track25_to_b64(&mut table, &format!("out{b}"), g_out.as_inner(), SHAKE_OUT_TRACK);
+				table.push(chain, b64);
+				Some(sel)
+			} else {
+				None
+			};
+			blocks.push(ShakeBlockTable { table_id: table.id(), g, pull_sel, push_sel });
+		}
+
+		let statement = Statement { boundaries: vec![], table_sizes: vec![1; n_blocks] };
 		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 		let mut out = Vec::with_capacity(n_blocks * variant.rate_bytes());
-		{
-			// ONE table, ONE row; all N gadgets share the segment (each has its own columns).
-			let tw = witness.init_table(table.table_id, 1)?;
+		for (b, blk) in blocks.iter().enumerate() {
+			let tw = witness.init_table(blk.table_id, 1)?;
 			let mut segment = tw.full_segment();
-			// fill the mask_full transparent constant (track 0 = all-ones, interior tracks = 0)
-			{
-				let mut d = segment.get_mut_as::<u64, B1, SHAKE_LANE_BITS>(table.mask_full)?;
-				for chunk in d.chunks_exact_mut(8) {
-					chunk.copy_from_slice(&[u64::MAX, 0, 0, 0, 0, 0, 0, 0]);
-				}
+			blk.g.populate_state_in(&mut segment, std::iter::once(&inputs[b]))?;
+			blk.g.populate(&mut segment)?;
+			let out_states: Vec<StateMatrix<u64>> = blk.g.read_state_outs(&segment)?.collect();
+			for lane in out_states[0].as_inner().iter().take(variant.rate_lanes()) {
+				out.extend_from_slice(&lane.to_le_bytes());
 			}
-			for (b, keccakf) in table.gadgets.iter().enumerate() {
-				keccakf.populate_state_in(&mut segment, std::iter::once(&inputs[b]))?;
-				keccakf.populate(&mut segment)?;
-				let so = keccakf.read_state_outs(&segment)?.next().unwrap();
-				for lane in so.as_inner().iter().take(variant.rate_lanes()) {
-					out.extend_from_slice(&lane.to_le_bytes());
-				}
+			// Fill the pulled input lanes (= this block's input state) and pushed output lanes
+			// (= this block's output state) so the channel tuples carry the genuine values.
+			if let Some(sel) = &blk.pull_sel {
+				fill_selected25(&mut segment, sel, std::slice::from_ref(&inputs[b]))?;
+			}
+			if let Some(sel) = &blk.push_sel {
+				fill_selected25(&mut segment, sel, &out_states)?;
 			}
 		}
 
@@ -964,25 +996,22 @@ mod tests {
 		Ok((sz, out))
 	}
 
-	/// GATE prove-1 (Phase-3) — a SHAKE-128 squeeze block PROVES AND VERIFIES over
-	/// B256TowerFamily at NIST L1 (128) via the Keccak-f gadget, and the in-circuit squeeze
-	/// equals the sha3-crate XOF's first `rate` bytes. This establishes the SHAKE-over-B256
-	/// foundation, reusing the committed Keccak-f/b256 infrastructure with zero fork change.
-	///
-	/// NOTE: `prove_shake_chain_b256` also builds the MULTI-BLOCK squeeze (a chain of Keccak-f
-	/// gadgets bound state_out(b)==state_in(b+1) by the b256_seam realign). For n=1 it verifies;
-	/// n>1 currently fails the seam zerocheck at verify — the correct multi-block chaining
-	/// primitive is N *rows* of one gadget with a cross-row shift (or the sha3_join channel),
-	/// not N gadgets in one row. Tracked as the next S1b prove increment.
+	/// GATE prove-1 (Phase-3) — the SHAKE-128 squeeze PROVES AND VERIFIES over B256TowerFamily
+	/// at NIST L1 (128), and the in-circuit squeeze equals the sha3-crate XOF byte-for-byte.
+	/// Tested single-block (n=1, self-contained permutation) AND multi-block (n=3, Keccak-f
+	/// tables joined by the sha3_join channel so state_out(b)==state_in(b+1)). Reuses the
+	/// committed Keccak-f/b256 + M2b channel infrastructure with zero fork change.
 	#[test]
 	fn shake_xof_proves_over_b256() {
 		let seed = [7u8; 34]; // ExpandA-sized seed
 		let rate = ShakeVariant::Shake128.rate_bytes();
-		let (sz, out) = prove_shake_chain_b256(ShakeVariant::Shake128, &seed, 1, 1, 128)
-			.expect("SHAKE-128 squeeze block must PROVE+VERIFY over B256");
-		assert_eq!(out, shake128_xof(&seed, rate), "in-circuit squeeze block != sha3 XOF");
-		assert!(sz > 0);
-		println!("GATE prove-1: SHAKE-128 squeeze block PROVEN+VERIFIED over B256 @L1(128); {sz} B; == sha3 XOF");
+		for n in [1usize, 3] {
+			let (sz, out) = prove_shake_chain_b256(ShakeVariant::Shake128, &seed, n, 1, 128)
+				.unwrap_or_else(|e| panic!("SHAKE-128 {n}-block squeeze must PROVE+VERIFY over B256: {e}"));
+			assert_eq!(out, shake128_xof(&seed, n * rate), "in-circuit {n}-block squeeze != sha3 XOF");
+			assert!(sz > 0);
+			println!("GATE prove-1: SHAKE-128 {n}-block squeeze PROVEN+VERIFIED over B256 @L1(128); {sz} B; == sha3 XOF");
+		}
 	}
 
 	/// GATE prove-2 (PENDING) — an ExpandA cell proves over B256; the in-circuit â
