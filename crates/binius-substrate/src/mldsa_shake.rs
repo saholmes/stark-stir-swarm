@@ -1168,6 +1168,186 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-2b (Phase-3) — the ExpandA ORDERED-PLACEMENT binding over B256: the output
+	/// polynomial â is bound to EXACTLY the accepted z's, positioned by rank, via a selector-gated
+	/// sha3_join channel. A candidate table runs the prove-2 carry-accept gadget and PUSHES
+	/// `(rank, z)` gated by the accept bit (`push_with_opts` selector); an output table PULLS
+	/// `(j, â[j])` for each position j. The channel balances as a multiset iff
+	/// `{(rank,z) : accept} == {(j, â[j])}` — so no coefficient can be dropped, inserted,
+	/// duplicated, or altered. Honest placement PROVES+VERIFIES; a tampered â value or a duplicated
+	/// rank UNBALANCES the channel and is REJECTED. (Pinning rank == scan-order prefix-sum — vs the
+	/// committed rank here — is the final refinement, prove-2c.)
+	#[test]
+	fn expand_a_placement_binds_ahat_and_tamper_rejected() {
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col};
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_m3::builder::{FlushOpts, B32};
+
+		const W: usize = 32;
+		const LOGW: usize = 5;
+		const Q: u32 = 8380417;
+		fn bits(x: u32) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// 16 candidates: 8 ACCEPT (z<q, distinct) at scan rows 0..7, then 8 REJECT (z≥q) at
+		// rows 8..15. K = 8 accepted → â has 8 coefficients. rank(accept row t) = t.
+		let accepted_z: [u32; 8] = [0, 1, 100, 12345, Q - 1, 777, 40000, 8000000];
+		let rejected_z: [u32; 8] = [Q, Q + 1, Q + 50, (1 << 24) - 1, Q + 9, Q + 3, Q + 100, Q + 7];
+		let cand: Vec<(u32, bool)> = accepted_z
+			.iter()
+			.map(|&z| (z, true))
+			.chain(rejected_z.iter().map(|&z| (z, false)))
+			.collect();
+		let n = cand.len(); // 16
+		let k = 8usize; // accepted count (power of two)
+		let mut ranks = vec![0u32; n];
+		{
+			let mut r = 0u32;
+			for t in 0..n {
+				if cand[t].1 {
+					ranks[t] = r;
+					r += 1;
+				}
+			}
+		}
+		let ahat: Vec<u32> = (0..k).map(|j| accepted_z[j]).collect(); // â[j] = accepted z at rank j
+
+		let c_bits = two_pow_w_minus(&bits(Q)); // 2^32 − q
+		let c_arr: [B1; W] = std::array::from_fn(|kk| if c_bits[kk] { B1::ONE } else { B1::ZERO });
+
+		// Build the two-table one-channel placement; overrides tamper one output value / one rank.
+		// Returns (validate_ok, validate_err, verify_ok).
+		let run = |ahat_override: Option<(usize, u32)>,
+		           rank_override: Option<(usize, u32)>,
+		           full: bool|
+		 -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let place = cs.add_channel("placement");
+
+			// candidate table: carry-accept gadget + selector-gated push (rank, z).
+			// A custom flush selector requires the table to be power-of-two sized (else the
+			// framework's implicit step-down selector would collide — "multiple selectors").
+			let mut ct = cs.add_table("ExpandA candidate placement over B256");
+			ct.require_power_of_two_size();
+			let z = ct.add_committed::<B1, W>("z");
+			let c_col = ct.add_constant("two_pow32_minus_q", c_arr);
+			let cout = ct.add_committed::<B1, W>("cout");
+			let cin = ct.add_shifted("cin", cout, LOGW, 1, ShiftVariant::LogicalLeft);
+			ct.assert_zero("acc_carry", (z + cin) * (c_col + cin) + cin - cout);
+			let final_carry = ct.add_selected("final_carry", cout, W - 1);
+			let accept = ct.add_committed::<B1, 1>("accept");
+			let one_col = ct.add_constant("one", [B1::ONE]);
+			ct.assert_zero("accept_bind", accept + final_carry + one_col); // accept = NOT final_carry
+			let rank = ct.add_committed::<B1, W>("rank");
+			let z_b32 = ct.add_packed::<B1, W, B32, 1>("z_b32", z);
+			let rank_b32 = ct.add_packed::<B1, W, B32, 1>("rank_b32", rank);
+			ct.push_with_opts(
+				place,
+				[rank_b32, z_b32],
+				FlushOpts { multiplicity: 1, selector: Some(accept) },
+			);
+			let ct_id = ct.id();
+
+			// output table: pull (j, â[j]) for each position.
+			let mut ot = cs.add_table("ExpandA ahat output over B256");
+			let jcol = ot.add_committed::<B1, W>("j");
+			let ahatcol = ot.add_committed::<B1, W>("ahat");
+			let j_b32 = ot.add_packed::<B1, W, B32, 1>("j_b32", jcol);
+			let ahat_b32 = ot.add_packed::<B1, W, B32, 1>("ahat_b32", ahatcol);
+			ot.pull(place, [j_b32, ahat_b32]);
+			let ot_id = ot.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n, k] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(ct_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for t in 0..n {
+					let (zv, acc) = cand[t];
+					write_col::<W>(&mut seg, z, t, &bits(zv)).unwrap();
+					write_col::<W>(&mut seg, c_col, t, &c_bits).unwrap();
+					let (_s, co) = ripple_add(&bits(zv), &c_bits);
+					write_col::<W>(&mut seg, cout, t, &co).unwrap();
+					write_col::<W>(&mut seg, cin, t, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, final_carry, t, co[W - 1]).unwrap();
+					write_bit(&mut seg, accept, t, acc).unwrap();
+					write_bit(&mut seg, one_col, t, true).unwrap();
+					let rv = match rank_override {
+						Some((r, v)) if r == t => v,
+						_ => ranks[t],
+					};
+					write_col::<W>(&mut seg, rank, t, &bits(rv)).unwrap();
+				}
+			}
+			{
+				let tw = witness.init_table(ot_id, k).unwrap();
+				let mut seg = tw.full_segment();
+				for j in 0..k {
+					write_col::<W>(&mut seg, jcol, j, &bits(j as u32)).unwrap();
+					let av = match ahat_override {
+						Some((jj, v)) if jj == j => v,
+						_ => ahat[j],
+					};
+					write_col::<W>(&mut seg, ahatcol, j, &bits(av)).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest: â = accepted z's by rank — validate + full B256 prove/verify ACCEPT.
+		let (vok, verr, verify_ok) = run(None, None, true);
+		assert!(vok, "honest placement failed validate_witness: {verr}");
+		assert!(verify_ok, "honest placement must PROVE+VERIFY over B256");
+
+		// (b) Tamper an OUTPUT value: â[0] := a value no accepted z has → channel UNBALANCED.
+		let (vok2, _e2, _) = run(Some((0, 9_999_999)), None, false);
+		assert!(!vok2, "SOUNDNESS FAILURE: a forged â coefficient was ACCEPTED (placement not bound)");
+
+		// (c) Tamper a RANK: duplicate rank 0 (rows 0 and 1 both rank 0) → position 1 unmatched,
+		// channel UNBALANCED.
+		let (vok3, _e3, _) = run(None, Some((1, 0)), false);
+		assert!(!vok3, "SOUNDNESS FAILURE: a duplicated placement rank was ACCEPTED");
+
+		println!(
+			"GATE prove-2b: ExpandA ordered placement PROVEN+VERIFIED over B256 @L1(128); {n}→{k} accepted, â bound to accepted z's by rank via selector-gated channel; forged â value + duplicated rank REJECTED (channel unbalanced)"
+		);
+	}
+
 	/// GATE prove-3 (PENDING, S1c) — SampleInBall proves over B256; the in-circuit c
 	/// equals sample_in_ball(c̃,τ) with weight τ; a smuggled j>i draw or a mis-placed
 	/// sign is REJECTED (Fisher–Yates carry + permutation-argument soundness gate).
