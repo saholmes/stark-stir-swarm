@@ -435,6 +435,71 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-R-1c (Phase-3, Tier A) — REAL pipeline-strand roots as the aggregation leaves
+	/// over B256. Each strand runs the reduced verify pipeline (prove-6b…10) over a coefficient
+	/// group and produces a w1Encode word; the strand's leaf preimage IS that output
+	/// (a = w1Encode ‖ b = strand metadata), so its root = SHA3-256(a‖b). The master channel-binds
+	/// strand 0's root into R* = SHA3-256(root0‖root1) (join + R* boundary), aggregating the two
+	/// real strand outputs. R* == the native batched-Merkle root over the real roots. A WRONG
+	/// pipeline output (corrupted w1Encode) yields a different strand root → the computed parent ≠
+	/// the R* boundary → REJECTED — the aggregation binds the strands' genuine pipeline outputs.
+	#[test]
+	fn pipeline_strand_roots_aggregate_over_b256() {
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+		use sha3::{Digest, Sha3_256};
+
+		const M: u64 = 44;
+		const BL: usize = 6;
+		fn h2(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+			let mut x = Sha3_256::new();
+			x.update(a);
+			x.update(b);
+			x.finalize().into()
+		}
+		// The reduced pipeline's UseHint→w1Encode over a 4-coefficient group (r1, sp, h) → word.
+		let usehint = |r1: u64, sp: u64, hb: u64| if hb == 0 { r1 } else if sp == 1 { (r1 + 1) % M } else { (r1 + M - 1) % M };
+		let w1e_word = |g: &[(u64, u64, u64); 4]| -> [u8; 32] {
+			let w: [u64; 4] = std::array::from_fn(|i| usehint(g[i].0, g[i].1, g[i].2));
+			let packed = (w[0] | (w[1] << BL) | (w[2] << (2 * BL)) | (w[3] << (3 * BL))) as u32;
+			let mut a = [0u8; 32];
+			a[..4].copy_from_slice(&packed.to_le_bytes()); // the strand's w1Encode output
+			a
+		};
+
+		// Two strands' coefficient groups (each = one bounded-RSS pipeline run).
+		let g0 = [(5u64, 0u64, 0u64), (43, 1, 1), (0, 0, 1), (20, 1, 0)];
+		let g1 = [(10u64, 1u64, 1u64), (7, 0, 0), (30, 1, 0), (1, 0, 1)];
+		let a0 = w1e_word(&g0); // strand-0 w1Encode output (leaf preimage half)
+		let a1 = w1e_word(&g1);
+		let meta0 = [0u8; 32]; // strand metadata (index/level tag); here trivial
+		let meta1 = { let mut m = [0u8; 32]; m[0] = 1; m }; // strand 1 tag
+		let root0 = h2(&a0, &meta0); // strand-0 root = SHA3(w1Encode0 ‖ meta0)
+		let root1 = h2(&a1, &meta1); // strand-1 root
+		let rstar = h2(&root0, &root1);
+		assert_eq!(rstar, super::merkle_root_sha3(&[root0, root1]), "R* != native merkle_root of real roots");
+
+		// Master: channel-bind strand-0's root (= SHA3(a0‖meta0), computed IN-CIRCUIT from the real
+		// w1Encode output a0) into R* = SHA3(root0‖root1); R* pinned by boundary; root1 = seam value.
+		let ok = prove_verify_join_b256(a0, meta0, root1, JoinMode::Honest, Some(rstar), 1, 128)
+			.expect("aggregation must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest aggregation of real strand roots must PROVE+VERIFY");
+		assert_eq!(ok.r_child, root0, "in-circuit strand-0 root != SHA3(w1Encode0 ‖ meta0)");
+		assert_eq!(ok.r_parent, rstar, "in-circuit R* != native merkle_root");
+
+		// Tamper: a CORRUPTED strand-0 pipeline output (flip a w1Encode byte) → different root0 →
+		// computed parent ≠ the R* boundary → REJECT. Binds the strand's genuine pipeline output.
+		let mut a0_bad = a0;
+		a0_bad[0] ^= 1;
+		assert_ne!(a0_bad, a0);
+		let bad = prove_verify_join_b256(a0_bad, meta0, root1, JoinMode::Honest, Some(rstar), 1, 128)
+			.expect("corrupted-output run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a corrupted pipeline w1Encode output still aggregated to R*");
+
+		println!(
+			"GATE prove-R-1c: REAL pipeline-strand roots (SHA3 of w1Encode outputs) aggregated into R* over B256 @L1(128); strand-0 root computed in-circuit from its w1Encode word; R*==native merkle_root; a corrupted pipeline output REJECTED (R* boundary mismatch)"
+		);
+	}
+
 	/// GATE prove-R-2 (PENDING, Tier B) — proof-carrying recursion: the master runs the
 	/// Binius verifier over each inner proof in-circuit (FRI/sumcheck/Merkle-path). Design
 	/// only; the arithmetized-verifier cost is the open milestone.
