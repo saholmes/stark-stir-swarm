@@ -2509,6 +2509,297 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-7 (Phase-3, S1-ASSEMBLY) — a REDUCED-DIMENSION verify pipeline over B256:
+	/// combine → Decompose chained by a channel seam. At n=1 the NTT is the identity, so the
+	/// combine's NTT-domain output ŵ = (Â·ẑ − ĉ·t̂1·2^d) mod q IS the time-domain w' that feeds
+	/// HighBits/Decompose. Two tables / one ConstraintSystem: the COMBINE table produces ŵ and
+	/// PUSHES it on a `wire` channel; the DECOMPOSE table PULLS r = ŵ and verifies its digit
+	/// decomposition (identity r + γ2 = r1·α + v0 + s·q, r1 < 44, v0 ∈ [1,α]). The channel binds
+	/// Decompose's input to the combine's genuine output — the verify's arithmetic→digit stage,
+	/// composed end-to-end. Honest pipelines PROVE+VERIFY over B256 at NIST L1; a tampered combine
+	/// output ŵ propagates through the seam and is REJECTED by Decompose. (UseHint → w1Encode →
+	/// SHAKE-256 → c̃'==c̃ continue the pipeline by the same seam; front-half ExpandA/SampleInBall
+	/// inputs are gated; full 256×k×l dimension is the R-phase scale-up.)
+	#[test]
+	fn verify_pipeline_combine_decompose_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B32};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const Q: u64 = 8_380_417;
+		const GAMMA2: u64 = (Q - 1) / 88;
+		const ALPHA: u64 = 2 * GAMMA2;
+		const D: u32 = 13;
+		const W: usize = 32;
+		const WLOG: usize = 5;
+		const R1W: usize = 8;
+		const R1LOG: usize = 3;
+		const R1_BITS: usize = 6;
+
+		fn bitsw(x: u64, w: usize) -> Vec<bool> {
+			(0..w).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arrw = |x: u64| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+		let mulq = |a: u64, b: u64| (a * b) % Q;
+
+		// (Â, ẑ, ĉ, t̂1) → ŵ = w'; then decompose(w').
+		let inputs: [(u64, u64, u64, u64); 4] =
+			[(3, 5, 7, 11), (1234567, 765432, 111, 222), (8380416, 2, 100, 3), (419020, 419021, 55, 800000)];
+		let n = inputs.len();
+		// (p1, p2, ŵ=w', s_combine, r1, v0, s_decompose)
+		let rows: Vec<(u64, u64, u64, u64, u64, u64, u64)> = inputs
+			.iter()
+			.map(|&(a, z, c, t1)| {
+				let p1 = mulq(a, z);
+				let td = mulq(t1, 1u64 << D);
+				let p2 = mulq(c, td);
+				let w = (p1 + Q - p2) % Q; // = ŵ = w'
+				let sc = if p1 >= p2 { 0u64 } else { 1u64 };
+				let (r1, r0) = super::decompose(w as i64, GAMMA2 as i64);
+				let v0 = (r0 + GAMMA2 as i64) as u64;
+				let sd = ((w as i64 + GAMMA2 as i64 - r1 * ALPHA as i64 - v0 as i64) / Q as i64) as u64;
+				(p1, p2, w, sc, r1 as u64, v0, sd)
+			})
+			.collect();
+
+		let q_arr = arrw(Q);
+		let g2_arr = arrw(GAMMA2);
+		let c_q_bits = two_pow_w_minus(&bitsw(Q, W));
+		let c_q_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_r1_bits = two_pow_w_minus(&bitsw(44, R1W));
+		let c_r1_arr: [B1; R1W] =
+			std::array::from_fn(|k| if c_r1_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_alpha = (ALPHA as u32).wrapping_neg();
+
+		let run = |w_override: Option<(usize, u64)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let wire = cs.add_channel("wire"); // carries ŵ = w' from combine → decompose
+
+			// ── COMBINE: ŵ = (p1 − p2) mod q, push ŵ ──
+			let mut ct = cs.add_table("verify combine → w'");
+			let p1 = ct.add_committed::<B1, W>("p1");
+			let p2 = ct.add_committed::<B1, W>("p2");
+			let wc = ct.add_committed::<B1, W>("w");
+			let sc = ct.add_committed::<B1, 1>("sc");
+			let sc_b = ct.add_committed::<B1, W>("sc_b");
+			let sc_br = ct.add_shifted("sc_br", sc_b, WLOG, 1, ShiftVariant::CircularLeft);
+			ct.assert_zero("sc_beq", sc_b - sc_br);
+			let sc_l0 = ct.add_selected("sc_l0", sc_b, 0);
+			ct.assert_zero("sc_bind", sc_l0 - sc);
+			let qc = ct.add_constant("qc", q_arr);
+			let scq = ct.add_computed("scq", sc_b * qc);
+			let cl = Adder::<W>::build(&mut ct, wc, p2, "cl");
+			let cr = Adder::<W>::build(&mut ct, p1, scq, "cr");
+			ct.assert_zero("combine", cl.sum - cr.sum);
+			let wc_b32 = ct.add_packed::<B1, W, B32, 1>("wc_b32", wc);
+			ct.push(wire, [wc_b32]);
+			let ct_id = ct.id();
+
+			// ── DECOMPOSE: pull r = ŵ, verify r + γ2 = r1·α + v0 + s·q, ranges ──
+			let mut dt = cs.add_table("verify decompose(w')");
+			let r = dt.add_committed::<B1, W>("r");
+			let r_b32 = dt.add_packed::<B1, W, B32, 1>("r_b32", r);
+			dt.pull(wire, [r_b32]);
+			let v0 = dt.add_committed::<B1, W>("v0");
+			let r1 = dt.add_committed::<B1, R1W>("r1");
+			let sd = dt.add_committed::<B1, 1>("sd");
+			// r1·α via bcast conditional-add.
+			let mut pps: Vec<Col<B1, W>> = Vec::new();
+			#[allow(clippy::type_complexity)]
+			let mut bc: Vec<(Col<B1, 1>, Col<B1, W>, Col<B1, W>, Col<B1, 1>, Col<B1, W>, Col<B1, W>)> =
+				Vec::new();
+			for k in 0..R1_BITS {
+				let r1b = dt.add_selected(format!("r1b{k}"), r1, k);
+				let bcast = dt.add_committed::<B1, W>(format!("bc{k}"));
+				let bcr = dt.add_shifted(format!("bc{k}r"), bcast, WLOG, 1, ShiftVariant::CircularLeft);
+				dt.assert_zero(format!("bc{k}eq"), bcast - bcr);
+				let bl0 = dt.add_selected(format!("bc{k}l0"), bcast, 0);
+				dt.assert_zero(format!("bc{k}bind"), bl0 - r1b);
+				let ashl = dt.add_constant(format!("ashl{k}"), arrw(ALPHA << k));
+				let pp = dt.add_computed(format!("pp{k}"), bcast * ashl);
+				pps.push(pp);
+				bc.push((r1b, bcast, bcr, bl0, pp, ashl));
+			}
+			let mut hi = pps[0];
+			let mut hi_adders = Vec::new();
+			for k in 1..R1_BITS {
+				let a = Adder::<W>::build(&mut dt, hi, pps[k], &format!("hi{k}"));
+				hi = a.sum;
+				hi_adders.push(a);
+			}
+			let rv0 = Adder::<W>::build(&mut dt, hi, v0, "rv0");
+			let sd_b = dt.add_committed::<B1, W>("sd_b");
+			let sd_br = dt.add_shifted("sd_br", sd_b, WLOG, 1, ShiftVariant::CircularLeft);
+			dt.assert_zero("sd_beq", sd_b - sd_br);
+			let sd_l0 = dt.add_selected("sd_l0", sd_b, 0);
+			dt.assert_zero("sd_bind", sd_l0 - sd);
+			let qd = dt.add_constant("qd", q_arr);
+			let sdq = dt.add_computed("sdq", sd_b * qd);
+			let rhs = Adder::<W>::build(&mut dt, rv0.sum, sdq, "rhs");
+			let g2c = dt.add_constant("g2", g2_arr);
+			let lhs = Adder::<W>::build(&mut dt, r, g2c, "lhs");
+			dt.assert_zero("identity", lhs.sum - rhs.sum);
+			// r1 < 44
+			let cr1 = dt.add_constant("cr1", c_r1_arr);
+			let r1co = dt.add_committed::<B1, R1W>("r1co");
+			let r1ci = dt.add_shifted("r1ci", r1co, R1LOG, 1, ShiftVariant::LogicalLeft);
+			dt.assert_zero("r1carry", (r1 + r1ci) * (cr1 + r1ci) + r1ci - r1co);
+			let r1fc = dt.add_selected("r1fc", r1co, R1W - 1);
+			dt.assert_zero("r1_lt", r1fc * B1::ONE);
+			// v0 ∈ [1, α]
+			let ones = dt.add_constant("ones", arrw(u32::MAX as u64));
+			let wsub = Adder::<W>::build(&mut dt, v0, ones, "wsub");
+			let ca = dt.add_constant("ca", arrw(c_alpha as u64));
+			let vco = dt.add_committed::<B1, W>("vco");
+			let vci = dt.add_shifted("vci", vco, WLOG, 1, ShiftVariant::LogicalLeft);
+			dt.assert_zero("vcarry", (wsub.sum + vci) * (ca + vci) + vci - vco);
+			let vfc = dt.add_selected("vfc", vco, W - 1);
+			dt.assert_zero("v0_range", vfc * B1::ONE);
+			let dt_id = dt.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n, n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// combine witness
+			{
+				let tw = witness.init_table(ct_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (p1v, p2v, mut wv, scv, _, _, _) = rows[row];
+					if let Some((rr, v)) = w_override {
+						if rr == row {
+							wv = v;
+						}
+					}
+					write_col::<W>(&mut seg, p1, row, &bitsw(p1v, W)).unwrap();
+					write_col::<W>(&mut seg, p2, row, &bitsw(p2v, W)).unwrap();
+					write_col::<W>(&mut seg, wc, row, &bitsw(wv, W)).unwrap();
+					write_bit(&mut seg, sc, row, scv == 1).unwrap();
+					let su = vec![scv == 1; W];
+					write_col::<W>(&mut seg, sc_b, row, &su).unwrap();
+					write_col::<W>(&mut seg, sc_br, row, &su).unwrap();
+					write_bit(&mut seg, sc_l0, row, scv == 1).unwrap();
+					write_col::<W>(&mut seg, qc, row, &bitsw(Q, W)).unwrap();
+					let scqv = if scv == 1 { bitsw(Q, W) } else { vec![false; W] };
+					write_col::<W>(&mut seg, scq, row, &scqv).unwrap();
+					let _ = cl.populate(&mut seg, row, &bitsw(wv, W), &bitsw(p2v, W)).unwrap();
+					let _ = cr.populate(&mut seg, row, &bitsw(p1v, W), &scqv).unwrap();
+				}
+			}
+			// decompose witness
+			{
+				let tw = witness.init_table(dt_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (_, _, mut wv, _, r1v, v0v, sdv) = rows[row];
+					if let Some((rr, v)) = w_override {
+						if rr == row {
+							wv = v;
+						}
+					}
+					write_col::<W>(&mut seg, r, row, &bitsw(wv, W)).unwrap();
+					write_col::<W>(&mut seg, v0, row, &bitsw(v0v, W)).unwrap();
+					write_col::<R1W>(&mut seg, r1, row, &bitsw(r1v, R1W)).unwrap();
+					write_bit(&mut seg, sd, row, sdv == 1).unwrap();
+					let mut pp_bits: Vec<Vec<bool>> = Vec::new();
+					for (k, &(r1b, bcast, bcr, bl0, pp, ashl)) in bc.iter().enumerate() {
+						let bit = (r1v >> k) & 1 == 1;
+						write_bit(&mut seg, r1b, row, bit).unwrap();
+						write_col::<W>(&mut seg, bcast, row, &vec![bit; W]).unwrap();
+						write_col::<W>(&mut seg, bcr, row, &vec![bit; W]).unwrap();
+						write_bit(&mut seg, bl0, row, bit).unwrap();
+						write_col::<W>(&mut seg, ashl, row, &bitsw(ALPHA << k, W)).unwrap();
+						let ppv = if bit { bitsw(ALPHA << k, W) } else { vec![false; W] };
+						write_col::<W>(&mut seg, pp, row, &ppv).unwrap();
+						pp_bits.push(ppv);
+					}
+					let mut acc = pp_bits[0].clone();
+					for (k, a) in hi_adders.iter().enumerate() {
+						acc = a.populate(&mut seg, row, &acc, &pp_bits[k + 1]).unwrap();
+					}
+					let rv0v = rv0.populate(&mut seg, row, &acc, &bitsw(v0v, W)).unwrap();
+					let su = vec![sdv == 1; W];
+					write_col::<W>(&mut seg, sd_b, row, &su).unwrap();
+					write_col::<W>(&mut seg, sd_br, row, &su).unwrap();
+					write_bit(&mut seg, sd_l0, row, sdv == 1).unwrap();
+					write_col::<W>(&mut seg, qd, row, &bitsw(Q, W)).unwrap();
+					let sdqv = if sdv == 1 { bitsw(Q, W) } else { vec![false; W] };
+					write_col::<W>(&mut seg, sdq, row, &sdqv).unwrap();
+					let _ = rhs.populate(&mut seg, row, &rv0v, &sdqv).unwrap();
+					write_col::<W>(&mut seg, g2c, row, &bitsw(GAMMA2, W)).unwrap();
+					let _ = lhs.populate(&mut seg, row, &bitsw(wv, W), &bitsw(GAMMA2, W)).unwrap();
+					write_col::<R1W>(&mut seg, cr1, row, &c_r1_bits).unwrap();
+					let (_s, r1c) = ripple_add(&bitsw(r1v, R1W), &c_r1_bits);
+					write_col::<R1W>(&mut seg, r1co, row, &r1c).unwrap();
+					write_col::<R1W>(&mut seg, r1ci, row, &shl(&r1c, 1)).unwrap();
+					write_bit(&mut seg, r1fc, row, r1c[R1W - 1]).unwrap();
+					write_col::<W>(&mut seg, ones, row, &bitsw(u32::MAX as u64, W)).unwrap();
+					let wsv = wsub.populate(&mut seg, row, &bitsw(v0v, W), &bitsw(u32::MAX as u64, W)).unwrap();
+					write_col::<W>(&mut seg, ca, row, &bitsw(c_alpha as u64, W)).unwrap();
+					let (_s2, vc) = ripple_add(&wsv, &bitsw(c_alpha as u64, W));
+					write_col::<W>(&mut seg, vco, row, &vc).unwrap();
+					write_col::<W>(&mut seg, vci, row, &shl(&vc, 1)).unwrap();
+					write_bit(&mut seg, vfc, row, vc[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest combine→decompose pipeline failed validate_witness: {verr}");
+		assert!(verify_ok, "honest combine→decompose pipeline must PROVE+VERIFY over B256");
+
+		// Tamper: corrupt the combine's ŵ (only in the COMBINE table). The decompose witness still
+		// decomposes the TRUE ŵ, so the seam pushes the corrupt value but decompose pulls it and
+		// its digit identity no longer holds → REJECT.
+		let bad = run(Some((0, (rows[0].2 + 1) % Q)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a corrupted verify-pipeline ŵ was ACCEPTED");
+
+		println!(
+			"GATE prove-7: reduced verify pipeline combine→Decompose channel-seamed, PROVEN+VERIFIED over B256 @L1(128); {n} coeffs; ŵ=w' flows through the seam into HighBits; corrupted ŵ REJECTED"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
