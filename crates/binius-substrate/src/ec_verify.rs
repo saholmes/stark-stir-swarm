@@ -2096,6 +2096,173 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-addsub (Phase-3, S2 foundation) — the EC field ADD/SUB mod p over B256, the
+	/// additive glue of every EC point-op formula. Since a,b < p the reduction quotient is a single
+	/// bit k: fe_add checks `out + k·p == a + b` (out < p); fe_sub checks `out + b == a + k·p`
+	/// (out < p). k·p is a bcast conditional-add of the constant p (no multiply). A tampered result
+	/// admits no valid k and is REJECTED. Shown for the Ed25519 base field p = 2²⁵⁵−19 (W=512).
+	/// With fe_mul/fe_inv/fe_sqrt this completes the S2 field toolkit; the point ops (Edwards/
+	/// Jacobian add/double) compose exactly these.
+	#[test]
+	fn ec_field_addsub_proves_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let p_arr = arr(&p);
+		let c_p_bits = two_pow_w_minus(&to_bits(&p)); // 2^W − p (x < p range)
+		let c_p_arr: [B1; W] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+
+		// (a, b) pairs; sum = (a+b) mod p (k_add = a+b ≥ p), diff = (a−b) mod p (k_sub = a < b).
+		let a0 = BigUint::parse_bytes(b"6f1e2d3c4b5a69788190a1b2c3d4e5f60f1e2d3c4b5a69788190a1b2c3d4e5f6", 16).unwrap() % &p;
+		let b0 = BigUint::parse_bytes(b"7edcba98765432100123456789abcdef7edcba98765432100123456789abcdef", 16).unwrap() % &p;
+		let pairs = [(a0.clone(), b0.clone()), (b0.clone(), a0.clone())];
+		let nrows = pairs.len();
+
+		// `tamper` corrupts one row's fe_add output.
+		let run = |tamper: Option<(usize, BigUint)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("EC fe_add/fe_sub mod p over B256");
+			let a = t.add_committed::<B1, W>("a");
+			let b = t.add_committed::<B1, W>("b");
+			let s = t.add_committed::<B1, W>("sum"); // (a+b) mod p
+			let d = t.add_committed::<B1, W>("diff"); // (a−b) mod p
+			let ka = t.add_committed::<B1, 1>("ka");
+			let kd = t.add_committed::<B1, 1>("kd");
+			let p_col = t.add_constant("p", p_arr);
+			// bcast helper for k·p.
+			let mk_kp = |t: &mut binius_m3::builder::TableBuilder<OurB256>, k: binius_m3::builder::Col<B1, 1>, nm: &str| {
+				let bc = t.add_committed::<B1, W>(format!("{nm}bc"));
+				let bcr = t.add_shifted(format!("{nm}bcr"), bc, WLOG, 1, ShiftVariant::CircularLeft);
+				t.assert_zero(format!("{nm}bceq"), bc - bcr);
+				let l0 = t.add_selected(format!("{nm}l0"), bc, 0);
+				t.assert_zero(format!("{nm}bind"), l0 - k);
+				let kp = t.add_computed(format!("{nm}kp"), bc * p_col);
+				(bc, bcr, l0, kp)
+			};
+			let (a_bc, a_bcr, a_l0, ka_p) = mk_kp(&mut t, ka, "a");
+			let (d_bc, d_bcr, d_l0, kd_p) = mk_kp(&mut t, kd, "d");
+			// fe_add: s + ka·p == a + b.
+			let apb = Adder::<W>::build(&mut t, a, b, "apb");
+			let slhs = Adder::<W>::build(&mut t, s, ka_p, "slhs");
+			t.assert_zero("fe_add", slhs.sum - apb.sum);
+			// fe_sub: d + b == a + kd·p.
+			let dlhs = Adder::<W>::build(&mut t, d, b, "dlhs");
+			let drhs = Adder::<W>::build(&mut t, a, kd_p, "drhs");
+			t.assert_zero("fe_sub", dlhs.sum - drhs.sum);
+			// s < p, d < p.
+			let mk_lt = |t: &mut binius_m3::builder::TableBuilder<OurB256>, x: binius_m3::builder::Col<B1, W>, nm: &str| {
+				let cc = t.add_constant(format!("{nm}cp"), c_p_arr);
+				let co = t.add_committed::<B1, W>(format!("{nm}co"));
+				let ci = t.add_shifted(format!("{nm}ci"), co, WLOG, 1, ShiftVariant::LogicalLeft);
+				t.assert_zero(format!("{nm}carry"), (x + ci) * (cc + ci) + ci - co);
+				let fc = t.add_selected(format!("{nm}fc"), co, W - 1);
+				t.assert_zero(format!("{nm}lt"), fc * B1::ONE);
+				(cc, co, ci, fc)
+			};
+			let rs = mk_lt(&mut t, s, "s");
+			let rd = mk_lt(&mut t, d, "d");
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, nrows).unwrap();
+				let mut seg = tw.full_segment();
+				for (row, (av, bv)) in pairs.iter().enumerate() {
+					let sum = (av + bv) % &p;
+					let sum = match &tamper {
+						Some((rr, v)) if *rr == row => v.clone(),
+						_ => sum,
+					};
+					let kav = if av + bv >= p { 1u64 } else { 0 };
+					let diff = ((av + &p) - bv) % &p;
+					let kdv = if av < bv { 1u64 } else { 0 };
+					write_col::<W>(&mut seg, a, row, &to_bits(av)).unwrap();
+					write_col::<W>(&mut seg, b, row, &to_bits(bv)).unwrap();
+					write_col::<W>(&mut seg, s, row, &to_bits(&sum)).unwrap();
+					write_col::<W>(&mut seg, d, row, &to_bits(&diff)).unwrap();
+					write_bit(&mut seg, ka, row, kav == 1).unwrap();
+					write_bit(&mut seg, kd, row, kdv == 1).unwrap();
+					write_col::<W>(&mut seg, p_col, row, &to_bits(&p)).unwrap();
+					for (bc, bcr, l0, k) in
+						[(a_bc, a_bcr, a_l0, kav), (d_bc, d_bcr, d_l0, kdv)]
+					{
+						let kb = vec![k == 1; W];
+						write_col::<W>(&mut seg, bc, row, &kb).unwrap();
+						write_col::<W>(&mut seg, bcr, row, &kb).unwrap();
+						write_bit(&mut seg, l0, row, k == 1).unwrap();
+					}
+					let kap = if kav == 1 { to_bits(&p) } else { vec![false; W] };
+					let kdp = if kdv == 1 { to_bits(&p) } else { vec![false; W] };
+					write_col::<W>(&mut seg, ka_p, row, &kap).unwrap();
+					write_col::<W>(&mut seg, kd_p, row, &kdp).unwrap();
+					let apbv = apb.populate(&mut seg, row, &to_bits(av), &to_bits(bv)).unwrap();
+					let _ = slhs.populate(&mut seg, row, &to_bits(&sum), &kap).unwrap();
+					let _ = apbv;
+					let _ = dlhs.populate(&mut seg, row, &to_bits(&diff), &to_bits(bv)).unwrap();
+					let _ = drhs.populate(&mut seg, row, &to_bits(av), &kdp).unwrap();
+					for (x_val, (cc, co, ci, fc)) in [(&sum, rs), (&diff, rd)] {
+						write_col::<W>(&mut seg, cc, row, &c_p_bits).unwrap();
+						let (_z, cout) = ripple_add(&to_bits(x_val), &c_p_bits);
+						write_col::<W>(&mut seg, co, row, &cout).unwrap();
+						write_col::<W>(&mut seg, ci, row, &shl(&cout, 1)).unwrap();
+						write_bit(&mut seg, fc, row, cout[W - 1]).unwrap();
+					}
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest fe_add/fe_sub failed validate_witness: {verr}");
+		assert!(verify_ok, "honest fe_add/fe_sub must PROVE+VERIFY over B256");
+
+		// Tamper: corrupt a fe_add output → no valid k closes out + k·p == a+b → REJECT.
+		let (vok2, _e2, _) = run(Some((0, (&a0 + &b0 + 1u32) % &p)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: a wrong fe_add result was ACCEPTED over B256");
+
+		println!(
+			"GATE prove-S2-addsub: EC field add/sub mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); {nrows} rows, fe_add out+k·p=a+b & fe_sub out+b=a+k·p, out<p; wrong result REJECTED. S2 field toolkit complete (mul/inv/sqrt/add/sub)."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
