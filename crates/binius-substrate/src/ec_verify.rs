@@ -2905,6 +2905,208 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-glue (Phase-3, S2 point op) — the LAST seam direction over B256: an fe_add
+	/// RESULT pushed onto a channel and pulled as a downstream ModMul's OPERAND. Every unified
+	/// point-op coordinate is X3 = E·F where E, F are fe_add/fe_sub combinations of the seamed
+	/// products A, B, C, D — NOT raw ModMul outputs. To tile X3 = E·F the E term must cross a seam
+	/// as a ModMul INPUT, so the fe_add gadget has to PUSH its modular result exactly as ModMul
+	/// pushes r. This gate proves that missing primitive: A = X1² (push chA), B = Y1² (push chB),
+	/// a FORMULA table pulls A and B, proves E = (A+B) mod p (fe_add + E<p) and PUSHES E on chE,
+	/// then ModMul2 = build_seamed_in(chE) proves q = E·W mod p pulling E as its operand. The chE
+	/// channel binds the ModMul's operand to the fe_add's genuine result — a forged intermediate
+	/// (ModMul2 pulling E' ≠ what the formula pushed) unbalances chE and is REJECTED. With this the
+	/// full seam toolkit tiles a point op end-to-end: products pushed → fe_add/fe_sub glue pushed →
+	/// output products pull both. Ed25519 base field p = 2²⁵⁵−19. Honest chain PROVES+VERIFIES at
+	/// NIST L1; a forged glue result is REJECTED.
+	#[test]
+	fn ec_fe_add_result_seamed_into_modmul_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder, ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::ChannelId;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+		let p_arr = arr(&p);
+		let c_p_bits = two_pow_w_minus(&to_bits(&p));
+		let c_p_arr: [B1; W] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+
+		let x1 = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let y1 = BigUint::parse_bytes(b"07f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee", 16).unwrap() % &p;
+		let w = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+		let av = (&x1 * &x1) % &p; // A = X1²
+		let bv = (&y1 * &y1) % &p; // B = Y1²
+		let ev = (&av + &bv) % &p; // E = (A + B) mod p  — the fe_add glue result
+		let ke = if &av + &bv >= p { 1u64 } else { 0 };
+		let qv = (&ev * &w) % &p; // q = E·W mod p — the downstream product
+
+		// `bad_e` forges the downstream ModMul's operand: it pulls E+1 that the formula never pushed.
+		let run = |bad_e: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let cha: ChannelId = cs.add_channel("chA"); // A = X1²
+			let chb: ChannelId = cs.add_channel("chB"); // B = Y1²
+			let che: ChannelId = cs.add_channel("chE"); // E = (A+B) mod p — fe_add result
+
+			// Two product strands push A, B.
+			let mma = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, cha);
+			let mmb = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chb);
+
+			// FORMULA table: pull A and B, prove E = (A+B) mod p, PUSH E on chE.
+			let mut ft = cs.add_table("EC glue E=(A+B) mod p, pushed as ModMul operand over B256");
+			// pull A
+			let a_c = ft.add_committed::<B1, W>("A");
+			let a_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| ft.add_selected_block::<B1, W, 64>(format!("A_sel{i}"), a_c, i));
+			let a_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| ft.add_packed::<B1, 64, B64, 1>(format!("A_b64{i}"), a_sel[i]));
+			ft.pull(cha, a_b64);
+			// pull B
+			let b_c = ft.add_committed::<B1, W>("B");
+			let b_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| ft.add_selected_block::<B1, W, 64>(format!("B_sel{i}"), b_c, i));
+			let b_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| ft.add_packed::<B1, 64, B64, 1>(format!("B_b64{i}"), b_sel[i]));
+			ft.pull(chb, b_b64);
+			// E and k for fe_add: E + k·p == A + B, with E < p.
+			let e_c = ft.add_committed::<B1, W>("E");
+			let k = ft.add_committed::<B1, 1>("k");
+			let kbc = ft.add_committed::<B1, W>("kbc");
+			let kbcr = ft.add_shifted("kbcr", kbc, WLOG, 1, ShiftVariant::CircularLeft);
+			ft.assert_zero("kbc_eq", kbc - kbcr);
+			let kl0 = ft.add_selected("kl0", kbc, 0);
+			ft.assert_zero("kbc_bind", kl0 - k);
+			let p_col = ft.add_constant("p", p_arr);
+			let kp = ft.add_computed("kp", kbc * p_col);
+			let lhs = Adder::<W>::build(&mut ft, e_c, kp, "lhs"); // E + k·p
+			let rhs = Adder::<W>::build(&mut ft, a_c, b_c, "rhs"); // A + B
+			ft.assert_zero("fe_add", lhs.sum - rhs.sum);
+			// E < p.
+			let cp = ft.add_constant("c_p", c_p_arr);
+			let eco = ft.add_committed::<B1, W>("eco");
+			let eci = ft.add_shifted("eci", eco, WLOG, 1, ShiftVariant::LogicalLeft);
+			ft.assert_zero("e_carry", (e_c + eci) * (cp + eci) + eci - eco);
+			let efc = ft.add_selected("efc", eco, W - 1);
+			ft.assert_zero("e_lt_p", efc * B1::ONE);
+			// PUSH E on chE (same recipe as ModMul's output seam).
+			let e_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| ft.add_selected_block::<B1, W, 64>(format!("E_sel{i}"), e_c, i));
+			let e_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| ft.add_packed::<B1, 64, B64, 1>(format!("E_b64{i}"), e_sel[i]));
+			ft.push(che, e_b64);
+			let ft_id = ft.id();
+
+			// Downstream product strand: q = E·W mod p, pulls E from chE as operand `a`.
+			let mmq = ModMul::<W>::build_seamed_in(&mut cs, &p_bits, np, che);
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1, 1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// A strand
+			{
+				let tw = witness.init_table(mma.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&x1 * &x1) / &p;
+				mma.populate(&mut seg, &[ModMulRow { a: to_bits(&x1), b: to_bits(&x1), q: to_bits(&q), r: to_bits(&av) }]).unwrap();
+			}
+			// B strand
+			{
+				let tw = witness.init_table(mmb.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&y1 * &y1) / &p;
+				mmb.populate(&mut seg, &[ModMulRow { a: to_bits(&y1), b: to_bits(&y1), q: to_bits(&q), r: to_bits(&bv) }]).unwrap();
+			}
+			// formula strand
+			{
+				let tw = witness.init_table(ft_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let ab = to_bits(&av);
+				write_col::<W>(&mut seg, a_c, 0, &ab).unwrap();
+				for (i, &s) in a_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &ab[i * 64..i * 64 + 64]).unwrap();
+				}
+				let bb = to_bits(&bv);
+				write_col::<W>(&mut seg, b_c, 0, &bb).unwrap();
+				for (i, &s) in b_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &bb[i * 64..i * 64 + 64]).unwrap();
+				}
+				let eb = to_bits(&ev);
+				write_col::<W>(&mut seg, e_c, 0, &eb).unwrap();
+				write_bit(&mut seg, k, 0, ke == 1).unwrap();
+				let kb = vec![ke == 1; W];
+				write_col::<W>(&mut seg, kbc, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, kbcr, 0, &kb).unwrap();
+				write_bit(&mut seg, kl0, 0, ke == 1).unwrap();
+				write_col::<W>(&mut seg, p_col, 0, &to_bits(&p)).unwrap();
+				let kpv = if ke == 1 { to_bits(&p) } else { vec![false; W] };
+				write_col::<W>(&mut seg, kp, 0, &kpv).unwrap();
+				let _ = lhs.populate(&mut seg, 0, &eb, &kpv).unwrap();
+				let _ = rhs.populate(&mut seg, 0, &ab, &bb).unwrap();
+				write_col::<W>(&mut seg, cp, 0, &c_p_bits).unwrap();
+				let (_z, co) = ripple_add(&eb, &c_p_bits);
+				write_col::<W>(&mut seg, eco, 0, &co).unwrap();
+				write_col::<W>(&mut seg, eci, 0, &shl(&co, 1)).unwrap();
+				write_bit(&mut seg, efc, 0, co[W - 1]).unwrap();
+				// pushed E lanes
+				for (i, &s) in e_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &eb[i * 64..i * 64 + 64]).unwrap();
+				}
+			}
+			// downstream product strand: operand a = E (pulled), b = W.
+			{
+				let tw = witness.init_table(mmq.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let a_use = if bad_e { (&ev + 1u32) % &p } else { ev.clone() };
+				let prod = &a_use * &w;
+				let q = &prod / &p;
+				let r = &prod % &p;
+				mmq.populate(&mut seg, &[ModMulRow { a: to_bits(&a_use), b: to_bits(&w), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		assert_eq!(qv, (&((&av + &bv) % &p) * &w) % &p, "q should equal (X1²+Y1²)·W");
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest fe_add-result-seamed chain failed validate_witness: {verr}");
+		assert!(verify_ok, "honest fe_add-result-seamed-into-ModMul chain must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: the downstream ModMul pulled an E the fe_add never pushed");
+
+		println!(
+			"GATE prove-S2-glue: fe_add result E=(A+B) mod (2²⁵⁵−19) PUSHED on a channel and PULLED as a downstream ModMul operand (q=E·W) PROVEN+VERIFIED over B256 @L1(128); forged glue result REJECTED. Last seam direction closed — point ops tile end-to-end (products pushed → fe_add/fe_sub glue pushed → output products pull both)."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
