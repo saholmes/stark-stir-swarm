@@ -1836,6 +1836,66 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-sqrt (Phase-3, S2 foundation) — the EC field SQUARE-ROOT check over B256, the
+	/// point-DECOMPRESSION primitive (Ed25519 §5.1.3 recovers x from y: x = sqrt of a field
+	/// element). The sqrt ALGORITHM (p≡5 mod 8 exponentiation) runs in the witness; the CIRCUIT
+	/// only verifies the claimed root: `root² ≡ target (mod p)` — one S0 ModMul (a=b=root) with the
+	/// output PINNED to `target`. A wrong root makes `root·root == q·p + target` unsatisfiable and
+	/// the circuit REJECTS, so a forged decompressed coordinate cannot pass. Shown for the Ed25519
+	/// base field p = 2²⁵⁵−19 (W=512). Honest root²≡target PROVES+VERIFIES over B256 at NIST L1; a
+	/// tampered root is REJECTED.
+	#[test]
+	fn ec_field_sqrt_proves_over_b256() {
+		use crate::nonnative::{prove_verify, ModMulRow};
+		use num_bigint::BigUint;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let p = prime(S2Curve::Ed25519); // 2²⁵⁵ − 19
+		let n = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+
+		// A quadratic residue target = s² mod p, whose square root the circuit checks.
+		let s = BigUint::parse_bytes(
+			b"09f1e2d3c4b5a6978869504132abfedc09f1e2d3c4b5a6978869504132abfedc",
+			16,
+		)
+		.unwrap()
+			% &p;
+		let sq = &s * &s;
+		let target = &sq % &p; // = s² mod p  (a QR, root = s)
+		let q = &sq / &p;
+		let root = &s;
+		assert_eq!(&(root * root) % &p, target, "native sqrt setup broken: root² ≢ target");
+
+		let honest = ModMulRow { a: to_bits(root), b: to_bits(root), q: to_bits(&q), r: to_bits(&target) };
+		let (sz, _) = prove_verify::<W>(&p_bits, n, &[honest])
+			.expect("fe_sqrt check (root²≡target mod p) must PROVE+VERIFY over B256");
+
+		// Tamper: a WRONG root (not ±s) with r still pinned to `target` → root'² mod p ≠ target →
+		// the identity root'·root' == q'·p + target is unsatisfiable → REJECT.
+		let bad_root = (&s + 1u32) % &p;
+		let bad_sq = &bad_root * &bad_root;
+		let bad_q = &bad_sq / &p;
+		let tampered = ModMulRow {
+			a: to_bits(&bad_root),
+			b: to_bits(&bad_root),
+			q: to_bits(&bad_q),
+			r: to_bits(&target),
+		};
+		assert!(
+			prove_verify::<W>(&p_bits, n, &[tampered]).is_err(),
+			"SOUNDNESS FAILURE: a wrong square root (output pinned to target) was ACCEPTED over B256"
+		);
+
+		println!(
+			"GATE prove-S2-sqrt: EC field sqrt root²≡target mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); {sz} B; wrong root REJECTED (output pinned to target). Point decompression foundation."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
