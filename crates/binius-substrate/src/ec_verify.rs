@@ -3870,6 +3870,128 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-in2chain (Phase-3, S2 point op) — the last seam primitive: an output product
+	/// that PULLS both operands AND PUSHES its result forward. A scalar-mul round's output coordinate
+	/// X3 = E·F must both consume the glue terms E, F (input seams) and hand X3 onward to the next
+	/// round (output seam) — i.e. build_seamed_in2_chain = build_inner(Some(out), Some(in_a),
+	/// Some(in_b)), the (pull-a, pull-b, push-r) corner of the seam cube (build() UNCHANGED; S0
+	/// regression stays 4/4). This gate proves it: E = X1² (push chE), F = Y1² (push chF), then
+	/// X3 = build_seamed_in2_chain(chE, chF, chOut) proves X3 = E·F while PULLING E, F and PUSHING X3
+	/// to chOut, which an OUTPUT boundary pulls (X3 published to the next round). Honest chain
+	/// PROVES+VERIFIES over B256 at NIST L1; a mis-published X3 boundary OR a forged pulled operand
+	/// unbalances a channel and is REJECTED. With this the full seam cube is proven, so a complete
+	/// scalar-mul round (eaddfull with all coords boundary-wrapped) is pure mechanical wiring.
+	/// Ed25519 field p = 2²⁵⁵−19.
+	#[test]
+	fn ec_output_product_pull2_push_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+
+		let x1 = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let y1 = BigUint::parse_bytes(b"07f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee", 16).unwrap() % &p;
+		let ev = (&x1 * &x1) % &p; // E = X1²
+		let fv = (&y1 * &y1) % &p; // F = Y1²
+		let x3 = (&ev * &fv) % &p; // X3 = E·F, handed forward
+
+		let run = |bad_out: bool, bad_a: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let che = cs.add_channel("chE");
+			let chf = cs.add_channel("chF");
+			let chout = cs.add_channel("chOut"); // X3 handed to the next round
+
+			let mme = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, che);
+			let mmf = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chf);
+			// pull E and F, prove X3 = E·F, push X3 on chOut.
+			let mmx3 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, che, chf, chout);
+
+			let x3_pub = if bad_out { (&x3 + 1u32) % &p } else { x3.clone() };
+			let boundaries = vec![Boundary {
+				values: to_boundary(&x3_pub),
+				channel_id: chout,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			}];
+			let statement = Statement { boundaries, table_sizes: vec![1, 1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mme.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&x1 * &x1) / &p;
+				mme.populate(&mut seg, &[ModMulRow { a: to_bits(&x1), b: to_bits(&x1), q: to_bits(&q), r: to_bits(&ev) }]).unwrap();
+			}
+			{
+				let tw = witness.init_table(mmf.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&y1 * &y1) / &p;
+				mmf.populate(&mut seg, &[ModMulRow { a: to_bits(&y1), b: to_bits(&y1), q: to_bits(&q), r: to_bits(&fv) }]).unwrap();
+			}
+			{
+				let tw = witness.init_table(mmx3.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				// operand a = E (pulled from chE); bad_a forges it to E+1 (channel unbalances).
+				let a_use = if bad_a { (&ev + 1u32) % &p } else { ev.clone() };
+				let prod = &a_use * &fv;
+				let q = &prod / &p;
+				let r = &prod % &p;
+				mmx3.populate(&mut seg, &[ModMulRow { a: to_bits(&a_use), b: to_bits(&fv), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, false, true);
+		assert!(vok, "honest pull2+push output product failed validate_witness: {verr}");
+		assert!(verify_ok, "honest build_seamed_in2_chain output product must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false, false);
+		assert!(!v2, "SOUNDNESS FAILURE: the round published an X3 it did not compute");
+		let (v3, _e, _) = run(false, true, false);
+		assert!(!v3, "SOUNDNESS FAILURE: the output product pulled an operand its source never produced");
+
+		println!(
+			"GATE prove-S2-in2chain: output product X3=E·F over B256 @L1(128) PULLS both operands (E,F from chE,chF) AND PUSHES X3 to an output boundary (next round's input) via build_seamed_in2_chain; PROVEN+VERIFIED; mis-published X3 OR forged operand REJECTED. Full seam cube proven — a complete scalar-mul round is now mechanical."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.

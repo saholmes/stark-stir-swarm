@@ -358,6 +358,21 @@ impl<const W: usize> ModMul<W> {
 		Self::build_inner(cs, m_bits, n, None, Some(in_a_chan), Some(in_b_chan))
 	}
 
+	/// Chaining output product: PULL both operands (`a` from `in_a_chan`, `b` from `in_b_chan`) AND
+	/// PUSH the result `r` to `out_chan`. This is what a scalar-mul round's output coordinate needs —
+	/// e.g. `X3 = E·F` pulls the glue terms E, F and simultaneously hands X3 forward to the next
+	/// round (a boundary, or the following point op's input seam).
+	pub fn build_seamed_in2_chain(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		in_a_chan: ChannelId,
+		in_b_chan: ChannelId,
+		out_chan: ChannelId,
+	) -> Self {
+		Self::build_inner(cs, m_bits, n, Some(out_chan), Some(in_a_chan), Some(in_b_chan))
+	}
+
 	fn build_inner(
 		cs: &mut ConstraintSystem<OurB256>,
 		m_bits: &[bool],
