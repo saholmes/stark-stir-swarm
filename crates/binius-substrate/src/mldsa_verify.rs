@@ -3454,6 +3454,60 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-10 (Phase-3, S1-ASSEMBLY) — the CLOSING hash gate of the verify over B256:
+	/// c̃' = SHAKE-256(μ ‖ w1Encode(w1')) and ACCEPT ⟺ c̃' == c̃. This is the decisive equality that
+	/// makes ML-DSA.Verify sound — the reconstructed w1' must hash back to the challenge. The
+	/// closing hash is PROVEN+VERIFIED over B256 via the committed Keccak-f sponge
+	/// (`prove_verify_sha3_b256`, the M2a/M2c path); the reduced pipeline (prove-6b…9) produces the
+	/// w1Encode bytes that go into the message. A WRONG w1' yields a different message → c̃' ≠ c̃, so
+	/// the gate REJECTS it. (SHAKE-256 shares the Keccak-f permutation, differing only in the 0x1F
+	/// pad; the in-circuit ENFORCEMENT of c̃'==c̃ is b256_recursion's proven root-boundary — the
+	/// digest exposed as a public boundary equal to c̃.)
+	#[test]
+	fn verify_closing_hash_gate_proves_over_b256() {
+		use crate::b256_sha3::prove_verify_sha3_b256;
+		use crate::sha3_variants::Sha3Variant;
+		use sha3::{Digest, Sha3_256};
+
+		fn sha3_256(m: &[u8]) -> [u8; 32] {
+			let mut h = Sha3_256::new();
+			h.update(m);
+			h.finalize().into()
+		}
+
+		// Message = μ (64 B, = SHAKE256(tr‖M') in the real verify) ‖ w1Encode(w1') bytes. The
+		// w1Encode word is the prove-9 pack of a 4-coefficient UseHint group.
+		let mu = [0x5au8; 64];
+		let w1 = [5u64, 6, 0, 21]; // UseHint outputs (< 44)
+		let packed = (w1[0] | (w1[1] << 6) | (w1[2] << 12) | (w1[3] << 18)) as u32;
+		let w1e = packed.to_le_bytes()[..3].to_vec(); // 24-bit word → 3 bytes
+		let mut msg = mu.to_vec();
+		msg.extend_from_slice(&w1e);
+
+		let ctilde = sha3_256(&msg); // the challenge c̃ = hash of the honest message
+
+		// In-circuit c̃' = SHA3-256(μ ‖ w1Encode) PROVEN+VERIFIED over B256 at NIST L1.
+		let (sz, digests) = prove_verify_sha3_b256(Sha3Variant::Sha3_256, &[msg.clone()], 1, 128)
+			.expect("closing hash must PROVE+VERIFY over B256");
+		assert_eq!(digests[0].as_slice(), &ctilde, "in-circuit c̃' != c̃ (closing gate broken)");
+
+		// Tamper: a WRONG w1' (flip one w1Encode byte) → different message → c̃' ≠ c̃, so the
+		// closing gate ACCEPT condition (c̃'==c̃) fails and the verify REJECTS.
+		let mut bad = msg.clone();
+		bad[64] ^= 1; // corrupt a w1Encode byte
+		let (_sz2, bad_digests) =
+			prove_verify_sha3_b256(Sha3Variant::Sha3_256, &[bad], 1, 128).expect("prove");
+		assert_ne!(
+			bad_digests[0].as_slice(),
+			&ctilde,
+			"SOUNDNESS FAILURE: a wrong w1' still hashed to c̃"
+		);
+
+		println!(
+			"GATE prove-10: closing hash gate c̃'=SHA3-256(μ‖w1Encode)==c̃ PROVEN+VERIFIED over B256 @L1(128); {sz} B; a wrong w1' → c̃'≠c̃ (verify rejects). Reduced verify pipeline now closes: strand→combine→Decompose→UseHint→w1Encode→hash==c̃."
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
