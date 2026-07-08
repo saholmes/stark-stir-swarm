@@ -1896,6 +1896,154 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-xr (Phase-3, S2 verify gate) — the ECDSA final ACCEPT condition over B256:
+	/// x ≡ r (mod n), where x is the affine x-coordinate of u1·G + u2·Q and r is the signature.
+	/// Because x < 2n (x is a field element ≲ the group order n), the quotient is a single bit k,
+	/// so the check collapses to the modular identity `x == r + k·n` (k ∈ {0,1}, r < n) — no big
+	/// multiply, k·n via a bcast conditional-add. A tampered r admits no valid k and the circuit
+	/// REJECTS. Shown for the P-256 group order n (W=512). Honest x≡r PROVES+VERIFIES over B256 at
+	/// NIST L1 (both k=0 and k=1 rows); a wrong r is REJECTED. This is the boundary the full ECDSA
+	/// assembly (prove-S2-1) closes over the scalar-mul output.
+	#[test]
+	fn ecdsa_x_mod_n_gate_proves_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let n = order(S2Curve::P256); // P-256 group order
+		let n_arr = arr(&n);
+		let c_n_bits = two_pow_w_minus(&to_bits(&n)); // 2^W − n  (r < n range)
+		let c_n_arr: [B1; W] = std::array::from_fn(|i| if c_n_bits[i] { B1::ONE } else { B1::ZERO });
+
+		// Two scalar-mul x-coordinates: one < n (k=0) and one in [n, 2n) (k=1); r = x mod n.
+		let x_small = &n - 12345u32; // < n → r = x, k = 0
+		let x_big = &n + 67890u32; // in [n, 2n) → r = 67890, k = 1
+		let rows: Vec<(BigUint, BigUint, u64)> = vec![
+			(x_small.clone(), &x_small % &n, if x_small >= n { 1 } else { 0 }),
+			(x_big.clone(), &x_big % &n, if x_big >= n { 1 } else { 0 }),
+		];
+		let nrows = rows.len();
+
+		// `r_override` corrupts one row's r → no k ∈ {0,1} closes x == r + k·n.
+		let run = |r_override: Option<(usize, BigUint)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ECDSA x≡r mod n gate over B256");
+			let x = t.add_committed::<B1, W>("x");
+			let r = t.add_committed::<B1, W>("r");
+			let k = t.add_committed::<B1, 1>("k");
+			// k·n via bcast conditional-add of the constant n.
+			let bcast = t.add_committed::<B1, W>("kbc");
+			let bcast_rot = t.add_shifted("kbc_rot", bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("kbc_eq", bcast - bcast_rot);
+			let bc_l0 = t.add_selected("kbc_l0", bcast, 0);
+			t.assert_zero("kbc_bind", bc_l0 - k);
+			let n_col = t.add_constant("n", n_arr);
+			let kn = t.add_computed("kn", bcast * n_col);
+			// identity: r + k·n == x.
+			let sum = Adder::<W>::build(&mut t, r, kn, "rk");
+			t.assert_zero("x_eq", sum.sum - x);
+			// r < n.
+			let cn = t.add_constant("c_n", c_n_arr);
+			let rcout = t.add_committed::<B1, W>("rcout");
+			let rcin = t.add_shifted("rcin", rcout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("r_carry", (r + rcin) * (cn + rcin) + rcin - rcout);
+			let rfc = t.add_selected("rfc", rcout, W - 1);
+			t.assert_zero("r_lt_n", rfc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, nrows).unwrap();
+				let mut seg = tw.full_segment();
+				for (row, (xv, rv0, kv)) in rows.iter().enumerate() {
+					let rv = match &r_override {
+						Some((rr, v)) if *rr == row => v.clone(),
+						_ => rv0.clone(),
+					};
+					write_col::<W>(&mut seg, x, row, &to_bits(xv)).unwrap();
+					write_col::<W>(&mut seg, r, row, &to_bits(&rv)).unwrap();
+					write_bit(&mut seg, k, row, *kv == 1).unwrap();
+					let kb = vec![*kv == 1; W];
+					write_col::<W>(&mut seg, bcast, row, &kb).unwrap();
+					write_col::<W>(&mut seg, bcast_rot, row, &kb).unwrap();
+					write_bit(&mut seg, bc_l0, row, *kv == 1).unwrap();
+					write_col::<W>(&mut seg, n_col, row, &to_bits(&n)).unwrap();
+					let knv = if *kv == 1 { to_bits(&n) } else { vec![false; W] };
+					write_col::<W>(&mut seg, kn, row, &knv).unwrap();
+					let _ = sum.populate(&mut seg, row, &to_bits(&rv), &knv).unwrap();
+					write_col::<W>(&mut seg, cn, row, &c_n_bits).unwrap();
+					let (_s, co) = ripple_add(&to_bits(&rv), &c_n_bits);
+					write_col::<W>(&mut seg, rcout, row, &co).unwrap();
+					write_col::<W>(&mut seg, rcin, row, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, rfc, row, co[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest x≡r mod n gate failed validate_witness: {verr}");
+		assert!(verify_ok, "honest x≡r mod n gate must PROVE+VERIFY over B256");
+
+		// Tamper: corrupt r on the k=1 row → x == r' + k·n has no k ∈ {0,1} solution → REJECT.
+		let (vok2, _e2, _) = run(Some((1, &rows[1].1 + 7u32)), false);
+		assert!(!vok2, "SOUNDNESS FAILURE: a wrong ECDSA r (x≢r mod n) was ACCEPTED over B256");
+
+		println!(
+			"GATE prove-S2-xr: ECDSA x≡r mod n ACCEPT gate PROVEN+VERIFIED over B256 @L1(128); {nrows} rows (k=0 and k=1), identity x=r+k·n + r<n; wrong r REJECTED. ECDSA verify boundary."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
