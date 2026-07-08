@@ -76,6 +76,7 @@
 // adjacent adder steps.
 
 use anyhow::Result;
+use binius_core::constraint_system::channel::ChannelId;
 use binius_core::{fiat_shamir::HasherChallenger, oracle::ShiftVariant};
 use binius_field::{
 	packed::{get_packed_slice, set_packed_slice},
@@ -84,6 +85,7 @@ use binius_field::{
 use binius_hash::sha2::Sha256Compression;
 use binius_m3::builder::{
 	Col, ConstraintSystem, Statement, TableBuilder, TableId, TableWitnessSegment, WitnessIndex, B1,
+	B64,
 };
 use bumpalo::Bump;
 use sha2::Sha256;
@@ -290,12 +292,38 @@ pub struct ModMul<const W: usize> {
 	n: usize,
 	m_set_bits: Vec<usize>,
 	c_bits: Vec<bool>,
+	// Seam (Some only for `build_seamed`): r's low 256 bits as four B64 lane-projections, pushed
+	// to a channel (B64 = tower level 6; B256 level 8 is unsupported by the m3 witness layer).
+	seam_r_lo: Option<[Col<B1, 64>; 4]>,
 }
 
 impl<const W: usize> ModMul<W> {
 	/// Add the constraint system for `a*b mod m`, where `m` is given as a length-`W`
 	/// little-endian bit vector and `n = ceil(log2 m)` is its bit length.
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize) -> Self {
+		Self::build_inner(cs, m_bits, n, None)
+	}
+
+	/// Like [`build`], but additionally PUSHES the reduced remainder `r` (its low 256 bits, as one
+	/// `B256` channel element) to `out_chan` — so an EC point-op formula table can PULL the field
+	/// product and compose it (the ModMul-output seam). Sound because `r < m < 2^256` for the EC /
+	/// ML-DSA primes, so the low 256 bits carry the full value. `W` must be 512 (the seam pack
+	/// asserts 8 + log2(1) == 0 + log2(256), i.e. the projected block is exactly 256 bits).
+	pub fn build_seamed(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		out_chan: ChannelId,
+	) -> Self {
+		Self::build_inner(cs, m_bits, n, Some(out_chan))
+	}
+
+	fn build_inner(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		seam: Option<ChannelId>,
+	) -> Self {
 		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
 		assert!(W.is_power_of_two());
 		assert!(n + 1 <= W, "need W >= n+1 for the q>>(n+1) range check");
@@ -394,6 +422,17 @@ impl<const W: usize> ModMul<W> {
 		// carry-out of the top bit must be 0  <=>  r < m.
 		table.assert_zero("r_lt_m", rlt_final_carry * B1::ONE);
 
+		// Seam: project r's low 256 bits as four 64-bit lanes and push them (as B64) to the channel.
+		let seam_r_lo = seam.map(|chan| {
+			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
+				table.add_selected_block::<B1, W, 64>(format!("seam_r_sel{i}"), r, i)
+			});
+			let b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_r_b64{i}"), sel[i]));
+			table.push(chan, b64);
+			sel
+		});
+
 		Self {
 			table_id: table.id(),
 			a,
@@ -414,6 +453,7 @@ impl<const W: usize> ModMul<W> {
 			n,
 			m_set_bits,
 			c_bits,
+			seam_r_lo,
 		}
 	}
 
@@ -487,6 +527,13 @@ impl<const W: usize> ModMul<W> {
 			write_col::<W>(seg, self.rlt_cout, row, &cout)?;
 			write_col::<W>(seg, self.rlt_cin, row, &cin)?;
 			write_bit(seg, self.rlt_final_carry, row, cout[W - 1])?;
+
+			// Seam projection: r's low 256 bits as four 64-bit lanes (the pushed channel value).
+			if let Some(sel) = self.seam_r_lo {
+				for (i, &s_col) in sel.iter().enumerate() {
+					write_col::<64>(seg, s_col, row, &inp.r[i * 64..i * 64 + 64])?;
+				}
+			}
 		}
 		Ok(())
 	}

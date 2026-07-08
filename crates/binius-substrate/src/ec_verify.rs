@@ -2374,6 +2374,169 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-madd (Phase-3, S2 composition) — the FIRST composed EC field computation over
+	/// B256: a point-op term t = (a·b + c) mod p, with the field product a·b CHANNEL-SEAMED from a
+	/// real 255-bit S0 ModMul into the formula table. A PRODUCT table proves prod = a·b mod p
+	/// (ModMul::build_seamed, W=512) and PUSHES prod on a `fp` channel; a FORMULA table PULLS prod
+	/// and proves t = (prod + c) mod p (fe_add). The channel binds the formula's prod to the
+	/// ModMul's genuine output — no free intermediate, so a forged product is REJECTED. This is the
+	/// ModMul-output seam the EC point ops (Edwards/Jacobian add/double) compose over: every point
+	/// op is a chain of seamed field mults + adds. Ed25519 base field p = 2²⁵⁵−19. Honest term
+	/// PROVES+VERIFIES over B256 at NIST L1; a forged product / wrong t is REJECTED.
+	#[test]
+	fn ec_field_multiply_add_seamed_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder, ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::ChannelId;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+		let p_arr = arr(&p);
+		let c_p_bits = two_pow_w_minus(&to_bits(&p));
+		let c_p_arr: [B1; W] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+
+		let a = BigUint::parse_bytes(b"3141592653589793238462643383279502884197169399375105820974944592", 16).unwrap() % &p;
+		let b = BigUint::parse_bytes(b"2718281828459045235360287471352662497757247093699959574966967627", 16).unwrap() % &p;
+		let c = BigUint::parse_bytes(b"1618033988749894848204586834365638117720309179805762862135448622", 16).unwrap() % &p;
+		let prod = (&a * &b) % &p; // a·b mod p
+		let t = (&prod + &c) % &p; // (a·b + c) mod p — the point-op term
+		let kt = if &prod + &c >= p { 1u64 } else { 0 };
+
+		// `prod_override` corrupts the formula's committed product → seam channel unbalanced.
+		let run = |prod_override: Option<BigUint>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let fp: ChannelId = cs.add_channel("fp"); // carries the field product a·b mod p
+
+			// PRODUCT strand: prod = a·b mod p, pushes prod on `fp`.
+			let mm = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, fp);
+
+			// FORMULA table: pull prod, prove t = (prod + c) mod p.
+			let mut ft = cs.add_table("EC point-op term (a·b + c) mod p over B256");
+			let prod_c = ft.add_committed::<B1, W>("prod");
+			let prod_sel: [Col<B1, 64>; 4] =
+				std::array::from_fn(|i| ft.add_selected_block::<B1, W, 64>(format!("prod_sel{i}"), prod_c, i));
+			let prod_b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| ft.add_packed::<B1, 64, B64, 1>(format!("prod_b64{i}"), prod_sel[i]));
+			ft.pull(fp, prod_b64);
+			let cc = ft.add_committed::<B1, W>("c");
+			let tt = ft.add_committed::<B1, W>("t");
+			let k = ft.add_committed::<B1, 1>("k");
+			// k·p via bcast.
+			let kbc = ft.add_committed::<B1, W>("kbc");
+			let kbcr = ft.add_shifted("kbcr", kbc, WLOG, 1, ShiftVariant::CircularLeft);
+			ft.assert_zero("kbc_eq", kbc - kbcr);
+			let kl0 = ft.add_selected("kl0", kbc, 0);
+			ft.assert_zero("kbc_bind", kl0 - k);
+			let p_col = ft.add_constant("p", p_arr);
+			let kp = ft.add_computed("kp", kbc * p_col);
+			// fe_add: t + k·p == prod + c.
+			let lhs = Adder::<W>::build(&mut ft, tt, kp, "lhs");
+			let rhs = Adder::<W>::build(&mut ft, prod_c, cc, "rhs");
+			ft.assert_zero("fe_add", lhs.sum - rhs.sum);
+			// t < p.
+			let cp = ft.add_constant("c_p", c_p_arr);
+			let tco = ft.add_committed::<B1, W>("tco");
+			let tci = ft.add_shifted("tci", tco, WLOG, 1, ShiftVariant::LogicalLeft);
+			ft.assert_zero("t_carry", (tt + tci) * (cp + tci) + tci - tco);
+			let tfc = ft.add_selected("tfc", tco, W - 1);
+			ft.assert_zero("t_lt_p", tfc * B1::ONE);
+			let ft_id = ft.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// product strand witness
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&a * &b) / &p;
+				mm.populate(
+					&mut seg,
+					&[ModMulRow { a: to_bits(&a), b: to_bits(&b), q: to_bits(&q), r: to_bits(&prod) }],
+				)
+				.unwrap();
+			}
+			// formula witness
+			{
+				let tw = witness.init_table(ft_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let prod_use = prod_override.clone().unwrap_or_else(|| prod.clone());
+				write_col::<W>(&mut seg, prod_c, 0, &to_bits(&prod_use)).unwrap();
+				// prod's low 256 bits as four 64-bit lanes (add_selected_block not auto-derived).
+				let pb = to_bits(&prod_use);
+				for (i, &s_col) in prod_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s_col, 0, &pb[i * 64..i * 64 + 64]).unwrap();
+				}
+				write_col::<W>(&mut seg, cc, 0, &to_bits(&c)).unwrap();
+				write_col::<W>(&mut seg, tt, 0, &to_bits(&t)).unwrap();
+				write_bit(&mut seg, k, 0, kt == 1).unwrap();
+				let kb = vec![kt == 1; W];
+				write_col::<W>(&mut seg, kbc, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, kbcr, 0, &kb).unwrap();
+				write_bit(&mut seg, kl0, 0, kt == 1).unwrap();
+				write_col::<W>(&mut seg, p_col, 0, &to_bits(&p)).unwrap();
+				let kpv = if kt == 1 { to_bits(&p) } else { vec![false; W] };
+				write_col::<W>(&mut seg, kp, 0, &kpv).unwrap();
+				let _ = lhs.populate(&mut seg, 0, &to_bits(&t), &kpv).unwrap();
+				let _ = rhs.populate(&mut seg, 0, &to_bits(&prod_use), &to_bits(&c)).unwrap();
+				write_col::<W>(&mut seg, cp, 0, &c_p_bits).unwrap();
+				let (_z, co) = ripple_add(&to_bits(&t), &c_p_bits);
+				write_col::<W>(&mut seg, tco, 0, &co).unwrap();
+				write_col::<W>(&mut seg, tci, 0, &shl(&co, 1)).unwrap();
+				write_bit(&mut seg, tfc, 0, co[W - 1]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest a·b+c term failed validate_witness: {verr}");
+		assert!(verify_ok, "honest seamed multiply-add must PROVE+VERIFY over B256");
+
+		// Tamper: the formula commits a product the ModMul never produced → `fp` channel unbalanced.
+		let (v2, _e, _) = run(Some((&prod + 1u32) % &p), false);
+		assert!(!v2, "SOUNDNESS FAILURE: a forged field product was composed into the point-op term");
+
+		println!(
+			"GATE prove-S2-madd: composed EC point-op term t=(a·b+c) mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); a·b channel-SEAMED from a real 255-bit ModMul into fe_add; forged product REJECTED. The ModMul-output seam EC point ops compose over."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
