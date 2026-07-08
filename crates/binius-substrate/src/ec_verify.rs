@@ -1780,6 +1780,62 @@ mod tests {
 		println!("GATE xcheck-ed25519: ed25519_verify agrees with ed25519-dalek (accept genuine, reject wrong-msg)");
 	}
 
+	/// GATE prove-S2-fe (Phase-3, S2 foundation) — the EC FIELD INVERSION gadget over B256, the
+	/// arithmetic primitive every EC verify rests on (ECDSA s⁻¹ mod n, affine Z⁻¹, point-add
+	/// slopes). fe_inv is one S0 ModMul with the output PINNED to 1: prove a·a⁻¹ == q·p + 1 with
+	/// r fixed to 1, so a WRONG inverse makes the identity a·b == q·p + 1 unsatisfiable (its true
+	/// residue ≠ 1) and the circuit REJECTS. Shown for the Ed25519 base field p = 2²⁵⁵−19 (W=512,
+	/// the field S0 already multiplies). Honest a·a⁻¹≡1 PROVES+VERIFIES over B256 at NIST L1; a
+	/// tampered inverse is REJECTED. (fe_mul = plain S0 ModMul mod p; fe_add/sub = carry; this
+	/// pins the inverse — the piece the EC point ops compose.)
+	#[test]
+	fn ec_field_inverse_proves_over_b256() {
+		use crate::nonnative::{prove_verify, ModMulRow};
+		use num_bigint::BigUint;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let p = prime(S2Curve::Ed25519); // 2²⁵⁵ − 19
+		let n = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+
+		// A field element a and its inverse a⁻¹ mod p; honest identity a·a⁻¹ = q·p + 1.
+		let a = BigUint::parse_bytes(
+			b"1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+			16,
+		)
+		.unwrap()
+			% &p;
+		let a_inv = fe_inv(&a, &p);
+		let prod = &a * &a_inv;
+		let q = &prod / &p;
+		let one = BigUint::from(1u32);
+		assert_eq!(&prod % &p, one, "native fe_inv broken: a·a⁻¹ ≢ 1");
+
+		let honest = ModMulRow { a: to_bits(&a), b: to_bits(&a_inv), q: to_bits(&q), r: to_bits(&one) };
+		let (sz, _) = prove_verify::<W>(&p_bits, n, &[honest])
+			.expect("fe_inv (a·a⁻¹≡1 mod p) must PROVE+VERIFY over B256");
+
+		// Tamper: a WRONG inverse with r still pinned to 1 → a·b = q·p + 1 has no integer solution
+		// (true residue = (1+a) mod p ≠ 1) → the identity constraint fails → REJECT.
+		let bad_inv = (&a_inv + 1u32) % &p;
+		let bad_prod = &a * &bad_inv;
+		let bad_q = &bad_prod / &p;
+		let tampered =
+			ModMulRow { a: to_bits(&a), b: to_bits(&bad_inv), q: to_bits(&bad_q), r: to_bits(&one) };
+		assert!(
+			prove_verify::<W>(&p_bits, n, &[tampered]).is_err(),
+			"SOUNDNESS FAILURE: a wrong fe_inv (output pinned to 1) was ACCEPTED over B256"
+		);
+
+		println!(
+			"GATE prove-S2-fe: EC field inversion a·a⁻¹≡1 mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); {sz} B; wrong inverse REJECTED (output pinned to 1). Foundation for ECDSA/Ed25519 point ops."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
