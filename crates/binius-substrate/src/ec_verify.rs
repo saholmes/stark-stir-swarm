@@ -3107,6 +3107,333 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-eaddx3 (Phase-3, S2 point op) — a COMPLETE twisted-Edwards extended-coordinate
+	/// X3 of a real point addition, assembled over B256 by wiring all four seam primitives. Using
+	/// the unified addition (Hisil–Wong–Carter–Dawson, a=−1) the X3 output coordinate is
+	///
+	///     X3 = E · F,   E = X1·Y2 + Y1·X2,   F = Z1·Z2 − d·T1·T2
+	///
+	/// (the (X1+Y1)(X2+Y2)−A−B form of E collapses to X1·Y2+Y1·X2). Every intermediate is a real
+	/// 255-bit S0 ModMul whose output crosses a channel; the fe_add/fe_sub glue pulls those products
+	/// and pushes E, F; the final X3 pulls BOTH glue results. Concretely (all seams multiplicity 1,
+	/// nonnative UNTOUCHED):
+	///   P = X1·Y2 (push chP),  Q = Y1·X2 (push chQ)      → E-glue pulls P,Q, pushes E=(P+Q) mod p
+	///   TT = T1·T2 (push chTT) → C = TT·d (build_seamed_chain: pull TT, push chC)
+	///   D = Z1·Z2 (push chD)                             → F-glue pulls C,D, pushes F=(D−C) mod p
+	///   X3 = build_seamed_in2(chE, chF)                  → X3 = E·F mod p
+	/// The channels bind X3 to the genuine E and F, and E/F to the genuine products — no free
+	/// intermediate anywhere in the coordinate. A forged product (here Q, one factor of E) unbalances
+	/// its channel and the whole coordinate is REJECTED. This is a full point-op coordinate built
+	/// entirely from build_seamed / build_seamed_chain / build_seamed_in2 / glue-push — the remaining
+	/// coordinates (Y3=G·H, Z3=F·G, T3=E·H) reuse E,F plus G=D+C, H=B+A with mult-2 glue fan-out.
+	/// Points carried in extended coords with Z=1, T=X·Y. Ed25519 base field p = 2²⁵⁵−19,
+	/// d = −121665/121666. Honest X3 PROVES+VERIFIES at NIST L1; a forged intermediate is REJECTED.
+	#[test]
+	fn ec_edwards_add_x3_coordinate_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder, ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::ChannelId;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+		let p_arr = arr(&p);
+		let c_p_bits = two_pow_w_minus(&to_bits(&p));
+		let c_p_arr: [B1; W] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+
+		// d = −121665 / 121666 mod p (Ed25519 curve constant), via Fermat inverse.
+		let inv = BigUint::from(121666u32).modpow(&(&p - 2u32), &p);
+		let d = ((&p - 121665u32) * inv) % &p;
+
+		// Two points in extended coords with Z=1, T=X·Y.
+		let x1 = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let y1 = BigUint::parse_bytes(b"07f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee", 16).unwrap() % &p;
+		let x2 = BigUint::parse_bytes(b"01223344556677889900aabbccddeeff102132435465768798a9bacbdcedfe0f", 16).unwrap() % &p;
+		let y2 = BigUint::parse_bytes(b"03fedcba9876543210efcdab8967452301224466880aacceeff11335577990bb", 16).unwrap() % &p;
+		let z1 = BigUint::from(1u32);
+		let z2 = BigUint::from(1u32);
+		let t1 = (&x1 * &y1) % &p;
+		let t2 = (&x2 * &y2) % &p;
+
+		let pp = (&x1 * &y2) % &p; // P = X1·Y2
+		let qq = (&y1 * &x2) % &p; // Q = Y1·X2
+		let ev = (&pp + &qq) % &p; // E = P + Q
+		let ke = if &pp + &qq >= p { 1u64 } else { 0 };
+		let tt = (&t1 * &t2) % &p; // TT = T1·T2
+		let cv = (&tt * &d) % &p; // C = d·T1·T2
+		let dv = (&z1 * &z2) % &p; // D = Z1·Z2
+		let kf = if dv < cv { 1u64 } else { 0 };
+		let fv = ((&dv + &p) - &cv) % &p; // F = D − C mod p
+		let x3 = (&ev * &fv) % &p; // X3 = E · F
+
+		// Independent cross-check of the closed-form X3.
+		let x3_ref = (&((&(&x1 * &y2) + &(&y1 * &x2)) % &p)
+			* &(((&(&z1 * &z2) % &p) + &p) - &((&(&(&t1 * &t2) % &p) * &d) % &p)) % &p) % &p;
+		assert_eq!(x3, x3_ref % &p, "X3 closed form mismatch");
+
+		// `bad_q` forges one factor of E (Q → Q+1): the chQ channel unbalances.
+		let run = |bad_q: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chp: ChannelId = cs.add_channel("chP"); // P = X1·Y2
+			let chq: ChannelId = cs.add_channel("chQ"); // Q = Y1·X2
+			let chtt: ChannelId = cs.add_channel("chTT"); // TT = T1·T2
+			let chc: ChannelId = cs.add_channel("chC"); // C = d·T1·T2
+			let chd: ChannelId = cs.add_channel("chD"); // D = Z1·Z2
+			let che: ChannelId = cs.add_channel("chE"); // E = P + Q
+			let chf: ChannelId = cs.add_channel("chF"); // F = D − C
+
+			// Product strands.
+			let mmp = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chp);
+			let mmq = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chq);
+			let mmtt = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chtt);
+			let mmc = ModMul::<W>::build_seamed_chain(&mut cs, &p_bits, np, chtt, chc); // C = TT·d
+			let mmd = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, chd);
+
+			// A pull helper: commit a W-bit column and pull its low 256 bits (4×B64) from `chan`.
+			let pull_word = |t: &mut TableBuilder<OurB256>, chan: ChannelId, nm: &str| -> (Col<B1, W>, [Col<B1, 64>; 4]) {
+				let c = t.add_committed::<B1, W>(nm.to_string());
+				let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{nm}_sel{i}"), c, i));
+				let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64{i}"), sel[i]));
+				t.pull(chan, b64);
+				(c, sel)
+			};
+			// A push helper: project a W-bit column's low 256 bits and push (4×B64) on `chan`.
+			let push_word = |t: &mut TableBuilder<OurB256>, chan: ChannelId, col: Col<B1, W>, nm: &str| -> [Col<B1, 64>; 4] {
+				let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{nm}_psel{i}"), col, i));
+				let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{nm}_pb64{i}"), sel[i]));
+				t.push(chan, b64);
+				sel
+			};
+
+			// E-glue: pull P, Q; prove E = (P+Q) mod p; push E on chE.
+			let mut eg = cs.add_table("E-glue E=(P+Q) mod p push chE");
+			let (p_c, p_sel) = pull_word(&mut eg, chp, "P");
+			let (q_c, q_sel) = pull_word(&mut eg, chq, "Q");
+			let e_c = eg.add_committed::<B1, W>("E");
+			let ek = eg.add_committed::<B1, 1>("ek");
+			let ekbc = eg.add_committed::<B1, W>("ekbc");
+			let ekbcr = eg.add_shifted("ekbcr", ekbc, WLOG, 1, ShiftVariant::CircularLeft);
+			eg.assert_zero("ekbc_eq", ekbc - ekbcr);
+			let ekl0 = eg.add_selected("ekl0", ekbc, 0);
+			eg.assert_zero("ekbc_bind", ekl0 - ek);
+			let ep_col = eg.add_constant("ep", p_arr);
+			let ekp = eg.add_computed("ekp", ekbc * ep_col);
+			let e_lhs = Adder::<W>::build(&mut eg, e_c, ekp, "e_lhs"); // E + k·p
+			let e_rhs = Adder::<W>::build(&mut eg, p_c, q_c, "e_rhs"); // P + Q
+			eg.assert_zero("e_add", e_lhs.sum - e_rhs.sum);
+			let ecp = eg.add_constant("e_c_p", c_p_arr);
+			let eco = eg.add_committed::<B1, W>("eco");
+			let eci = eg.add_shifted("eci", eco, WLOG, 1, ShiftVariant::LogicalLeft);
+			eg.assert_zero("e_carry", (e_c + eci) * (ecp + eci) + eci - eco);
+			let efc = eg.add_selected("efc", eco, W - 1);
+			eg.assert_zero("e_lt_p", efc * B1::ONE);
+			let e_psel = push_word(&mut eg, che, e_c, "E");
+			let eg_id = eg.id();
+
+			// F-glue: pull C, D; prove F = (D−C) mod p  (F + C = D + k·p); push F on chF.
+			let mut fg = cs.add_table("F-glue F=(D-C) mod p push chF");
+			let (c_c, c_sel) = pull_word(&mut fg, chc, "C");
+			let (d_c, d_sel) = pull_word(&mut fg, chd, "D");
+			let f_c = fg.add_committed::<B1, W>("F");
+			let fk = fg.add_committed::<B1, 1>("fk");
+			let fkbc = fg.add_committed::<B1, W>("fkbc");
+			let fkbcr = fg.add_shifted("fkbcr", fkbc, WLOG, 1, ShiftVariant::CircularLeft);
+			fg.assert_zero("fkbc_eq", fkbc - fkbcr);
+			let fkl0 = fg.add_selected("fkl0", fkbc, 0);
+			fg.assert_zero("fkbc_bind", fkl0 - fk);
+			let fp_col = fg.add_constant("fp", p_arr);
+			let fkp = fg.add_computed("fkp", fkbc * fp_col);
+			let f_lhs = Adder::<W>::build(&mut fg, f_c, c_c, "f_lhs"); // F + C
+			let f_rhs = Adder::<W>::build(&mut fg, d_c, fkp, "f_rhs"); // D + k·p
+			fg.assert_zero("f_sub", f_lhs.sum - f_rhs.sum);
+			let fcp = fg.add_constant("f_c_p", c_p_arr);
+			let fco = fg.add_committed::<B1, W>("fco");
+			let fci = fg.add_shifted("fci", fco, WLOG, 1, ShiftVariant::LogicalLeft);
+			fg.assert_zero("f_carry", (f_c + fci) * (fcp + fci) + fci - fco);
+			let ffc = fg.add_selected("ffc", fco, W - 1);
+			fg.assert_zero("f_lt_p", ffc * B1::ONE);
+			let f_psel = push_word(&mut fg, chf, f_c, "F");
+			let fg_id = fg.id();
+
+			// Output coordinate: X3 = E · F, pulls E from chE and F from chF.
+			let mmx3 = ModMul::<W>::build_seamed_in2(&mut cs, &p_bits, np, che, chf);
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1; 8] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// helper to fill a pulled/pushed word's four lanes.
+			let fill_lanes = |seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, sel: &[Col<B1, 64>; 4], bits: &[bool]| {
+				for (i, &s) in sel.iter().enumerate() {
+					write_col::<64>(seg, s, 0, &bits[i * 64..i * 64 + 64]).unwrap();
+				}
+			};
+
+			// P strand
+			{
+				let tw = witness.init_table(mmp.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&x1 * &y2) / &p;
+				mmp.populate(&mut seg, &[ModMulRow { a: to_bits(&x1), b: to_bits(&y2), q: to_bits(&q), r: to_bits(&pp) }]).unwrap();
+			}
+			// Q strand (bad_q forges Q → Q+1: its pushed output no longer matches E-glue's honest pull)
+			{
+				let tw = witness.init_table(mmq.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q_out = if bad_q { (&qq + 1u32) % &p } else { qq.clone() };
+				// keep the product internally consistent: prove Y1·X2' where X2' makes r=q_out is hard;
+				// instead corrupt only the pushed value by proving a genuine product equal to q_out via
+				// a matching factor is not needed — we corrupt the committed r directly is unsound-safe
+				// because the ModMul constraints tie r to a·b. So forge via a different second factor.
+				// Simplest sound corruption: multiply Y1 by (X2+something) is unavailable; use q_out as a
+				// standalone product X=q_out, one=1.
+				let (fa, fb) = if bad_q { (q_out.clone(), BigUint::from(1u32)) } else { (y1.clone(), x2.clone()) };
+				let prod = &fa * &fb;
+				let q = &prod / &p;
+				let r = &prod % &p;
+				mmq.populate(&mut seg, &[ModMulRow { a: to_bits(&fa), b: to_bits(&fb), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			}
+			// TT strand
+			{
+				let tw = witness.init_table(mmtt.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&t1 * &t2) / &p;
+				mmtt.populate(&mut seg, &[ModMulRow { a: to_bits(&t1), b: to_bits(&t2), q: to_bits(&q), r: to_bits(&tt) }]).unwrap();
+			}
+			// C strand: C = TT·d (a=TT pulled, b=d)
+			{
+				let tw = witness.init_table(mmc.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&tt * &d) / &p;
+				mmc.populate(&mut seg, &[ModMulRow { a: to_bits(&tt), b: to_bits(&d), q: to_bits(&q), r: to_bits(&cv) }]).unwrap();
+			}
+			// D strand
+			{
+				let tw = witness.init_table(mmd.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&z1 * &z2) / &p;
+				mmd.populate(&mut seg, &[ModMulRow { a: to_bits(&z1), b: to_bits(&z2), q: to_bits(&q), r: to_bits(&dv) }]).unwrap();
+			}
+			// E-glue witness
+			{
+				let tw = witness.init_table(eg_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let pb = to_bits(&pp);
+				let qb = to_bits(&qq);
+				write_col::<W>(&mut seg, p_c, 0, &pb).unwrap();
+				fill_lanes(&mut seg, &p_sel, &pb);
+				write_col::<W>(&mut seg, q_c, 0, &qb).unwrap();
+				fill_lanes(&mut seg, &q_sel, &qb);
+				let eb = to_bits(&ev);
+				write_col::<W>(&mut seg, e_c, 0, &eb).unwrap();
+				write_bit(&mut seg, ek, 0, ke == 1).unwrap();
+				let kb = vec![ke == 1; W];
+				write_col::<W>(&mut seg, ekbc, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, ekbcr, 0, &kb).unwrap();
+				write_bit(&mut seg, ekl0, 0, ke == 1).unwrap();
+				write_col::<W>(&mut seg, ep_col, 0, &to_bits(&p)).unwrap();
+				let kpv = if ke == 1 { to_bits(&p) } else { vec![false; W] };
+				write_col::<W>(&mut seg, ekp, 0, &kpv).unwrap();
+				let _ = e_lhs.populate(&mut seg, 0, &eb, &kpv).unwrap();
+				let _ = e_rhs.populate(&mut seg, 0, &pb, &qb).unwrap();
+				write_col::<W>(&mut seg, ecp, 0, &c_p_bits).unwrap();
+				let (_z, co) = ripple_add(&eb, &c_p_bits);
+				write_col::<W>(&mut seg, eco, 0, &co).unwrap();
+				write_col::<W>(&mut seg, eci, 0, &shl(&co, 1)).unwrap();
+				write_bit(&mut seg, efc, 0, co[W - 1]).unwrap();
+				fill_lanes(&mut seg, &e_psel, &eb);
+			}
+			// F-glue witness
+			{
+				let tw = witness.init_table(fg_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let cb = to_bits(&cv);
+				let db = to_bits(&dv);
+				write_col::<W>(&mut seg, c_c, 0, &cb).unwrap();
+				fill_lanes(&mut seg, &c_sel, &cb);
+				write_col::<W>(&mut seg, d_c, 0, &db).unwrap();
+				fill_lanes(&mut seg, &d_sel, &db);
+				let fb = to_bits(&fv);
+				write_col::<W>(&mut seg, f_c, 0, &fb).unwrap();
+				write_bit(&mut seg, fk, 0, kf == 1).unwrap();
+				let kb = vec![kf == 1; W];
+				write_col::<W>(&mut seg, fkbc, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, fkbcr, 0, &kb).unwrap();
+				write_bit(&mut seg, fkl0, 0, kf == 1).unwrap();
+				write_col::<W>(&mut seg, fp_col, 0, &to_bits(&p)).unwrap();
+				let kpv = if kf == 1 { to_bits(&p) } else { vec![false; W] };
+				write_col::<W>(&mut seg, fkp, 0, &kpv).unwrap();
+				let _ = f_lhs.populate(&mut seg, 0, &fb, &cb).unwrap();
+				let _ = f_rhs.populate(&mut seg, 0, &db, &kpv).unwrap();
+				write_col::<W>(&mut seg, fcp, 0, &c_p_bits).unwrap();
+				let (_z, co) = ripple_add(&fb, &c_p_bits);
+				write_col::<W>(&mut seg, fco, 0, &co).unwrap();
+				write_col::<W>(&mut seg, fci, 0, &shl(&co, 1)).unwrap();
+				write_bit(&mut seg, ffc, 0, co[W - 1]).unwrap();
+				fill_lanes(&mut seg, &f_psel, &fb);
+			}
+			// X3 strand: a = E (pulled), b = F (pulled).
+			{
+				let tw = witness.init_table(mmx3.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let prod = &ev * &fv;
+				let q = &prod / &p;
+				let r = &prod % &p;
+				mmx3.populate(&mut seg, &[ModMulRow { a: to_bits(&ev), b: to_bits(&fv), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// Cheap validate-only pass first (seconds) to shake out structural/balance errors.
+		let (vpre, verrpre, _) = run(false, false);
+		assert!(vpre, "honest X3 coordinate failed validate_witness: {verrpre}");
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest X3 coordinate failed validate_witness (full): {verr}");
+		assert!(verify_ok, "honest Edwards X3 coordinate must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: a forged E factor was composed into the X3 coordinate");
+
+		println!(
+			"GATE prove-S2-eaddx3: complete twisted-Edwards X3 = (X1·Y2+Y1·X2)·(Z1·Z2 − d·T1·T2) mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); 6 seamed ModMuls + 2 fe_add/fe_sub glue tables, every intermediate channel-bound, forged E factor REJECTED. A full point-op coordinate assembled from the seam toolkit (build_seamed / _chain / _in2 / glue-push)."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
