@@ -1933,6 +1933,167 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-5 (Phase-3, S1e) — the FIPS-204 z-field DECODE (BitUnpack) gadget over B256.
+	/// σ's z field packs each coefficient as e = γ1 − z in bitlen(2γ1−1)=18 bits (L1, γ1=2^17 so
+	/// 2γ1=2^18). Decoding a 3-coefficient group binds the packed word to its slots by the shifted
+	/// sum `packed = e0 + (e1<<18) + (e2<<36)` (add_shifted + Adder), range-checks each e < 2^18
+	/// (its high bits zero — well-formedness), and recovers the signed coefficient by the transform
+	/// `rc = γ1 − e` (rc + e = γ1). Honest decodings PROVE+VERIFY over B256 at NIST L1; a tampered
+	/// packed word / out-of-slot coefficient is REJECTED.
+	#[test]
+	fn z_decode_gadget_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const GAMMA1: u64 = 1 << 17; // 131072
+		const ZBITS: usize = 18; // bitlen(2γ1 − 1)
+		const W: usize = 64;
+		const WLOG: usize = 6;
+
+		fn bits64(x: u64) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arr64 = |x: u64| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+
+		// 3-coefficient groups of z ∈ (−γ1, γ1]; e = γ1 − z ∈ [0, 2^18). (n is a power of two so
+		// the table needs no padding row — constants are `Repeating` and must hold in every row.)
+		let zgroups: [[i64; 3]; 4] = [
+			[0, 1, -1],
+			[100, -50, GAMMA1 as i64],
+			[-(GAMMA1 as i64) + 1, 12345, -9999],
+			[50, -50, 1000],
+		];
+		let n = zgroups.len();
+		let enc = |z: i64| -> u64 { (GAMMA1 as i64 - z) as u64 }; // e = γ1 − z ∈ [0, 2^18)
+		let pack = |g: &[i64; 3]| -> u64 {
+			enc(g[0]) | (enc(g[1]) << ZBITS) | (enc(g[2]) << (2 * ZBITS))
+		};
+		// mask of bits ZBITS..W (high bits that a well-formed e must leave zero).
+		let mask_hi: Vec<bool> = (0..W).map(|k| k >= ZBITS).collect();
+		let mask_hi_arr: [B1; W] =
+			std::array::from_fn(|k| if mask_hi[k] { B1::ONE } else { B1::ZERO });
+
+		let run = |packed_override: Option<(usize, u64)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA z-field BitUnpack over B256");
+			let e: [_; 3] = std::array::from_fn(|j| t.add_committed::<B1, W>(format!("e{j}")));
+			let packed = t.add_committed::<B1, W>("packed");
+			let rc: [_; 3] = std::array::from_fn(|j| t.add_committed::<B1, W>(format!("rc{j}")));
+			// unpack: packed = e0 + (e1<<18) + (e2<<36).
+			let sh1 = t.add_shifted("sh1", e[1], WLOG, ZBITS, ShiftVariant::LogicalLeft);
+			let sh2 = t.add_shifted("sh2", e[2], WLOG, 2 * ZBITS, ShiftVariant::LogicalLeft);
+			let a1 = Adder::<W>::build(&mut t, e[0], sh1, "a1");
+			let a2 = Adder::<W>::build(&mut t, a1.sum, sh2, "a2");
+			t.assert_zero("unpack_def", packed - a2.sum);
+			// well-formedness + transform, per coefficient.
+			let mask = t.add_constant("mask_hi", mask_hi_arr);
+			let g1_col = t.add_constant("gamma1", arr64(GAMMA1));
+			let mut xforms = Vec::new();
+			for j in 0..3 {
+				// e_j < 2^18 : high bits zero.
+				t.assert_zero(format!("e{j}_wf"), e[j] * mask);
+				// rc_j = γ1 − e_j : rc_j + e_j = γ1.
+				let sum = Adder::<W>::build(&mut t, rc[j], e[j], &format!("rcadd{j}"));
+				t.assert_zero(format!("rc{j}_def"), sum.sum - g1_col);
+				xforms.push(sum);
+			}
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let g = zgroups[row];
+					let ev = [enc(g[0]), enc(g[1]), enc(g[2])];
+					let rcv = [
+						(GAMMA1.wrapping_sub(ev[0])),
+						(GAMMA1.wrapping_sub(ev[1])),
+						(GAMMA1.wrapping_sub(ev[2])),
+					];
+					let mut pk = pack(&g);
+					if let Some((rr, v)) = packed_override {
+						if rr == row {
+							pk = v;
+						}
+					}
+					for j in 0..3 {
+						write_col::<W>(&mut seg, e[j], row, &bits64(ev[j])).unwrap();
+						write_col::<W>(&mut seg, rc[j], row, &bits64(rcv[j])).unwrap();
+					}
+					write_col::<W>(&mut seg, packed, row, &bits64(pk)).unwrap();
+					let s1 = crate::nonnative::shl(&bits64(ev[1]), ZBITS);
+					let s2 = crate::nonnative::shl(&bits64(ev[2]), 2 * ZBITS);
+					write_col::<W>(&mut seg, sh1, row, &s1).unwrap();
+					write_col::<W>(&mut seg, sh2, row, &s2).unwrap();
+					let v1 = a1.populate(&mut seg, row, &bits64(ev[0]), &s1).unwrap();
+					let _ = a2.populate(&mut seg, row, &v1, &s2).unwrap();
+					write_col::<W>(&mut seg, mask, row, &mask_hi).unwrap();
+					write_col::<W>(&mut seg, g1_col, row, &bits64(GAMMA1)).unwrap();
+					for (j, xf) in xforms.iter().enumerate() {
+						let _ = xf.populate(&mut seg, row, &bits64(rcv[j]), &bits64(ev[j])).unwrap();
+					}
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest z decode failed validate_witness: {verr}");
+		assert!(verify_ok, "honest z decode must PROVE+VERIFY over B256");
+
+		// Tamper: flip a bit of the packed word → packed ≠ shifted-sum of slots → REJECT.
+		let bad = run(Some((0, pack(&zgroups[0]) ^ 1)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a wrong z decoding was ACCEPTED");
+
+		println!(
+			"GATE prove-5: ML-DSA z-field BitUnpack PROVEN+VERIFIED over B256 @L1(128); {n} 3-coeff groups (18-bit e=γ1−z), unpack + e<2^18 + rc=γ1−e transform; tampered packing REJECTED"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
