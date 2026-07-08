@@ -2044,6 +2044,58 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-pteq (Phase-3, S2 verify gate) — the Ed25519 final ACCEPT condition reduces to
+	/// a PROJECTIVE POINT EQUALITY [8][S]B == [8]R + [8][k]A, checked by CROSS-MULTIPLICATION (no
+	/// inversion): for points P=(X:Y:Z), Q, the X-equality is P.X·Q.Z ≡ Q.X·P.Z (mod p). Both
+	/// cross-products are proven equal by PINNING them to the same value cx (two S0 ModMuls, same
+	/// output): if P ≠ Q the two products differ and cannot both equal cx → REJECT. Shown for the
+	/// Ed25519 base field p = 2²⁵⁵−19 (W=512); the Y-equality is the identical gate on (Y, Z).
+	/// Honest P==Q PROVES+VERIFIES over B256 at NIST L1; a point that is NOT equal is REJECTED.
+	#[test]
+	fn ed25519_point_equality_proves_over_b256() {
+		use crate::nonnative::{prove_verify, ModMulRow};
+		use num_bigint::BigUint;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize; // 255
+		let p_bits = to_bits(&p);
+
+		// Two projective representatives of the SAME point: P = (x:y:1), Q = (x·λ : y·λ : λ).
+		let x = BigUint::parse_bytes(b"2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748", 16).unwrap() % &p;
+		let lam = BigUint::parse_bytes(b"55667788990011223344556677889900aabbccddeeff00112233445566778899", 16).unwrap() % &p;
+		let px = x.clone();
+		let pz = BigUint::from(1u32);
+		let qx = (&x * &lam) % &p; // = x·λ mod p
+		let qz = lam.clone();
+		let cx = (&px * &qz) % &p; // P.X·Q.Z mod p = x·λ mod p
+		assert_eq!(cx, (&qx * &pz) % &p, "same-point cross products must match (X-equality)");
+
+		// Row 0: P.X·Q.Z ≡ cx ; Row 1: Q.X·P.Z ≡ cx  (both pinned to cx).
+		let mk = |a: &BigUint, b: &BigUint| -> ModMulRow {
+			let prod = a * b;
+			ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&(&prod / &p)), r: to_bits(&cx) }
+		};
+		let (sz, _) = prove_verify::<W>(&p_bits, np, &[mk(&px, &qz), mk(&qx, &pz)])
+			.expect("Ed25519 point-equality (cross-mult) must PROVE+VERIFY over B256");
+
+		// Tamper: a Q whose X is off by one (≠ P) → Q.X·P.Z mod p ≠ cx → row-1 identity (pinned to
+		// cx) is unsatisfiable → REJECT.
+		let qx_bad = (&qx + 1u32) % &p;
+		assert!(
+			prove_verify::<W>(&p_bits, np, &[mk(&px, &qz), mk(&qx_bad, &pz)]).is_err(),
+			"SOUNDNESS FAILURE: an unequal Ed25519 point passed the equality gate over B256"
+		);
+
+		println!(
+			"GATE prove-S2-pteq: Ed25519 projective point-equality P.X·Q.Z≡Q.X·P.Z mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); {sz} B; unequal point REJECTED (cross-products pinned to cx). Ed25519 verify boundary (Y-equality identical)."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
