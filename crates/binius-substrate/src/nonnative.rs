@@ -298,13 +298,15 @@ pub struct ModMul<const W: usize> {
 	// Input seam (Some for `build_seamed_chain`): operand `a`'s low 256 bits as four B64 lanes,
 	// PULLED from a channel — binds `a` to a prior ModMul's pushed output (mult chaining).
 	seam_a_lo: Option<[Col<B1, 64>; 4]>,
+	// Input seam for operand `b` (Some for `build_seamed_in2`): same, pulled for `b`.
+	seam_b_lo: Option<[Col<B1, 64>; 4]>,
 }
 
 impl<const W: usize> ModMul<W> {
 	/// Add the constraint system for `a*b mod m`, where `m` is given as a length-`W`
 	/// little-endian bit vector and `n = ceil(log2 m)` is its bit length.
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize) -> Self {
-		Self::build_inner(cs, m_bits, n, None, None)
+		Self::build_inner(cs, m_bits, n, None, None, None)
 	}
 
 	/// Like [`build`], but additionally PUSHES the reduced remainder `r` (its low 256 bits, as one
@@ -318,7 +320,7 @@ impl<const W: usize> ModMul<W> {
 		n: usize,
 		out_chan: ChannelId,
 	) -> Self {
-		Self::build_inner(cs, m_bits, n, Some(out_chan), None)
+		Self::build_inner(cs, m_bits, n, Some(out_chan), None, None)
 	}
 
 	/// Chain link: PULL operand `a` from `in_a_chan` (binding it to a prior ModMul's pushed
@@ -331,7 +333,7 @@ impl<const W: usize> ModMul<W> {
 		in_a_chan: ChannelId,
 		out_chan: ChannelId,
 	) -> Self {
-		Self::build_inner(cs, m_bits, n, Some(out_chan), Some(in_a_chan))
+		Self::build_inner(cs, m_bits, n, Some(out_chan), Some(in_a_chan), None)
 	}
 
 	/// Final chain link: PULL operand `a` from `in_a_chan` (no output push).
@@ -341,7 +343,19 @@ impl<const W: usize> ModMul<W> {
 		n: usize,
 		in_a_chan: ChannelId,
 	) -> Self {
-		Self::build_inner(cs, m_bits, n, None, Some(in_a_chan))
+		Self::build_inner(cs, m_bits, n, None, Some(in_a_chan), None)
+	}
+
+	/// Final chain link pulling BOTH operands: `a` from `in_a_chan`, `b` from `in_b_chan` — for the
+	/// output products of a point op (e.g. `X3 = E·F`, both operands earlier results).
+	pub fn build_seamed_in2(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		in_a_chan: ChannelId,
+		in_b_chan: ChannelId,
+	) -> Self {
+		Self::build_inner(cs, m_bits, n, None, Some(in_a_chan), Some(in_b_chan))
 	}
 
 	fn build_inner(
@@ -350,6 +364,7 @@ impl<const W: usize> ModMul<W> {
 		n: usize,
 		seam: Option<ChannelId>,
 		seam_in_a: Option<ChannelId>,
+		seam_in_b: Option<ChannelId>,
 	) -> Self {
 		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
 		assert!(W.is_power_of_two());
@@ -470,6 +485,15 @@ impl<const W: usize> ModMul<W> {
 			table.pull(chan, b64);
 			sel
 		});
+		let seam_b_lo = seam_in_b.map(|chan| {
+			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
+				table.add_selected_block::<B1, W, 64>(format!("seam_b_sel{i}"), b, i)
+			});
+			let b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_b_b64{i}"), sel[i]));
+			table.pull(chan, b64);
+			sel
+		});
 
 		Self {
 			table_id: table.id(),
@@ -493,6 +517,7 @@ impl<const W: usize> ModMul<W> {
 			c_bits,
 			seam_r_lo,
 			seam_a_lo,
+			seam_b_lo,
 		}
 	}
 
@@ -576,6 +601,11 @@ impl<const W: usize> ModMul<W> {
 			if let Some(sel) = self.seam_a_lo {
 				for (i, &s_col) in sel.iter().enumerate() {
 					write_col::<64>(seg, s_col, row, &inp.a[i * 64..i * 64 + 64])?;
+				}
+			}
+			if let Some(sel) = self.seam_b_lo {
+				for (i, &s_col) in sel.iter().enumerate() {
+					write_col::<64>(seg, s_col, row, &inp.b[i * 64..i * 64 + 64])?;
 				}
 			}
 		}
