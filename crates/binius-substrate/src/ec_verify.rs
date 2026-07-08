@@ -3762,6 +3762,114 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-strand (Phase-3, S2 scalar-mul) — the round-to-round HANDOFF that makes a
+	/// scalar multiplication decompose into independent per-round STRANDS (the tunable-RSS knob).
+	/// A double-and-add scalar mult is a chain of point ops [k]P = round_n(…round_1(P)); to prove it
+	/// with bounded memory each round is its own proof (its own strand), and consecutive rounds are
+	/// glued NOT by sharing a witness but by the point crossing a STATEMENT BOUNDARY: round r exposes
+	/// its output point as a public boundary that round r+1 consumes as its input boundary. This gate
+	/// proves that handoff mechanism for a coordinate over B256: a strand PULLS its input coordinate
+	/// X_in from a channel that an INPUT boundary pushes (the previous round's published output), does
+	/// its field work (here the per-round update r = X_in·m via build_seamed_chain), and PUSHES the
+	/// result to a channel that an OUTPUT boundary pulls (the value the next round will consume). The
+	/// boundary values are the coordinate's four low 64-bit lanes as B256 — exactly the channel tuple
+	/// the ModMul seams carry — so the public point published between proofs is bit-identical to the
+	/// witnessed one. If the published output boundary claims a coordinate the strand did not compute,
+	/// the chOut multiset unbalances and the strand is REJECTED (likewise a mis-published input). This
+	/// is the primitive a full scalar-mul strand uses: wrap eaddfull's eight input coords / four output
+	/// coords in Push/Pull boundaries and every round proves independently. Ed25519 field p = 2²⁵⁵−19.
+	/// Honest strand PROVES+VERIFIES at NIST L1; a mis-published boundary point is REJECTED.
+	#[test]
+	fn ec_scalarmul_strand_boundary_io_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		// A coordinate's four low 64-bit lanes as B256 — the channel/boundary tuple encoding.
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+
+		let x_in = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let m = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+		let r_out = (&x_in * &m) % &p; // the round's output coordinate
+
+		// `bad_out` publishes an output coordinate the strand did not compute; `bad_in` mis-publishes
+		// the input coordinate. Either unbalances a boundary channel.
+		let run = |bad_out: bool, bad_in: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chin = cs.add_channel("chIn"); // previous round's published output → this strand's input
+			let chout = cs.add_channel("chOut"); // this strand's output → next round's input
+
+			// Strand: pull X_in from chIn, prove r = X_in·m, push r to chOut.
+			let mm = ModMul::<W>::build_seamed_chain(&mut cs, &p_bits, np, chin, chout);
+
+			let x_in_pub = if bad_in { (&x_in + 1u32) % &p } else { x_in.clone() };
+			let r_pub = if bad_out { (&r_out + 1u32) % &p } else { r_out.clone() };
+			let boundaries = vec![
+				Boundary { values: to_boundary(&x_in_pub), channel_id: chin, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&r_pub), channel_id: chout, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&x_in * &m) / &p;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(&x_in), b: to_bits(&m), q: to_bits(&q), r: to_bits(&r_out) }]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, false, true);
+		assert!(vok, "honest strand handoff failed validate_witness: {verr}");
+		assert!(verify_ok, "honest scalar-mul strand (boundary I/O) must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false, false);
+		assert!(!v2, "SOUNDNESS FAILURE: strand published an output coordinate it did not compute");
+		let (v3, _e, _) = run(false, true, false);
+		assert!(!v3, "SOUNDNESS FAILURE: strand accepted a mis-published input coordinate");
+
+		println!(
+			"GATE prove-S2-strand: scalar-mul round handoff over B256 @L1(128) — a strand PULLS its input coordinate from an input BOUNDARY (previous round's published point), computes its update, and PUSHES the result to an output BOUNDARY (next round's input); boundary values = the coord's four B256 lanes, bit-identical to the witnessed point; PROVEN+VERIFIED, mis-published input OR output REJECTED. Per-round scalar-mul strand decomposition (tunable RSS) works."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
