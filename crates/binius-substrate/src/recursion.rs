@@ -316,14 +316,57 @@ mod tests {
 		println!("GATE ref-R-5: FRI-query Merkle opening verifies honest paths, rejects tampered leaf/path");
 	}
 
-	/// GATE prove-R-1 (PENDING, Tier A) — the batched-Merkle master proves over B256/B512:
-	/// N inner roots pulled from the join channel, R* == merkle_root_sha3 exposed as a
-	/// Boundary; a substituted inner root or wrong R* is REJECTED (channel-unbalanced /
-	/// boundary mismatch). Reuses sha3_join + sha3_seam + sha3_root_boundary (committed).
+	/// GATE prove-R-1 (Phase-3, Tier A) — the batched-Merkle master over B256: a STRAND's root is
+	/// channel-bound into the master aggregation node and the master root R* is exposed as a public
+	/// Boundary. This is the R-phase base case: the reduced verify pipeline (prove-6b…10) becomes
+	/// ONE strand producing an output root R_child = SHA3-256(a‖b); the master node computes
+	/// R* = SHA3-256(R_child ‖ sibling) = merkle_root over the two, binding R_child to the strand
+	/// via the `join` channel (the proven M2b-4 mechanism) and pinning R* by boundary. Honest
+	/// aggregation PROVES+VERIFIES over B256 at NIST L1 with R* == the native batched-Merkle root;
+	/// a FORGED strand root (one the strand never produced) UNBALANCES the seam and is REJECTED
+	/// (the ref-R-2 aggregation-binding, in-circuit). An N-ary tree chains this node.
 	#[test]
-	#[ignore = "R Tier-A batched-Merkle master not wired — needs N-child join + tree over Keccakf"]
 	fn batched_merkle_master_proves_over_b256() {
-		unimplemented!("N-child sha3_join pull + binary Keccakf tree + R* root Boundary; tamper rejects");
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+		use sha3::{Digest, Sha3_256};
+
+		fn h(m: &[u8]) -> [u8; 32] {
+			let mut x = Sha3_256::new();
+			x.update(m);
+			x.finalize().into()
+		}
+		fn cat(a: &[u8; 32], b: &[u8; 32]) -> Vec<u8> {
+			let mut v = a.to_vec();
+			v.extend_from_slice(b);
+			v
+		}
+
+		// A strand's output root = SHA3-256(a‖b); aggregate it with a sibling strand root `d`
+		// into the master node R* = SHA3-256(R_child ‖ d) = merkle_root([R_child, d]).
+		let a = [0x11u8; 32];
+		let b = [0x22u8; 32];
+		let d = [0x33u8; 32];
+		let r_child = h(&cat(&a, &b));
+		let rstar = h(&cat(&r_child, &d));
+		assert_eq!(rstar, super::merkle_root_sha3(&[r_child, d]), "R* != native merkle_root");
+
+		// Honest: strand root channel-bound into the master; R* pinned by boundary.
+		let ok = prove_verify_join_b256(a, b, d, JoinMode::Honest, Some(rstar), 1, 128)
+			.expect("master aggregation must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest master must PROVE+VERIFY over B256");
+		assert_eq!(ok.r_parent, rstar, "in-circuit R* != native merkle_root");
+
+		// Tamper (ref-R-2 binding): a forged strand root the strand never produced → the join
+		// channel is unbalanced → REJECT.
+		let forged = [0xDEu8; 32];
+		assert_ne!(forged, r_child);
+		let bad = prove_verify_join_b256(a, b, d, JoinMode::ForgedInnerRoot { forged }, None, 1, 128)
+			.expect("forged-master run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a forged strand root was aggregated into the master");
+
+		println!(
+			"GATE prove-R-1: Tier-A batched-Merkle master — strand root channel-bound into R*=merkle_root, PROVEN+VERIFIED over B256 @L1(128), R* pinned by boundary; forged strand root REJECTED (seam unbalanced)"
+		);
 	}
 
 	/// GATE prove-R-2 (PENDING, Tier B) — proof-carrying recursion: the master runs the
