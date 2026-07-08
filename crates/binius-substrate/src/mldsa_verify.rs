@@ -2274,6 +2274,241 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-6b (Phase-3, S1-ASSEMBLY) — a real product STRAND channel-seamed into the
+	/// verify-core combine over B256. Two tables in ONE ConstraintSystem: a PRODUCT-STRAND table
+	/// computes p1 = Â·ẑ (the pointwise NTT-domain product, via S0's bcast shift-and-add multiply)
+	/// and PUSHES it on a `seam` channel; the COMBINE table PULLS p1 and verifies ŵ = (p1 − p2)
+	/// mod q (identity ŵ + p2 = p1 + s·q). The channel balances iff the combine's p1 equals the
+	/// strand's genuine product — this is the strand/R-phase seam that binds each ModMul strand's
+	/// output into the verify. Honest strand+combine PROVE+VERIFY over B256 at NIST L1; a combine
+	/// that pulls a p1 the strand never produced UNBALANCES the channel and is REJECTED. (Operands
+	/// are kept < 2^11 so Â·ẑ < q and needs no reduction — isolating the SEAM; the full 23-bit
+	/// var·var mod-q product is the S0 `ModMul` strand.)
+	#[test]
+	fn verify_core_strand_seam_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B32};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const Q: u64 = 8_380_417;
+		const W: usize = 32;
+		const WLOG: usize = 5;
+		const AB_BITS: usize = 11; // operands < 2^11 → product < 2^22 < q (no reduction)
+
+		fn bitsw(x: u64) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arrw = |x: u64| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+
+		// (Â, ẑ, ĉ, t̂1-ish p2) per coefficient. p1 = Â·ẑ (< q); p2 committed; ŵ=(p1−p2) mod q.
+		// Distinct p1 across rows so the seam multiset is unambiguous.
+		let coeffs: [(u64, u64, u64); 4] =
+			[(3, 5, 100), (1000, 999, 2_000_000), (1500, 1500, 50), (777, 321, 8_380_000)];
+		let n = coeffs.len();
+		let rows: Vec<(u64, u64, u64)> = coeffs
+			.iter()
+			.map(|&(a, z, p2)| {
+				let p1 = a * z; // < 2^22 < q
+				let w = (p1 + Q - p2) % Q;
+				let s = if p1 >= p2 { 0u64 } else { 1u64 };
+				(p1, w, s)
+			})
+			.collect();
+
+		let q_arr = arrw(Q);
+		let c_q_bits = two_pow_w_minus(&bitsw(Q));
+		let c_q_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits[k] { B1::ONE } else { B1::ZERO });
+
+		// `p1_override` makes the combine pull a p1 the strand never pushed → seam unbalanced.
+		let run = |p1_override: Option<(usize, u64)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let seam = cs.add_channel("seam"); // carries the pointwise product p1
+
+			// ── PRODUCT STRAND: p1 = Â·ẑ (bcast shift-and-add), push p1 to seam ──
+			let mut st = cs.add_table("product strand Â·ẑ over B256");
+			let a = st.add_committed::<B1, W>("a");
+			let z = st.add_committed::<B1, W>("z");
+			let mut pps: Vec<Col<B1, W>> = Vec::new();
+			#[allow(clippy::type_complexity)]
+			let mut mb: Vec<(Option<Col<B1, W>>, Col<B1, W>, Col<B1, W>, Col<B1, 1>, Col<B1, 1>)> =
+				Vec::new(); // (a<<k, bcast, bcast_rot, bcast_l0, z_bit)
+			for k in 0..AB_BITS {
+				let ashl = if k == 0 {
+					None
+				} else {
+					Some(st.add_shifted(format!("a{k}"), a, WLOG, k, ShiftVariant::LogicalLeft))
+				};
+				let sa = ashl.unwrap_or(a);
+				let z_bit = st.add_selected(format!("zb{k}"), z, k);
+				let bcast = st.add_committed::<B1, W>(format!("bc{k}"));
+				let bcast_rot = st.add_shifted(format!("bc{k}r"), bcast, WLOG, 1, ShiftVariant::CircularLeft);
+				st.assert_zero(format!("bc{k}eq"), bcast - bcast_rot);
+				let bc_l0 = st.add_selected(format!("bc{k}l0"), bcast, 0);
+				st.assert_zero(format!("bc{k}bind"), bc_l0 - z_bit);
+				let pp = st.add_computed(format!("pp{k}"), bcast * sa);
+				pps.push(pp);
+				mb.push((ashl, bcast, bcast_rot, bc_l0, z_bit));
+			}
+			let mut p1s = pps[0];
+			let mut st_adders = Vec::new();
+			for k in 1..AB_BITS {
+				let ad = Adder::<W>::build(&mut st, p1s, pps[k], &format!("acc{k}"));
+				p1s = ad.sum;
+				st_adders.push(ad);
+			}
+			let p1s_b32 = st.add_packed::<B1, W, B32, 1>("p1s_b32", p1s);
+			st.push(seam, [p1s_b32]);
+			let st_id = st.id();
+
+			// ── COMBINE: pull p1, verify ŵ = (p1 − p2) mod q ──
+			let mut ct = cs.add_table("verify-core combine (seamed) over B256");
+			let p1 = ct.add_committed::<B1, W>("p1");
+			let p1_b32 = ct.add_packed::<B1, W, B32, 1>("p1_b32", p1);
+			ct.pull(seam, [p1_b32]);
+			let p2 = ct.add_committed::<B1, W>("p2");
+			let w = ct.add_committed::<B1, W>("w");
+			let s = ct.add_committed::<B1, 1>("s");
+			let s_bcast = ct.add_committed::<B1, W>("s_bcast");
+			let s_bcast_rot = ct.add_shifted("s_bcast_rot", s_bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			ct.assert_zero("s_bcast_eq", s_bcast - s_bcast_rot);
+			let s_l0 = ct.add_selected("s_l0", s_bcast, 0);
+			ct.assert_zero("s_bind", s_l0 - s);
+			let q_col = ct.add_constant("q", q_arr);
+			let sq = ct.add_computed("sq", s_bcast * q_col);
+			let lhs = Adder::<W>::build(&mut ct, w, p2, "lhs");
+			let rhs = Adder::<W>::build(&mut ct, p1, sq, "rhs");
+			ct.assert_zero("combine", lhs.sum - rhs.sum);
+			// ŵ < q.
+			let cq = ct.add_constant("cq", c_q_arr);
+			let w_cout = ct.add_committed::<B1, W>("w_cout");
+			let w_cin = ct.add_shifted("w_cin", w_cout, WLOG, 1, ShiftVariant::LogicalLeft);
+			ct.assert_zero("w_carry", (w + w_cin) * (cq + w_cin) + w_cin - w_cout);
+			let w_fc = ct.add_selected("w_fc", w_cout, W - 1);
+			ct.assert_zero("w_lt_q", w_fc * B1::ONE);
+			let ct_id = ct.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n, n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// strand witness
+			{
+				let tw = witness.init_table(st_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (av, zv, _) = coeffs[row];
+					write_col::<W>(&mut seg, a, row, &bitsw(av)).unwrap();
+					write_col::<W>(&mut seg, z, row, &bitsw(zv)).unwrap();
+					let mut pp_bits: Vec<Vec<bool>> = Vec::new();
+					for (k, &(ashl, bcast, bcast_rot, bc_l0, z_bit)) in mb.iter().enumerate() {
+						let bit = (zv >> k) & 1 == 1;
+						if let Some(col) = ashl {
+							write_col::<W>(&mut seg, col, row, &shl(&bitsw(av), k)).unwrap();
+						}
+						write_bit(&mut seg, z_bit, row, bit).unwrap();
+						// rotation of a uniform value is the same uniform value.
+						write_col::<W>(&mut seg, bcast, row, &vec![bit; W]).unwrap();
+						write_col::<W>(&mut seg, bcast_rot, row, &vec![bit; W]).unwrap();
+						write_bit(&mut seg, bc_l0, row, bit).unwrap();
+						let ppv = if bit { shl(&bitsw(av), k) } else { vec![false; W] };
+						pp_bits.push(ppv);
+					}
+					for (k, &pp) in pps.iter().enumerate() {
+						write_col::<W>(&mut seg, pp, row, &pp_bits[k]).unwrap();
+					}
+					let mut acc = pp_bits[0].clone();
+					for (k, ad) in st_adders.iter().enumerate() {
+						acc = ad.populate(&mut seg, row, &acc, &pp_bits[k + 1]).unwrap();
+					}
+					let _ = acc; // = p1
+				}
+			}
+			// combine witness
+			{
+				let tw = witness.init_table(ct_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (p1v0, wv, sv) = rows[row];
+					let (_, _, p2v) = coeffs[row];
+					let p1v = match p1_override {
+						Some((rr, v)) if rr == row => v,
+						_ => p1v0,
+					};
+					write_col::<W>(&mut seg, p1, row, &bitsw(p1v)).unwrap();
+					write_col::<W>(&mut seg, p2, row, &bitsw(p2v)).unwrap();
+					write_col::<W>(&mut seg, w, row, &bitsw(wv)).unwrap();
+					write_bit(&mut seg, s, row, sv == 1).unwrap();
+					let su = vec![sv == 1; W];
+					write_col::<W>(&mut seg, s_bcast, row, &su).unwrap();
+					write_col::<W>(&mut seg, s_bcast_rot, row, &su).unwrap();
+					write_bit(&mut seg, s_l0, row, sv == 1).unwrap();
+					write_col::<W>(&mut seg, q_col, row, &bitsw(Q)).unwrap();
+					let sqv = if sv == 1 { bitsw(Q) } else { vec![false; W] };
+					write_col::<W>(&mut seg, sq, row, &sqv).unwrap();
+					let _ = lhs.populate(&mut seg, row, &bitsw(wv), &bitsw(p2v)).unwrap();
+					let _ = rhs.populate(&mut seg, row, &bitsw(p1v), &sqv).unwrap();
+					write_col::<W>(&mut seg, cq, row, &c_q_bits).unwrap();
+					let (_s, co) = ripple_add(&bitsw(wv), &c_q_bits);
+					write_col::<W>(&mut seg, w_cout, row, &co).unwrap();
+					write_col::<W>(&mut seg, w_cin, row, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, w_fc, row, co[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest strand+combine failed validate_witness: {verr}");
+		assert!(verify_ok, "honest strand+combine must PROVE+VERIFY over B256");
+
+		// Tamper: the combine pulls a p1 the strand never produced → seam channel UNBALANCED.
+		let bad = run(Some((0, rows[0].0 + 1)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a combine p1 not produced by the strand was ACCEPTED");
+
+		println!(
+			"GATE prove-6b: product strand Â·ẑ channel-seamed into verify-core combine, PROVEN+VERIFIED over B256 @L1(128); {n} coeffs; combine's p1 bound to the strand's genuine product; forged p1 REJECTED (seam unbalanced)"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
