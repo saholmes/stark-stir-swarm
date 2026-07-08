@@ -2094,6 +2094,186 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-6 (Phase-3, S1-ASSEMBLY) — the verify-core NTT-domain COMBINE over B256: the
+	/// subtraction that binds the signature to the challenge. In the verify relation
+	/// w'Approx = InvNTT(Â∘ẑ − ĉ∘t̂1·2^d), each pointwise product p1 = Â·ẑ mod q and
+	/// p2 = ĉ·(t̂1·2^d) mod q is a var·var mod-q multiply — an S0 `ModMul` strand (m=q, already
+	/// proven). This gadget verifies the COMBINE ŵ = (p1 − p2) mod q via the non-negative identity
+	/// `ŵ + p2 = p1 + s·q` (s ∈ {0,1}), with ŵ, p1, p2 ∈ [0, q). Honest combines PROVE+VERIFY over
+	/// B256 at NIST L1, with p1/p2/ŵ gated against the native verify arithmetic (Â·ẑ, ĉ·(t̂1·2^d),
+	/// their mod-q difference); a wrong ŵ is REJECTED. (The channel seam binding each ModMul strand
+	/// output into this combine — and the full 256×k×l dimension + InvNTT — is the strand/R-phase
+	/// scale-up; this pins the arithmetic heart.)
+	#[test]
+	fn verify_core_combine_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const Q: u64 = 8_380_417;
+		const D: u32 = 13; // t1·2^d
+		const W: usize = 32;
+		const WLOG: usize = 5;
+
+		fn bitsw(x: u64) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+		let arrw = |x: u64| -> [B1; W] {
+			std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO })
+		};
+		let mulq = |a: u64, b: u64| (a * b) % Q;
+
+		// (Â, ẑ, ĉ, t̂1) NTT-domain coefficients < q; p1 = Â·ẑ, td = t̂1·2^d, p2 = ĉ·td (all mod q);
+		// ŵ = (p1 − p2) mod q — the native verify intermediate this circuit reproduces.
+		let inputs: [(u64, u64, u64, u64); 4] = [
+			(3, 5, 7, 11),
+			(1234567, 7654321, 111111, 222222),
+			(8380416, 2, 8380416, 1),
+			(4190208, 4190209, 100, 8000000),
+		];
+		let n = inputs.len();
+		let rows: Vec<(u64, u64, u64, u64)> = inputs
+			.iter()
+			.map(|&(a, z, c, t1)| {
+				let p1 = mulq(a, z);
+				let td = mulq(t1, 1u64 << D);
+				let p2 = mulq(c, td);
+				let w = (p1 + Q - p2) % Q;
+				let s = if p1 >= p2 { 0u64 } else { 1u64 };
+				(p1, p2, w, s)
+			})
+			.collect();
+
+		let q_arr = arrw(Q);
+		let c_q_bits = two_pow_w_minus(&bitsw(Q)); // 2^32 − q  (x < q range)
+		let c_q_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits[k] { B1::ONE } else { B1::ZERO });
+
+		let run = |w_override: Option<(usize, u64)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA verify-core combine (ŵ=(p1−p2) mod q) over B256");
+			let p1 = t.add_committed::<B1, W>("p1");
+			let p2 = t.add_committed::<B1, W>("p2");
+			let w = t.add_committed::<B1, W>("w");
+			let s = t.add_committed::<B1, 1>("s");
+			// s·q via bcast conditional-add.
+			let s_bcast = t.add_committed::<B1, W>("s_bcast");
+			let s_bcast_rot = t.add_shifted("s_bcast_rot", s_bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("s_bcast_eq", s_bcast - s_bcast_rot);
+			let s_l0 = t.add_selected("s_l0", s_bcast, 0);
+			t.assert_zero("s_bind", s_l0 - s);
+			let q_col = t.add_constant("q", q_arr);
+			let sq = t.add_computed("sq", s_bcast * q_col);
+			// identity: w + p2 = p1 + s·q.
+			let lhs = Adder::<W>::build(&mut t, w, p2, "lhs");
+			let rhs = Adder::<W>::build(&mut t, p1, sq, "rhs");
+			t.assert_zero("combine", lhs.sum - rhs.sum);
+			// ranges: p1, p2, w < q.
+			let mk_lt_q = |t: &mut binius_m3::builder::TableBuilder<OurB256>, x: binius_m3::builder::Col<B1, W>, nm: &str| {
+				let cc = t.add_constant(format!("{nm}_cq"), c_q_arr);
+				let cout = t.add_committed::<B1, W>(format!("{nm}_cout"));
+				let cin = t.add_shifted(format!("{nm}_cin"), cout, WLOG, 1, ShiftVariant::LogicalLeft);
+				t.assert_zero(format!("{nm}_carry"), (x + cin) * (cc + cin) + cin - cout);
+				let fc = t.add_selected(format!("{nm}_fc"), cout, W - 1);
+				t.assert_zero(format!("{nm}_lt_q"), fc * B1::ONE);
+				(cc, cout, cin, fc)
+			};
+			let rp1 = mk_lt_q(&mut t, p1, "p1");
+			let rp2 = mk_lt_q(&mut t, p2, "p2");
+			let rw = mk_lt_q(&mut t, w, "w");
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let (p1v, p2v, mut wv, sv) = rows[row];
+					if let Some((rr, v)) = w_override {
+						if rr == row {
+							wv = v;
+						}
+					}
+					write_col::<W>(&mut seg, p1, row, &bitsw(p1v)).unwrap();
+					write_col::<W>(&mut seg, p2, row, &bitsw(p2v)).unwrap();
+					write_col::<W>(&mut seg, w, row, &bitsw(wv)).unwrap();
+					write_bit(&mut seg, s, row, sv == 1).unwrap();
+					let su = vec![sv == 1; W];
+					write_col::<W>(&mut seg, s_bcast, row, &su).unwrap();
+					write_col::<W>(&mut seg, s_bcast_rot, row, &su).unwrap();
+					write_bit(&mut seg, s_l0, row, sv == 1).unwrap();
+					write_col::<W>(&mut seg, q_col, row, &bitsw(Q)).unwrap();
+					let sqv = if sv == 1 { bitsw(Q) } else { vec![false; W] };
+					write_col::<W>(&mut seg, sq, row, &sqv).unwrap();
+					let lv = lhs.populate(&mut seg, row, &bitsw(wv), &bitsw(p2v)).unwrap();
+					let _ = rhs.populate(&mut seg, row, &bitsw(p1v), &sqv).unwrap();
+					let _ = lv;
+					for (x_val, (cc, cout, cin, fc)) in
+						[(p1v, rp1), (p2v, rp2), (wv, rw)]
+					{
+						write_col::<W>(&mut seg, cc, row, &c_q_bits).unwrap();
+						let (_s, co) = ripple_add(&bitsw(x_val), &c_q_bits);
+						write_col::<W>(&mut seg, cout, row, &co).unwrap();
+						write_col::<W>(&mut seg, cin, row, &shl(&co, 1)).unwrap();
+						write_bit(&mut seg, fc, row, co[W - 1]).unwrap();
+					}
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest verify-core combine failed validate_witness: {verr}");
+		assert!(verify_ok, "honest verify-core combine must PROVE+VERIFY over B256");
+
+		// Tamper: claim a wrong ŵ (off by one) → no valid s closes w + p2 = p1 + s·q → REJECT.
+		let bad = run(Some((0, (rows[0].2 + 1) % Q)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: a wrong verify-core ŵ was ACCEPTED");
+
+		println!(
+			"GATE prove-6: ML-DSA verify-core combine ŵ=(Â·ẑ − ĉ·t̂1·2^d) mod q PROVEN+VERIFIED over B256 @L1(128); {n} coeffs gated vs native; identity ŵ+p2=p1+s·q + p1,p2,ŵ<q; wrong ŵ REJECTED"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
