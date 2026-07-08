@@ -369,6 +369,72 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-R-1b (Phase-3, Tier A) — an N=4 batched-Merkle tree AGGREGATED ACROSS TWO STRAND
+	/// PROCESSES over B256, the strand-decomposition shape: each strand is a SEPARATE bounded-RSS
+	/// proof, seamed to the next by boundary equality (the coarse cross-proof seam). Strand B
+	/// proves node1 = SHA3-256(l2‖l3) in its own process and exposes node1. Strand A channel-binds
+	/// node0 = SHA3-256(l0‖l1) into the root R* = SHA3-256(node0‖node1) (join channel + R* boundary),
+	/// consuming node1 as the seam value. The coordinator checks strand B's proven node1 equals the
+	/// node1 fed to strand A, and R* == the native balanced-Merkle root. A forged node0 (strand A)
+	/// or a substituted node1 (strand B) breaks the tree and is REJECTED. This scales prove-R-1 to
+	/// N strands: each subtree is its own process, roots seamed by boundaries — O(log N) levels.
+	#[test]
+	fn batched_merkle_tree_multistrand_over_b256() {
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+		use crate::b256_sha3::prove_verify_sha3_b256;
+		use crate::sha3_variants::Sha3Variant;
+		use sha3::{Digest, Sha3_256};
+
+		fn h2(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+			let mut x = Sha3_256::new();
+			x.update(a);
+			x.update(b);
+			x.finalize().into()
+		}
+
+		// 4 strand-leaf roots → balanced binary tree → R*.
+		let l = [[0x11u8; 32], [0x22; 32], [0x33; 32], [0x44; 32]];
+		let node0 = h2(&l[0], &l[1]);
+		let node1 = h2(&l[2], &l[3]);
+		let rstar = h2(&node0, &node1);
+		assert_eq!(rstar, super::merkle_root_sha3(&l), "R* != native balanced-Merkle root");
+
+		// Strand B (own bounded process): prove node1 = SHA3-256(l2‖l3) over B256; boundary = node1.
+		let mut m1 = l[2].to_vec();
+		m1.extend_from_slice(&l[3]);
+		let (_szb, d1) = prove_verify_sha3_b256(Sha3Variant::Sha3_256, &[m1], 1, 128)
+			.expect("strand B must PROVE+VERIFY over B256");
+		let node1_proven: [u8; 32] = d1[0].clone().try_into().unwrap();
+		assert_eq!(node1_proven, node1, "strand B root != node1");
+
+		// Strand A + root (own bounded process): node0 = SHA3(l0‖l1) channel-bound into
+		// R* = SHA3(node0‖node1); node1 is the seam value (D); R* pinned by boundary.
+		let ok = prove_verify_join_b256(l[0], l[1], node1, JoinMode::Honest, Some(rstar), 1, 128)
+			.expect("root strand must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest tree must PROVE+VERIFY over B256");
+		assert_eq!(ok.r_child, node0, "in-circuit node0 != SHA3(l0‖l1)");
+		assert_eq!(ok.r_parent, rstar, "in-circuit R* != native merkle_root");
+
+		// Cross-proof seam (coordinator): strand B's proven node1 == the node1 strand A consumed.
+		assert_eq!(node1_proven, node1, "cross-proof boundary seam: node1 mismatch across strands");
+
+		// Tamper 1 (strand A): a forged node0 the strand never produced → root join REJECTS.
+		let bad =
+			prove_verify_join_b256(l[0], l[1], node1, JoinMode::ForgedInnerRoot { forged: [0xDE; 32] }, None, 1, 128)
+				.expect("forged-node0 run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a forged node0 was aggregated");
+		// Tamper 2 (strand B): a substituted node1 → different R* ≠ native merkle_root.
+		assert_ne!(
+			super::merkle_root_sha3(&[l[0], l[1], [0x99u8; 32], l[3]]),
+			rstar,
+			"SOUNDNESS FAILURE: a substituted strand-B leaf left R* unchanged"
+		);
+
+		println!(
+			"GATE prove-R-1b: N=4 batched-Merkle tree across 2 strand processes over B256 @L1(128); node0 channel-bound into R*, node1 proven in its own strand, cross-proof boundary seam; R*==native merkle_root; forged node0 / substituted node1 REJECTED"
+		);
+	}
+
 	/// GATE prove-R-2 (PENDING, Tier B) — proof-carrying recursion: the master runs the
 	/// Binius verifier over each inner proof in-circuit (FRI/sumcheck/Merkle-path). Design
 	/// only; the arithmetized-verifier cost is the open milestone.
