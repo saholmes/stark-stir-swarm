@@ -2263,6 +2263,117 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-lows (Phase-3, S2 verify gate) — the ECDSA low-S malleability guard over B256.
+	/// A canonical ECDSA signature requires s ∈ [1, (n−1)/2]: s ≠ 0, and s in the LOW half of the
+	/// group order so the malleable twin (n−s) is rejected (BIP-146 / RFC-6979 low-S). Both bounds
+	/// collapse to one range check on w = s − 1: `w < (n−1)/2` (w's carry-out of w + (2^W − h) is 0,
+	/// h=(n−1)/2), since s=0 wraps w huge and s>(n−1)/2 overflows. Shown for the P-256 group order n
+	/// (W=512). A valid low-S s PROVES+VERIFIES over B256 at NIST L1; s=0 or a high-S s (> (n−1)/2)
+	/// is REJECTED.
+	#[test]
+	fn ecdsa_low_s_guard_proves_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		let n = order(S2Curve::P256);
+		let half = (&n - 1u32) / 2u32; // (n−1)/2  (low-S bound)
+		let ones = BigUint::parse_bytes(&vec![b'f'; W / 4], 16).unwrap(); // 2^W − 1
+		let c_half_bits = two_pow_w_minus(&to_bits(&half)); // 2^W − (n−1)/2
+		let c_half_arr: [B1; W] = std::array::from_fn(|i| if c_half_bits[i] { B1::ONE } else { B1::ZERO });
+		let ones_arr = arr(&ones);
+
+		// `s` values: a valid low-S (accept), and — via override — s=0 / high-S (reject).
+		let s_ok = BigUint::parse_bytes(b"0102030405060708090a0b0c0d0e0f101112131415161718", 16).unwrap();
+		assert!(s_ok >= BigUint::from(1u32) && s_ok <= half);
+
+		let run = |s_val: BigUint, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ECDSA low-S guard over B256");
+			let s = t.add_committed::<B1, W>("s");
+			// w = s − 1  (via s + (2^W − 1)).
+			let ones_col = t.add_constant("ones", ones_arr);
+			let wsub = Adder::<W>::build(&mut t, s, ones_col, "wsub");
+			let w = wsub.sum;
+			// w < (n−1)/2 : carry-out of w + (2^W − h) must be 0.
+			let ch = t.add_constant("c_half", c_half_arr);
+			let co = t.add_committed::<B1, W>("co");
+			let ci = t.add_shifted("ci", co, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("carry", (w + ci) * (ch + ci) + ci - co);
+			let fc = t.add_selected("fc", co, W - 1);
+			t.assert_zero("low_s", fc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, s, 0, &to_bits(&s_val)).unwrap();
+				write_col::<W>(&mut seg, ones_col, 0, &to_bits(&ones)).unwrap();
+				let wv = wsub.populate(&mut seg, 0, &to_bits(&s_val), &to_bits(&ones)).unwrap();
+				write_col::<W>(&mut seg, ch, 0, &c_half_bits).unwrap();
+				let (_z, cout) = ripple_add(&wv, &c_half_bits);
+				write_col::<W>(&mut seg, co, 0, &cout).unwrap();
+				write_col::<W>(&mut seg, ci, 0, &shl(&cout, 1)).unwrap();
+				crate::nonnative::write_bit(&mut seg, fc, 0, cout[W - 1]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(s_ok.clone(), true);
+		assert!(vok, "honest low-S guard failed validate_witness: {verr}");
+		assert!(verify_ok, "honest low-S s must PROVE+VERIFY over B256");
+
+		// Tamper 1: high-S (n − s_ok) > (n−1)/2 → w ≥ h → carry-out 1 → REJECT.
+		let s_high = &n - &s_ok;
+		assert!(s_high > half);
+		let (v_hi, _e, _) = run(s_high, false);
+		assert!(!v_hi, "SOUNDNESS FAILURE: a high-S (malleable) signature passed the low-S guard");
+		// Tamper 2: s = 0 → w = −1 wraps to 2^W−1 ≥ h → carry-out 1 → REJECT.
+		let (v_zero, _e, _) = run(BigUint::from(0u32), false);
+		assert!(!v_zero, "SOUNDNESS FAILURE: s = 0 passed the low-S guard");
+
+		println!(
+			"GATE prove-S2-lows: ECDSA low-S guard s∈[1,(n−1)/2] PROVEN+VERIFIED over B256 @L1(128); high-S (malleable twin) and s=0 REJECTED. ECDSA canonical-signature check."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
