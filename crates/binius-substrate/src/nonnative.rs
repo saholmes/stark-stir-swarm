@@ -295,13 +295,16 @@ pub struct ModMul<const W: usize> {
 	// Seam (Some only for `build_seamed`): r's low 256 bits as four B64 lane-projections, pushed
 	// to a channel (B64 = tower level 6; B256 level 8 is unsupported by the m3 witness layer).
 	seam_r_lo: Option<[Col<B1, 64>; 4]>,
+	// Input seam (Some for `build_seamed_chain`): operand `a`'s low 256 bits as four B64 lanes,
+	// PULLED from a channel — binds `a` to a prior ModMul's pushed output (mult chaining).
+	seam_a_lo: Option<[Col<B1, 64>; 4]>,
 }
 
 impl<const W: usize> ModMul<W> {
 	/// Add the constraint system for `a*b mod m`, where `m` is given as a length-`W`
 	/// little-endian bit vector and `n = ceil(log2 m)` is its bit length.
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize) -> Self {
-		Self::build_inner(cs, m_bits, n, None)
+		Self::build_inner(cs, m_bits, n, None, None)
 	}
 
 	/// Like [`build`], but additionally PUSHES the reduced remainder `r` (its low 256 bits, as one
@@ -315,7 +318,30 @@ impl<const W: usize> ModMul<W> {
 		n: usize,
 		out_chan: ChannelId,
 	) -> Self {
-		Self::build_inner(cs, m_bits, n, Some(out_chan))
+		Self::build_inner(cs, m_bits, n, Some(out_chan), None)
+	}
+
+	/// Chain link: PULL operand `a` from `in_a_chan` (binding it to a prior ModMul's pushed
+	/// output) and PUSH the result `r` to `out_chan`. This lets EC point ops chain field mults —
+	/// e.g. `X3 = E·F` where `E`/`F` are earlier products — over the seam channels.
+	pub fn build_seamed_chain(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		in_a_chan: ChannelId,
+		out_chan: ChannelId,
+	) -> Self {
+		Self::build_inner(cs, m_bits, n, Some(out_chan), Some(in_a_chan))
+	}
+
+	/// Final chain link: PULL operand `a` from `in_a_chan` (no output push).
+	pub fn build_seamed_in(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		in_a_chan: ChannelId,
+	) -> Self {
+		Self::build_inner(cs, m_bits, n, None, Some(in_a_chan))
 	}
 
 	fn build_inner(
@@ -323,6 +349,7 @@ impl<const W: usize> ModMul<W> {
 		m_bits: &[bool],
 		n: usize,
 		seam: Option<ChannelId>,
+		seam_in_a: Option<ChannelId>,
 	) -> Self {
 		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
 		assert!(W.is_power_of_two());
@@ -422,7 +449,7 @@ impl<const W: usize> ModMul<W> {
 		// carry-out of the top bit must be 0  <=>  r < m.
 		table.assert_zero("r_lt_m", rlt_final_carry * B1::ONE);
 
-		// Seam: project r's low 256 bits as four 64-bit lanes and push them (as B64) to the channel.
+		// Output seam: project r's low 256 bits as four 64-bit lanes, PUSH them (as B64).
 		let seam_r_lo = seam.map(|chan| {
 			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
 				table.add_selected_block::<B1, W, 64>(format!("seam_r_sel{i}"), r, i)
@@ -430,6 +457,17 @@ impl<const W: usize> ModMul<W> {
 			let b64: [Col<B64, 1>; 4] =
 				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_r_b64{i}"), sel[i]));
 			table.push(chan, b64);
+			sel
+		});
+		// Input seam: project operand a's low 256 bits as four 64-bit lanes, PULL them — binds a
+		// to a prior ModMul's pushed output.
+		let seam_a_lo = seam_in_a.map(|chan| {
+			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
+				table.add_selected_block::<B1, W, 64>(format!("seam_a_sel{i}"), a, i)
+			});
+			let b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_a_b64{i}"), sel[i]));
+			table.pull(chan, b64);
 			sel
 		});
 
@@ -454,6 +492,7 @@ impl<const W: usize> ModMul<W> {
 			m_set_bits,
 			c_bits,
 			seam_r_lo,
+			seam_a_lo,
 		}
 	}
 
@@ -528,10 +567,15 @@ impl<const W: usize> ModMul<W> {
 			write_col::<W>(seg, self.rlt_cin, row, &cin)?;
 			write_bit(seg, self.rlt_final_carry, row, cout[W - 1])?;
 
-			// Seam projection: r's low 256 bits as four 64-bit lanes (the pushed channel value).
+			// Seam projections: r's low 256 bits (pushed) and a's low 256 bits (pulled), 4 B64 each.
 			if let Some(sel) = self.seam_r_lo {
 				for (i, &s_col) in sel.iter().enumerate() {
 					write_col::<64>(seg, s_col, row, &inp.r[i * 64..i * 64 + 64])?;
+				}
+			}
+			if let Some(sel) = self.seam_a_lo {
+				for (i, &s_col) in sel.iter().enumerate() {
+					write_col::<64>(seg, s_col, row, &inp.a[i * 64..i * 64 + 64])?;
 				}
 			}
 		}

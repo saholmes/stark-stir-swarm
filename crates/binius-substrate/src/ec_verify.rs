@@ -2701,6 +2701,105 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-mchain (Phase-3, S2 point op) — MULT CHAINING over B256: one field product
+	/// feeding directly into the next as an operand — the depth the EC point ops need (e.g.
+	/// X3 = E·F where E,F are earlier products). ModMul0 proves m0 = x1·x2 mod p and PUSHES it;
+	/// ModMul1 (build_seamed_in) PULLS m0 as its operand `a` and proves q = m0·y mod p, so
+	/// q = (x1·x2)·y mod p is verified with `a` cryptographically bound to ModMul0's output. No
+	/// formula table — the chain is ModMul→ModMul over the seam channel. Honest chain
+	/// PROVES+VERIFIES over B256 at NIST L1; a ModMul1 that pulls an operand ModMul0 never produced
+	/// UNBALANCES the seam and is REJECTED. Ed25519 base field p = 2²⁵⁵−19.
+	#[test]
+	fn ec_mult_chain_seamed_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::ChannelId;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+
+		let x1 = BigUint::parse_bytes(b"0abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678", 16).unwrap() % &p;
+		let x2 = BigUint::parse_bytes(b"076543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9", 16).unwrap() % &p;
+		let y = BigUint::parse_bytes(b"0112358132134558914423337761098715972584418167651094617711286574", 16).unwrap() % &p;
+		let m0 = (&x1 * &x2) % &p; // ModMul0 output
+		let q = (&m0 * &y) % &p; // ModMul1 output = (x1·x2)·y mod p
+
+		// `bad_a` makes ModMul1 commit an operand a ≠ m0 → the input seam pull unbalances.
+		let run = |bad_a: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mid: ChannelId = cs.add_channel("mid"); // carries m0 = x1·x2 from ModMul0 → ModMul1
+
+			let mm0 = ModMul::<W>::build_seamed(&mut cs, &p_bits, np, mid);
+			let mm1 = ModMul::<W>::build_seamed_in(&mut cs, &p_bits, np, mid);
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// ModMul0: m0 = x1·x2 mod p, pushes m0.
+			{
+				let tw = witness.init_table(mm0.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q0 = (&x1 * &x2) / &p;
+				mm0.populate(&mut seg, &[ModMulRow { a: to_bits(&x1), b: to_bits(&x2), q: to_bits(&q0), r: to_bits(&m0) }]).unwrap();
+			}
+			// ModMul1: pulls a = m0, proves q = a·y mod p.
+			{
+				let tw = witness.init_table(mm1.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let a_use = if bad_a { (&m0 + 1u32) % &p } else { m0.clone() };
+				let prod = &a_use * &y;
+				let q1 = &prod / &p;
+				let r1 = &prod % &p;
+				mm1.populate(&mut seg, &[ModMulRow { a: to_bits(&a_use), b: to_bits(&y), q: to_bits(&q1), r: to_bits(&r1) }]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// sanity: the chained result equals the native (x1·x2)·y mod p.
+		assert_eq!(q, (&(&x1 * &x2 % &p) * &y) % &p);
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest mult chain failed validate_witness: {verr}");
+		assert!(verify_ok, "honest ModMul→ModMul chain must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: ModMul1 pulled an operand ModMul0 never produced");
+
+		println!(
+			"GATE prove-S2-mchain: ModMul→ModMul chain q=(x1·x2)·y mod (2²⁵⁵−19) PROVEN+VERIFIED over B256 @L1(128); ModMul1's operand bound to ModMul0's output via the input seam; forged operand REJECTED. EC point-op mult chaining (E·F-style) works."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
