@@ -877,6 +877,151 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-D-nsec3 (D denial of existence) — a name provably does NOT exist in the zone,
+	/// proven over B256. NSEC3 (RFC 5155) proves non-existence by showing the query name's iterated
+	/// hash falls STRICTLY in the gap (owner, next) of a signed NSEC3 record — the sorted chain of
+	/// existing hashed names has no entry there. The load-bearing in-circuit check is the gap
+	/// coverage: owner < h_query < next (two range comparisons over the 160-bit NSEC3 hashes). This
+	/// gate proves both strict inequalities over B256 via chained S0 adders: a < b is proven as
+	/// a+1 ≤ b, i.e. (a+1)+d == b with the top carry-out forced to 0 (no overflow ⇒ a+1 ≤ b ⇒ a < b),
+	/// the prover forced to supply d = b−(a+1). The query hash is the real iterated salted SHA-1
+	/// (nsec3_hash), and owner/next are the bracketing NSEC3 record's hashes. Honest denial (query
+	/// hash in the gap) PROVES+VERIFIES at NIST L1; an EXISTING name (hash == a gap endpoint, so not
+	/// strictly inside) has no valid witness and is REJECTED — you cannot forge a denial for a name
+	/// that exists. The NSEC3 record is itself RRSIG-signed (a separate S-slice) and aggregated into
+	/// the epoch root like any record; this gate is its denial semantics. Completes DNS-STARK's
+	/// query answers: positive (prove-D-0 record verify) AND negative (this denial).
+	#[test]
+	fn dns_nsec3_denial_gap_coverage_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, write_bit, write_col, Adder};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+
+		// Real NSEC3 query hash (iterated salted SHA-1), and a bracketing signed NSEC3 record.
+		let salt = [0xAA, 0xBB, 0xCC, 0xDD];
+		let iters = 5;
+		let hq = nsec3_hash("nonexistent.example.com", &salt, iters);
+		let hq_n = BigUint::from_bytes_be(&hq);
+		let owner_n = &hq_n - 1000u32; // the NSEC3 record's owner hash, just below the query
+		let next_n = &hq_n + 1000u32; // its next-hash, just above — the gap covers h_query
+		let to20 = |x: &BigUint| -> [u8; 20] {
+			let mut b = x.to_bytes_be();
+			let mut out = [0u8; 20];
+			out[20 - b.len()..].copy_from_slice(&b);
+			b.clear();
+			out
+		};
+		assert!(nsec3_covers(&hq, &to20(&owner_n), &to20(&next_n)), "the NSEC3 gap must cover the query hash");
+
+		let one_arr = arr(&BigUint::from(1u32));
+
+		// A strict-less-than gadget a<b over B256: proves (a+1)+d == b with no overflow.
+		struct Lt {
+			a1: Adder<W>,
+			d: Col<B1, W>,
+			s2: Adder<W>,
+			fc: Col<B1, 1>,
+		}
+		// `bad_hq` sets h_query = owner (an existing name at the gap endpoint) → owner < hq fails.
+		let run = |bad_hq: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("NSEC3 denial: owner < h_query < next over B256");
+			let one_col = t.add_constant("one", one_arr);
+			let build_lt = |t: &mut TableBuilder<OurB256>, a: Col<B1, W>, b: Col<B1, W>, tag: &str| -> Lt {
+				let a1 = Adder::<W>::build(t, a, one_col, &format!("{tag}_a1")); // a + 1
+				let d = t.add_committed::<B1, W>(format!("{tag}_d"));
+				let s2 = Adder::<W>::build(t, a1.sum, d, &format!("{tag}_s2")); // (a+1) + d
+				t.assert_zero(format!("{tag}_eq"), s2.sum - b); // == b
+				let fc = t.add_selected(format!("{tag}_fc"), s2.cout, W - 1);
+				t.assert_zero(format!("{tag}_no_ovf"), fc * B1::ONE); // no overflow ⇒ a+1 ≤ b ⇒ a < b
+				Lt { a1, d, s2, fc }
+			};
+			let owner = t.add_committed::<B1, W>("owner");
+			let hq_c = t.add_committed::<B1, W>("hq");
+			let next = t.add_committed::<B1, W>("next");
+			let lt1 = build_lt(&mut t, owner, hq_c, "lt1"); // owner < h_query
+			let lt2 = build_lt(&mut t, hq_c, next, "lt2"); // h_query < next
+			let t_id = t.id();
+
+			let hq_use = if bad_hq { owner_n.clone() } else { hq_n.clone() };
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let one_bits = to_bits(&BigUint::from(1u32));
+				write_col::<W>(&mut seg, one_col, 0, &one_bits).unwrap();
+				write_col::<W>(&mut seg, owner, 0, &to_bits(&owner_n)).unwrap();
+				write_col::<W>(&mut seg, hq_c, 0, &to_bits(&hq_use)).unwrap();
+				write_col::<W>(&mut seg, next, 0, &to_bits(&next_n)).unwrap();
+				// populate an a<b gadget for concrete (a_val, b_val).
+				let mut pop_lt = |seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, lt: &Lt, a_val: &BigUint, b_val: &BigUint| {
+					let a1v = a_val + 1u32;
+					let a1_bits = to_bits(&a1v);
+					let _ = lt.a1.populate(seg, 0, &to_bits(a_val), &one_bits).unwrap();
+					// d = b − (a+1); if a ≥ b this underflows (wraps), forcing the overflow the check rejects.
+					let d_val = if b_val >= &a1v {
+						b_val - &a1v
+					} else {
+						(BigUint::from(1u32) << W) + b_val - &a1v
+					};
+					let d_bits = to_bits(&d_val);
+					write_col::<W>(seg, lt.d, 0, &d_bits).unwrap();
+					let _ = lt.s2.populate(seg, 0, &a1_bits, &d_bits).unwrap();
+					let (_s, cout) = ripple_add(&a1_bits, &d_bits);
+					write_bit(seg, lt.fc, 0, cout[W - 1]).unwrap();
+				};
+				pop_lt(&mut seg, &lt1, &owner_n, &hq_use);
+				pop_lt(&mut seg, &lt2, &hq_use, &next_n);
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest NSEC3 denial failed validate_witness: {verr}");
+		assert!(verify_ok, "honest NSEC3 gap coverage (owner < h_query < next) must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: a denial was forged for an EXISTING name (hash at the gap endpoint)");
+
+		println!(
+			"GATE prove-D-nsec3: NSEC3 denial of existence PROVEN over B256 @L1(128) — the query's iterated-SHA-1 hash falls STRICTLY in a signed record's gap (owner < h_query < next), each inequality a chained-adder a+1≤b range check; a name that provably does NOT exist VERIFIES, and a denial forged for an EXISTING name (hash at a gap endpoint) is REJECTED. DNS-STARK negative answers."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
