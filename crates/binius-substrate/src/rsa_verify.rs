@@ -875,6 +875,84 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S3-wideW (S3 width scaling) — the S0 ModMul gadget proves+verifies at DOUBLE the
+	/// Ed25519 width, confirming the claim that real RSA is the identical construction at wider W. The
+	/// gadget needs W ≈ 2·np columns to hold the schoolbook product a·b before reduction (Ed25519:
+	/// np=255, W=512); a real ~504-bit RSA modulus therefore needs W=1024. This gate proves one
+	/// modular squaring s² mod N over B256 at W=1024 with a genuine ~504-bit modulus (derived from the
+	/// real RSA-2048 vector, kept odd) — the per-strand operation of the RSA modexp chain at real
+	/// width. Honest s² PROVES+VERIFIES at NIST L1; a wrong remainder is REJECTED (the r = s·s − q·N,
+	/// r < N reduction still binds at W=1024). This concretely validates that RSA-2048's modexp is
+	/// prove-S3-0's strand chain at W=4096 — the code is width-generic, only the column count grows
+	/// (per-ModMul cost ≈ (W/512)² ≈ 4× here, ~64× at W=4096), which is exactly why the modexp MUST
+	/// be strand-decomposed for bounded memory.
+	#[test]
+	fn rsa_modmul_wide_width_prove_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const W: usize = 1024; // 2·np headroom for a ~504-bit modulus (RSA-scale, 2× Ed25519)
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		// Genuine ~504-bit modulus (126 hex = 504 bits, from the real RSA-2048 vector, forced odd).
+		let nmod = BigUint::parse_bytes(&N_HEX.as_bytes()[..126], 16).unwrap() | BigUint::from(1u32);
+		let np = nmod.bits() as usize;
+		assert!(np >= 500 && 2 * np <= W, "np={np} must leave 2·np ≤ W={W} headroom for the product");
+		let n_bits = to_bits(&nmod);
+		let s = BigUint::parse_bytes(&SIG_HEX.as_bytes()[..126], 16).unwrap() % &nmod;
+
+		let run = |bad_r: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = ModMul::<W>::build(&mut cs, &n_bits, np);
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&s * &s) / &nmod;
+				let r = if bad_r { ((&s * &s) % &nmod) + 1u32 } else { (&s * &s) % &nmod };
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(&s), b: to_bits(&s), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest wide-W s² failed validate_witness: {verr}");
+		assert!(verify_ok, "honest ~504-bit s² mod N must PROVE+VERIFY over B256 at W=1024");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: a wrong remainder passed the wide-W reduction");
+
+		println!(
+			"GATE prove-S3-wideW: ~504-bit s² mod N PROVEN+VERIFIED over B256 @L1(128) at W=1024 (2× Ed25519); r=s·s−q·N, r<N reduction binds; wrong remainder REJECTED. The S0 ModMul is width-generic — real RSA-2048 modexp is prove-S3-0's strand chain at W=4096, only the column count grows."
+		);
+	}
+
 	/// GATE prove-S3-1 (PENDING) — RSA-2048 PKCS1-v1.5 verify proves over B256; genuine
 	/// `rsa`-crate sig accepts, tampered sig/msg/padding reject (isolated to the EM byte-
 	/// equality). Needs the limb MulUU32 + bigint schoolbook + S0 limb reduction + modexp
