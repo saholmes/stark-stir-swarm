@@ -777,6 +777,106 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-D-chain (D chain-of-trust) — the full DNSSEC delegation chain from the parent's DS
+	/// trust anchor down to the zone records, aggregated to ONE root over B256. The chain is:
+	/// parent DS binds the child KSK (DS.digest == SHA-256(owner ‖ KSK DNSKEY RDATA), RFC 4034 §5.1);
+	/// the KSK signs the DNSKEY RRset (containing KSK + ZSK); a ZSK from that RRset signs the zone's
+	/// RRsets. Each link is a commitment: c_ds = the DS delegation digest (binds the KSK to the
+	/// parent), c_dnskey = SHA-256 of the DNSKEY-RRset signing input (the KSK-signed key set),
+	/// c_zone = SHA-256 of a zone record's signing input (the ZSK-signed data). They aggregate to the
+	/// chain root R = SHA3(SHA3(c_ds ‖ c_dnskey) ‖ c_zone) over B256 via the Tier-A master, R pinned
+	/// as the anchor. A resolver that trusts the parent's DS checks R and that c_ds is the DS it
+	/// trusts — binding the whole chain to the anchor. A rogue KSK (an attacker swaps the key set)
+	/// changes c_ds, which the parent's DS does not bind (ds_binds_dnskey = false), so the anchored
+	/// chain root the parent published was not built from it ⇒ REJECT. Honest chain PROVES+VERIFIES
+	/// at NIST L1; a KSK the parent's DS does not commit to is REJECTED. This anchors the whole zone
+	/// (prove-D-mixed / prove-D-epoch) to the external DNSSEC root of trust.
+	#[test]
+	fn dns_chain_of_trust_ds_to_zone_over_b256() {
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+
+		let owner = "example.com";
+		// KSK (flags 257) and ZSK (flags 256) DNSKEY RDATA: flags(2) ‖ protocol(3) ‖ algorithm(8) ‖ key.
+		let ksk_rdata = {
+			let mut v = vec![0x01, 0x01, 0x03, 0x08];
+			v.extend_from_slice(&[0xAA; 32]);
+			v
+		};
+		let zsk_rdata = {
+			let mut v = vec![0x01, 0x00, 0x03, 0x08];
+			v.extend_from_slice(&[0xBB; 32]);
+			v
+		};
+		let ksk_tag = dnskey_key_tag(&ksk_rdata);
+		let zsk_tag = dnskey_key_tag(&zsk_rdata);
+
+		// Parent DS binds the KSK (delegation link).
+		let ds = DsRecord {
+			key_tag: ksk_tag,
+			algorithm: 8,
+			digest_type: 2,
+			digest: ds_digest_sha256(owner, &ksk_rdata).to_vec(),
+		};
+		assert!(ds_binds_dnskey(&ds, owner, &ksk_rdata), "parent DS must bind the KSK");
+		let c_ds = ds_digest_sha256(owner, &ksk_rdata);
+
+		// KSK signs the DNSKEY RRset (KSK + ZSK).
+		let dnskey_ksk = CanonicalRr { name: owner.to_string(), rr_type: 48, class: 1, orig_ttl: 3600, rdata: ksk_rdata.clone() };
+		let dnskey_zsk = CanonicalRr { name: owner.to_string(), rr_type: 48, class: 1, orig_ttl: 3600, rdata: zsk_rdata.clone() };
+		let dnskey_rrsig = RrsigFields {
+			type_covered: 48, // DNSKEY
+			algorithm: 8,
+			labels: 2,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag: ksk_tag, // signed by the KSK
+			signer_name: owner.to_string(),
+		};
+		let c_dnskey = rrsig_sha256_message(&dnskey_rrsig, &[dnskey_ksk, dnskey_zsk]);
+
+		// ZSK signs a zone record.
+		let a_rec = CanonicalRr { name: "www.example.com".to_string(), rr_type: 1, class: 1, orig_ttl: 3600, rdata: vec![93, 184, 216, 34] };
+		let zone_rrsig = RrsigFields {
+			type_covered: 1,
+			algorithm: 8,
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag: zsk_tag, // signed by the ZSK
+			signer_name: owner.to_string(),
+		};
+		let c_zone = rrsig_sha256_message(&zone_rrsig, std::slice::from_ref(&a_rec));
+
+		// Chain root anchored at the DS: R = SHA3(SHA3(c_ds‖c_dnskey)‖c_zone).
+		let subtree = crate::recursion::merkle_root_sha3(&[c_ds, c_dnskey]);
+		let chain_root = crate::recursion::merkle_root_sha3(&[subtree, c_zone]);
+
+		let ok = prove_verify_join_b256(c_ds, c_dnskey, c_zone, JoinMode::Honest, Some(chain_root), 1, 128)
+			.expect("chain-of-trust aggregation must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest DS→DNSKEY→zone chain must PROVE+VERIFY over B256");
+		assert_eq!(ok.r_parent, chain_root, "in-circuit chain root != native");
+
+		// Attack: a rogue KSK the parent's DS does not bind ⇒ c_ds changes ⇒ REJECT.
+		let rogue_ksk = {
+			let mut v = vec![0x01, 0x01, 0x03, 0x08];
+			v.extend_from_slice(&[0xCC; 32]);
+			v
+		};
+		assert!(!ds_binds_dnskey(&ds, owner, &rogue_ksk), "parent DS must NOT bind a rogue KSK");
+		let c_ds_rogue = ds_digest_sha256(owner, &rogue_ksk);
+		let forged_subtree = crate::recursion::merkle_root_sha3(&[c_ds_rogue, c_dnskey]);
+		assert_ne!(forged_subtree, subtree);
+		let bad = prove_verify_join_b256(c_ds, c_dnskey, c_zone, JoinMode::ForgedInnerRoot { forged: forged_subtree }, None, 1, 128)
+			.expect("rogue-KSK run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a rogue KSK the parent DS does not bind was accepted");
+
+		println!(
+			"GATE prove-D-chain: the DNSSEC chain of trust DS→DNSKEY(KSK)→RRSIG(ZSK)→record aggregates to ONE root over B256 @L1(128) — c_ds binds the KSK to the parent (SHA-256(owner‖DNSKEY)), c_dnskey the KSK-signed key set, c_zone the ZSK-signed record; chain root pinned as the anchor, a rogue KSK the parent DS does not bind REJECTED. The zone hangs from the external DNSSEC trust root."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
