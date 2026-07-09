@@ -524,4 +524,141 @@ mod tests {
 			r.rstar_ok,
 		);
 	}
+
+	// =========================================================================
+	// PART 3 (PER-CIRCUIT-TYPE prove-RSS) — the atomic stitchable circuits the
+	// streaming/"sliver" prover schedules to verify a signature. A full verify
+	// decomposes into a KNOWN LIST of these circuits (see the per-scheme circuit
+	// inventory); because the sliver prover proves them one-at-a-time, the peak
+	// prover RSS of the WHOLE signature == the max over its circuit types. This
+	// runner measures ONE instance of each circuit type so the shell wrapper can
+	// pair it (under /usr/bin/time -l) with the whole-process peak RSS — the
+	// per-circuit memory budget the sliver prover must fit.
+	//
+	// Circuits (CKT env):
+	//   modmul — the non-native modular multiply `ModMul<W>` (nonnative::
+	//            prove_verify::<W>), the dominant RSA/EC circuit; RSS ~ (W/512)^2.
+	//            MM_W selects the column width, MM_N the operand bit-width (must
+	//            satisfy 2*MM_N+1 <= MM_W). Scheme widths: Ed25519 (512,255),
+	//            P-256 (1024,256), RSA-496 (1024,496), RSA-1024 (2048,1024),
+	//            RSA-2048 (8192,2048), ML-DSA mod-q (64,23).
+	//   keccak — one Keccak-f[1600] permutation over B256 (bench_keccak_b256, N=1)
+	//            — the SHA3/SHAKE block underlying ML-DSA hashing, DNS commitments,
+	//            and the aggregation leaves.
+	//   join   — one Tier-A batched-Merkle aggregation node (prove_verify_join_b256).
+
+	/// Little-endian W-bit vector of a BigUint (num-bigint, a dev-dep on the
+	/// `cargo test` build path — this whole module is `#[cfg(test)]`).
+	fn to_bits_w(v: &num_bigint::BigUint, w: usize) -> Vec<bool> {
+		let bytes = v.to_bytes_le();
+		(0..w)
+			.map(|k| {
+				let byte = k / 8;
+				byte < bytes.len() && (bytes[byte] >> (k % 8)) & 1 == 1
+			})
+			.collect()
+	}
+
+	/// One honest `ModMul<W>` row for `n`-bit operands under an `n`-bit modulus.
+	/// The RSS depends only on (W, n) — the trace geometry — not the modulus value,
+	/// so a fixed near-`2^n` modulus/operands is a faithful stand-in for the field
+	/// prime. Returns `(m_bits, row)`.
+	fn modmul_fixture(n: usize, w: usize) -> (Vec<bool>, crate::nonnative::ModMulRow) {
+		use num_bigint::BigUint;
+		let one = BigUint::from(1u8);
+		let m = (&one << n) - &one; // 2^n - 1 (odd), a valid n-bit modulus
+		let a = (&one << n) - BigUint::from(3u8);
+		let b = (&one << n) - BigUint::from(5u8);
+		let prod = &a * &b;
+		let q = &prod / &m;
+		let r = &prod % &m;
+		(
+			to_bits_w(&m, w),
+			crate::nonnative::ModMulRow {
+				a: to_bits_w(&a, w),
+				b: to_bits_w(&b, w),
+				q: to_bits_w(&q, w),
+				r: to_bits_w(&r, w),
+			},
+		)
+	}
+
+	/// Prove+verify ONE `ModMul<W>` over B256 at operand width `n`; returns
+	/// `(proof_bytes, prove_verify_ms)`. The whole-process peak RSS (prove-dominated)
+	/// is captured externally by the shell wrapper.
+	fn run_modmul<const W: usize>(n: usize) -> (usize, u128) {
+		assert!(2 * n + 1 <= W, "ModMul needs 2n+1 <= W (n={n}, W={W})");
+		let (m_bits, row) = modmul_fixture(n, W);
+		let t = Instant::now();
+		let (sz, _) = crate::nonnative::prove_verify::<W>(&m_bits, n, &[row])
+			.expect("ModMul must prove AND verify over B256");
+		(sz, t.elapsed().as_millis())
+	}
+
+	/// PART 3 runner (ONE circuit). `CKT` selects the circuit type; the remaining
+	/// env vars parameterize it. Prints ONE structured RESULT line. `#[ignore]` so
+	/// the normal suite skips it; the shell wrapper runs the built test binary
+	/// directly under `/usr/bin/time -l`, once per circuit, to capture peak RSS.
+	#[test]
+	#[ignore = "PART 3 per-circuit prove-RSS row; run via scripts/bench-circuit-rss.sh"]
+	fn circuit_rss_row() {
+		let ckt = env::var("CKT").unwrap_or_else(|_| "modmul".to_string());
+		match ckt.as_str() {
+			"modmul" => {
+				let w: usize = env::var("MM_W").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+				let n: usize = env::var("MM_N").ok().and_then(|s| s.parse().ok()).unwrap_or(496);
+				let (sz, ms) = match w {
+					64 => run_modmul::<64>(n),
+					512 => run_modmul::<512>(n),
+					1024 => run_modmul::<1024>(n),
+					2048 => run_modmul::<2048>(n),
+					4096 => run_modmul::<4096>(n),
+					8192 => run_modmul::<8192>(n),
+					other => panic!("unsupported MM_W={other}; add a match arm in circuit_rss_row"),
+				};
+				println!("RESULT circuit=ModMul W={w} n={n} prove_ms={ms} proof_bytes={sz}");
+			}
+			"keccak" => {
+				let t = Instant::now();
+				let r = bench_keccak_b256(1, 1, 128).expect("Keccak-f must prove+verify over B256");
+				let ms = t.elapsed().as_millis();
+				println!(
+					"RESULT circuit=Keccakf W=1600 n=1 prove_ms={} proof_bytes={} wall_ms={}",
+					r.prove_ms, r.proof_bytes, ms
+				);
+			}
+			"join" => {
+				use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+				use crate::recursion::merkle_root_sha3;
+				let a = [0x11u8; 32];
+				let b = [0x22u8; 32];
+				let d = [0x33u8; 32];
+				let r2 = merkle_root_sha3(&[merkle_root_sha3(&[a, b]), d]);
+				// r_child = SHA3(a||b); r_parent = SHA3(r_child||d) = merkle node.
+				let rstar = {
+					use sha3::{Digest, Sha3_256};
+					let mut h = Sha3_256::new();
+					h.update(a);
+					h.update(b);
+					let rc: [u8; 32] = h.finalize().into();
+					let mut h2 = Sha3_256::new();
+					h2.update(rc);
+					h2.update(d);
+					let rp: [u8; 32] = h2.finalize().into();
+					rp
+				};
+				let _ = r2;
+				let t = Instant::now();
+				let j = prove_verify_join_b256(a, b, d, JoinMode::Honest, Some(rstar), 1, 128)
+					.expect("join must prove+verify over B256");
+				let ms = t.elapsed().as_millis();
+				assert!(j.accepted() && j.verify_ok, "join must accept");
+				println!(
+					"RESULT circuit=Join W=256 n=1 prove_ms={} proof_bytes={} wall_ms={}",
+					ms, j.proof_size, ms
+				);
+			}
+			other => panic!("unknown CKT='{other}': expected modmul | keccak | join"),
+		}
+	}
 }
