@@ -635,6 +635,73 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-D-epoch (D zone aggregation, Tier A) — a DNSSEC zone's per-record commitments
+	/// aggregate to ONE epoch root over B256, the verifier-enforced trust anchor. Each record's
+	/// commitment is the SHA-256 of its RRSIG signing input (RFC 4034 §3.1.8.1) — the exact message
+	/// the per-record S-slice verifies (prove-D-0). A three-record zone (www / mail / ns A records,
+	/// each with an RRSIG) has commitments c_www, c_mail, c_ns; the epoch root is the batched Merkle
+	/// R* = SHA3-256(SHA3-256(c_www ‖ c_mail) ‖ c_ns) = zone_epoch_root over the zone. The Tier-A
+	/// master (prove_verify_join_b256) proves R* == merkle_root of the commitments in-circuit and
+	/// PINS R* as a boundary. Editing ANY record changes its signing input ⇒ a different commitment ⇒
+	/// a different subtree/epoch root, which the pinned trust anchor was not built from, so the
+	/// aggregation channel unbalances ⇒ REJECT. This is the zone-aggregation half of DNS-STARK: the
+	/// edge artifact is the {record commitments} + this one master proof; a resolver checks R* ==
+	/// the published trust anchor and the master proof binds every record. Composes with prove-D-0
+	/// (each c_i is the message a verified RRSIG signs) and R Tier-A. Honest zone PROVES+VERIFIES at
+	/// NIST L1; a tampered record is REJECTED.
+	#[test]
+	fn dns_zone_epoch_root_binds_records_over_b256() {
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+
+		let rrsig = |key_tag: u16| RrsigFields {
+			type_covered: 1, // A
+			algorithm: 8,    // RSA/SHA-256
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag,
+			signer_name: "example.com".to_string(),
+		};
+		let a_rr = |name: &str, ip: [u8; 4]| CanonicalRr {
+			name: name.to_string(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: ip.to_vec(),
+		};
+		// Three signed records → three per-record commitments (each = SHA-256 of its signing input).
+		let rec_www = a_rr("www.example.com", [93, 184, 216, 34]);
+		let rec_mail = a_rr("mail.example.com", [93, 184, 216, 35]);
+		let rec_ns = a_rr("ns.example.com", [93, 184, 216, 36]);
+		let c_www = rrsig_sha256_message(&rrsig(0x4d2), std::slice::from_ref(&rec_www));
+		let c_mail = rrsig_sha256_message(&rrsig(0x4d3), std::slice::from_ref(&rec_mail));
+		let c_ns = rrsig_sha256_message(&rrsig(0x4d4), std::slice::from_ref(&rec_ns));
+
+		// Epoch root = batched Merkle over the zone: R* = SHA3(SHA3(c_www‖c_mail)‖c_ns).
+		let subtree = crate::recursion::merkle_root_sha3(&[c_www, c_mail]);
+		let epoch = crate::recursion::merkle_root_sha3(&[subtree, c_ns]);
+
+		// Tier-A master: prove R* == merkle_root(commitments), R* pinned as the trust-anchor boundary.
+		let ok = prove_verify_join_b256(c_www, c_mail, c_ns, JoinMode::Honest, Some(epoch), 1, 128)
+			.expect("zone epoch aggregation must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest zone must PROVE+VERIFY its epoch root over B256");
+		assert_eq!(ok.r_parent, epoch, "in-circuit epoch root != native zone_epoch_root");
+
+		// Tamper: edit the www record (IP 34→99) ⇒ its commitment and the www/mail subtree change;
+		// pinned to the original epoch (trust anchor), the aggregation unbalances ⇒ REJECT.
+		let c_www_edited = rrsig_sha256_message(&rrsig(0x4d2), std::slice::from_ref(&a_rr("www.example.com", [93, 184, 216, 99])));
+		let forged_subtree = crate::recursion::merkle_root_sha3(&[c_www_edited, c_mail]);
+		assert_ne!(forged_subtree, subtree);
+		let bad = prove_verify_join_b256(c_www, c_mail, c_ns, JoinMode::ForgedInnerRoot { forged: forged_subtree }, None, 1, 128)
+			.expect("tampered-zone run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a tampered DNSSEC record aggregated into the epoch root");
+
+		println!(
+			"GATE prove-D-epoch: a 3-record DNSSEC zone's per-record commitments (SHA-256 of each RRSIG signing input) aggregate to ONE epoch root R* over B256 @L1(128) via Tier-A batched Merkle; R*==native zone_epoch_root, pinned as the trust-anchor boundary; an edited record REJECTED (subtree ≠ what R* was built from). The zone-aggregation half of DNS-STARK — the record commitments + 1 master proof = the edge artifact."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
