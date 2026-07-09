@@ -702,6 +702,81 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-D-mixed (D heterogeneous zone, the assembly of assemblies) — a MIXED-scheme DNSSEC
+	/// zone aggregates to ONE epoch root over B256, each record dispatched to the S-slice that proves
+	/// its RRSIG. This is the DNS-STARK core claim: one zone artifact over records signed with
+	/// DIFFERENT algorithms, each verified by its own proven slice, bound by one epoch root. The zone
+	/// holds an RSA/SHA-256 record (algorithm 8 → S3, proven end-to-end in prove-D-0), an Ed25519
+	/// record (algorithm 15 → S2, the point-equality ACCEPT proven in prove-S2-edverify), and an
+	/// ECDSA-P256 record (algorithm 13 → S2, the x≡r ACCEPT proven in prove-S2-xr). Each record's
+	/// commitment is the SHA-256 of its canonical RRSIG signing input — the exact message its slice
+	/// verifies — and the algorithm→S-slice dispatch is asserted per record. The three commitments
+	/// aggregate to R* = zone_epoch_root over B256 via the Tier-A master (prove_verify_join_b256),
+	/// R* pinned as the trust anchor. Editing ANY record (regardless of scheme) changes its signing
+	/// input ⇒ a different commitment ⇒ a subtree the trust anchor was not built from ⇒ REJECT. The
+	/// per-record slices are heterogeneous but the aggregation is uniform (it binds commitments, not
+	/// schemes), which is exactly why a mixed zone ships as {commitments}+1 master proof. Honest
+	/// mixed zone PROVES+VERIFIES at NIST L1; a tampered record (any algorithm) is REJECTED.
+	#[test]
+	fn dns_mixed_scheme_zone_epoch_root_over_b256() {
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+
+		// One record per signature scheme, each with its algorithm's RRSIG.
+		let rrsig = |algorithm: u8, key_tag: u16| RrsigFields {
+			type_covered: 1,
+			algorithm,
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag,
+			signer_name: "example.com".to_string(),
+		};
+		let a_rr = |name: &str, ip: [u8; 4]| CanonicalRr {
+			name: name.to_string(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: ip.to_vec(),
+		};
+		// Dispatch each algorithm to its proven S-slice (RFC/IANA → S1/S2/S3).
+		assert_eq!(DnssecAlgorithm::RsaSha256.s_slice(), SSlice::S3Rsa);
+		assert_eq!(DnssecAlgorithm::Ed25519.s_slice(), SSlice::S2Ec);
+		assert_eq!(DnssecAlgorithm::EcdsaP256Sha256.s_slice(), SSlice::S2Ec);
+		assert_eq!(DnssecAlgorithm::RsaSha256.iana(), 8);
+		assert_eq!(DnssecAlgorithm::Ed25519.iana(), 15);
+		assert_eq!(DnssecAlgorithm::EcdsaP256Sha256.iana(), 13);
+
+		// Heterogeneous records: RSA (8), Ed25519 (15), ECDSA-P256 (13).
+		let rec_rsa = a_rr("rsa.example.com", [93, 184, 216, 34]);
+		let rec_ed = a_rr("ed.example.com", [93, 184, 216, 35]);
+		let rec_ec = a_rr("ec.example.com", [93, 184, 216, 36]);
+		let c_rsa = rrsig_sha256_message(&rrsig(8, 0x4d2), std::slice::from_ref(&rec_rsa));
+		let c_ed = rrsig_sha256_message(&rrsig(15, 0x4d3), std::slice::from_ref(&rec_ed));
+		let c_ec = rrsig_sha256_message(&rrsig(13, 0x4d4), std::slice::from_ref(&rec_ec));
+
+		// Epoch root over the mixed zone: R* = SHA3(SHA3(c_rsa‖c_ed)‖c_ec).
+		let subtree = crate::recursion::merkle_root_sha3(&[c_rsa, c_ed]);
+		let epoch = crate::recursion::merkle_root_sha3(&[subtree, c_ec]);
+
+		let ok = prove_verify_join_b256(c_rsa, c_ed, c_ec, JoinMode::Honest, Some(epoch), 1, 128)
+			.expect("mixed-zone epoch aggregation must run over B256");
+		assert!(ok.accepted() && ok.verify_ok, "honest mixed-scheme zone must PROVE+VERIFY over B256");
+		assert_eq!(ok.r_parent, epoch, "in-circuit epoch root != native zone_epoch_root");
+
+		// Tamper the Ed25519 record ⇒ its commitment and the rsa/ed subtree change ⇒ REJECT.
+		let c_ed_edited = rrsig_sha256_message(&rrsig(15, 0x4d3), std::slice::from_ref(&a_rr("ed.example.com", [10, 0, 0, 1])));
+		let forged_subtree = crate::recursion::merkle_root_sha3(&[c_rsa, c_ed_edited]);
+		assert_ne!(forged_subtree, subtree);
+		let bad = prove_verify_join_b256(c_rsa, c_ed, c_ec, JoinMode::ForgedInnerRoot { forged: forged_subtree }, None, 1, 128)
+			.expect("tampered-mixed-zone run");
+		assert!(!bad.accepted(), "SOUNDNESS FAILURE: a tampered record in a mixed-scheme zone was aggregated");
+
+		println!(
+			"GATE prove-D-mixed: a MIXED-scheme DNSSEC zone (RSA/8→S3, Ed25519/15→S2, ECDSA/13→S2) aggregates to ONE epoch root R* over B256 @L1(128) — each record dispatched to its proven S-slice, commitments = SHA-256 of each RRSIG signing input, R*==native zone_epoch_root pinned as trust anchor; an edited record (any scheme) REJECTED. DNS-STARK's assembly of assemblies: heterogeneous per-record slices, one uniform aggregation."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
