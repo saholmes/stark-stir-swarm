@@ -292,14 +292,16 @@ pub struct ModMul<const W: usize> {
 	n: usize,
 	m_set_bits: Vec<usize>,
 	c_bits: Vec<bool>,
-	// Seam (Some only for `build_seamed`): r's low 256 bits as four B64 lane-projections, pushed
-	// to a channel (B64 = tower level 6; B256 level 8 is unsupported by the m3 witness layer).
-	seam_r_lo: Option<[Col<B1, 64>; 4]>,
-	// Input seam (Some for `build_seamed_chain`): operand `a`'s low 256 bits as four B64 lanes,
-	// PULLED from a channel — binds `a` to a prior ModMul's pushed output (mult chaining).
-	seam_a_lo: Option<[Col<B1, 64>; 4]>,
+	// Seam (Some only for `build_seamed`): r's low `ceil(np/64)` bits as B64 lane-projections, pushed
+	// to a channel (B64 = tower level 6; B256 level 8 is unsupported by the m3 witness layer). The
+	// lane count = ceil(np/64) fully covers r < N: 4 lanes for a 255-bit prime (EC), 8 for a 496-bit
+	// RSA modulus — enough to bind the WHOLE value across the channel, incl. an EMSA padding prefix.
+	seam_r_lo: Option<Vec<Col<B1, 64>>>,
+	// Input seam (Some for `build_seamed_chain`): operand `a`'s low `ceil(np/64)` lanes, PULLED from
+	// a channel — binds `a` to a prior ModMul's pushed output (mult chaining).
+	seam_a_lo: Option<Vec<Col<B1, 64>>>,
 	// Input seam for operand `b` (Some for `build_seamed_in2`): same, pulled for `b`.
-	seam_b_lo: Option<[Col<B1, 64>; 4]>,
+	seam_b_lo: Option<Vec<Col<B1, 64>>>,
 }
 
 impl<const W: usize> ModMul<W> {
@@ -479,33 +481,33 @@ impl<const W: usize> ModMul<W> {
 		// carry-out of the top bit must be 0  <=>  r < m.
 		table.assert_zero("r_lt_m", rlt_final_carry * B1::ONE);
 
-		// Output seam: project r's low 256 bits as four 64-bit lanes, PUSH them (as B64).
+		// Lane count = ceil(np/64): enough B64 lanes to cover r/a/b < N across the channel (4 for a
+		// 255-bit EC prime, 8 for a 496-bit RSA modulus). Backward-compatible: np≤256 ⇒ 4 lanes.
+		let n_lanes = (n + 63) / 64;
+		// Output seam: project r's low `n_lanes` 64-bit lanes, PUSH them (as B64).
 		let seam_r_lo = seam.map(|chan| {
-			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
-				table.add_selected_block::<B1, W, 64>(format!("seam_r_sel{i}"), r, i)
-			});
-			let b64: [Col<B64, 1>; 4] =
-				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_r_b64{i}"), sel[i]));
+			let sel: Vec<Col<B1, 64>> =
+				(0..n_lanes).map(|i| table.add_selected_block::<B1, W, 64>(format!("seam_r_sel{i}"), r, i)).collect();
+			let b64: Vec<Col<B64, 1>> =
+				(0..n_lanes).map(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_r_b64{i}"), sel[i])).collect();
 			table.push(chan, b64);
 			sel
 		});
-		// Input seam: project operand a's low 256 bits as four 64-bit lanes, PULL them — binds a
-		// to a prior ModMul's pushed output.
+		// Input seam: project operand a's low `n_lanes` 64-bit lanes, PULL them — binds a to a prior
+		// ModMul's pushed output.
 		let seam_a_lo = seam_in_a.map(|chan| {
-			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
-				table.add_selected_block::<B1, W, 64>(format!("seam_a_sel{i}"), a, i)
-			});
-			let b64: [Col<B64, 1>; 4] =
-				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_a_b64{i}"), sel[i]));
+			let sel: Vec<Col<B1, 64>> =
+				(0..n_lanes).map(|i| table.add_selected_block::<B1, W, 64>(format!("seam_a_sel{i}"), a, i)).collect();
+			let b64: Vec<Col<B64, 1>> =
+				(0..n_lanes).map(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_a_b64{i}"), sel[i])).collect();
 			table.pull(chan, b64);
 			sel
 		});
 		let seam_b_lo = seam_in_b.map(|chan| {
-			let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| {
-				table.add_selected_block::<B1, W, 64>(format!("seam_b_sel{i}"), b, i)
-			});
-			let b64: [Col<B64, 1>; 4] =
-				std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_b_b64{i}"), sel[i]));
+			let sel: Vec<Col<B1, 64>> =
+				(0..n_lanes).map(|i| table.add_selected_block::<B1, W, 64>(format!("seam_b_sel{i}"), b, i)).collect();
+			let b64: Vec<Col<B64, 1>> =
+				(0..n_lanes).map(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_b_b64{i}"), sel[i])).collect();
 			table.pull(chan, b64);
 			sel
 		});
@@ -607,18 +609,18 @@ impl<const W: usize> ModMul<W> {
 			write_col::<W>(seg, self.rlt_cin, row, &cin)?;
 			write_bit(seg, self.rlt_final_carry, row, cout[W - 1])?;
 
-			// Seam projections: r's low 256 bits (pushed) and a's low 256 bits (pulled), 4 B64 each.
-			if let Some(sel) = self.seam_r_lo {
+			// Seam projections: r's low lanes (pushed), a's / b's low lanes (pulled), ceil(np/64) B64 each.
+			if let Some(sel) = &self.seam_r_lo {
 				for (i, &s_col) in sel.iter().enumerate() {
 					write_col::<64>(seg, s_col, row, &inp.r[i * 64..i * 64 + 64])?;
 				}
 			}
-			if let Some(sel) = self.seam_a_lo {
+			if let Some(sel) = &self.seam_a_lo {
 				for (i, &s_col) in sel.iter().enumerate() {
 					write_col::<64>(seg, s_col, row, &inp.a[i * 64..i * 64 + 64])?;
 				}
 			}
-			if let Some(sel) = self.seam_b_lo {
+			if let Some(sel) = &self.seam_b_lo {
 				for (i, &s_col) in sel.iter().enumerate() {
 					write_col::<64>(seg, s_col, row, &inp.b[i * 64..i * 64 + 64])?;
 				}
