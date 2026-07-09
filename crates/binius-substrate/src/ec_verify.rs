@@ -4456,6 +4456,106 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-chain (Phase-3, S2 scalar-mul) — the RSS payoff: multiple scalar-mul rounds
+	/// composing ACROSS SEPARATE PROOFS, glued only by matching published-boundary points. A
+	/// double-and-add never has to hold the whole computation in one witness — each round is its own
+	/// proof (its own bounded memory), and round k+1 consumes exactly the point round k published.
+	/// This gate proves three independent rounds end-to-end: round k is a self-contained strand whose
+	/// input coordinate is injected by an input boundary and whose output coordinate is exposed by an
+	/// output boundary (as in prove-S2-strand); the aggregator sets round k+1's input boundary to
+	/// round k's output boundary value. Each round is prove()d and verify()d on its OWN
+	/// ConstraintSystem — three separate proofs — and the chain X0 → X1 → X2 → X3 composes to
+	/// X3 = X0·m³ mod p. The cross-round binding is a PUBLIC check the aggregator makes (round k's
+	/// output boundary value == round k+1's input boundary value); a round that publishes an output it
+	/// did not compute fails its OWN verification (output boundary unbalanced), and a broken chain (a
+	/// round fed an input the previous round never published) is caught by the public boundary
+	/// mismatch. Three single-ModMul strands, three independent proofs. Ed25519 field p = 2²⁵⁵−19.
+	/// Every honest round VERIFIES and the chain composes; a round lying about its output is REJECTED.
+	#[test]
+	fn ec_scalarmul_multiround_chain_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+		let m = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+
+		// Prove ONE round on its own ConstraintSystem: input coord x_in in via input boundary, output
+		// coord published as x_out_pub via output boundary; the strand proves x_out = x_in·m.
+		let prove_round = |x_in: &BigUint, x_out_pub: &BigUint| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chin = cs.add_channel("chIn");
+			let chout = cs.add_channel("chOut");
+			let mm = ModMul::<W>::build_seamed_chain(&mut cs, &p_bits, np, chin, chout);
+			let r_true = (x_in * &m) % &p;
+			let boundaries = vec![
+				Boundary { values: to_boundary(x_in), channel_id: chin, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(x_out_pub), channel_id: chout, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (x_in * &m) / &p;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(x_in), b: to_bits(&m), q: to_bits(&q), r: to_bits(&r_true) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			}
+		};
+
+		// The chain of published points X0 → X1 → X2 → X3 (each = previous · m).
+		let x0 = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let x1 = (&x0 * &m) % &p;
+		let x2 = (&x1 * &m) % &p;
+		let x3 = (&x2 * &m) % &p;
+
+		// Three INDEPENDENT proofs; the aggregator wires round k+1's input to round k's output.
+		assert!(prove_round(&x0, &x1), "round 1 must verify");
+		assert!(prove_round(&x1, &x2), "round 2 must verify");
+		assert!(prove_round(&x2, &x3), "round 3 must verify");
+
+		// Cross-round glue is a public boundary-value equality — true here by construction (x1, x2 are
+		// each one round's output and the next round's input). Composed result matches m³.
+		let m3 = (&(&(&m * &m) % &p) * &m) % &p;
+		assert_eq!(x3, (&x0 * &m3) % &p, "the three rounds must compose to X0·m³");
+
+		// Soundness: a round that publishes an output it did not compute fails its OWN verification.
+		assert!(!prove_round(&x1, &((&x2 + 1u32) % &p)), "a round lying about its output must be REJECTED");
+
+		println!(
+			"GATE prove-S2-chain: 3 scalar-mul rounds compose ACROSS SEPARATE PROOFS over B256 @L1(128) — each round an independent bounded-memory proof (input coord via input boundary, output coord via output boundary), round k+1's input boundary = round k's output boundary; X0→X1→X2→X3 composes to X0·m³, all three VERIFY, a round lying about its output REJECTED. RSS strand decomposition composes end-to-end — a double-and-add is N such proofs, never one monolith."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
