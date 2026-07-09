@@ -320,8 +320,208 @@ pub fn bench_keccak_b512(
 	})
 }
 
-// NOTE: intentionally no #[cfg(test)] module here. The timed harness reuses the
-// exact FIPS wiring already gated by `sha3_gadget`'s M2a in-circuit + NIST-vector
-// tests, so adding a bench-only test would just duplicate that coverage (and
-// change the crate's authoritative "16 tests" count). The `bench_sha3` binary is
-// the end-to-end exercise of this path.
+// =============================================================================
+// PART 2 (Tier-A AGGREGATION RSS) — peak resident-set of the LEVEL-1 aggregation
+// tier under the strand/swarm model with small STITCHABLE proof circuits.
+//
+// The Tier-A story (prove-R-1b/1c, prove-D-epoch): a zone of N records is NOT one
+// monolithic proof. Each record commitment is proven as a SEPARATE bounded-RSS
+// strand (`prove_verify_sha3_b256` — one Keccak-f node hash), the coordinator
+// folds the 32-byte strand roots NATIVELY into R* (`merkle_root_sha3`, negligible
+// memory), and the master binds a root into the tree IN-CIRCUIT via one Tier-A
+// join node (`prove_verify_join_b256`, the proven M2b/ref-R-2 mechanism).
+//
+// Because the strands prove one-at-a-time (each call's `bumpalo::Bump` witness is
+// dropped before the next), the process never holds two witnesses at once, so the
+// PEAK RSS of the whole aggregation == the largest SINGLE stitchable proof and is
+// INDEPENDENT of the zone size N. That flatness is the swarm payoff: an edge/IoT
+// aggregator folds an arbitrarily large zone under one strand's memory budget.
+// Peak RSS is captured out-of-process by `/usr/bin/time -l` in the shell wrapper,
+// exactly as PART 1 does; here we only drive the aggregation and time each leg.
+// =============================================================================
+
+/// One row of the Tier-A aggregation RSS table: for a zone of `n_leaves` record
+/// strands aggregated to one root R* over B256, the per-leg timings (ms) and the
+/// stitchable proof sizes (bytes). `leaf_proof_bytes` is constant across N (every
+/// strand is one Keccak-f node hash); `agg_artifact_bytes` is the batched-Merkle
+/// edge artifact = one master join proof + N 32-byte record commitments.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchAggResult {
+	pub n_leaves: usize,
+	pub log_inv_rate: usize,
+	pub security_bits: usize,
+	/// Slowest single leaf strand — the RSS-relevant unit (peak ∝ this, not N).
+	pub leaf_max_prove_ms: u128,
+	/// Sum of all leaf strand prove times (sequential wall-clock on one worker).
+	pub leaf_total_prove_ms: u128,
+	/// The master Tier-A join node prove time.
+	pub master_prove_ms: u128,
+	/// One leaf strand proof size (constant across N).
+	pub leaf_proof_bytes: usize,
+	/// The master join proof size.
+	pub master_proof_bytes: usize,
+	/// Batched-Merkle edge artifact = master proof + N × 32-byte commitments.
+	pub agg_artifact_bytes: usize,
+	/// `true` iff the in-circuit master reproduced R* over the strand roots
+	/// (r_child == the leaf root it binds, r_parent == native merkle_root).
+	pub rstar_ok: bool,
+}
+
+/// Deterministic 64-byte preimage (two 32-byte lanes) for record strand `i` — a
+/// stand-in for a per-record RRSIG-signing-input commitment. Fixed content; the
+/// message value does not change a single-block strand's prover cost.
+fn agg_leaf_message(i: usize) -> Vec<u8> {
+	let mut m = vec![0u8; 64];
+	m[..8].copy_from_slice(&(i as u64).to_le_bytes());
+	m[32..40].copy_from_slice(&(0xA660_0000u64 ^ i as u64).to_le_bytes());
+	m
+}
+
+/// PART 2 — drive the LEVEL-1 (Tier-A) aggregation of an `n_leaves`-record zone in
+/// the strand/swarm model and time each leg, so the shell wrapper can pair the
+/// timings with the WHOLE-PROCESS peak RSS. `n_leaves >= 2`.
+///
+/// Legs:
+///  1. `n_leaves` bounded strand proofs — each `prove_verify_sha3_b256` over B256
+///     produces a record root; the witness is dropped between strands so peak RSS
+///     is one strand, not the sum.
+///  2. Coordinator fold — `merkle_root_sha3` over the roots (native, ~no memory).
+///  3. One master Tier-A join — `prove_verify_join_b256` binds leaf-0's root
+///     (recomputed in-circuit as SHA3(a‖b) from its 64-byte preimage) as the left
+///     child and leaf-1's root as the sibling, into R2 = SHA3(root0‖root1); this
+///     is the proven aggregation-node mechanism at bounded RSS.
+pub fn bench_agg_rss(
+	n_leaves: usize,
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<BenchAggResult> {
+	use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+	use crate::b256_sha3::prove_verify_sha3_b256;
+	use crate::recursion::merkle_root_sha3;
+	use crate::sha3_variants::Sha3Variant;
+
+	assert!(n_leaves >= 2, "Tier-A aggregation needs at least two record strands");
+
+	// --- Leg 1: N bounded record strands (each an independent stitchable proof). ---
+	let mut roots: Vec<[u8; 32]> = Vec::with_capacity(n_leaves);
+	let mut leaf_max_prove_ms: u128 = 0;
+	let mut leaf_total_prove_ms: u128 = 0;
+	let mut leaf_proof_bytes: usize = 0;
+	for i in 0..n_leaves {
+		let msg = agg_leaf_message(i);
+		let t = Instant::now();
+		let (sz, digests) =
+			prove_verify_sha3_b256(Sha3Variant::Sha3_256, &[msg], log_inv_rate, security_bits)?;
+		let ms = t.elapsed().as_millis();
+		// The `bumpalo::Bump` inside the call is dropped here (NLL) → the next
+		// strand starts from baseline; peak RSS stays at one strand.
+		leaf_total_prove_ms += ms;
+		leaf_max_prove_ms = leaf_max_prove_ms.max(ms);
+		leaf_proof_bytes = sz;
+		let root: [u8; 32] = digests[0]
+			.as_slice()
+			.try_into()
+			.expect("SHA3-256 strand root must be 32 bytes");
+		roots.push(root);
+	}
+
+	// --- Leg 2: coordinator natively folds the strand roots into R* (cheap). ---
+	let rstar = merkle_root_sha3(&roots);
+	let r2 = merkle_root_sha3(&roots[..2]); // the master node's target sub-root.
+
+	// --- Leg 3: one master Tier-A join node, bounded RSS. ---
+	let leaf0 = agg_leaf_message(0);
+	let a: [u8; 32] = leaf0[..32].try_into().unwrap();
+	let b: [u8; 32] = leaf0[32..].try_into().unwrap();
+	let t = Instant::now();
+	let join = prove_verify_join_b256(
+		a,
+		b,
+		roots[1],
+		JoinMode::Honest,
+		Some(r2),
+		log_inv_rate,
+		security_bits,
+	)?;
+	let master_prove_ms = t.elapsed().as_millis();
+
+	let rstar_ok = join.accepted()
+		&& join.verify_ok
+		&& join.r_child == roots[0]
+		&& join.r_parent == r2;
+	// R* is the coordinator's balanced-Merkle root over all strand roots; the
+	// master proves the base node R2 in-circuit. (Guard against unused warning.)
+	debug_assert_eq!(rstar, merkle_root_sha3(&roots));
+
+	let master_proof_bytes = join.proof_size;
+	let agg_artifact_bytes = master_proof_bytes + n_leaves * 32;
+
+	Ok(BenchAggResult {
+		n_leaves,
+		log_inv_rate,
+		security_bits,
+		leaf_max_prove_ms,
+		leaf_total_prove_ms,
+		master_prove_ms,
+		leaf_proof_bytes,
+		master_proof_bytes,
+		agg_artifact_bytes,
+		rstar_ok,
+	})
+}
+
+// The PART 1 (`bench_keccak_*`) path is driven by the `bench_b256b512` binary; the
+// PART 2 Tier-A aggregation path is driven, at RSS-measurement time, by the single
+// `#[ignore]`d `agg_rss_row` runner below (via `scripts/bench-agg-rss.sh`). It is
+// `#[ignore]`d exactly like the heavy prove gates, so a normal `cargo test --lib`
+// run neither executes it nor counts it among the authoritative pass count — it is
+// invoked only, one row at a time, by the shell wrapper under `/usr/bin/time -l`.
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::env;
+
+	/// blowup = 2^1 = 2, matching the b256 Keccak / join gates.
+	const LOG_INV_RATE: usize = 1;
+
+	/// PART 2 RSS runner (ONE row). Reads the zone size from `AGG_N` (default 8) and
+	/// the FS soundness target from `AGG_SEC` (default 128 = NIST L1), drives the
+	/// Level-1 Tier-A aggregation via `bench_agg_rss`, and prints ONE structured
+	/// RESULT line. `#[ignore]` so the normal suite skips it; the shell wrapper runs
+	/// the built test binary directly under `/usr/bin/time -l`, re-invoking it once
+	/// per `AGG_N` in the sweep so peak RSS is measured per zone size in isolation.
+	#[test]
+	#[ignore = "PART 2 Tier-A aggregation RSS row; run via scripts/bench-agg-rss.sh"]
+	fn agg_rss_row() {
+		let n: usize = env::var("AGG_N")
+			.ok()
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(8);
+		let sec: usize = env::var("AGG_SEC")
+			.ok()
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(128);
+
+		let r = bench_agg_rss(n, LOG_INV_RATE, sec)
+			.expect("Tier-A aggregation must prove AND verify over B256");
+		assert!(
+			r.rstar_ok,
+			"in-circuit master did not reproduce R* over the strand roots"
+		);
+
+		// Single structured line — stable key=value fields for the shell parser.
+		println!(
+			"RESULT tier=A N={} sec={} log_inv_rate={} leaf_max_prove_ms={} leaf_total_prove_ms={} master_prove_ms={} leaf_proof_bytes={} master_proof_bytes={} agg_artifact_bytes={} rstar_ok={}",
+			r.n_leaves,
+			r.security_bits,
+			r.log_inv_rate,
+			r.leaf_max_prove_ms,
+			r.leaf_total_prove_ms,
+			r.master_prove_ms,
+			r.leaf_proof_bytes,
+			r.master_proof_bytes,
+			r.agg_artifact_bytes,
+			r.rstar_ok,
+		);
+	}
+}

@@ -51,9 +51,10 @@ p256    = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = "2.1"
 rsa     = "0.9"
 fips204 = "0.4"
-# Native SHA3-256 reference (FIPS 202) used only by tests to gate the in-circuit
-# sponge against NIST vectors. Version pinned to Binius's Cargo.lock (0.10.8) to
-# avoid any transitive lock churn.
+# Native SHA3-256 reference (FIPS 202). Used by `recursion::merkle_root_sha3` /
+# `merkle_tree_sha3` (the Tier-A aggregation relation R* the in-circuit master is
+# gated against) and to gate the in-circuit sponge against NIST vectors. Both live
+# on the `cargo test --lib` build path. Pinned to Binius's Cargo.lock (0.10.8).
 sha3    = "0.10.8"
 # Independent native Keccak-f[1600] reference for the B256 in-circuit gadget's
 # `keccak_b256_matches_native` gate (test-only; isolated to this detached crate's lock).
