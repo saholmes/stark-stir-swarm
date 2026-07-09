@@ -1022,6 +1022,150 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-D-1e (D end-to-end, per-record verify ∘ zone aggregation) — a DNSSEC record's RRSIG
+	/// is verified in-circuit AND the verified record is committed into the zone's epoch root, bound
+	/// by ONE shared commitment, over B256. This closes the loop the two D halves left open: prove-D-0
+	/// proves the RRSIG verifies (s³ mod N == EMSA(SHA-256(signing input))), and prove-D-epoch
+	/// aggregates record commitments to the epoch root — and the record's commitment c = SHA-256 of
+	/// its RRSIG signing input is EXACTLY the message the RSA verify binds. So the same c is (i) the
+	/// EMSA-bound message of the per-record verify proof and (ii) a leaf of the epoch-root aggregation
+	/// proof. Two independent proofs (the verify at W=1024, the aggregation via the Tier-A join),
+	/// glued by the public commitment c: a resolver checks both proofs verify and that they share c,
+	/// concluding "this record's signature is valid AND it is the record committed at leaf i of the
+	/// epoch root". Editing the record changes its signing input ⇒ a different c ⇒ BOTH the verify
+	/// (different EMSA, boundary unbalanced) AND the aggregation (different leaf, subtree ≠ anchor)
+	/// REJECT. Honest record verifies-and-commits at NIST L1; a tampered record fails both proofs.
+	/// This is the end-to-end DNS-STARK unit: verify a record, commit it to the zone, one shared c.
+	#[test]
+	fn dns_record_verify_and_zone_commit_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::b256_recursion::{prove_verify_join_b256, JoinMode};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use crate::rsa_verify::emsa_pkcs1_sha256;
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use rand::{rngs::StdRng, SeedableRng};
+		use rsa::traits::PublicKeyParts;
+		use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+
+		const W: usize = 1024;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		// The record to verify-and-commit, plus its RSA RRSIG (algorithm 8).
+		let rrsig = |key_tag: u16| RrsigFields {
+			type_covered: 1,
+			algorithm: 8,
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag,
+			signer_name: "example.com".to_string(),
+		};
+		let a_rr = |name: &str, ip: [u8; 4]| CanonicalRr {
+			name: name.to_string(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: ip.to_vec(),
+		};
+		let record = a_rr("www.example.com", [93, 184, 216, 34]);
+		// c = SHA-256 of the RRSIG signing input: the record commitment AND the RSA-verified message.
+		let c_record = rrsig_sha256_message(&rrsig(0x4d2), std::slice::from_ref(&record));
+
+		// Sign the record with a genuine RSA-496 key (e=3).
+		let mut rng = StdRng::seed_from_u64(0xD1_E2E0_0001);
+		let e3 = rsa::BigUint::from(3u32);
+		let sk = RsaPrivateKey::new_with_exp(&mut rng, 496, &e3).expect("rsa-496 keygen");
+		let n = BigUint::from_bytes_be(&sk.n().to_bytes_be());
+		let np = n.bits() as usize;
+		let n_lanes = (np + 63) / 64;
+		let k = (np + 7) / 8;
+		let n_bits = to_bits(&n);
+		let sig_bytes = sk.sign(Pkcs1v15Sign::new::<sha2::Sha256>(), &c_record).expect("sign RRSIG");
+		let s = BigUint::from_bytes_be(&sig_bytes);
+		let s2 = (&s * &s) % &n;
+		let em = (&s2 * &s) % &n; // s³ mod N = EMSA(c_record)
+		let em_expected = BigUint::from_bytes_be(&emsa_pkcs1_sha256(&c_record, k));
+		assert_eq!(em, em_expected, "genuine RRSIG must recover EMSA(c_record)");
+
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(n_lanes * 8, 0);
+			(0..n_lanes).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		// PROOF 1 — the per-record RRSIG verify: s³ mod N pinned to EMSA(em_pub).
+		let verify_record = |em_pub: &BigUint| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chs = cs.add_channel("chS");
+			let chs2 = cs.add_channel("chS2");
+			let chem = cs.add_channel("chEM");
+			let mm_sq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, chs, chs, chs2);
+			let mm_mul = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, chs2, chs, chem);
+			let boundaries = vec![
+				Boundary { values: to_boundary(&s), channel_id: chs, direction: FlushDirection::Push, multiplicity: 3 },
+				Boundary { values: to_boundary(em_pub), channel_id: chem, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm_sq.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm_sq.populate(&mut seg, &[ModMulRow { a: to_bits(&s), b: to_bits(&s), q: to_bits(&((&s * &s) / &n)), r: to_bits(&s2) }]).unwrap();
+			}
+			{
+				let tw = witness.init_table(mm_mul.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm_mul.populate(&mut seg, &[ModMulRow { a: to_bits(&s2), b: to_bits(&s), q: to_bits(&((&s2 * &s) / &n)), r: to_bits(&em) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			match binius_core::constraint_system::prove::<U256, B256TowerFamily, sha2::Sha256, Sha256Compression, HasherChallenger<sha2::Sha256>, _>(
+				&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+			) {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<U256, B256TowerFamily, sha2::Sha256, Sha256Compression, HasherChallenger<sha2::Sha256>>(
+					&ccs, 1, 128, &statement.boundaries, pf,
+				)
+				.is_ok(),
+			}
+		};
+
+		// PROOF 2 — the zone aggregation: c_record is a leaf of the epoch root.
+		let c_sib1 = rrsig_sha256_message(&rrsig(0x4d3), std::slice::from_ref(&a_rr("mail.example.com", [93, 184, 216, 35])));
+		let c_sib2 = rrsig_sha256_message(&rrsig(0x4d4), std::slice::from_ref(&a_rr("ns.example.com", [93, 184, 216, 36])));
+		let subtree = crate::recursion::merkle_root_sha3(&[c_record, c_sib1]);
+		let epoch = crate::recursion::merkle_root_sha3(&[subtree, c_sib2]);
+
+		// Honest: the RRSIG verifies AND the record commits into the epoch root, sharing c_record.
+		assert!(verify_record(&em), "genuine record's RRSIG must verify over B256");
+		let agg = prove_verify_join_b256(c_record, c_sib1, c_sib2, JoinMode::Honest, Some(epoch), 1, 128)
+			.expect("zone aggregation must run over B256");
+		assert!(agg.accepted() && agg.verify_ok, "the verified record must commit into the epoch root");
+		assert_eq!(agg.r_parent, epoch, "in-circuit epoch root != native");
+
+		// Tamper: edit the record ⇒ a different commitment c' ⇒ BOTH proofs reject.
+		let c_edited = rrsig_sha256_message(&rrsig(0x4d2), std::slice::from_ref(&a_rr("www.example.com", [10, 0, 0, 1])));
+		let em_edited = BigUint::from_bytes_be(&emsa_pkcs1_sha256(&c_edited, k));
+		assert!(!verify_record(&em_edited), "SOUNDNESS: RRSIG must not verify against the edited record's EMSA");
+		let forged_subtree = crate::recursion::merkle_root_sha3(&[c_edited, c_sib1]);
+		let agg_bad = prove_verify_join_b256(c_record, c_sib1, c_sib2, JoinMode::ForgedInnerRoot { forged: forged_subtree }, None, 1, 128)
+			.expect("tampered-aggregation run");
+		assert!(!agg_bad.accepted(), "SOUNDNESS: the edited record must not commit into the anchored epoch root");
+
+		println!(
+			"GATE prove-D-1e: a DNSSEC record VERIFIES AND COMMITS end-to-end over B256 @L1(128) — its RSA RRSIG proves (s³ mod N == EMSA(SHA-256(signing input)), W=1024) AND its commitment c = that same SHA-256 is a leaf of the epoch root (Tier-A); one shared c binds verify∘aggregate. Editing the record rejects BOTH proofs (different EMSA, different leaf). The end-to-end DNS-STARK unit."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
