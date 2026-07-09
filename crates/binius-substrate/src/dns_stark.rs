@@ -496,6 +496,145 @@ mod tests {
 		println!("GATE ref-D-7: RRSIG signed message = SHA-256(signing_input) binds record (tamper RRset/RRSIG ⇒ different); routes to S1/S2/S3");
 	}
 
+	/// GATE prove-D-0 (D per-record verify, RSA slice) — a real DNSSEC record's RRSIG verifies
+	/// in-circuit over B256, wiring the S3 RSA slice to the canonical DNSSEC signing input. A
+	/// www.example.com A record and an RRSIG (algorithm 8 = RSA/SHA-256) are signed by a genuine
+	/// RSA key (e=3, RSA-496 so the modexp is tractable): the signature s satisfies
+	/// s³ mod N = EMSA-PKCS1-v1.5(SHA-256(RRSIG_RDATA ‖ A-record)), the exact RFC 4034 §3.1.8.1
+	/// signing input. The circuit proves the modexp s³ mod N as two seam-glued ModMul strands at
+	/// W=1024 and PINS the recovered encoded message to the EMSA encoding of the record's signing
+	/// input (all ceil(np/64)=8 lanes, full padding + digest). Balanced iff the signature verifies
+	/// for THIS record ⇒ ACCEPT. Editing the record (here the A rdata / IP address) changes the
+	/// canonical signing input ⇒ a different SHA-256 ⇒ a different EMSA, which s³ does not equal, so
+	/// the boundary unbalances ⇒ REJECT — a signature does not verify for a tampered record. This is
+	/// the per-record leg of prove-D-1; the epoch aggregation (R Tier-A over record roots) and the
+	/// other slices (Ed25519/ML-DSA already proven in S2/S1) compose on top. Honest record
+	/// PROVES+VERIFIES at NIST L1; a tampered record is REJECTED.
+	#[test]
+	fn dns_rsa_record_rrsig_verify_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use crate::rsa_verify::emsa_pkcs1_sha256;
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use rand::{rngs::StdRng, SeedableRng};
+		use rsa::traits::PublicKeyParts;
+		use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+
+		const W: usize = 1024;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		// A genuine DNSSEC A record and its RRSIG (algorithm 8 = RSA/SHA-256).
+		let rrsig = RrsigFields {
+			type_covered: 1, // A
+			algorithm: 8,    // RSA/SHA-256
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_735_689_600,
+			sig_inception: 1_704_067_200,
+			key_tag: 0x4d2,
+			signer_name: "example.com".to_string(),
+		};
+		let a_rr = |ip: [u8; 4]| CanonicalRr {
+			name: "www.example.com".to_string(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: ip.to_vec(),
+		};
+		let record = a_rr([93, 184, 216, 34]);
+		let digest = rrsig_sha256_message(&rrsig, std::slice::from_ref(&record)); // SHA-256(signing input)
+
+		// Sign the canonical signing input with a genuine RSA-496 key (e=3, for tractable modexp).
+		let mut rng = StdRng::seed_from_u64(0xD5_5EC0_0008);
+		let e3 = rsa::BigUint::from(3u32);
+		let sk = RsaPrivateKey::new_with_exp(&mut rng, 496, &e3).expect("rsa-496 keygen");
+		let n = BigUint::from_bytes_be(&sk.n().to_bytes_be());
+		let np = n.bits() as usize;
+		let n_lanes = (np + 63) / 64;
+		let k = (np + 7) / 8;
+		let n_bits = to_bits(&n);
+		let sig_bytes = sk.sign(Pkcs1v15Sign::new::<Sha256>(), &digest).expect("sign RRSIG");
+		let s = BigUint::from_bytes_be(&sig_bytes);
+		let s2 = (&s * &s) % &n;
+		let em = (&s2 * &s) % &n; // recovered encoded message = s³ mod N
+
+		// The EMSA encoding of THIS record's signing input, and of a TAMPERED record (IP + 1).
+		let em_record = BigUint::from_bytes_be(&emsa_pkcs1_sha256(&digest, k));
+		assert_eq!(em, em_record, "genuine DNSSEC RRSIG must recover EMSA(SHA-256(signing input))");
+		let digest_tampered = rrsig_sha256_message(&rrsig, std::slice::from_ref(&a_rr([93, 184, 216, 35])));
+		let em_tampered = BigUint::from_bytes_be(&emsa_pkcs1_sha256(&digest_tampered, k));
+
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(n_lanes * 8, 0);
+			(0..n_lanes).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let run = |em_pub: &BigUint, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chs = cs.add_channel("chS");
+			let chs2 = cs.add_channel("chS2");
+			let chem = cs.add_channel("chEM");
+			let mm_sq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, chs, chs, chs2);
+			let mm_mul = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, chs2, chs, chem);
+			let boundaries = vec![
+				Boundary { values: to_boundary(&s), channel_id: chs, direction: FlushDirection::Push, multiplicity: 3 },
+				Boundary { values: to_boundary(em_pub), channel_id: chem, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm_sq.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&s * &s) / &n;
+				mm_sq.populate(&mut seg, &[ModMulRow { a: to_bits(&s), b: to_bits(&s), q: to_bits(&q), r: to_bits(&s2) }]).unwrap();
+			}
+			{
+				let tw = witness.init_table(mm_mul.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (&s2 * &s) / &n;
+				mm_mul.populate(&mut seg, &[ModMulRow { a: to_bits(&s2), b: to_bits(&s), q: to_bits(&q), r: to_bits(&em) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(&em_record, true);
+		assert!(vok, "honest DNSSEC RSA record verify failed validate_witness: {verr}");
+		assert!(verify_ok, "genuine DNSSEC RSA RRSIG must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(&em_tampered, false);
+		assert!(!v2, "SOUNDNESS FAILURE: the RRSIG verified for a TAMPERED record");
+
+		println!(
+			"GATE prove-D-0: a DNSSEC A record's RSA RRSIG (algorithm 8, RSA/SHA-256) VERIFIES over B256 @L1(128) — s³ mod N proven as seam-glued ModMul strands (W=1024), output pinned to EMSA(SHA-256(RFC-4034 signing input)); ACCEPT for the record, REJECT when the A rdata is edited. The S3 slice wired into the DNS layer — per-record leg of prove-D-1."
+		);
+	}
+
 	/// GATE prove-D-1 (PENDING) — a mixed DNSSEC zone proves end-to-end over Binius: each
 	/// record's RRSIG verified by its S-slice, aggregated to R*; a tampered zone is
 	/// REJECTED. Needs S1/S2/S3 + R prove paths wired.
