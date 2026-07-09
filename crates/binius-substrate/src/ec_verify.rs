@@ -4556,6 +4556,155 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-1b (S2 ECDSA verify decision) — the ECDSA-P256 verification ACCEPT, consuming
+	/// the point-op strand output as a boundary-published point, at the same abstraction level as the
+	/// Ed25519 accept (prove-S2-edverify). ECDSA verify computes R = [u1]G + [u2]Q (u1 = e·s⁻¹,
+	/// u2 = r·s⁻¹ mod n) and accepts iff R.x ≡ r (mod n). Each of [u1]G and [u2]Q is a Weierstrass
+	/// scalar-mul strand and R = their sum; the final R.x (affine) is published on a boundary. This
+	/// gate is the top of that pipeline: it PULLS R.x from the strand's boundary and proves the ECDSA
+	/// acceptance R.x = r + k·n with k ∈ {0,1} and r < n (the x≡r identity, prove-S2-xr, now fed by a
+	/// boundary instead of a free witness). Balanced + identity closes iff R.x reduces to r mod n ⇒
+	/// ACCEPT. A forged signature yields an R whose x-coordinate does not reduce to r (no k ∈ {0,1}
+	/// closes r + k·n = R.x), so verification is REJECTED. P-256 group order n; R.x < p < 2²⁵⁶ carried
+	/// as four B256 lanes, bit-identical to the point the scalar-mul strands published. Honest sig
+	/// PROVES+VERIFIES at NIST L1; a forged signature (wrong R.x) is REJECTED. Completes the fourth
+	/// signature scheme's in-circuit verify decision (ML-DSA/S1, Ed25519/edverify, RSA/S3-1b, ECDSA).
+	#[test]
+	fn ecdsa_p256_accept_decision_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		const WLOG: usize = 9;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let n = order(S2Curve::P256);
+		let n_arr = arr(&n);
+		let c_n_bits = two_pow_w_minus(&to_bits(&n));
+		let c_n_arr: [B1; W] = std::array::from_fn(|i| if c_n_bits[i] { B1::ONE } else { B1::ZERO });
+
+		// Genuine ECDSA acceptance: R.x = n + 12345 (in [n, p), so k=1), r = R.x mod n = 12345.
+		let rx = &n + 12345u32;
+		let r_val = &rx % &n;
+		let k_val = if rx >= n { 1u64 } else { 0 };
+
+		// `bad_rx` publishes an R.x the strands never produced for this r (forged signature).
+		let run = |bad_rx: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chrx = cs.add_channel("chRx"); // R.x published by the scalar-mul + add strands
+
+			let mut t = cs.add_table("ECDSA accept: R.x ≡ r mod n, R.x pulled from strand boundary");
+			// pull R.x from the boundary channel (four B256 lanes = low 256 bits of R.x).
+			let x = t.add_committed::<B1, W>("Rx");
+			let x_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("Rx_sel{i}"), x, i));
+			let x_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("Rx_b64{i}"), x_sel[i]));
+			t.pull(chrx, x_b64);
+			let r = t.add_committed::<B1, W>("r");
+			let k = t.add_committed::<B1, 1>("k");
+			let bcast = t.add_committed::<B1, W>("kbc");
+			let bcast_rot = t.add_shifted("kbc_rot", bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("kbc_eq", bcast - bcast_rot);
+			let bc_l0 = t.add_selected("kbc_l0", bcast, 0);
+			t.assert_zero("kbc_bind", bc_l0 - k);
+			let n_col = t.add_constant("n", n_arr);
+			let kn = t.add_computed("kn", bcast * n_col);
+			let sum = Adder::<W>::build(&mut t, r, kn, "rk"); // r + k·n
+			t.assert_zero("x_eq", sum.sum - x); // == R.x
+			let cn = t.add_constant("c_n", c_n_arr);
+			let rcout = t.add_committed::<B1, W>("rcout");
+			let rcin = t.add_shifted("rcin", rcout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("r_carry", (r + rcin) * (cn + rcin) + rcin - rcout);
+			let rfc = t.add_selected("rfc", rcout, W - 1);
+			t.assert_zero("r_lt_n", rfc * B1::ONE);
+			let t_id = t.id();
+
+			let rx_pub = if bad_rx { &rx + 1u32 } else { rx.clone() };
+			let boundaries = vec![Boundary {
+				values: to_boundary(&rx_pub),
+				channel_id: chrx,
+				direction: FlushDirection::Push,
+				multiplicity: 1,
+			}];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				// x column = the published R.x (its low 256 bits are pulled/bound to the boundary).
+				let xb = to_bits(&rx_pub);
+				write_col::<W>(&mut seg, x, 0, &xb).unwrap();
+				for (i, &s) in x_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &xb[i * 64..i * 64 + 64]).unwrap();
+				}
+				write_col::<W>(&mut seg, r, 0, &to_bits(&r_val)).unwrap();
+				write_bit(&mut seg, k, 0, k_val == 1).unwrap();
+				let kb = vec![k_val == 1; W];
+				write_col::<W>(&mut seg, bcast, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, bcast_rot, 0, &kb).unwrap();
+				write_bit(&mut seg, bc_l0, 0, k_val == 1).unwrap();
+				write_col::<W>(&mut seg, n_col, 0, &to_bits(&n)).unwrap();
+				let knv = if k_val == 1 { to_bits(&n) } else { vec![false; W] };
+				write_col::<W>(&mut seg, kn, 0, &knv).unwrap();
+				let _ = sum.populate(&mut seg, 0, &to_bits(&r_val), &knv).unwrap();
+				write_col::<W>(&mut seg, cn, 0, &c_n_bits).unwrap();
+				let (_s, cout) = ripple_add(&to_bits(&r_val), &c_n_bits);
+				write_col::<W>(&mut seg, rcout, 0, &cout).unwrap();
+				write_col::<W>(&mut seg, rcin, 0, &shl(&cout, 1)).unwrap();
+				write_bit(&mut seg, rfc, 0, cout[W - 1]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest ECDSA accept failed validate_witness: {verr}");
+		assert!(verify_ok, "genuine ECDSA-P256 acceptance R.x≡r mod n must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: a forged ECDSA signature (wrong R.x) was ACCEPTED");
+
+		println!(
+			"GATE prove-S2-1b: ECDSA-P256 verify ACCEPT over B256 @L1(128) — R.x of R=[u1]G+[u2]Q pulled from the scalar-mul strand boundary, proven R.x=r+k·n (k∈{{0,1}}, r<n) i.e. R.x≡r mod n; genuine signature VERIFIES, a forged signature (wrong R.x) REJECTED. Fourth scheme's verify decision — ML-DSA/Ed25519/RSA/ECDSA all decide in-circuit over B256."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
