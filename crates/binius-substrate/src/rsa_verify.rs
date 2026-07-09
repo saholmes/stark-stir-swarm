@@ -736,6 +736,145 @@ mod tests {
 		println!("GATE xcheck-rsa: my S3 RSA-2048 sig verified by the rsa crate AND rsa_pkcs1_sha256_verify; tampered rejected");
 	}
 
+	/// GATE prove-S3-0 (S3 modexp over B256, strand-decomposed) — the FIRST in-circuit RSA modexp
+	/// proof: s^e mod N computed over B256 as a chain of seam-glued ModMul STRANDS, each an
+	/// independent bounded-memory proof, exactly the RSS decomposition the EC scalar mult uses
+	/// (prove-S2-chain). RSA verify recovers em = s^e mod N; for e = 17 = 2⁴+1 that is four modular
+	/// squarings then one multiply: s → s² → s⁴ → s⁸ → s¹⁶ → s¹⁶·s. Each step is a self-contained
+	/// strand: a squaring pulls its input coord from an input boundary (multiplicity 2, since x² pulls
+	/// x twice) and pushes x² to an output boundary; the final multiply pulls s¹⁶ and s and pushes em.
+	/// Every strand is prove()d and verify()d on its OWN ConstraintSystem — five separate proofs — and
+	/// the chain composes to em = s¹⁷ mod N (num-bigint cross-checked). The cross-strand binding is the
+	/// public boundary-value equality the aggregator checks (step k's output boundary == step k+1's
+	/// input boundary); a strand that publishes a value it did not compute fails its own verification
+	/// and is REJECTED. Reduction is proved by the S0 ModMul gadget (r = s·s − q·N with r < N). A
+	/// toy-width modulus (~248-bit, derived from the real RSA-2048 vector, kept odd) makes each ModMul
+	/// ≈ the Ed25519 cost; real RSA-2048 is the identical strand chain at W = 4096 (e = 65537 → 16
+	/// squarings + 1 multiply), each still a separate bounded-memory proof. Honest chain
+	/// PROVES+VERIFIES over B256 at NIST L1; a strand lying about its output is REJECTED. This is the
+	/// arithmetic core of prove-S3-1 (the EMSA byte-equality boundary over binius_circuits::sha256 is
+	/// the remaining wiring).
+	#[test]
+	fn rsa_modexp_strands_prove_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		// Toy-width modulus (~248-bit) derived from the real RSA-2048 vector, forced odd; s < N.
+		let nmod = BigUint::parse_bytes(&N_HEX.as_bytes()[..62], 16).unwrap() | BigUint::from(1u32);
+		let s = BigUint::parse_bytes(&SIG_HEX.as_bytes()[..62], 16).unwrap() % &nmod;
+		let n_bits = to_bits(&nmod);
+		let np = nmod.bits() as usize;
+
+		// A squaring strand: x → x² mod N. Input coord via boundary (mult 2), output via boundary.
+		let prove_square = |x: &BigUint, x2_pub: &BigUint| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chx = cs.add_channel("chX");
+			let chout = cs.add_channel("chOut");
+			let mm = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, chx, chx, chout);
+			let r_true = (x * x) % &nmod;
+			let boundaries = vec![
+				Boundary { values: to_boundary(x), channel_id: chx, direction: FlushDirection::Push, multiplicity: 2 },
+				Boundary { values: to_boundary(x2_pub), channel_id: chout, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (x * x) / &nmod;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(x), b: to_bits(x), q: to_bits(&q), r: to_bits(&r_true) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			}
+		};
+
+		// A multiply strand: a·b mod N. Both operands via boundaries.
+		let prove_mult = |a: &BigUint, b: &BigUint, r_pub: &BigUint| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let cha = cs.add_channel("chA");
+			let chb = cs.add_channel("chB");
+			let chout = cs.add_channel("chOut");
+			let mm = ModMul::<W>::build_seamed_in2_chain(&mut cs, &n_bits, np, cha, chb, chout);
+			let r_true = (a * b) % &nmod;
+			let boundaries = vec![
+				Boundary { values: to_boundary(a), channel_id: cha, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(b), channel_id: chb, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(r_pub), channel_id: chout, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = (a * b) / &nmod;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&q), r: to_bits(&r_true) }]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			}
+		};
+
+		// modexp chain for e = 17: s → s² → s⁴ → s⁸ → s¹⁶ → em = s¹⁶·s.
+		let s2 = (&s * &s) % &nmod;
+		let s4 = (&s2 * &s2) % &nmod;
+		let s8 = (&s4 * &s4) % &nmod;
+		let s16 = (&s8 * &s8) % &nmod;
+		let em = (&s16 * &s) % &nmod;
+
+		// Five INDEPENDENT proofs; the aggregator wires each output boundary to the next input.
+		assert!(prove_square(&s, &s2), "s² strand must verify");
+		assert!(prove_square(&s2, &s4), "s⁴ strand must verify");
+		assert!(prove_square(&s4, &s8), "s⁸ strand must verify");
+		assert!(prove_square(&s8, &s16), "s¹⁶ strand must verify");
+		assert!(prove_mult(&s16, &s, &em), "final multiply strand must verify");
+
+		// The composed chain equals the modexp (num-bigint cross-check).
+		assert_eq!(em, s.modpow(&BigUint::from(17u32), &nmod), "chain must compose to s¹⁷ mod N");
+
+		// Soundness: a strand publishing an output it did not compute fails its OWN verification.
+		assert!(!prove_square(&s, &((&s2 + 1u32) % &nmod)), "a squaring lying about its output must be REJECTED");
+		assert!(!prove_mult(&s16, &s, &((&em + 1u32) % &nmod)), "the final multiply lying about em must be REJECTED");
+
+		println!(
+			"GATE prove-S3-0: RSA modexp s^17 mod N proven over B256 @L1(128) as 5 seam-glued ModMul STRANDS (4 squarings + 1 multiply), each an INDEPENDENT bounded-memory proof glued output-boundary→input-boundary; chain composes to s¹⁷ mod N (num-bigint cross-checked), a strand lying about its output REJECTED. RSA modexp decomposes exactly like the EC scalar mult — real RSA-2048 = same chain at W=4096, e=65537 (16 squarings + 1 multiply)."
+		);
+	}
+
 	/// GATE prove-S3-1 (PENDING) — RSA-2048 PKCS1-v1.5 verify proves over B256; genuine
 	/// `rsa`-crate sig accepts, tampered sig/msg/padding reject (isolated to the EM byte-
 	/// equality). Needs the limb MulUU32 + bigint schoolbook + S0 limb reduction + modexp
