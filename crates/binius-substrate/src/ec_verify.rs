@@ -4321,6 +4321,141 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-edverify (Phase-3, S2 signature decision) — the Ed25519 verification ACCEPT
+	/// decision, consuming the point-op strand outputs as boundary-published points. Ed25519 verify
+	/// checks [S]B = R + [h]A, i.e. two points are EQUAL: the left point L = [S]B and the right point
+	/// M = R + [h]A. Each of L and M is produced by a chain of scalar-mul DOUBLING/ADD strands
+	/// (prove-S2-dblstrand / eaddfull) whose final coordinate is published on a boundary; this gate is
+	/// the top of that pipeline — it pulls L and M in as boundary-published projective points and
+	/// proves the projective equality L.X·M.Z ≡ M.X·L.Z and L.Y·M.Z ≡ M.Y·L.Z (mod p), which is the
+	/// verifier's ACCEPT. Four cross-product ModMuls pull their coordinate operands from the input
+	/// boundaries; each equality is enforced by pushing BOTH of its cross-products to a shared channel
+	/// that a boundary drains with multiplicity 2 at the claimed value cx/cy — balanced iff the two
+	/// cross-products are equal to each other and to the public value, i.e. the points are equal. If
+	/// the two published points are NOT the same projective point (an M whose coordinates the strands
+	/// never produced for an equal point), a cross-product diverges and the ACCEPT channel unbalances,
+	/// so verification is REJECTED — a forged signature does not verify. L and M carried as projective
+	/// (X,Y,Z); Ed25519 field p = 2²⁵⁵−19. Honest equal points PROVE+VERIFY at NIST L1; unequal points
+	/// REJECTED. This is the ECDSA x≡r / Ed25519 point-equality accept boundary fed by real strands.
+	#[test]
+	fn ec_ed25519_verify_accept_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 512;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::Ed25519);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+
+		// L = [S]B and M = R + [h]A, published by the strands as two projective reps of the SAME
+		// affine point (ax, ay) (verification succeeds). L is the Z=1 rep; M scaled by zm.
+		let ax = BigUint::parse_bytes(b"05a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f00", 16).unwrap() % &p;
+		let ay = BigUint::parse_bytes(b"07f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee", 16).unwrap() % &p;
+		let zm = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+		let lx = ax.clone();
+		let ly = ay.clone();
+		let lz = BigUint::from(1u32);
+		let mx = (&ax * &zm) % &p;
+		let my = (&ay * &zm) % &p;
+		let mz = zm.clone();
+		let cx = (&lx * &mz) % &p; // L.X·M.Z = ax·zm = M.X·L.Z
+		let cy = (&ly * &mz) % &p; // L.Y·M.Z = ay·zm = M.Y·L.Z
+
+		// bad_pt publishes an M whose X is off by one — no longer the same projective point.
+		let run = |bad_pt: bool, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chlx = cs.add_channel("chLX");
+			let chly = cs.add_channel("chLY");
+			let chlz = cs.add_channel("chLZ");
+			let chmx = cs.add_channel("chMX");
+			let chmy = cs.add_channel("chMY");
+			let chmz = cs.add_channel("chMZ");
+			let chcx = cs.add_channel("chCX"); // X cross-product equality
+			let chcy = cs.add_channel("chCY"); // Y cross-product equality
+
+			// cross-products, operands pulled from the published-point boundaries, results to chCX/chCY.
+			let mm_lxmz = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, chlx, chmz, chcx); // L.X·M.Z
+			let mm_mxlz = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, chmx, chlz, chcx); // M.X·L.Z
+			let mm_lymz = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, chly, chmz, chcy); // L.Y·M.Z
+			let mm_mylz = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, chmy, chlz, chcy); // M.Y·L.Z
+
+			let mx_use = if bad_pt { (&mx + 1u32) % &p } else { mx.clone() };
+			let boundaries = vec![
+				// Input points published by the strands (consumption multiplicity: Z of each point ×2).
+				Boundary { values: to_boundary(&lx), channel_id: chlx, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&ly), channel_id: chly, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&lz), channel_id: chlz, direction: FlushDirection::Push, multiplicity: 2 },
+				Boundary { values: to_boundary(&mx_use), channel_id: chmx, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&my), channel_id: chmy, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&mz), channel_id: chmz, direction: FlushDirection::Push, multiplicity: 2 },
+				// ACCEPT: each equality's two cross-products must both equal the public cx/cy.
+				Boundary { values: to_boundary(&cx), channel_id: chcx, direction: FlushDirection::Pull, multiplicity: 2 },
+				Boundary { values: to_boundary(&cy), channel_id: chcy, direction: FlushDirection::Pull, multiplicity: 2 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1; 4] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let mut fill_mm = |mm: &ModMul<W>, a: &BigUint, b: &BigUint| {
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let prod = a * b;
+				let q = &prod / &p;
+				let r = &prod % &p;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&q), r: to_bits(&r) }]).unwrap();
+			};
+			fill_mm(&mm_lxmz, &lx, &mz);
+			fill_mm(&mm_mxlz, &mx_use, &lz); // uses the (possibly forged) M.X
+			fill_mm(&mm_lymz, &ly, &mz);
+			fill_mm(&mm_mylz, &my, &lz);
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		let (vok, verr, verify_ok) = run(false, true);
+		assert!(vok, "honest Ed25519 accept failed validate_witness: {verr}");
+		assert!(verify_ok, "honest Ed25519 point-equality accept must PROVE+VERIFY over B256");
+
+		let (v2, _e, _) = run(true, false);
+		assert!(!v2, "SOUNDNESS FAILURE: a forged signature (unequal points) was ACCEPTED");
+
+		println!(
+			"GATE prove-S2-edverify: Ed25519 verify ACCEPT over B256 @L1(128) — pulls the strand-published points L=[S]B and M=R+[h]A from boundaries and proves projective equality L.X·M.Z≡M.X·L.Z ∧ L.Y·M.Z≡M.Y·L.Z (4 cross-product ModMuls, dual mult-2 ACCEPT channels); equal points VERIFY, a forged signature (unequal points) REJECTED. The signature decision atop the scalar-mul strands."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
