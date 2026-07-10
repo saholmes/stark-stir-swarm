@@ -252,6 +252,80 @@ pub fn prove_verify_fs_bridge(words: [u32; 8]) -> Result<(usize, [u64; 4])> {
 	Ok((sz, want))
 }
 
+// --- M5 FS SCHEDULE: the observe/sample sequence of a whole proof transcript ---------
+//
+// A recursive verifier must recompute EVERY challenge in the exact order a Binius proof
+// draws them. HasherChallenger<Sha256> (hasher_challenger.rs) is a feed-forward SHA-256
+// duplex; tracing its state machine gives one clean rule per sampled digest:
+//
+//   d_0   = SHA-256([])                                        (initial buffer)
+//   d_i   = SHA-256( d_{i-1} ‖ idx_i(u64 LE) ‖ obs_i )         (each fill_buffer)
+//
+// where `idx_i` = the sampler byte-index captured when the observe *before* this sample
+// began (bytes already drawn from d_{i-1}); `obs_i` = all bytes observed since the last
+// sample. A contiguous draw crossing 32 bytes with NO observe rehashes by pure
+// feed-forward (obs empty, idx contribution absent). So the whole schedule is a CHAIN of
+// M4a multi-block SHA-256 hashes — no new primitive, just d_{i-1} wired into hash i.
+
+/// One transcript operation in a Fiat-Shamir schedule.
+#[derive(Clone, Debug)]
+pub enum FsOp {
+	/// Prover observes bytes into the transcript (a commitment root, a message, …).
+	Observe(Vec<u8>),
+	/// Verifier samples `usize` challenge bytes (a field challenge = 32, a query index, …).
+	Sample(usize),
+}
+
+/// Native model of `HasherChallenger<Sha256>` over a schedule of observe/sample ops.
+/// Returns the sampled bytes of each `Sample` op, in order. Faithful to the feed-forward
+/// duplex in hasher_challenger.rs; the reference the in-circuit chain must reproduce.
+pub fn fs_schedule_ref(ops: &[FsOp]) -> Vec<Vec<u8>> {
+	use sha2::Digest;
+	const OUT: usize = 32;
+	let d0 = Sha256::digest([]);
+	let mut acc: Vec<u8> = d0.to_vec(); // running hasher := update(initial_digest)
+	let mut buffer: Vec<u8> = d0.to_vec();
+	let mut index: usize = 0; // sampler byte-index into `buffer`
+	let mut sampler_mode = true; // default() starts in Sampler
+	let mut out = Vec::new();
+	for op in ops {
+		match op {
+			FsOp::Observe(bytes) => {
+				if sampler_mode {
+					// Sampler -> Observer: hasher.update(index.to_le_bytes())
+					acc.extend_from_slice(&(index as u64).to_le_bytes());
+					sampler_mode = false;
+				}
+				// observer buffers then flushes to the hasher; block boundaries don't
+				// affect the final digest, so append the observed bytes directly.
+				acc.extend_from_slice(bytes);
+			}
+			FsOp::Sample(n) => {
+				if !sampler_mode {
+					// Observer -> Sampler: flush (already in acc), index := output_size.
+					index = OUT;
+					buffer = vec![0u8; OUT];
+					sampler_mode = true;
+				}
+				let mut got = Vec::with_capacity(*n);
+				for _ in 0..*n {
+					if index == OUT {
+						// fill_buffer: digest = finalize_reset(acc); feed-forward acc := digest.
+						let digest = Sha256::digest(&acc);
+						acc = digest.to_vec();
+						buffer = digest.to_vec();
+						index = 0;
+					}
+					got.push(buffer[index]);
+					index += 1;
+				}
+				out.push(got);
+			}
+		}
+	}
+	out
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -284,6 +358,51 @@ mod tests {
 			got[4 * i..4 * i + 4].copy_from_slice(&st[i].to_be_bytes());
 		}
 		assert_eq!(got, out, "FS challenge != SHA-256(constructed input) — protocol trace wrong");
+	}
+
+	/// M5 FS-schedule (native): the `fs_schedule_ref` model reproduces a live
+	/// `HasherChallenger<Sha256>` driven with an INTERLEAVED observe/sample script —
+	/// partial buffer draws, contiguous >32-byte draws, and index-carry across observes.
+	/// Locks the schedule rule before wiring the in-circuit chain.
+	#[test]
+	fn fs_schedule_matches_challenger() {
+		use binius_core::fiat_shamir::Challenger;
+		use bytes::{Buf, BufMut};
+
+		// commit-root(32) -> sample field-challenge(32) -> observe fold-commit(32) ->
+		// sample 3 bytes (partial) -> observe(10) -> sample 40 bytes (crosses a buffer).
+		let root: Vec<u8> = (0..32u32).map(|i| (i as u8).wrapping_mul(7) ^ 0x11).collect();
+		let fold_commit: Vec<u8> = (0..32u32).map(|i| (i as u8).wrapping_mul(29) ^ 0x5a).collect();
+		let msg: Vec<u8> = (0..10u32).map(|i| (i as u8) ^ 0xa3).collect();
+		let ops = vec![
+			FsOp::Observe(root.clone()),
+			FsOp::Sample(32),
+			FsOp::Observe(fold_commit.clone()),
+			FsOp::Sample(3),
+			FsOp::Observe(msg.clone()),
+			FsOp::Sample(40),
+		];
+
+		let mut ch = HasherChallenger::<Sha256>::default();
+		let mut want: Vec<Vec<u8>> = Vec::new();
+		for op in &ops {
+			match op {
+				FsOp::Observe(b) => ch.observer().put_slice(b),
+				FsOp::Sample(n) => {
+					let mut o = vec![0u8; *n];
+					ch.sampler().copy_to_slice(&mut o);
+					want.push(o);
+				}
+			}
+		}
+
+		let got = fs_schedule_ref(&ops);
+		assert_eq!(got, want, "fs_schedule_ref != HasherChallenger<Sha256> on interleaved script");
+		println!(
+			"GATE M5-schedule (native): fs_schedule_ref reproduces HasherChallenger<Sha256> across \
+			 {} observe/sample ops (partial + cross-buffer draws) — the verifier's challenge spine",
+			ops.len()
+		);
 	}
 
 	/// The native multi-block hash matches `sha2::Sha256`.
