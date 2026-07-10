@@ -27,10 +27,10 @@ pub const SHA256_IV: [u32; 8] = [
 	0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-fn u32_bits(v: u32) -> Vec<bool> {
+pub(crate) fn u32_bits(v: u32) -> Vec<bool> {
 	(0..32).map(|k| (v >> k) & 1 == 1).collect()
 }
-fn wc(seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, col: Col<B1, 32>, row: usize, v: u32) -> Result<()> {
+pub(crate) fn wc(seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, col: Col<B1, 32>, row: usize, v: u32) -> Result<()> {
 	crate::nonnative::write_col::<32>(seg, col, row, &u32_bits(v))
 }
 
@@ -153,14 +153,14 @@ pub fn prove_verify_sha256_hash(msg: &[u8]) -> Result<(usize, [u8; 32])> {
 // layer consumes as the FS challenge — the tie between the SHA-256 and field worlds.
 
 /// One byte-swap of a 32-bit word column (reverse_bytes), for the digest->field reorder.
-struct BSwap32 {
-	s24: Col<B1, 32>,
+pub(crate) struct BSwap32 {
+	pub(crate) s24: Col<B1, 32>,
 	s8: Col<B1, 32>,
 	r8: Col<B1, 32>,
 	r24: Col<B1, 32>,
-	out: Col<B1, 32>,
+	pub(crate) out: Col<B1, 32>,
 }
-fn build_bswap32(t: &mut TableBuilder<OurB256>, x: Col<B1, 32>, m1: Col<B1, 32>, m2: Col<B1, 32>, nm: &str) -> BSwap32 {
+pub(crate) fn build_bswap32(t: &mut TableBuilder<OurB256>, x: Col<B1, 32>, m1: Col<B1, 32>, m2: Col<B1, 32>, nm: &str) -> BSwap32 {
 	let s24 = t.add_shifted(format!("{nm}s24"), x, 5, 24, ShiftVariant::LogicalLeft);
 	let s8 = t.add_shifted(format!("{nm}s8"), x, 5, 8, ShiftVariant::LogicalLeft);
 	let r8 = t.add_shifted(format!("{nm}r8"), x, 5, 8, ShiftVariant::LogicalRight);
@@ -168,7 +168,7 @@ fn build_bswap32(t: &mut TableBuilder<OurB256>, x: Col<B1, 32>, m1: Col<B1, 32>,
 	let out = t.add_computed(format!("{nm}bs"), s24 + s8 * m2 + r8 * m1 + r24);
 	BSwap32 { s24, s8, r8, r24, out }
 }
-fn pop_bswap32(bs: &BSwap32, seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, row: usize, x: u32) -> Result<()> {
+pub(crate) fn pop_bswap32(bs: &BSwap32, seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, row: usize, x: u32) -> Result<()> {
 	wc(seg, bs.s24, row, x << 24)?;
 	wc(seg, bs.s8, row, x << 8)?;
 	wc(seg, bs.r8, row, x >> 8)?;

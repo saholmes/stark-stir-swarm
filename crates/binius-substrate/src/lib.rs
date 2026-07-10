@@ -153,6 +153,7 @@ pub mod merkle_air; // Tier-B M2: in-circuit SHA-256 Merkle-path verification (F
 pub mod fri_air; // Tier-B M3: in-circuit FRI folding (field arithmetic)
 pub mod gf256_air; // Tier-B M3b: in-circuit GF(2^256) multiply
 pub mod fs_air; // Tier-B M4: in-circuit Fiat-Shamir transcript (multi-block SHA-256)
+pub mod m5_air; // Tier-B M5 kernel: FS challenge drives the FRI fold (recursive-verify composition)
 pub mod dns_stark; // D DNS-STARK zone assembly
 
 use std::iter::repeat_with;

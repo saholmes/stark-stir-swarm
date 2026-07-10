@@ -19,10 +19,10 @@ use sha2::Sha256;
 
 use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 
-type B64 = BinaryField64b;
+pub(crate) type B64 = BinaryField64b;
 
 /// The B64->B128 tower constant (B128 = B64[y]/(y^2 + BETA·y + 1)); verified in tests.
-fn beta() -> B64 {
+pub(crate) fn beta() -> B64 {
 	B64::new(1u64 << 32)
 }
 
@@ -34,7 +34,7 @@ fn split128(x: BinaryField128b) -> (B64, B64) {
 	(B64::new(u as u64), B64::new((u >> 64) as u64))
 }
 /// Split a B256 element into its four B64 tower components `[lo.lo, lo.hi, hi.lo, hi.hi]`.
-fn split256(x: OurB256) -> [B64; 4] {
+pub(crate) fn split256(x: OurB256) -> [B64; 4] {
 	let (l0, l1) = split128(x.lo());
 	let (h0, h1) = split128(x.hi());
 	[l0, l1, h0, h1]
@@ -79,7 +79,7 @@ fn build_b128_mul(
 	B128Mul { w0, w2, w1m, w2b, r0, r1 }
 }
 
-fn wc64(seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, col: Col<B64, 1>, row: usize, v: B64) -> Result<()> {
+pub(crate) fn wc64(seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, col: Col<B64, 1>, row: usize, v: B64) -> Result<()> {
 	let mut slice = seg.get_mut(col)?;
 	set_packed_slice(&mut slice, row, v);
 	Ok(())
@@ -403,22 +403,22 @@ pub fn fold_pair_native(u: OurB256, v: OurB256, r: OurB256, t: OurB256) -> OurB2
 
 // --- reusable fold_pair builder (namespaced, so a chunk-fold can chain many) ------
 
-struct FoldPairCols {
+pub(crate) struct FoldPairCols {
 	vp: [Col<B64, 1>; 4],
 	up: [Col<B64, 1>; 4],
 	d: [Col<B64, 1>; 4],
 	m1: B256MulCols,
 	m2: B256MulCols,
-	folded: [Col<B64, 1>; 4],
+	pub(crate) folded: [Col<B64, 1>; 4],
 }
 
-fn col4(t: &mut TableBuilder<OurB256>, nm: &str) -> [Col<B64, 1>; 4] {
+pub(crate) fn col4(t: &mut TableBuilder<OurB256>, nm: &str) -> [Col<B64, 1>; 4] {
 	std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{nm}{i}")))
 }
 
 /// Build one fold_pair on given input columns; returns `folded` + intermediates. `pfx`
 /// namespaces columns so a chunk-fold can chain several in one table.
-fn build_b256_fold_pair(
+pub(crate) fn build_b256_fold_pair(
 	t: &mut TableBuilder<OurB256>,
 	beta_col: Col<B64, 1>,
 	cu: [Col<B64, 1>; 4],
@@ -449,7 +449,7 @@ fn build_b256_fold_pair(
 }
 
 /// Populate a fold_pair from native B256 (u,v,r,t); writes all columns, returns folded.
-fn pop_b256_fold_pair(
+pub(crate) fn pop_b256_fold_pair(
 	fp: &FoldPairCols,
 	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
 	row: usize,
