@@ -354,6 +354,127 @@ pub fn prove_verify_fold_consistency(
 	Ok((sz, f2))
 }
 
+// --- reusable codeword-leaf bridge: 8 SHA words -> 4 B64 field cols (bswap + pack) -----
+struct LeafBridge {
+	cw: [Col<B1, 32>; 8],
+	bsw: [BSwap32; 8],
+	g: [Col<B1, 64>; 4],
+	los: [Col<B1, 32>; 4],
+	his: [Col<B1, 32>; 4],
+	cc: [Col<B64, 1>; 4], // the 4 B64 field components (add_packed, auto-derived)
+}
+fn build_leaf_bridge(
+	t: &mut binius_m3::builder::TableBuilder<OurB256>,
+	m1: Col<B1, 32>,
+	m2: Col<B1, 32>,
+	pfx: &str,
+) -> LeafBridge {
+	let cw: [Col<B1, 32>; 8] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("{pfx}w{i}")));
+	let bsw: [BSwap32; 8] = std::array::from_fn(|i| build_bswap32(t, cw[i], m1, m2, &format!("{pfx}bs{i}_")));
+	let g: [Col<B1, 64>; 4] = std::array::from_fn(|k| t.add_committed::<B1, 64>(format!("{pfx}g{k}")));
+	let mut los = Vec::new();
+	let mut his = Vec::new();
+	let mut cc = Vec::new();
+	for k in 0..4 {
+		let lo = t.add_selected_block::<B1, 64, 32>(format!("{pfx}g{k}_lo"), g[k], 0);
+		let hi = t.add_selected_block::<B1, 64, 32>(format!("{pfx}g{k}_hi"), g[k], 1);
+		t.assert_zero(format!("{pfx}g{k}_loc"), lo - bsw[2 * k].out);
+		t.assert_zero(format!("{pfx}g{k}_hic"), hi - bsw[2 * k + 1].out);
+		cc.push(t.add_packed::<B1, 64, B64, 1>(format!("{pfx}c{k}"), g[k]));
+		los.push(lo);
+		his.push(hi);
+	}
+	LeafBridge {
+		cw,
+		bsw,
+		g,
+		los: los.try_into().unwrap(),
+		his: his.try_into().unwrap(),
+		cc: cc.try_into().unwrap(),
+	}
+}
+fn pop_leaf_bridge(lb: &LeafBridge, seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, row: usize, value: OurB256) -> Result<()> {
+	let mut bytes = [0u8; 32];
+	bytes[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
+	bytes[16..32].copy_from_slice(&value.hi().to_underlier().to_le_bytes());
+	let words: [u32; 8] = std::array::from_fn(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()));
+	let want: [u64; 4] = std::array::from_fn(|k| split256(value)[k].to_underlier());
+	for i in 0..8 {
+		wc(seg, lb.cw[i], row, words[i])?;
+		pop_bswap32(&lb.bsw[i], seg, row, words[i])?;
+	}
+	for k in 0..4 {
+		let gbits: Vec<bool> = (0..64).map(|b| (want[k] >> b) & 1 == 1).collect();
+		crate::nonnative::write_col::<64>(seg, lb.g[k], row, &gbits)?;
+		let lob: Vec<bool> = (0..32).map(|b| (want[k] >> b) & 1 == 1).collect();
+		let hib: Vec<bool> = (0..32).map(|b| (want[k] >> (32 + b)) & 1 == 1).collect();
+		crate::nonnative::write_col::<32>(seg, lb.los[k], row, &lob)?;
+		crate::nonnative::write_col::<32>(seg, lb.his[k], row, &hib)?;
+	}
+	Ok(())
+}
+
+/// Prove + verify that two FRI codeword LEAVES (32 canonical bytes each) bridge to field
+/// and FOLD in ONE proof over B256: the bridge's 4 B64 output columns ARE the fold_pair
+/// operands (no intermediate commit), so the folded value provably derives from the leaf
+/// bytes. Returns `(proof_bytes, folded)`, gated == the native fold of the deserialized
+/// leaves. Composes M5-cwbridge x2 + M3c fold_pair — the value half of the query path.
+pub fn prove_verify_bridge_fold(uval: OurB256, vval: OurB256, r: OurB256, tw: OurB256) -> Result<(usize, OurB256)> {
+	let folded = fold_pair_native(uval, vval, r, tw);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("codeword bridge -> fold");
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bits = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let m1 = mkmask(&mut t, "mask_ff00", 0x0000_FF00);
+	let m2 = mkmask(&mut t, "mask_ff0000", 0x00FF_0000);
+	let lb_u = build_leaf_bridge(&mut t, m1, m2, "u_");
+	let lb_v = build_leaf_bridge(&mut t, m1, m2, "v_");
+	// the bridged field cols ARE the fold operands (the binding).
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cr = col4(&mut t, "r");
+	let ctw = col4(&mut t, "tw");
+	let fp = build_b256_fold_pair(&mut t, beta_col, lb_u.cc, lb_v.cc, cr, ctw, "fp_");
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (rv, tvv) = (split256(r), split256(tw));
+		for row in 0..NROWS {
+			wc(&mut seg, m1, row, 0x0000_FF00)?;
+			wc(&mut seg, m2, row, 0x00FF_0000)?;
+			pop_leaf_bridge(&lb_u, &mut seg, row, uval)?;
+			pop_leaf_bridge(&lb_v, &mut seg, row, vval)?;
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cr[i], row, rv[i])?;
+				wc64(&mut seg, ctw[i], row, tvv[i])?;
+			}
+			pop_b256_fold_pair(&fp, &mut seg, row, uval, vval, r, tw)?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, folded))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -370,6 +491,27 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-bridgefold — two FRI codeword leaves bridge to field AND fold in ONE proof:
+	/// the bridge's B64 output columns ARE the fold_pair operands (no intermediate commit),
+	/// so the folded value provably derives from the 32 canonical leaf bytes == native fold
+	/// of the deserialized leaves. The value half of the per-query path, bound end-to-end.
+	#[test]
+	fn bridge_fold_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xbf; 32]);
+		use rand::SeedableRng;
+		let uval = <OurB256 as Field>::random(&mut rng);
+		let vval = <OurB256 as Field>::random(&mut rng);
+		let r = <OurB256 as Field>::random(&mut rng);
+		let tw = <OurB256 as Field>::random(&mut rng);
+		let want = fold_pair_native(uval, vval, r, tw);
+		let (size, got) = prove_verify_bridge_fold(uval, vval, r, tw).expect("bridge->fold must PROVE+VERIFY");
+		assert_eq!(got, want, "in-circuit bridge->fold != native fold of deserialized leaves");
+		println!(
+			"GATE M5-bridgefold: codeword leaves bridge (bytes->field) AND fold in ONE proof over \
+			 B256 @L1(128) — bridged cols ARE the fold operands == native; proof = {size} bytes"
+		);
 	}
 
 	/// GATE M5-foldchain — the FRI per-query fold-consistency chain PROVES+VERIFIES in
