@@ -147,6 +147,35 @@ mod tests {
 	use super::*;
 	use sha2::Digest;
 
+	/// Confirm the exact FS input: HasherChallenger<Sha256>'s first sampled 32 bytes ==
+	/// SHA-256( SHA-256([]) ‖ 0u64_le ‖ transcript ). If so, an in-circuit FS challenge
+	/// is just M4a (multi-block SHA-256) of this constructed input.
+	#[test]
+	fn fs_challenge_is_sha256_of_constructed_input() {
+		use binius_core::fiat_shamir::Challenger;
+		use bytes::{Buf, BufMut};
+
+		let transcript: Vec<u8> = (0..70u32).map(|i| (i as u8).wrapping_mul(13) ^ 0x3c).collect();
+
+		let mut ch = HasherChallenger::<Sha256>::default();
+		ch.observer().put_slice(&transcript);
+		let mut out = [0u8; 32];
+		ch.sampler().copy_to_slice(&mut out);
+
+		// Constructed input: initial digest SHA-256([]) ‖ index(0usize).to_le_bytes() ‖ transcript.
+		let mut input = Vec::new();
+		input.extend_from_slice(&Sha256::digest([]));
+		input.extend_from_slice(&0usize.to_le_bytes());
+		input.extend_from_slice(&transcript);
+
+		let st = sha256_hash_ref(&input);
+		let mut got = [0u8; 32];
+		for i in 0..8 {
+			got[4 * i..4 * i + 4].copy_from_slice(&st[i].to_be_bytes());
+		}
+		assert_eq!(got, out, "FS challenge != SHA-256(constructed input) — protocol trace wrong");
+	}
+
 	/// The native multi-block hash matches `sha2::Sha256`.
 	#[test]
 	fn sha256_hash_ref_matches_sha2() {
@@ -160,6 +189,34 @@ mod tests {
 			}
 			assert_eq!(&gb[..], want.as_slice(), "sha256_hash_ref != sha2 at len {len}");
 		}
+	}
+
+	/// GATE M4b — an in-circuit Fiat-Shamir CHALLENGE proves+verifies over B256: the
+	/// challenge HasherChallenger<Sha256> produces from a transcript == the M4a in-circuit
+	/// SHA-256 of the reconstructed FS input. So FS challenge derivation is in-circuit
+	/// (reusing M4a) — the last recursion-verifier primitive.
+	#[test]
+	fn fs_challenge_proves_over_b256() {
+		use binius_core::fiat_shamir::Challenger;
+		use bytes::{Buf, BufMut};
+
+		let transcript: Vec<u8> = (0..90u32).map(|i| (i as u8).wrapping_mul(17) ^ 0x5c).collect();
+		let mut ch = HasherChallenger::<Sha256>::default();
+		ch.observer().put_slice(&transcript);
+		let mut out = [0u8; 32];
+		ch.sampler().copy_to_slice(&mut out);
+
+		let mut input = Vec::new();
+		input.extend_from_slice(&Sha256::digest([]));
+		input.extend_from_slice(&0usize.to_le_bytes());
+		input.extend_from_slice(&transcript);
+
+		let (size, got) = prove_verify_sha256_hash(&input).expect("FS challenge must PROVE+VERIFY");
+		assert_eq!(got, out, "in-circuit FS challenge != HasherChallenger<Sha256>");
+		println!(
+			"GATE M4b fs-challenge: in-circuit Fiat-Shamir challenge (via M4a SHA-256 of the \
+			 reconstructed FS input) == binius HasherChallenger<Sha256>; proof = {size} bytes"
+		);
 	}
 
 	/// GATE M4a — a full multi-block SHA-256 proves+verifies IN-CIRCUIT over B256 and

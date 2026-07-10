@@ -44,6 +44,7 @@ rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] 
 sha2    = { version = "0.10.8", features = ["compress", "oid"] }
 
 [dev-dependencies]
+bytes   = "1"
 # Phase-2 cross-check crates (RustCrypto / fips204): the canonical implementations our
 # hand-written native references are gated against, alongside the NIST/RFC vectors. Added
 # incrementally; versions kept conservative for the pinned nightly-2025-04-24 (rustc 1.88).
