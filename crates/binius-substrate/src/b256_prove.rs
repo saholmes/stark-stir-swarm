@@ -385,6 +385,23 @@ mod tests {
 		println!("GATE 1: B256 ring-switch proof VERIFIED at L3(192); proof size = {size_l3} bytes");
 	}
 
+	/// FIELD-FLOOR PROBE — does binius GUARD the field-vs-security relationship, or will it
+	/// silently emit an "L5" (256-bit) proof over the too-small B256 field (whose κ_IT floor
+	/// is ~2^-230)? If 256 on B256 SUCCEEDS, the caller — not the library — owns ensuring the
+	/// field clears the target level. Reports; the answer scopes the L3/L5 field-ladder claim.
+	#[test]
+	fn b256_field_floor_probe() {
+		for sec in [128usize, 192, 256, 384] {
+			match super::measure_square_scaling_b256(&[4096], 1, sec) {
+				Ok(v) => println!("# B256 @ security_bits={sec}: ACCEPTED (proof {} B) — field reaches this target", v[0].3),
+				Err(_) => println!("# B256 @ security_bits={sec}: REJECTED — 'cannot satisfy security target': field floor exceeded"),
+			}
+		}
+		println!("# ⇒ binius GUARDS the field floor: B256 ACCEPTS L1(128) + L3(192) and REFUSES 256. So B256 \
+			IS sufficient for L3 (the library emits a 192-bit proof); L5(256) is rejected → needs B512. \
+			The field ladder B256(L1/L3)->B512(L5) is library-ENFORCED, not just a caller convention.");
+	}
+
 	/// GATE 2 — SOUNDNESS. (a) a dishonest witness (one wrong `y`) is rejected, and
 	/// (b) a single flipped transcript byte on an honest proof is rejected.
 	#[test]
