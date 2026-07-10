@@ -152,6 +152,7 @@ pub mod sha256_air; // Tier-B M1: M3-native SHA-256 compression (FIPS 180-4) rec
 pub mod merkle_air; // Tier-B M2: in-circuit SHA-256 Merkle-path verification (FRI query opening)
 pub mod fri_air; // Tier-B M3: in-circuit FRI folding (field arithmetic)
 pub mod gf256_air; // Tier-B M3b: in-circuit GF(2^256) multiply
+pub mod fs_air; // Tier-B M4: in-circuit Fiat-Shamir transcript (multi-block SHA-256)
 pub mod dns_stark; // D DNS-STARK zone assembly
 
 use std::iter::repeat_with;
