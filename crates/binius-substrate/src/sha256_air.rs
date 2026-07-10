@@ -150,11 +150,30 @@ pub struct Sha256Compress {
 }
 
 impl Sha256Compress {
+	/// Compression with a FREE (committed) input state — the general FIPS 180-4 block
+	/// compression (M1).
 	pub fn build(cs: &mut ConstraintSystem<OurB256>) -> Self {
+		Self::build_inner(cs, None)
+	}
+
+	/// Compression with a CONSTANT input state `iv` — the Merkle 2-to-1 node (M2): the
+	/// state is soundly fixed to `iv` (constant columns), so a prover cannot substitute
+	/// a different initial state. Used with `iv = binius_compress_iv()`.
+	pub fn build_with_iv(cs: &mut ConstraintSystem<OurB256>, iv: [u32; 8]) -> Self {
+		Self::build_inner(cs, Some(iv))
+	}
+
+	fn build_inner(cs: &mut ConstraintSystem<OurB256>, iv: Option<[u32; 8]>) -> Self {
 		let mut table = cs.add_table("sha256 block compression (FIPS 180-4)");
 
-		let h_in: [Col<B1, 32>; 8] =
-			std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("h_in{i}")));
+		let h_in: [Col<B1, 32>; 8] = match iv {
+			Some(iv) => std::array::from_fn(|i| {
+				let bits = u32_bits(iv[i]);
+				let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+				table.add_constant(format!("h_iv{i}"), arr)
+			}),
+			None => std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("h_in{i}"))),
+		};
 		let w_in: [Col<B1, 32>; 16] =
 			std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("w{i}")));
 
@@ -427,6 +446,36 @@ pub fn prove_verify_sha256_compress(
 		HasherChallenger<Sha256>,
 	>(&ccs, 1, 128, &statement.boundaries, proof)?;
 
+	Ok((proof_size, out))
+}
+
+/// Prove + verify one CONSTANT-IV compression `compress256(iv, block)` over B256 — the
+/// Merkle 2-to-1 node (M2). The state is soundly fixed to `iv` (constant columns).
+/// Returns `(proof_bytes, out_state)`.
+pub fn prove_verify_merkle_compress(iv: [u32; 8], block: &[u32; 16]) -> Result<(usize, [u32; 8])> {
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let air = Sha256Compress::build_with_iv(&mut cs, iv);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let out;
+	{
+		let tw = witness.init_table(air.table_id, 1)?;
+		let mut seg = tw.full_segment();
+		air.populate(&mut seg, 0, &iv, block)?;
+		out = std::array::from_fn(|i| air.read_out(&seg, i, 0).unwrap());
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let proof_size = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
 	Ok((proof_size, out))
 }
 
