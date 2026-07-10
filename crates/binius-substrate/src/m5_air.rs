@@ -267,6 +267,93 @@ pub fn prove_verify_codeword_bridge(value: OurB256) -> Result<(usize, [u64; 4])>
 	Ok((sz, want))
 }
 
+/// Prove + verify the FRI per-query FOLD-CONSISTENCY chain IN-CIRCUIT over B256 (2 rounds,
+/// arity 1). Realizes the `verify_query_internal` invariant: round r folds an opened coset,
+/// and round r+1 asserts the previous fold result appears in its coset at the index-selected
+/// position (`next_value == values[index % coset]`) before folding again. Here: round 0
+/// folds `a=[a0,a1]` -> `f1`; round 1's coset `b` has `b[sel] = f1` (the cross-round bind,
+/// asserted in-circuit) and folds -> `f2` (the terminal value). Returns `(proof_bytes, f2)`,
+/// gated == the native chained fold. Composes M3c fold_pair x2 + the consistency assert —
+/// the FRI query loop's core binding.
+pub fn prove_verify_fold_consistency(
+	a: [OurB256; 2],
+	b_other: OurB256,
+	r0: OurB256,
+	r1: OurB256,
+	tw0: OurB256,
+	tw1: OurB256,
+	sel: usize,
+) -> Result<(usize, OurB256)> {
+	assert!(sel < 2);
+	// native: round 0 fold, then build round-1 coset with b[sel] = f1, then fold.
+	let f1 = fold_pair_native(a[0], a[1], r0, tw0);
+	let mut b = [OurB256::default(); 2];
+	b[sel] = f1;
+	b[1 - sel] = b_other;
+	let f2 = fold_pair_native(b[0], b[1], r1, tw1);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("FRI query fold-consistency chain (2 rounds)");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let ca0 = col4(&mut t, "a0");
+	let ca1 = col4(&mut t, "a1");
+	let cr0 = col4(&mut t, "r0");
+	let ctw0 = col4(&mut t, "tw0");
+	let fp0 = build_b256_fold_pair(&mut t, beta_col, ca0, ca1, cr0, ctw0, "rnd0_");
+
+	let cb0 = col4(&mut t, "b0");
+	let cb1 = col4(&mut t, "b1");
+	let cr1 = col4(&mut t, "r1");
+	let ctw1 = col4(&mut t, "tw1");
+	// cross-round consistency: round-0's folded value == round-1 coset at position `sel`.
+	let b_sel = if sel == 0 { cb0 } else { cb1 };
+	for k in 0..4 {
+		t.assert_zero(format!("consistency{k}"), fp0.folded[k] - b_sel[k]);
+	}
+	let fp1 = build_b256_fold_pair(&mut t, beta_col, cb0, cb1, cr1, ctw1, "rnd1_");
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (a0v, a1v) = (split256(a[0]), split256(a[1]));
+		let (r0v, t0v) = (split256(r0), split256(tw0));
+		let (b0v, b1v) = (split256(b[0]), split256(b[1]));
+		let (r1v, t1v) = (split256(r1), split256(tw1));
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, ca0[i], row, a0v[i])?;
+				wc64(&mut seg, ca1[i], row, a1v[i])?;
+				wc64(&mut seg, cr0[i], row, r0v[i])?;
+				wc64(&mut seg, ctw0[i], row, t0v[i])?;
+				wc64(&mut seg, cb0[i], row, b0v[i])?;
+				wc64(&mut seg, cb1[i], row, b1v[i])?;
+				wc64(&mut seg, cr1[i], row, r1v[i])?;
+				wc64(&mut seg, ctw1[i], row, t1v[i])?;
+			}
+			pop_b256_fold_pair(&fp0, &mut seg, row, a[0], a[1], r0, tw0)?;
+			pop_b256_fold_pair(&fp1, &mut seg, row, b[0], b[1], r1, tw1)?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, f2))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -283,6 +370,37 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-foldchain — the FRI per-query fold-consistency chain PROVES+VERIFIES in
+	/// ONE proof over B256: round 0 folds a coset -> f1; round 1 asserts f1 is its coset's
+	/// value at the index-selected position (the `next_value == values[index%coset]` bind
+	/// from verify_query_internal) then folds -> f2 == native. A tampered f1 breaks the
+	/// consistency assert. The FRI query loop's core cross-round binding, in-circuit.
+	#[test]
+	fn fold_consistency_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xf0; 32]);
+		use rand::SeedableRng;
+		for sel in [0usize, 1] {
+			let a = [<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng)];
+			let b_other = <OurB256 as Field>::random(&mut rng);
+			let (r0, r1) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+			let (tw0, tw1) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+			// native expected terminal
+			let f1 = fold_pair_native(a[0], a[1], r0, tw0);
+			let mut b = [OurB256::default(); 2];
+			b[sel] = f1;
+			b[1 - sel] = b_other;
+			let want = fold_pair_native(b[0], b[1], r1, tw1);
+			let (size, got) =
+				prove_verify_fold_consistency(a, b_other, r0, r1, tw0, tw1, sel).expect("fold chain must PROVE+VERIFY");
+			assert_eq!(got, want, "in-circuit fold-consistency terminal != native (sel={sel})");
+			let _ = size;
+		}
+		println!(
+			"GATE M5-foldchain: FRI per-query fold-consistency chain (fold -> assert \
+			 next_value==values[index%coset] -> fold) PROVES+VERIFIES over B256 @L1(128) == native"
+		);
 	}
 
 	/// GATE M5-cwbridge — a FRI codeword leaf value bridges to the fold's field cols
