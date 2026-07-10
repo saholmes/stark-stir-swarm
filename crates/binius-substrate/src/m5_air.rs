@@ -21,6 +21,7 @@ use sha2::Sha256;
 use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 use crate::fs_air::{build_bswap32, pop_bswap32, u32_bits, wc, BSwap32};
 use crate::gf256_air::{beta, build_b256_fold_pair, col4, fold_pair_native, pop_b256_fold_pair, split256, wc64};
+use crate::merkle_air::{merkle_root_from_path, MerklePath};
 
 /// Prove + verify the M5 kernel: given a FS-challenge digest (8 SHA-256 words) and fold
 /// operands `u,v` + twiddle `tw`, recompute the B256 challenge `r` from the digest
@@ -355,8 +356,9 @@ pub fn prove_verify_fold_consistency(
 }
 
 // --- reusable codeword-leaf bridge: 8 SHA words -> 4 B64 field cols (bswap + pack) -----
+// Takes the 8 leaf word columns as INPUT (not committed here), so the caller can share the
+// SAME columns with an M2 Merkle path — binding the folded value to the authenticated leaf.
 struct LeafBridge {
-	cw: [Col<B1, 32>; 8],
 	bsw: [BSwap32; 8],
 	g: [Col<B1, 64>; 4],
 	los: [Col<B1, 32>; 4],
@@ -365,12 +367,12 @@ struct LeafBridge {
 }
 fn build_leaf_bridge(
 	t: &mut binius_m3::builder::TableBuilder<OurB256>,
+	words: [Col<B1, 32>; 8],
 	m1: Col<B1, 32>,
 	m2: Col<B1, 32>,
 	pfx: &str,
 ) -> LeafBridge {
-	let cw: [Col<B1, 32>; 8] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("{pfx}w{i}")));
-	let bsw: [BSwap32; 8] = std::array::from_fn(|i| build_bswap32(t, cw[i], m1, m2, &format!("{pfx}bs{i}_")));
+	let bsw: [BSwap32; 8] = std::array::from_fn(|i| build_bswap32(t, words[i], m1, m2, &format!("{pfx}bs{i}_")));
 	let g: [Col<B1, 64>; 4] = std::array::from_fn(|k| t.add_committed::<B1, 64>(format!("{pfx}g{k}")));
 	let mut los = Vec::new();
 	let mut his = Vec::new();
@@ -385,7 +387,6 @@ fn build_leaf_bridge(
 		his.push(hi);
 	}
 	LeafBridge {
-		cw,
 		bsw,
 		g,
 		los: los.try_into().unwrap(),
@@ -393,6 +394,17 @@ fn build_leaf_bridge(
 		cc: cc.try_into().unwrap(),
 	}
 }
+/// The 8 big-endian SHA-256 message words of a codeword value's 32 canonical bytes — the
+/// M2 Merkle-leaf representation and the bridge's word-column inputs.
+fn leaf_words(value: OurB256) -> [u32; 8] {
+	let mut bytes = [0u8; 32];
+	bytes[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
+	bytes[16..32].copy_from_slice(&value.hi().to_underlier().to_le_bytes());
+	std::array::from_fn(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
+}
+
+/// Populate the bridge's derived columns (bswap + g + los/his) from the leaf `value`. The
+/// 8 word columns themselves are populated by the caller (they may be shared M2 leaf cols).
 fn pop_leaf_bridge(lb: &LeafBridge, seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, row: usize, value: OurB256) -> Result<()> {
 	let mut bytes = [0u8; 32];
 	bytes[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
@@ -400,7 +412,6 @@ fn pop_leaf_bridge(lb: &LeafBridge, seg: &mut binius_m3::builder::TableWitnessSe
 	let words: [u32; 8] = std::array::from_fn(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()));
 	let want: [u64; 4] = std::array::from_fn(|k| split256(value)[k].to_underlier());
 	for i in 0..8 {
-		wc(seg, lb.cw[i], row, words[i])?;
 		pop_bswap32(&lb.bsw[i], seg, row, words[i])?;
 	}
 	for k in 0..4 {
@@ -432,8 +443,10 @@ pub fn prove_verify_bridge_fold(uval: OurB256, vval: OurB256, r: OurB256, tw: Ou
 	};
 	let m1 = mkmask(&mut t, "mask_ff00", 0x0000_FF00);
 	let m2 = mkmask(&mut t, "mask_ff0000", 0x00FF_0000);
-	let lb_u = build_leaf_bridge(&mut t, m1, m2, "u_");
-	let lb_v = build_leaf_bridge(&mut t, m1, m2, "v_");
+	let cw_u: [Col<B1, 32>; 8] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("u_w{i}")));
+	let cw_v: [Col<B1, 32>; 8] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("v_w{i}")));
+	let lb_u = build_leaf_bridge(&mut t, cw_u, m1, m2, "u_");
+	let lb_v = build_leaf_bridge(&mut t, cw_v, m1, m2, "v_");
 	// the bridged field cols ARE the fold operands (the binding).
 	let beta_col = t.add_committed::<B64, 1>("beta");
 	let cr = col4(&mut t, "r");
@@ -451,6 +464,11 @@ pub fn prove_verify_bridge_fold(uval: OurB256, vval: OurB256, r: OurB256, tw: Ou
 		for row in 0..NROWS {
 			wc(&mut seg, m1, row, 0x0000_FF00)?;
 			wc(&mut seg, m2, row, 0x00FF_0000)?;
+			for (cw, val) in [(cw_u, uval), (cw_v, vval)] {
+				for (i, w) in leaf_words(val).into_iter().enumerate() {
+					wc(&mut seg, cw[i], row, w)?;
+				}
+			}
 			pop_leaf_bridge(&lb_u, &mut seg, row, uval)?;
 			pop_leaf_bridge(&lb_v, &mut seg, row, vval)?;
 			wc64(&mut seg, beta_col, row, beta())?;
@@ -475,6 +493,87 @@ pub fn prove_verify_bridge_fold(uval: OurB256, vval: OurB256, r: OurB256, tw: Ou
 	Ok((sz, folded))
 }
 
+/// Prove + verify the FULL per-query binding IN-CIRCUIT over B256: a codeword leaf is
+/// Merkle-AUTHENTICATED (M2 path leaf -> root) AND the SAME leaf columns bridge to field
+/// and FOLD — all in ONE table/proof. So the folded value is provably the value committed
+/// at the authenticated leaf. Returns `(proof_bytes, root, folded)`; gated == native root
+/// and native fold. Composes M2b(open) + M5-cwbridge + M3c(fold) on shared leaf columns —
+/// the per-query verifier's authentication+value binding.
+pub fn prove_verify_query_open_fold(
+	value: OurB256,
+	index: usize,
+	siblings: &[[u8; 32]],
+	v_other: OurB256,
+	r: OurB256,
+	tw: OurB256,
+) -> Result<(usize, [u8; 32], OurB256)> {
+	let depth = siblings.len();
+	// native: leaf bytes = canonical serialization of `value` (so digest_to_words == leaf_words).
+	let mut leaf = [0u8; 32];
+	leaf[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
+	leaf[16..32].copy_from_slice(&value.hi().to_underlier().to_le_bytes());
+	let root_native = merkle_root_from_path(&leaf, index, siblings);
+	let folded = fold_pair_native(value, v_other, r, tw);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut table = cs.add_table("query: merkle-open leaf -> bridge -> fold");
+	let path = MerklePath::build_in(&mut table, depth);
+	// bridge masks (distinct names from the path's own masks) + bridge over the SHARED leaf.
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bits = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let bm1 = mkmask(&mut table, "brmask_ff00", 0x0000_FF00);
+	let bm2 = mkmask(&mut table, "brmask_ff0000", 0x00FF_0000);
+	let lb = build_leaf_bridge(&mut table, path.leaf, bm1, bm2, "lf_");
+	// fold the authenticated leaf (lb.cc) with a second opened value.
+	let beta_col = table.add_committed::<B64, 1>("beta");
+	let cv = col4(&mut table, "v");
+	let cr = col4(&mut table, "r");
+	let ctw = col4(&mut table, "tw");
+	let fp = build_b256_fold_pair(&mut table, beta_col, lb.cc, cv, cr, ctw, "fp_");
+	let table_id = table.id();
+
+	const NROWS: usize = 64; // fold's B64 packing needs a batch; replicate the query across rows.
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let mut root = [0u8; 32];
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (vv, rv, tvv) = (split256(v_other), split256(r), split256(tw));
+		for row in 0..NROWS {
+			path.populate(&mut seg, row, &leaf, index, siblings)?;
+			wc(&mut seg, bm1, row, 0x0000_FF00)?;
+			wc(&mut seg, bm2, row, 0x00FF_0000)?;
+			pop_leaf_bridge(&lb, &mut seg, row, value)?;
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cv[i], row, vv[i])?;
+				wc64(&mut seg, cr[i], row, rv[i])?;
+				wc64(&mut seg, ctw[i], row, tvv[i])?;
+			}
+			pop_b256_fold_pair(&fp, &mut seg, row, value, v_other, r, tw)?;
+		}
+		root = path.read_root(&seg, 0)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	assert_eq!(root, root_native, "in-circuit merkle root != native");
+	Ok((sz, root, folded))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -491,6 +590,38 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-queryopen — the FULL per-query binding in ONE proof: a codeword leaf is
+	/// Merkle-AUTHENTICATED (path -> root) and the SAME leaf columns bridge to field and
+	/// FOLD, so the folded value is provably the value committed at the authenticated leaf.
+	/// Composes M2b(open) + cwbridge + fold on shared columns == native root + native fold.
+	#[test]
+	fn query_open_fold_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0x90; 32]);
+		use rand::SeedableRng;
+		let value = <OurB256 as Field>::random(&mut rng);
+		let v_other = <OurB256 as Field>::random(&mut rng);
+		let r = <OurB256 as Field>::random(&mut rng);
+		let tw = <OurB256 as Field>::random(&mut rng);
+		let siblings: [[u8; 32]; 2] =
+			[std::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x22), std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0x9e)];
+		let index = 2usize;
+		let want_fold = fold_pair_native(value, v_other, r, tw);
+		let mut leaf = [0u8; 32];
+		use binius_field::underlier::WithUnderlier as _;
+		leaf[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
+		leaf[16..32].copy_from_slice(&value.hi().to_underlier().to_le_bytes());
+		let want_root = crate::merkle_air::merkle_root_from_path(&leaf, index, &siblings);
+
+		let (size, root, folded) =
+			prove_verify_query_open_fold(value, index, &siblings, v_other, r, tw).expect("query open+fold must PROVE+VERIFY");
+		assert_eq!(root, want_root, "in-circuit root != native");
+		assert_eq!(folded, want_fold, "in-circuit folded != native");
+		println!(
+			"GATE M5-queryopen: Merkle-authenticated leaf (path->root) AND its fold share the SAME \
+			 columns in ONE proof over B256 @L1(128) == native root + fold; proof = {size} bytes"
+		);
 	}
 
 	/// GATE M5-bridgefold — two FRI codeword leaves bridge to field AND fold in ONE proof:

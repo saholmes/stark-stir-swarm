@@ -152,8 +152,8 @@ struct PathNode {
 
 /// An `depth`-level SHA-256 Merkle authentication path, verified in ONE proof.
 pub struct MerklePath {
-	table_id: binius_m3::builder::TableId,
-	leaf: [Col<B1, 32>; 8],
+	pub(crate) table_id: binius_m3::builder::TableId,
+	pub(crate) leaf: [Col<B1, 32>; 8],
 	nodes: Vec<PathNode>,
 	root_state: [Col<B1, 32>; 8],
 	// Constant columns (must be populated explicitly).
@@ -166,7 +166,14 @@ pub struct MerklePath {
 impl MerklePath {
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, depth: usize) -> Self {
 		let mut table = cs.add_table(format!("sha256 merkle path (depth {depth})"));
-		let k_cols = build_k_cols(&mut table);
+		Self::build_in(&mut table, depth)
+	}
+
+	/// Add the authentication-path columns onto a CALLER-OWNED table, so a larger circuit
+	/// (e.g. the query verifier) can bind the leaf columns to a bridge + fold in the same
+	/// table. `build` is the standalone wrapper around this.
+	pub(crate) fn build_in(table: &mut TableBuilder<OurB256>, depth: usize) -> Self {
+		let k_cols = build_k_cols(table);
 		// Constant IV columns (binius compress IV) + byte masks.
 		let iv = binius_compress_iv();
 		let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
@@ -179,8 +186,8 @@ impl MerklePath {
 			let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
 			t.add_constant(nm.to_string(), arr)
 		};
-		let m1 = mkmask(&mut table, "mask_ff00", 0x0000_FF00);
-		let m2 = mkmask(&mut table, "mask_ff0000", 0x00FF_0000);
+		let m1 = mkmask(table, "mask_ff00", 0x0000_FF00);
+		let m2 = mkmask(table, "mask_ff0000", 0x00FF_0000);
 
 		let leaf: [Col<B1, 32>; 8] =
 			std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("leaf{i}")));
@@ -210,7 +217,7 @@ impl MerklePath {
 			let core = build_sha256_core(&mut table.with_namespace(format!("n{k}")), ivc, block, &k_cols);
 			let next_bswap = if k < depth - 1 {
 				let bs: [BSwap; 8] = std::array::from_fn(|i| {
-					BSwap::build(&mut table, core.h_out[i], m1, m2, &format!("bs{k}_{i}"))
+					BSwap::build(table, core.h_out[i], m1, m2, &format!("bs{k}_{i}"))
 				});
 				acc = std::array::from_fn(|i| bs[i].out);
 				Some(bs)
@@ -223,7 +230,7 @@ impl MerklePath {
 		MerklePath { table_id: table.id(), leaf, nodes, root_state, ivc, k_cols, m1, m2 }
 	}
 
-	fn populate(
+	pub(crate) fn populate(
 		&self,
 		seg: &mut TableWitnessSegment<OurB256>,
 		row: usize,
@@ -278,7 +285,7 @@ impl MerklePath {
 		Ok(())
 	}
 
-	fn read_root(&self, seg: &TableWitnessSegment<OurB256>, row: usize) -> Result<[u8; 32]> {
+	pub(crate) fn read_root(&self, seg: &TableWitnessSegment<OurB256>, row: usize) -> Result<[u8; 32]> {
 		let mut state = [0u32; 8];
 		for i in 0..8 {
 			let bits = crate::nonnative::read_col::<32>(seg, self.root_state[i], row)?;
