@@ -103,6 +103,13 @@ def _scheme_leaf_count(costs, scheme, limb_key):
     raise SystemExit(f"unknown scheme '{scheme}'")
 
 
+def workload_flat(n, cost_ms, out_bytes=0):
+    """N independent strands, no aggregation — the calibration workload (embarrassingly
+    parallel; makespan = ceil(N/P)*cost under the ideal no-contention model)."""
+    tasks = {f"s{i}": Task(f"s{i}", cost_ms, out_bytes, []) for i in range(n)}
+    return tasks, None, {"leaves": n, "leaf": "flat", "leaf_proof_bytes": 0}
+
+
 def workload_epoch(costs, n_records, scheme, limb_key, arity, edge_bytes):
     """An N-record epoch: each record's strands are leaves; per-record roots aggregate
     into a zone/epoch root (the published epoch artifact)."""
@@ -214,13 +221,20 @@ def main():
     ap.add_argument("--edge", default="root", choices=["root", "proof"],
                     help="aggregation edge transfer: 32-byte root (Tier-A) or full proof (Tier-B recursion)")
     ap.add_argument("--p", default="1,8,64,512,4096,16384", help="comma-separated processor counts")
+    ap.add_argument("--strand-cost-ms", type=float, default=None,
+                    help="override per-strand cost (for calibration flat:N workload)")
     args = ap.parse_args()
 
     costs = load_costs(args.costs)
     limb_key = f"limbproduct_{args.limb}"
     edge_root = costs["comm_edge_bytes"]["aggregation_root"]
 
-    if args.workload.startswith("epoch:"):
+    if args.workload.startswith("flat:"):
+        n = int(args.workload.split(":", 1)[1])
+        cost = args.strand_cost_ms if args.strand_cost_ms is not None else strand(costs, limb_key)["prove_ms"]
+        tasks, root, info = workload_flat(n, cost)
+        title = f"FLAT {n} strands (calibration)"
+    elif args.workload.startswith("epoch:"):
         n = int(args.workload.split(":", 1)[1])
         _, skey = _scheme_leaf_count(costs, args.scheme, limb_key)
         edge_bytes = strand(costs, skey)["proof_bytes"] if args.edge == "proof" else edge_root
