@@ -196,6 +196,15 @@ NETS = {  # latency_ms, bandwidth bytes/ms
     "iot": (30.0, 1_000.0),        # IoT/WAN fleet: 30ms RTT + ~1 MB/s
 }
 
+# Network-DNS resolution baselines — the round-trip an edge resolver would otherwise pay
+# to resolve+validate ONE name. (rtts, per-RTT ms, note). These are the bar the local
+# DNS-STARK edge-verify must beat. Latencies are conservative real-world figures.
+DNS_BASELINES = [
+    ("warm cache (resolver hit)",        1, 15,  "name already cached at a nearby recursive resolver"),
+    ("cold, same-region authoritative",  3, 30,  "root→TLD→auth delegation, low-latency path"),
+    ("cold chain + DNSSEC over WAN",      4, 50,  "full delegation + DNSSEC chain validation, transcontinental"),
+]
+
 
 def fmt_ms(ms):
     if ms < 1000:
@@ -207,6 +216,54 @@ def fmt_ms(ms):
     if m < 90:
         return f"{m:.1f} min"
     return f"{m/60:.2f} h"
+
+
+def report_verify(costs, info, ntasks, verify_ms):
+    """Verifier-side comparison: an edge resolver verifying the published epoch artifact
+    ONCE, versus a network DNS round-trip. Tier-A verifies the whole aggregation chain
+    (grows with the workload — seconds); Tier-B verifies a single recursive rollup proof
+    (constant in #records — the target that beats the network)."""
+    n_leaves = info["leaves"]
+    n_joins = ntasks - n_leaves
+    leaf_v = strand(costs, info["leaf"])["verify_ms"]
+    join_v = strand(costs, "join_aggregation")["verify_ms"]
+    tier_a = n_leaves * leaf_v + n_joins * join_v   # full chain a non-recursive client checks
+
+    print("# --- Network DNS baseline (the round-trip to beat, per name) ---")
+    print(f"| {'scenario':<34} | {'RTTs':>4} | {'per-RTT':>7} | {'total':>8} |")
+    print(f"|{'-'*36}|{'-'*6}|{'-'*9}|{'-'*10}|")
+    baselines = []
+    for name, rtts, per, _ in DNS_BASELINES:
+        tot = rtts * per
+        baselines.append((name, tot))
+        print(f"| {name:<34} | {rtts:>4} | {per:>4} ms | {fmt_ms(tot):>8} |")
+    slowest = max(b[1] for b in baselines)
+    fastest = min(b[1] for b in baselines)
+    print()
+    print("# --- DNS-STARK edge verify (verify the epoch artifact locally, no network) ---")
+    print(f"# Tier-A  (verify full aggregation chain, grows with workload):")
+    print(f"#         {n_leaves:,} leaf verifies + {n_joins:,} join verifies = {fmt_ms(tier_a)}"
+          f"  →  {'SLOWER' if tier_a > slowest else 'faster'} than the network"
+          f"  ({tier_a/slowest:.0f}× the slowest baseline)")
+    print(f"# Tier-B  (verify ONE recursive rollup proof, constant in #records):")
+    print(f"#         single-proof verify = {fmt_ms(verify_ms)}")
+    print()
+    print(f"| {'vs baseline':<34} | {'baseline':>8} | {'Tier-B':>8} | {'verdict':>16} |")
+    print(f"|{'-'*36}|{'-'*10}|{'-'*10}|{'-'*18}|")
+    for name, tot in baselines:
+        beat = verify_ms <= tot
+        verdict = f"{tot/verify_ms:.1f}× faster" if beat else f"{verify_ms/tot:.1f}× slower"
+        print(f"| {name:<34} | {fmt_ms(tot):>8} | {fmt_ms(verify_ms):>8} | {verdict:>16} |")
+    print()
+    # measured single-proof verify spectrum, so the reader can site the Tier-B number
+    complete = sorted(((k, s["verify_ms"]) for k, s in costs["strands"].items()
+                       if s.get("proof_bytes", 0) > 0), key=lambda kv: kv[1])
+    lo, hi = complete[0], complete[-1]
+    print(f"# Measured single-proof L1 Binius verifies span {fmt_ms(lo[1])} ({lo[0]}) … "
+          f"{fmt_ms(hi[1])} ({hi[0]}).")
+    print(f"# Tier-B's job is to collapse the {fmt_ms(tier_a)} chain into ONE such verify. To beat")
+    print(f"# even a warm resolver cache ({fmt_ms(fastest)}) the recursive verify must reach the low")
+    print(f"# end of that span — a tight, non-slivered L1 verify — which is the assembly target.")
 
 
 def main():
@@ -223,6 +280,10 @@ def main():
     ap.add_argument("--p", default="1,8,64,512,4096,16384", help="comma-separated processor counts")
     ap.add_argument("--strand-cost-ms", type=float, default=None,
                     help="override per-strand cost (for calibration flat:N workload)")
+    ap.add_argument("--mode", default="prove", choices=["prove", "verify"],
+                    help="prove: parallel prover wall-clock; verify: edge-verify vs network DNS")
+    ap.add_argument("--verify-ms", type=float, default=None,
+                    help="Tier-B single recursive-proof verify cost (default: smallest measured L1 verify)")
     args = ap.parse_args()
 
     costs = load_costs(args.costs)
@@ -245,8 +306,21 @@ def main():
         tasks, root, info = workload_rsa2048(costs, limb_key, args.arity, edge_bytes, )
         title = "RSA-2048 record (slivered)"
 
-    lat, bw = NETS[args.net]
     ntasks = len(tasks)
+
+    if args.mode == "verify":
+        # default Tier-B single-proof verify = smallest measured complete-circuit verify
+        vms = args.verify_ms
+        if vms is None:
+            vms = min(s["verify_ms"] for s in costs["strands"].values() if s.get("proof_bytes", 0) > 0)
+        print(f"# DNS-STARK edge-verify vs network DNS — {title}")
+        print(f"# workload: {info['leaves']:,} leaf strands + {ntasks - info['leaves']:,} joins  "
+              f"(leaf={info['leaf']})")
+        print()
+        report_verify(costs, info, ntasks, vms)
+        return
+
+    lat, bw = NETS[args.net]
     serial = sum(t.cost for t in tasks.values())
     depth = int(math.ceil(math.log(max(info["leaves"], 2), args.arity)))
     # critical path (P = inf) — the wall-clock floor no fleet size beats
