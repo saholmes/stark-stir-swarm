@@ -252,6 +252,149 @@ pub fn prove_verify_fs_bridge(words: [u32; 8]) -> Result<(usize, [u64; 4])> {
 	Ok((sz, want))
 }
 
+/// Prove + verify a TWO-sample FS challenge chain IN-CIRCUIT over B256: the schedule
+/// `observe(root) → sample d1 → observe(commit) → sample d2`, with hash-2's message
+/// prefix column-wired to hash-1's digest (d1). Realizes the schedule rule
+/// `d_i = SHA-256(d_{i-1} ‖ idx_i ‖ obs_i)` as a chain of M4a hashes — the digest of
+/// hash i-1 IS the first 8 message words of hash i (SHA-256 reads them back big-endian,
+/// so no reorder). Returns `(proof_bytes, [d1, d2])`; gated against `fs_schedule_ref`.
+pub fn prove_verify_fs_chain2(root: [u8; 32], commit: [u8; 32]) -> Result<(usize, [[u8; 32]; 2])> {
+	use sha2::Digest;
+
+	// native reference: d1, d2 and the padded message blocks to populate with.
+	let sched = fs_schedule_ref(&[
+		FsOp::Observe(root.to_vec()),
+		FsOp::Sample(32),
+		FsOp::Observe(commit.to_vec()),
+		FsOp::Sample(32),
+	]);
+	let d1: [u8; 32] = sched[0][..].try_into().unwrap();
+	let d2: [u8; 32] = sched[1][..].try_into().unwrap();
+	let d0 = Sha256::digest([]);
+	let mut msg1 = Vec::new();
+	msg1.extend_from_slice(&d0);
+	msg1.extend_from_slice(&0u64.to_le_bytes()); // idx_1 = 0
+	msg1.extend_from_slice(&root);
+	let mut msg2 = Vec::new();
+	msg2.extend_from_slice(&d1);
+	msg2.extend_from_slice(&32u64.to_le_bytes()); // idx_2 = 32 (full draw from d1)
+	msg2.extend_from_slice(&commit);
+	let p1 = sha256_pad(&msg1); // 72 -> 128 (2 blocks)
+	let p2 = sha256_pad(&msg2);
+	let (nb1, nb2) = (p1.len() / 64, p2.len() / 64);
+	assert!(nb1 == 2 && nb2 == 2);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut table = cs.add_table("FS challenge chain (2 samples)");
+	let k_cols = build_k_cols(&mut table);
+	let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
+		let bits = u32_bits(SHA256_IV[i]);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		table.add_constant(format!("iv{i}"), arr)
+	});
+
+	// hash 1 — all message words committed, IV input state (block 0), chained thereafter.
+	let mut h_in = ivc;
+	let mut h1_win: Vec<[Col<B1, 32>; 16]> = Vec::new();
+	let mut h1_cores: Vec<Sha256Core> = Vec::new();
+	for k in 0..nb1 {
+		let w_in: [Col<B1, 32>; 16] =
+			std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("h1_w{k}_{i}")));
+		let core = build_sha256_core(&mut table.with_namespace(format!("h1blk{k}")), h_in, w_in, &k_cols);
+		h_in = core.h_out;
+		h1_win.push(w_in);
+		h1_cores.push(core);
+	}
+	let d1_cols = h1_cores[nb1 - 1].h_out; // the 8 digest words of hash 1 = d1
+
+	// hash 2 — block-0 message words [0..8] ARE d1_cols (the chain wire); rest committed.
+	let mut h_in2 = ivc;
+	let mut h2_win: Vec<[Col<B1, 32>; 16]> = Vec::new();
+	let mut h2_cores: Vec<Sha256Core> = Vec::new();
+	for k in 0..nb2 {
+		let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| {
+			if k == 0 && i < 8 {
+				d1_cols[i]
+			} else {
+				table.add_committed::<B1, 32>(format!("h2_w{k}_{i}"))
+			}
+		});
+		let core = build_sha256_core(&mut table.with_namespace(format!("h2blk{k}")), h_in2, w_in, &k_cols);
+		h_in2 = core.h_out;
+		h2_win.push(w_in);
+		h2_cores.push(core);
+	}
+	let out2 = h2_cores[nb2 - 1].h_out;
+	let table_id = table.id();
+
+	let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let mut got1 = [0u8; 32];
+	let mut got2 = [0u8; 32];
+	{
+		let tw = witness.init_table(table_id, 1)?;
+		let mut seg = tw.full_segment();
+		for i in 0..8 {
+			wc(&mut seg, ivc[i], 0, SHA256_IV[i])?;
+		}
+		for (t, col) in k_cols.iter().enumerate() {
+			wc(&mut seg, *col, 0, K256[t])?;
+		}
+		// hash 1: populate all message words + cores.
+		let mut state = SHA256_IV;
+		for k in 0..nb1 {
+			let blk = block_words(&p1[k * 64..k * 64 + 64]);
+			for i in 0..16 {
+				wc(&mut seg, h1_win[k][i], 0, blk[i])?;
+			}
+			populate_sha256_core(&h1_cores[k], &mut seg, 0, &state, &blk)?;
+			state = crate::sha256_air::compress256_ref(&state, &blk);
+		}
+		got1 = read_state(&seg, &d1_cols)?;
+		// hash 2: block-0 words [0..8] are d1_cols (already populated by hash 1's ff — skip);
+		// populate the committed words + cores from the native message blocks.
+		let mut state2 = SHA256_IV;
+		for k in 0..nb2 {
+			let blk = block_words(&p2[k * 64..k * 64 + 64]);
+			for i in 0..16 {
+				if k == 0 && i < 8 {
+					continue; // wired to hash 1's digest columns
+				}
+				wc(&mut seg, h2_win[k][i], 0, blk[i])?;
+			}
+			populate_sha256_core(&h2_cores[k], &mut seg, 0, &state2, &blk)?;
+			state2 = crate::sha256_air::compress256_ref(&state2, &blk);
+		}
+		got2 = read_state(&seg, &out2)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	assert_eq!(got1, d1, "in-circuit d1 != fs_schedule_ref");
+	assert_eq!(got2, d2, "in-circuit d2 != fs_schedule_ref");
+	Ok((sz, [got1, got2]))
+}
+
+/// Read an 8-word SHA-256 state (big-endian digest) from output-state columns.
+fn read_state(seg: &binius_m3::builder::TableWitnessSegment<OurB256>, cols: &[Col<B1, 32>; 8]) -> Result<[u8; 32]> {
+	let mut d = [0u8; 32];
+	for i in 0..8 {
+		let bits = crate::nonnative::read_col::<32>(seg, cols[i], 0)?;
+		let w = (0..32).fold(0u32, |a, k| a | ((bits[k] as u32) << k));
+		d[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+	}
+	Ok(d)
+}
+
 // --- M5 FS SCHEDULE: the observe/sample sequence of a whole proof transcript ---------
 //
 // A recursive verifier must recompute EVERY challenge in the exact order a Binius proof
@@ -402,6 +545,29 @@ mod tests {
 			"GATE M5-schedule (native): fs_schedule_ref reproduces HasherChallenger<Sha256> across \
 			 {} observe/sample ops (partial + cross-buffer draws) — the verifier's challenge spine",
 			ops.len()
+		);
+	}
+
+	/// GATE M5-chain — a TWO-sample FS challenge chain PROVES+VERIFIES in-circuit over
+	/// B256: hash-2's message prefix is column-wired to hash-1's digest (d1), so both
+	/// scheduled challenges are recomputed in ONE proof == `fs_schedule_ref`. The
+	/// in-circuit realization of the verifier's challenge spine.
+	#[test]
+	fn fs_chain2_proves_over_b256() {
+		let root: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0x11);
+		let commit: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(29) ^ 0x5a);
+		let want = fs_schedule_ref(&[
+			FsOp::Observe(root.to_vec()),
+			FsOp::Sample(32),
+			FsOp::Observe(commit.to_vec()),
+			FsOp::Sample(32),
+		]);
+		let (size, got) = prove_verify_fs_chain2(root, commit).expect("FS chain must PROVE+VERIFY");
+		assert_eq!(&got[0][..], &want[0][..], "in-circuit d1 != schedule");
+		assert_eq!(&got[1][..], &want[1][..], "in-circuit d2 != schedule");
+		println!(
+			"GATE M5-chain: 2-sample FS challenge chain (d2 = SHA-256(d1‖idx‖obs), d1 wired \
+			 into hash-2) PROVES+VERIFIES over B256 @L1(128) == fs_schedule_ref; proof = {size} bytes"
 		);
 	}
 
