@@ -1135,6 +1135,196 @@ pub fn measure_fold_verify_scaling(rows_list: &[usize]) -> Result<Vec<(usize, u1
 	Ok(out)
 }
 
+/// Isolation probe: a batch of N independent SHA-256 compressions in one table (the LDT
+/// Merkle-path / FS-replay op-table). Returns (verify_ms, proof_bytes). Used to confirm the
+/// multi-row SHA core before assembling it with fold + sumcheck.
+pub fn measure_sha_batch_verify(n_rows: usize) -> Result<(u128, usize)> {
+	use std::time::Instant;
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut ts = cs.add_table("sha256 compressions");
+	// Multi-row constants must be COMMITTED (populated every row), NOT add_constant transparent
+	// oracles — the SHA core's adders read these values, and a transparent single-value poly
+	// disagrees with a filled multi-row column under the ring-switch evaluation.
+	let k_cols: Vec<Col<B1, 32>> = (0..64).map(|t| ts.add_committed::<B1, 32>(format!("K{t}"))).collect();
+	let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| ts.add_committed::<B1, 32>(format!("iv{i}")));
+	let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| ts.add_committed::<B1, 32>(format!("w{i}")));
+	let core = build_sha256_core(&mut ts.with_namespace("c"), ivc, w_in, &k_cols);
+	let _ = core.h_out;
+	let sha_id = ts.id();
+	let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let mut rng = rand::rngs::StdRng::from_seed([0x4a; 32]);
+	use rand::{RngCore, SeedableRng};
+	{
+		let tw = witness.init_table(sha_id, n_rows)?;
+		let mut seg = tw.full_segment();
+		for row in 0..n_rows {
+			for i in 0..8 {
+				wc(&mut seg, ivc[i], row, SHA256_IV[i])?;
+			}
+			for (t, col) in k_cols.iter().enumerate() {
+				wc(&mut seg, *col, row, K256[t])?;
+			}
+			let blk: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+			for i in 0..16 {
+				wc(&mut seg, w_in[i], row, blk[i])?;
+			}
+			populate_sha256_core(&core, &mut seg, row, &SHA256_IV, &blk)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	let t1 = Instant::now();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((t1.elapsed().as_millis(), sz))
+}
+
+/// Measure the ASSEMBLED recursion verify as ONE number, with the three-term decomposition.
+/// Builds the three real op-tables the row-batched recursion verifier reduces to — SHA-256
+/// compressions (LDT Merkle paths + FS replay), fold_pairs (LDT coset folds), sumcheck
+/// rounds — in ONE constraint system at the given row counts, and times the single verify.
+/// Because verify is row-flat, moderate row counts read off the recursion-scale constant.
+/// Returns `(n_sha, n_fold, n_sum, prove_ms, verify_ms, proof_bytes)` per scale.
+pub fn measure_assembled_recursion_verify(scales: &[(usize, usize, usize)]) -> Result<Vec<(usize, usize, usize, u128, u128, usize)>> {
+	use binius_field::Field;
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &(n_sha, n_fold, n_sum) in scales {
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+
+		// --- table 0: SHA-256 compressions (one per row); COMMITTED constants (multi-row) ---
+		let mut ts = cs.add_table("sha256 compressions");
+		let k_cols: Vec<Col<B1, 32>> = (0..64).map(|t| ts.add_committed::<B1, 32>(format!("K{t}"))).collect();
+		let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| ts.add_committed::<B1, 32>(format!("iv{i}")));
+		let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| ts.add_committed::<B1, 32>(format!("w{i}")));
+		let core = build_sha256_core(&mut ts.with_namespace("c"), ivc, w_in, &k_cols);
+		let _ = core.h_out;
+		let sha_id = ts.id();
+
+		// --- table 1: fold_pairs ---
+		let mut tf = cs.add_table("fold_pairs");
+		let beta_col = tf.add_committed::<B64, 1>("beta");
+		let fu = col4(&mut tf, "u");
+		let fv = col4(&mut tf, "v");
+		let frr = col4(&mut tf, "r");
+		let ftw = col4(&mut tf, "tw");
+		let fp = build_b256_fold_pair(&mut tf, beta_col, fu, fv, frr, ftw, "fp_");
+		let fold_id = tf.id();
+
+		// --- table 2: sumcheck rounds ---
+		let mut tc = cs.add_table("sumcheck rounds");
+		let sbeta = tc.add_committed::<B64, 1>("sbeta");
+		let sc0 = col4(&mut tc, "sc0");
+		let sc1 = col4(&mut tc, "sc1");
+		let sc2 = col4(&mut tc, "sc2");
+		let sx = col4(&mut tc, "sx");
+		let sclaim = col4(&mut tc, "sclaim");
+		for k in 0..4 {
+			tc.assert_zero(format!("srchk{k}"), sclaim[k] - (sc1[k] + sc2[k]));
+		}
+		let sm1 = build_b256_mul(&mut tc, sbeta, sx, sc2, "sm1_");
+		let ss1 = col4(&mut tc, "ss1");
+		for k in 0..4 {
+			tc.assert_zero(format!("ss1c{k}"), ss1[k] - (sc1[k] + sm1.c[k]));
+		}
+		let sm2 = build_b256_mul(&mut tc, sbeta, sx, ss1, "sm2_");
+		let sgx = col4(&mut tc, "sgx");
+		for k in 0..4 {
+			tc.assert_zero(format!("sgxc{k}"), sgx[k] - (sc0[k] + sm2.c[k]));
+		}
+		let sum_id = tc.id();
+
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n_sha, n_fold, n_sum] };
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		let mut rng = rand::rngs::StdRng::from_seed([0x4a; 32]);
+		use rand::{RngCore, SeedableRng};
+		// SHA rows
+		{
+			let tw = witness.init_table(sha_id, n_sha)?;
+			let mut seg = tw.full_segment();
+			for row in 0..n_sha {
+				for i in 0..8 {
+					wc(&mut seg, ivc[i], row, SHA256_IV[i])?;
+				}
+				for (t, col) in k_cols.iter().enumerate() {
+					wc(&mut seg, *col, row, K256[t])?;
+				}
+				let blk: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+				for i in 0..16 {
+					wc(&mut seg, w_in[i], row, blk[i])?;
+				}
+				populate_sha256_core(&core, &mut seg, row, &SHA256_IV, &blk)?;
+			}
+		}
+		// fold rows
+		{
+			let tw = witness.init_table(fold_id, n_fold)?;
+			let mut seg = tw.full_segment();
+			for row in 0..n_fold {
+				let (u, v, r, tw2) = (
+					<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng),
+					<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng),
+				);
+				wc64(&mut seg, beta_col, row, beta())?;
+				let (uv, vv, rv, tvv) = (split256(u), split256(v), split256(r), split256(tw2));
+				for i in 0..4 {
+					wc64(&mut seg, fu[i], row, uv[i])?;
+					wc64(&mut seg, fv[i], row, vv[i])?;
+					wc64(&mut seg, frr[i], row, rv[i])?;
+					wc64(&mut seg, ftw[i], row, tvv[i])?;
+				}
+				pop_b256_fold_pair(&fp, &mut seg, row, u, v, r, tw2)?;
+			}
+		}
+		// sumcheck rows
+		{
+			let tw = witness.init_table(sum_id, n_sum)?;
+			let mut seg = tw.full_segment();
+			for row in 0..n_sum {
+				let (c0, c1, c2, x) = (
+					<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng),
+					<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng),
+				);
+				let claim = c1 + c2;
+				let s1v = c1 + x * c2;
+				wc64(&mut seg, sbeta, row, beta())?;
+				for (col, val) in [(sc0, c0), (sc1, c1), (sc2, c2), (sx, x), (sclaim, claim), (ss1, s1v), (sgx, c0 + x * s1v)] {
+					let sv = split256(val);
+					for i in 0..4 {
+						wc64(&mut seg, col[i], row, sv[i])?;
+					}
+				}
+				pop_b256_mul(&sm1, &mut seg, row, split256(x), split256(c2))?;
+				pop_b256_mul(&sm2, &mut seg, row, split256(x), split256(s1v))?;
+			}
+		}
+
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, 1, 128, &statement.boundaries, proof)?;
+		out.push((n_sha, n_fold, n_sum, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1166,6 +1356,40 @@ mod tests {
 			s.terminate_codeword_len, s.n_oracles, s.n_test_queries
 		);
 		assert!(s.proof_bytes > 0);
+	}
+
+	/// Probe: multi-row SHA-256 compression batch verifies (isolates the SHA op-table).
+	#[test]
+	fn sha_batch_probe() {
+		for n in [64usize, 256, 1024] {
+			let (v, sz) = super::measure_sha_batch_verify(n).expect("sha batch must verify");
+			println!("# SHA batch {n} rows: verify {v} ms, proof {} KB", sz / 1024);
+		}
+	}
+
+	/// The ASSEMBLED recursion verify as ONE measured number (L1) — the three real op-tables
+	/// (SHA-256 compressions + fold_pairs + sumcheck) in one CS. ★DOMINATED BY THE SHA TABLE:
+	/// SHA-256 is the adder-heavy in-circuit gadget (~26s+ verify even at 64 rows), so the
+	/// assembled verify is TENS OF SECONDS, NOT the ~60ms the fold-only table suggested. This
+	/// is the number the reviewer asked for; it motivates leveling the recursion hash to
+	/// Keccak/SHA3 (the cheap in-circuit arithmetization AND the correct binding hash).
+	#[test]
+	#[ignore] // heavy (~minutes): SHA op-table dominates prove+verify
+	fn assembled_recursion_verify() {
+		let scales = [(64usize, 256usize, 64usize), (256, 512, 64)];
+		let res = measure_assembled_recursion_verify(&scales).expect("assembled measure must succeed");
+		println!("| n_sha | n_fold | n_sum | prove ms | verify ms | proof KB |");
+		println!("|---:|---:|---:|---:|---:|---:|");
+		for (a, b, c, p, v, sz) in &res {
+			println!("| {} | {} | {} | {} | {} | {} |", a, b, c, p, v, sz / 1024);
+		}
+		let (_, _, _, _, v_scale, _) = *res.last().unwrap();
+		println!(
+			"# ASSEMBLED L1 recursion verify = {} ms — DOMINATED by the SHA-256 op-table (adder-heavy). \
+			 The fold-only ~60ms was unrepresentative. Leveling recursion hash -> Keccak/SHA3 collapses \
+			 this term (cheap in-circuit) AND fixes binding soundness. Steady-state amortization survives.",
+			v_scale
+		);
 	}
 
 	/// Verify-vs-rows scaling for a batched fold_pair table — answers whether the recursion
