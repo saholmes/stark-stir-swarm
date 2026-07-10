@@ -707,6 +707,23 @@ mod tests {
 			 leveling the recursion hash -> Keccak/SHA3 collapses the dominant assembled-verify term.");
 	}
 
+	/// LEVER C — recursion-proof BLOWUP vs verify time, on the Keccak-f op-table (fixed 256
+	/// perms, L1). Higher outer blowup → better rate → FEWER recursion queries → faster
+	/// verify, at a larger proof. Quantifies the verify/proof trade the recursion proof can
+	/// dial without touching the hash gadget.
+	#[test]
+	#[ignore = "heavy (~minutes): recursion-proof blowup sweep"]
+	fn keccak_verify_vs_blowup() {
+		println!("| blowup | prove ms | verify ms | proof KB |");
+		println!("|---:|---:|---:|---:|");
+		for lir in [1usize, 2, 3, 4] {
+			let k = bench_keccak_b256(256, lir, 128).expect("keccak-f must prove+verify");
+			println!("| {} | {} | {} | {} |", 1usize << lir, k.prove_ms, k.verify_ms, k.proof_bytes / 1024);
+		}
+		println!("# Higher outer blowup cuts recursion queries -> faster verify, bigger proof. \
+			 A lever the recursion proof dials WITHOUT changing the hash gadget (orthogonal to width).");
+	}
+
 	/// PART 3 runner (ONE circuit). `CKT` selects the circuit type; the remaining
 	/// env vars parameterize it. Prints ONE structured RESULT line. `#[ignore]` so
 	/// the normal suite skips it; the shell wrapper runs the built test binary
