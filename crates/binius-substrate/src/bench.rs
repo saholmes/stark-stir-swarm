@@ -130,6 +130,74 @@ pub fn bench_sha3_256(n: usize, log_inv_rate: usize, security_bits: usize) -> Re
 	})
 }
 
+/// PoC — prove+verify `n` Grøstl-256 P-permutations over the SAME field/commitment
+/// wiring as `bench_sha3_256` (CanonicalTowerFamily / B128, SHA-256 commit + FS), so
+/// Grøstl-vs-Keccak verify is an apples-to-apples hash comparison. Grøstl's state is
+/// 64 B8 (byte) columns = a 512-bit permutation vs Keccak's 1600-bit state — the
+/// "narrow hash" whose verify cost we want to quantify against Keccak's ~1.4 s floor.
+/// (Grøstl is a SHA-3 finalist, NOT FIPS-standard — this measures the narrow-hash
+/// ceiling; the production FIPS narrow master would be an M3 SHA-256.)
+pub fn bench_groestl_perm(n: usize, log_inv_rate: usize, security_bits: usize) -> Result<BenchResult> {
+	use binius_m3::builder::B8;
+	use binius_m3::gadgets::hash::groestl::{Permutation, PermutationVariant};
+
+	assert!(n > 0, "bench_groestl_perm needs at least one permutation");
+	let n = n.next_power_of_two();
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::new();
+	let mut table = cs.add_table("groestl P-permutation (bench)");
+	let input = table.add_committed_multiple::<B8, 8, 8>("state_in");
+	let perm = Permutation::new(&mut table, PermutationVariant::P, input);
+	let table_id = table.id();
+
+	let statement = Statement {
+		boundaries: vec![],
+		table_sizes: vec![n],
+	};
+
+	let mut rng = StdRng::from_seed([7u8; 32]);
+	let in_states: Vec<[B8; 64]> = (0..n)
+		.map(|_| std::array::from_fn(|_| <B8 as binius_field::Field>::random(&mut rng)))
+		.collect();
+
+	let mut witness = WitnessIndex::<P>::new(&cs, &allocator);
+	{
+		let table_witness = witness.init_table(table_id, n)?;
+		let mut segment = table_witness.full_segment();
+		perm.populate_state_in(&mut segment, in_states.iter())?;
+		perm.populate(&mut segment)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	let backend = binius_hal::make_portable_backend();
+
+	let t_prove = Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U,
+		CanonicalTowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, witness, &backend)?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let proof_bytes = proof.get_proof_size();
+
+	let t_verify = Instant::now();
+	binius_core::constraint_system::verify::<
+		U,
+		CanonicalTowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof)?;
+	let verify_ms = t_verify.elapsed().as_millis();
+
+	Ok(BenchResult { n, log_inv_rate, prove_ms, verify_ms, proof_bytes })
+}
+
 // =============================================================================
 // PART 1 (RSS baseline at NIST) — timed prove/verify of a batch of raw Keccak-f
 // permutations over the NIST tower fields B256 (L1, security_bits=128) and B512
@@ -583,16 +651,37 @@ mod tests {
 		)
 	}
 
-	/// Prove+verify ONE `ModMul<W>` over B256 at operand width `n`; returns
-	/// `(proof_bytes, prove_verify_ms)`. The whole-process peak RSS (prove-dominated)
-	/// is captured externally by the shell wrapper.
-	fn run_modmul<const W: usize>(n: usize) -> (usize, u128) {
+	/// Prove+verify ONE `ModMul<W>` over B256 at operand width `n`, timing prove and
+	/// verify SEPARATELY; returns `(proof_bytes, prove_ms, verify_ms)`. The
+	/// whole-process peak RSS (prove-dominated) is captured externally by the wrapper.
+	fn run_modmul<const W: usize>(n: usize) -> (usize, u128, u128) {
 		assert!(2 * n + 1 <= W, "ModMul needs 2n+1 <= W (n={n}, W={W})");
 		let (m_bits, row) = modmul_fixture(n, W);
-		let t = Instant::now();
-		let (sz, _) = crate::nonnative::prove_verify::<W>(&m_bits, n, &[row])
-			.expect("ModMul must prove AND verify over B256");
-		(sz, t.elapsed().as_millis())
+		crate::nonnative::prove_verify_timed::<W>(&m_bits, n, &[row])
+			.expect("ModMul must prove AND verify over B256")
+	}
+
+	/// One honest raw-limb-product row `p = a*b` for `n`-bit operands in W-bit columns.
+	fn limbproduct_fixture(n: usize, w: usize) -> crate::nonnative::LimbProductRow {
+		use num_bigint::BigUint;
+		let one = BigUint::from(1u8);
+		let a = (&one << n) - BigUint::from(3u8);
+		let b = (&one << n) - BigUint::from(5u8);
+		let p = &a * &b; // < 2^{2n} <= 2^W
+		crate::nonnative::LimbProductRow {
+			a: to_bits_w(&a, w),
+			b: to_bits_w(&b, w),
+			p: to_bits_w(&p, w),
+		}
+	}
+
+	/// Prove+verify ONE `LimbProduct<W>` (raw n-bit×n-bit multiply, W=2n) over B256 —
+	/// the atomic sliver strand of the limb-decomposed big-integer multiply.
+	fn run_limbproduct<const W: usize>(n: usize) -> (usize, u128, u128) {
+		assert!(2 * n <= W, "LimbProduct needs 2n <= W (n={n}, W={W})");
+		let row = limbproduct_fixture(n, W);
+		crate::nonnative::prove_verify_limb_timed::<W>(n, &[row])
+			.expect("LimbProduct must prove AND verify over B256")
 	}
 
 	/// PART 3 runner (ONE circuit). `CKT` selects the circuit type; the remaining
@@ -607,8 +696,10 @@ mod tests {
 			"modmul" => {
 				let w: usize = env::var("MM_W").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
 				let n: usize = env::var("MM_N").ok().and_then(|s| s.parse().ok()).unwrap_or(496);
-				let (sz, ms) = match w {
+				let (sz, pms, vms) = match w {
 					64 => run_modmul::<64>(n),
+					128 => run_modmul::<128>(n),
+					256 => run_modmul::<256>(n),
 					512 => run_modmul::<512>(n),
 					1024 => run_modmul::<1024>(n),
 					2048 => run_modmul::<2048>(n),
@@ -616,15 +707,50 @@ mod tests {
 					8192 => run_modmul::<8192>(n),
 					other => panic!("unsupported MM_W={other}; add a match arm in circuit_rss_row"),
 				};
-				println!("RESULT circuit=ModMul W={w} n={n} prove_ms={ms} proof_bytes={sz}");
+				println!("RESULT circuit=ModMul W={w} n={n} prove_ms={pms} verify_ms={vms} proof_bytes={sz}");
+			}
+			"limbproduct" => {
+				// The raw limb-product strand of LimbMul<L>: an L×L->2L multiply, W=2L.
+				let l: usize = env::var("LP_L").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+				let (sz, pms, vms) = match l {
+					64 => run_limbproduct::<128>(64),
+					128 => run_limbproduct::<256>(128),
+					256 => run_limbproduct::<512>(256),
+					512 => run_limbproduct::<1024>(512),
+					other => panic!("unsupported LP_L={other}; add a match arm in circuit_rss_row"),
+				};
+				println!("RESULT circuit=LimbProduct W={} n={l} prove_ms={pms} verify_ms={vms} proof_bytes={sz}", 2 * l);
 			}
 			"keccak" => {
-				let t = Instant::now();
-				let r = bench_keccak_b256(1, 1, 128).expect("Keccak-f must prove+verify over B256");
-				let ms = t.elapsed().as_millis();
+				// KECCAK_N = number of Keccak-f permutations proven as ROWS in one
+				// narrow table (fixed width = one Keccak-f state). Verify is expected
+				// ~constant in N (verify scales with column WIDTH, not rows) — the
+				// property that makes a batched-Merkle master's verify N-independent.
+				let kn: usize = env::var("KECCAK_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+				let r = bench_keccak_b256(kn, 1, 128).expect("Keccak-f must prove+verify over B256");
 				println!(
-					"RESULT circuit=Keccakf W=1600 n=1 prove_ms={} proof_bytes={} wall_ms={}",
-					r.prove_ms, r.proof_bytes, ms
+					"RESULT circuit=Keccakf W=1600 n={} prove_ms={} verify_ms={} proof_bytes={}",
+					r.n, r.prove_ms, r.verify_ms, r.proof_bytes
+				);
+			}
+			"groestl" => {
+				// Narrow-hash PoC: N Grøstl-256 P-permutations (512-bit byte-column
+				// state) over B128, same commit/FS wiring as keccak128.
+				let gn: usize = env::var("GROESTL_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+				let r = bench_groestl_perm(gn, 2, 100).expect("Groestl perm must prove+verify");
+				println!(
+					"RESULT circuit=Groestl W=512 n={} prove_ms={} verify_ms={} proof_bytes={}",
+					r.n, r.prove_ms, r.verify_ms, r.proof_bytes
+				);
+			}
+			"keccak128" => {
+				// Keccak-f over B128 (CanonicalTowerFamily) — the same-field baseline
+				// the Grøstl PoC is compared against.
+				let kn: usize = env::var("KECCAK_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+				let r = bench_sha3_256(kn, 2, 100).expect("Keccak-f (B128) must prove+verify");
+				println!(
+					"RESULT circuit=Keccak128 W=1600 n={} prove_ms={} verify_ms={} proof_bytes={}",
+					r.n, r.prove_ms, r.verify_ms, r.proof_bytes
 				);
 			}
 			"join" => {

@@ -70,8 +70,8 @@ if [[ -z "${BIN}" || ! -x "${BIN}" ]]; then
 fi
 echo "# test binary: ${BIN}" 1>&2
 
-echo "| circuit | W | n | prove_ms | proof_bytes | peak_RSS_MiB |"
-echo "|:---|---:|---:|---:|---:|---:|"
+echo "| circuit | W | n | prove_ms | verify_ms | proof_bytes | peak_RSS_MiB |"
+echo "|:---|---:|---:|---:|---:|---:|---:|"
 
 # run_one dispatches two spec kinds:
 #   modmul:<W>:<n> | keccak | join   -> the parameterized circuit_rss_row runner
@@ -95,19 +95,30 @@ run_one() {
 		PMS="$(awk -v s="${REAL_S:-0}" 'BEGIN{ printf "%.0f", s*1000 }')"
 		RSS_BYTES="$(grep 'maximum resident set size' "${ERR}" | awk '{print $1}')"
 		RSS_MIB="$(awk -v b="${RSS_BYTES:-0}" 'BEGIN{ printf "%.1f", b/1048576 }')"
-		echo "| ${GLABEL} (gate) | - | - | ${PMS} | - | ${RSS_MIB} |"
+		echo "| ${GLABEL} (gate) | - | - | ${PMS} | - | - | ${RSS_MIB} |"
 		rm -f "${OUT}" "${ERR}"
 		return
 	fi
 
-	local CKT MM_W MM_N
+	local CKT MM_W MM_N LP_L KECCAK_N GROESTL_N
+	LP_L=256; KECCAK_N=1; GROESTL_N=1
 	case "${SPEC}" in
 		modmul:*:*)
 			CKT="modmul"
 			MM_W="$(echo "${SPEC}" | cut -d: -f2)"
 			MM_N="$(echo "${SPEC}" | cut -d: -f3)"
 			;;
+		limbproduct:*)
+			CKT="limbproduct"
+			LP_L="$(echo "${SPEC}" | cut -d: -f2)"
+			MM_W=$((2 * LP_L)); MM_N="${LP_L}"
+			;;
+		keccak:*) CKT="keccak"; KECCAK_N="$(echo "${SPEC}" | cut -d: -f2)"; MM_W=1600; MM_N="${KECCAK_N}" ;;
 		keccak) CKT="keccak"; MM_W=1600; MM_N=1 ;;
+		keccak128:*) CKT="keccak128"; KECCAK_N="$(echo "${SPEC}" | cut -d: -f2)"; MM_W=1600; MM_N="${KECCAK_N}" ;;
+		keccak128) CKT="keccak128"; MM_W=1600; MM_N=1 ;;
+		groestl:*) CKT="groestl"; GROESTL_N="$(echo "${SPEC}" | cut -d: -f2)"; MM_W=512; MM_N="${GROESTL_N}" ;;
+		groestl) CKT="groestl"; MM_W=512; MM_N=1 ;;
 		join)   CKT="join";   MM_W=256;  MM_N=1 ;;
 		*) echo "ERROR: bad spec '${SPEC}'" 1>&2; exit 1 ;;
 	esac
@@ -115,7 +126,7 @@ run_one() {
 	local OUT ERR
 	OUT="$(mktemp)"; ERR="$(mktemp)"
 
-	CKT="${CKT}" MM_W="${MM_W}" MM_N="${MM_N}" /usr/bin/time -l "${BIN}" \
+	CKT="${CKT}" MM_W="${MM_W}" MM_N="${MM_N}" LP_L="${LP_L}" KECCAK_N="${KECCAK_N}" GROESTL_N="${GROESTL_N}" /usr/bin/time -l "${BIN}" \
 		--exact "${TEST_PATH}" --ignored --nocapture --test-threads=1 \
 		>"${OUT}" 2>"${ERR}" || true
 
@@ -128,7 +139,7 @@ run_one() {
 		local FRSS_B FRSS_M
 		FRSS_B="$(grep 'maximum resident set size' "${ERR}" | awk '{print $1}')"
 		FRSS_M="$(awk -v b="${FRSS_B:-0}" 'BEGIN{ printf "%.1f", b/1048576 }')"
-		echo "| ${CKT}(${MM_W},${MM_N}) FAILED | ${MM_W} | ${MM_N} | - | - | ${FRSS_M} |"
+		echo "| ${CKT}(${MM_W},${MM_N}) FAILED | ${MM_W} | ${MM_N} | - | - | - | ${FRSS_M} |"
 		echo "# NOTE: ${SPEC} produced no RESULT (panic/OOM). stderr tail:" 1>&2
 		tail -n3 "${ERR}" 1>&2
 		rm -f "${OUT}" "${ERR}"; return
@@ -136,15 +147,16 @@ run_one() {
 
 	local get
 	get() { echo "${RESULT_LINE}" | tr ' ' '\n' | grep "^$1=" | cut -d= -f2; }
-	local CNAME CW CN PMS PB
+	local CNAME CW CN PMS VMS PB
 	CNAME="$(get circuit)"; CW="$(get W)"; CN="$(get n)"
-	PMS="$(get prove_ms)"; PB="$(get proof_bytes)"
+	PMS="$(get prove_ms)"; VMS="$(get verify_ms)"; PB="$(get proof_bytes)"
+	[[ -z "${VMS}" ]] && VMS="-"
 
 	local RSS_BYTES RSS_MIB
 	RSS_BYTES="$(grep 'maximum resident set size' "${ERR}" | awk '{print $1}')"
 	RSS_MIB="$(awk -v b="${RSS_BYTES:-0}" 'BEGIN{ printf "%.1f", b/1048576 }')"
 
-	echo "| ${CNAME} | ${CW} | ${CN} | ${PMS} | ${PB} | ${RSS_MIB} |"
+	echo "| ${CNAME} | ${CW} | ${CN} | ${PMS} | ${VMS} | ${PB} | ${RSS_MIB} |"
 	rm -f "${OUT}" "${ERR}"
 }
 

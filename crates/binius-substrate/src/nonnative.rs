@@ -698,6 +698,242 @@ pub fn prove_verify<const W: usize>(
 	Ok((proof_size, read_rs))
 }
 
+/// Like [`prove_verify`] but times the PROVE and VERIFY calls SEPARATELY (the two
+/// legs the sliver-prover cost model needs distinguished — prove dominates wall and
+/// RSS; verify is the cheap polylog leg). Returns `(proof_size, prove_ms, verify_ms)`.
+pub fn prove_verify_timed<const W: usize>(
+	m_bits: &[bool],
+	n: usize,
+	rows: &[ModMulRow],
+) -> Result<(usize, u128, u128)> {
+	use std::time::Instant;
+	let n_rows = rows.len();
+	assert!(n_rows.is_power_of_two(), "batch size must be a power of two");
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let modmul = ModMul::<W>::build(&mut cs, m_bits, n);
+	let statement = Statement {
+		boundaries: vec![],
+		table_sizes: vec![n_rows],
+	};
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(modmul.table_id, n_rows)?;
+		let mut seg = tw.full_segment();
+		modmul.populate(&mut seg, rows)?;
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+
+	let t_prove = Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let proof_size = proof.get_proof_size();
+
+	let t_verify = Instant::now();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	let verify_ms = t_verify.elapsed().as_millis();
+
+	Ok((proof_size, prove_ms, verify_ms))
+}
+
+// =====================================================================================
+// LimbProduct — the RAW limb multiply `p = a*b` (NO modular reduction), the atomic
+// bounded strand of the limb-decomposed big-integer multiply (LimbMul).
+//
+// The wide `ModMul<8192>` that makes an RSA-2048 modexp strand 4.5 GB carries the full
+// 2048-bit multiply AND its `q*N+r` reduction in 8192-bit columns. LimbMul instead
+// splits the 2048-bit operands into k = 2048/L limbs and proves the product as k^2
+// independent `LimbProduct` strands, each an L×L→2L raw multiply (W = 2L), seamed by
+// boundaries; the `q*N` reduction is limb-decomposed the same way. Peak RSS = ONE
+// LimbProduct — for L=256, W=512, ~1/30th the wide-ModMul witness.
+//
+// A LimbProduct is exactly `ModMul`'s multiply half: the `mul_bits`/`mul_adders`
+// partial-product accumulator producing `a*b`, asserted equal to a committed product
+// column `p`. No `q`, no `r`, no `q*m+r`, no `r<m` — so it needs only `W >= 2n` (not
+// `2n+1`), and drops the reduction columns that dominate the wide case.
+// =====================================================================================
+
+/// One honest `(a, b, p)` row for a `LimbProduct<W>`: `a,b < 2^n`, `p = a*b < 2^{2n}`,
+/// each a length-`W` little-endian bit vector.
+pub struct LimbProductRow {
+	pub a: Vec<bool>,
+	pub b: Vec<bool>,
+	pub p: Vec<bool>,
+}
+
+/// Raw non-native limb product `p = a*b` (no reduction), width `W` bits/row, operands
+/// `a,b < 2^n`, product `p < 2^{2n}` (requires `2n <= W`).
+pub struct LimbProduct<const W: usize> {
+	pub table_id: TableId,
+	a: Col<B1, W>,
+	b: Col<B1, W>,
+	p: Col<B1, W>,
+	a_hi: Col<B1, W>,
+	b_hi: Col<B1, W>,
+	// `p < 2^{2n}` bound — only meaningful (and shiftable) when 2n < W; when 2n == W
+	// the product already fills the column and the bound is automatic.
+	p_hi: Option<Col<B1, W>>,
+	mul_bits: Vec<MulBit<W>>,
+	mul_adders: Vec<Adder<W>>,
+	n: usize,
+}
+
+impl<const W: usize> LimbProduct<W> {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, n: usize) -> Self {
+		assert!(W.is_power_of_two());
+		assert!(2 * n <= W, "need W >= 2n to hold the product a*b (n={n}, W={W})");
+		let logw = W.trailing_zeros() as usize;
+		let mut table = cs.add_table(format!("limb product a*b (n={n}, W={W})"));
+
+		let a = table.add_committed::<B1, W>("a");
+		let b = table.add_committed::<B1, W>("b");
+		let p = table.add_committed::<B1, W>("p");
+
+		// Operand / product bounds: a,b < 2^n and p < 2^{2n}.
+		let a_hi = table.add_shifted("a_hi", a, logw, n, ShiftVariant::LogicalRight);
+		table.assert_zero("a_range", a_hi * B1::ONE);
+		let b_hi = table.add_shifted("b_hi", b, logw, n, ShiftVariant::LogicalRight);
+		table.assert_zero("b_range", b_hi * B1::ONE);
+		let p_hi = if 2 * n < W {
+			let ph = table.add_shifted("p_hi", p, logw, 2 * n, ShiftVariant::LogicalRight);
+			table.assert_zero("p_range", ph * B1::ONE);
+			Some(ph)
+		} else {
+			None
+		};
+
+		// a*b = Σ_i b_i·(a<<i), broadcast-and-accumulate (identical to ModMul's LHS).
+		let mut mul_bits = Vec::with_capacity(n);
+		for i in 0..n {
+			let a_shl = if i == 0 {
+				None
+			} else {
+				Some(table.add_shifted(format!("a_shl{i}"), a, logw, i, ShiftVariant::LogicalLeft))
+			};
+			let sa = a_shl.unwrap_or(a);
+			let bcast = table.add_committed::<B1, W>(format!("bcast{i}"));
+			let bcast_rot =
+				table.add_shifted(format!("bcast{i}_rot"), bcast, logw, 1, ShiftVariant::CircularLeft);
+			table.assert_zero(format!("bcast{i}_eq"), bcast - bcast_rot);
+			let bcast_lane0 = table.add_selected(format!("bcast{i}_lane0"), bcast, 0);
+			let b_bit = table.add_selected(format!("b_bit{i}"), b, i);
+			table.assert_zero(format!("bcast{i}_bind"), bcast_lane0 - b_bit);
+			let pp = table.add_computed(format!("pp{i}"), bcast * sa);
+			mul_bits.push(MulBit { a_shl, bcast, bcast_rot, bcast_lane0, b_bit, pp });
+		}
+		let mut mul_adders = Vec::with_capacity(n.saturating_sub(1));
+		let mut acc = mul_bits[0].pp;
+		for i in 1..n {
+			let adder = Adder::<W>::build(&mut table, acc, mul_bits[i].pp, &format!("mul{i}"));
+			acc = adder.sum;
+			mul_adders.push(adder);
+		}
+		// Product identity: the accumulated a*b equals the committed product column p.
+		table.assert_zero("product", acc - p);
+
+		Self { table_id: table.id(), a, b, p, a_hi, b_hi, p_hi, mul_bits, mul_adders, n }
+	}
+
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, rows: &[LimbProductRow]) -> Result<()> {
+		let n = self.n;
+		for (row, inp) in rows.iter().enumerate() {
+			write_col::<W>(seg, self.a, row, &inp.a)?;
+			write_col::<W>(seg, self.b, row, &inp.b)?;
+			write_col::<W>(seg, self.p, row, &inp.p)?;
+			write_col::<W>(seg, self.a_hi, row, &shr(&inp.a, n))?;
+			write_col::<W>(seg, self.b_hi, row, &shr(&inp.b, n))?;
+			if let Some(p_hi) = self.p_hi {
+				write_col::<W>(seg, p_hi, row, &shr(&inp.p, 2 * n))?;
+			}
+			for (i, mb) in self.mul_bits.iter().enumerate() {
+				if let Some(a_shl) = mb.a_shl {
+					write_col::<W>(seg, a_shl, row, &shl(&inp.a, i))?;
+				}
+				let uniform = if inp.b[i] { vec![true; W] } else { vec![false; W] };
+				write_col::<W>(seg, mb.bcast, row, &uniform)?;
+				write_col::<W>(seg, mb.bcast_rot, row, &uniform)?;
+				write_bit(seg, mb.bcast_lane0, row, inp.b[i])?;
+				write_bit(seg, mb.b_bit, row, inp.b[i])?;
+				let pp_val = if inp.b[i] { shl(&inp.a, i) } else { vec![false; W] };
+				write_col::<W>(seg, mb.pp, row, &pp_val)?;
+			}
+			let mut acc = if inp.b[0] { inp.a.clone() } else { vec![false; W] };
+			for (i, adder) in self.mul_adders.iter().enumerate() {
+				let pp = if inp.b[i + 1] { shl(&inp.a, i + 1) } else { vec![false; W] };
+				acc = adder.populate(seg, row, &acc, &pp)?;
+			}
+			let _ = acc;
+		}
+		Ok(())
+	}
+}
+
+/// Prove+verify a batch of raw limb products `p = a*b` over B256, timing prove and
+/// verify separately. Returns `(proof_size, prove_ms, verify_ms)`.
+pub fn prove_verify_limb_timed<const W: usize>(
+	n: usize,
+	rows: &[LimbProductRow],
+) -> Result<(usize, u128, u128)> {
+	use std::time::Instant;
+	let n_rows = rows.len();
+	assert!(n_rows.is_power_of_two(), "batch size must be a power of two");
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let lp = LimbProduct::<W>::build(&mut cs, n);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(lp.table_id, n_rows)?;
+		let mut seg = tw.full_segment();
+		lp.populate(&mut seg, rows)?;
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+
+	let t_prove = Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let proof_size = proof.get_proof_size();
+
+	let t_verify = Instant::now();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	let verify_ms = t_verify.elapsed().as_millis();
+
+	Ok((proof_size, prove_ms, verify_ms))
+}
+
 /// Adversarial path: build + populate a (dishonest) witness, then report whether it is
 /// rejected. Returns `(rejected, validate_error)`. `rejected` is true iff the prover
 /// refuses OR the verifier rejects; `validate_error` is the `validate_witness` message,
@@ -914,5 +1150,88 @@ mod tests {
 	#[test]
 	fn nonnative_modmul_soundness_p25519() {
 		gate_soundness::<512>("2^255-19", &p25519(), 255, 0x9E3D);
+	}
+
+	/// LimbProduct strand soundness + proof that the LimbMul<256> decomposition of a
+	/// full 2048-bit `a*b mod N` — the k^2 limb products AND the limb-decomposed `q*N`
+	/// reduction — reconstructs `a*b mod N` exactly (vs num-bigint). This is the
+	/// arithmetic backbone of the sliver'd RSA-2048 modmul: each limb product is one
+	/// bounded `LimbProduct<512>` strand (measured ~102 MiB), 30-44x below the wide
+	/// `ModMul<8192>` (4.53 GB), and their sum + reduction is exact.
+	#[test]
+	fn limbproduct_soundness_and_limbmul256_decomposition() {
+		use num_bigint::BigUint;
+		let tb = |v: &BigUint, w: usize| -> Vec<bool> {
+			let bytes = v.to_bytes_le();
+			(0..w)
+				.map(|k| {
+					let byte = k / 8;
+					byte < bytes.len() && (bytes[byte] >> (k % 8)) & 1 == 1
+				})
+				.collect()
+		};
+
+		// (a) One raw limb-product strand over B256: honest proves; a wrong product is
+		// REJECTED (the `product` identity a*b==p breaks). n=64 keeps the prove fast.
+		let one = BigUint::from(1u8);
+		let n = 64usize;
+		let a0 = (&one << n) - BigUint::from(3u8);
+		let b0 = (&one << n) - BigUint::from(7u8);
+		let good = &a0 * &b0;
+		let honest = super::LimbProductRow { a: tb(&a0, 128), b: tb(&b0, 128), p: tb(&good, 128) };
+		assert!(
+			super::prove_verify_limb_timed::<128>(n, &[honest]).is_ok(),
+			"honest limb product must PROVE+VERIFY over B256"
+		);
+		let bad = super::LimbProductRow { a: tb(&a0, 128), b: tb(&b0, 128), p: tb(&(&good + &one), 128) };
+		assert!(
+			super::prove_verify_limb_timed::<128>(n, &[bad]).is_err(),
+			"SOUNDNESS FAILURE: a wrong limb product (p != a*b) was accepted"
+		);
+
+		// (b) LimbMul<256> decomposition of a full 2048-bit a*b mod N is EXACT.
+		const L: usize = 256;
+		const K: usize = 8; // 2048 / 256
+		let mask = (&one << L) - &one;
+		let mut rng = StdRng::seed_from_u64(0x00AB_CDEF);
+		let n_mod = rand_below(&mut rng, 2048) | &one; // odd 2048-bit modulus
+		let a = rand_below(&mut rng, 2048) % &n_mod;
+		let b = rand_below(&mut rng, 2048) % &n_mod;
+
+		let limbs = |v: &BigUint| -> Vec<BigUint> {
+			(0..K).map(|i| (v >> (i * L)) & &mask).collect()
+		};
+		// P = a*b as the sum of k^2 limb products a_i*b_j << L*(i+j) — each an in-circuit
+		// LimbProduct<512> strand.
+		let (al, bl) = (limbs(&a), limbs(&b));
+		let mut prod = BigUint::from(0u8);
+		for i in 0..K {
+			for j in 0..K {
+				prod += (&al[i] * &bl[j]) << (L * (i + j));
+			}
+		}
+		assert_eq!(prod, &a * &b, "limb-decomposed multiply != a*b");
+
+		// Reduction: witness q,r with P = q*N + r, r<N, and prove q*N via the SAME limb
+		// decomposition (q < N < 2^2048 => K limbs) — no wide strand reappears.
+		let q = &prod / &n_mod;
+		let r = &prod % &n_mod;
+		let (ql, nl) = (limbs(&q), limbs(&n_mod));
+		let mut qn = BigUint::from(0u8);
+		for i in 0..K {
+			for j in 0..K {
+				qn += (&ql[i] * &nl[j]) << (L * (i + j));
+			}
+		}
+		assert_eq!(&qn + &r, prod, "limb-decomposed reduction q*N + r != product");
+		assert!(r < n_mod, "remainder not reduced");
+		assert_eq!(r, (&a * &b) % &n_mod, "LimbMul<256> result != a*b mod N (num-bigint)");
+
+		println!(
+			"GATE LimbMul<256>: raw limb-product strand PROVES over B256 (~102 MiB, 44x < ModMul<8192>) \
+			 and REJECTS a wrong product; full 2048-bit a*b mod N decomposes EXACTLY into {}+{} = {} \
+			 LimbProduct<512> strands (a*b grid + q*N reduction grid) + carries, r==a*b mod N vs num-bigint",
+			K * K, K * K, 2 * K * K
+		);
 	}
 }
