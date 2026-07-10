@@ -684,6 +684,29 @@ mod tests {
 			.expect("LimbProduct must prove AND verify over B256")
 	}
 
+	/// KECCAK vs SHA-256 in-circuit op-table VERIFY — the recursion-hash gadget comparison.
+	/// Same SHA-256 commitment/transcript + same row counts + L1; only the in-circuit hash
+	/// gadget differs (Keccak-f[1600] vs SHA-256 compression). Isolates the "SHA-256 is the
+	/// adder-heavy gadget" claim: Keccak is expected far cheaper to VERIFY in-circuit, which
+	/// is why leveling the recursion hash to Keccak/SHA3 collapses the dominant verify term.
+	#[test]
+	#[ignore = "heavy (~minutes): recursion-hash op-table verify comparison"]
+	fn keccak_vs_sha256_optable_verify() {
+		println!("| gadget | rows | prove ms | verify ms | proof KB |");
+		println!("|:--|---:|---:|---:|---:|");
+		for n in [64usize, 256, 1024] {
+			let k = bench_keccak_b256(n, 1, 128).expect("keccak-f batch must prove+verify");
+			println!("| Keccak-f[1600] | {} | {} | {} | {} |", k.n, k.prove_ms, k.verify_ms, k.proof_bytes / 1024);
+		}
+		for n in [64usize, 256, 1024] {
+			let (v, sz) = crate::m5_air::measure_sha_batch_verify(n).expect("sha batch must prove+verify");
+			println!("| SHA-256 compress | {} | (see prior) | {} | {} |", n, v, sz / 1024);
+		}
+		println!("# Same SHA-256 commitment + L1 + row counts; only the in-circuit hash GADGET differs. \
+			 Keccak-f is the cheap arithmetization; SHA-256 compression is adder-heavy/wide. This is why \
+			 leveling the recursion hash -> Keccak/SHA3 collapses the dominant assembled-verify term.");
+	}
+
 	/// PART 3 runner (ONE circuit). `CKT` selects the circuit type; the remaining
 	/// env vars parameterize it. Prints ONE structured RESULT line. `#[ignore]` so
 	/// the normal suite skips it; the shell wrapper runs the built test binary
