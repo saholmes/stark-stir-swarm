@@ -127,10 +127,77 @@ pub fn prove_verify_m5_kernel(
 	Ok((sz, folded))
 }
 
+/// Prove + verify the FRI query-index derivation `sample_bits(bits)` in-circuit: the
+/// index = low `bits` bits of u32_le(digest[0..4]) = bswap32(word[0]) & ((1<<bits)-1).
+/// Returns `(proof_bytes, index)`. This is the query index that drives M2b's path MUX.
+pub fn prove_verify_query_index(word0: u32, bits: usize) -> Result<(usize, u32)> {
+	assert!(bits <= 32);
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("fri query index sample_bits");
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bb = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bb[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let m1 = mkmask(&mut t, "mask_ff00", 0x0000_FF00);
+	let m2 = mkmask(&mut t, "mask_ff0000", 0x00FF_0000);
+	let mask_val = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+	let maskc = mkmask(&mut t, "idx_mask", mask_val);
+
+	let cw0 = t.add_committed::<B1, 32>("w0");
+	let bs = build_bswap32(&mut t, cw0, m1, m2, "bs0_");
+	// idx = bswap(w0) & mask  (per-bit AND = B1 multiply).
+	let idx = t.add_computed("idx", bs.out * maskc);
+	let table_id = t.id();
+
+	let index = word0.swap_bytes() & mask_val;
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		for row in 0..NROWS {
+			wc(&mut seg, m1, row, 0x0000_FF00)?;
+			wc(&mut seg, m2, row, 0x00FF_0000)?;
+			wc(&mut seg, maskc, row, mask_val)?;
+			wc(&mut seg, cw0, row, word0)?;
+			pop_bswap32(&bs, &mut seg, row, word0)?;
+			wc(&mut seg, idx, row, index)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, index))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use binius_field::Field;
+
+	/// GATE M5-qidx — the FRI query-index sample_bits proves+verifies in-circuit ==
+	/// binius sample_bits_reader (u32_le(digest[0..4]) & mask).
+	#[test]
+	fn query_index_proves_over_b256() {
+		for (word0, bits) in [(0x1234_5678u32, 8usize), (0xdead_beef, 12), (0x0000_00ff, 5), (0xffff_ffff, 20)] {
+			let (size, idx) = prove_verify_query_index(word0, bits).expect("query index must PROVE+VERIFY");
+			let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+			assert_eq!(idx, word0.swap_bytes() & mask, "in-circuit query index != sample_bits");
+			let _ = size;
+		}
+		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
 
 	/// GATE M5-kernel — a recomputed FS challenge DRIVES the FRI fold in ONE proof: the
 	/// digest->B256 bridge feeds the fold_pair, and the result == the native fold with
