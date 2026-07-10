@@ -235,6 +235,92 @@ pub fn prove_verify_b256_mul(a: OurB256, b: OurB256) -> Result<(usize, OurB256)>
 	Ok((sz, c_native))
 }
 
+/// Prove + verify the FRI fold `folded = u + (v - u)·r` over the FULL B256 field
+/// in-circuit (M3a's fold, now at NIST L1 via the M3b GF(2^256) multiply). Returns
+/// `(proof_bytes, in_circuit_folded)`; gated against the native B256 fold.
+pub fn prove_verify_b256_fold(u: OurB256, v: OurB256, r: OurB256) -> Result<(usize, OurB256)> {
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("gf(2^256) FRI fold u+(v-u)*r");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cu: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("u{i}")));
+	let cv: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("v{i}")));
+	let cr: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("r{i}")));
+	let cf: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("f{i}")));
+	// d = v - u (per B64 component; subtraction == addition == XOR in GF(2)).
+	let cd: [Col<B64, 1>; 4] = std::array::from_fn(|i| {
+		let d = t.add_committed::<B64, 1>(format!("d{i}"));
+		t.assert_zero(format!("d{i}c"), d - (cv[i] - cu[i]));
+		d
+	});
+	// p = d · r  (nested Karatsuba, operands d and r).
+	let z0 = build_b128_mul(&mut t, beta_col, cd[0], cd[1], cr[0], cr[1], "z0");
+	let z2 = build_b128_mul(&mut t, beta_col, cd[2], cd[3], cr[2], cr[3], "z2");
+	let sa0 = t.add_committed::<B64, 1>("sa0");
+	t.assert_zero("sa0c", sa0 - (cd[0] + cd[2]));
+	let sa1 = t.add_committed::<B64, 1>("sa1");
+	t.assert_zero("sa1c", sa1 - (cd[1] + cd[3]));
+	let sb0 = t.add_committed::<B64, 1>("sb0");
+	t.assert_zero("sb0c", sb0 - (cr[0] + cr[2]));
+	let sb1 = t.add_committed::<B64, 1>("sb1");
+	t.assert_zero("sb1c", sb1 - (cr[1] + cr[3]));
+	let s = build_b128_mul(&mut t, beta_col, sa0, sa1, sb0, sb1, "s");
+	let z2ab = t.add_committed::<B64, 1>("z2ab");
+	t.assert_zero("z2abc", z2ab - z2.r1 * beta_col);
+	// p components (as in the mul), then folded = u + p.
+	let p0 = z0.r0 + z2.r0;
+	let p1 = z0.r1 + z2.r1;
+	let p2 = (s.r0 - z0.r0 - z2.r0) + z2.r1;
+	let p3 = (s.r1 - z0.r1 - z2.r1) + (z2.r0 + z2ab);
+	t.assert_zero("f0", cf[0] - (cu[0] + p0));
+	t.assert_zero("f1", cf[1] - (cu[1] + p1));
+	t.assert_zero("f2", cf[2] - (cu[2] + p2));
+	t.assert_zero("f3", cf[3] - (cu[3] + p3));
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let folded_native = u + (v - u) * r;
+	let (uv, vv, rv, dv, fv) =
+		(split256(u), split256(v), split256(r), split256(v - u), split256(folded_native));
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw.full_segment();
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cu[i], row, uv[i])?;
+				wc64(&mut seg, cv[i], row, vv[i])?;
+				wc64(&mut seg, cr[i], row, rv[i])?;
+				wc64(&mut seg, cf[i], row, fv[i])?;
+				wc64(&mut seg, cd[i], row, dv[i])?;
+			}
+			wc64(&mut seg, sa0, row, dv[0] + dv[2])?;
+			wc64(&mut seg, sa1, row, dv[1] + dv[3])?;
+			wc64(&mut seg, sb0, row, rv[0] + rv[2])?;
+			wc64(&mut seg, sb1, row, rv[1] + rv[3])?;
+			pop_b128_mul(&z0, &mut seg, row, dv[0], dv[1], rv[0], rv[1])?;
+			let (_z2r0, z2r1) = pop_b128_mul(&z2, &mut seg, row, dv[2], dv[3], rv[2], rv[3])?;
+			pop_b128_mul(&s, &mut seg, row, dv[0] + dv[2], dv[1] + dv[3], rv[0] + rv[2], rv[1] + rv[3])?;
+			wc64(&mut seg, z2ab, row, z2r1 * beta())?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, folded_native))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -286,6 +372,23 @@ mod tests {
 			"GATE M3b gf256-mul: GF(2^256) multiply PROVES+VERIFIES over B256 @L1(128) as nested \
 			 Karatsuba over native B64 muls (α₈=B128(1<<64), α₇=B64(1<<32)) == native B256 *; \
 			 proof = {size} bytes"
+		);
+	}
+
+	/// GATE M3 — the FRI fold u+(v-u)·r over the FULL B256 field (NIST L1) proves+
+	/// verifies in-circuit == the native B256 fold; wrong challenge changes it.
+	#[test]
+	fn b256_fri_fold_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xF0; 32]);
+		let u = <OurB256 as Field>::random(&mut rng);
+		let v = <OurB256 as Field>::random(&mut rng);
+		let r = <OurB256 as Field>::random(&mut rng);
+		let (size, got) = prove_verify_b256_fold(u, v, r).expect("B256 FRI fold must PROVE+VERIFY");
+		assert_eq!(got, u + (v - u) * r, "in-circuit B256 fold != native");
+		assert_ne!(u + (v - u) * (r + <OurB256 as Field>::ONE), got, "fold not bound to r");
+		println!(
+			"GATE M3 b256-fold: FRI fold u+(v-u)·r over the FULL B256 field (NIST L1, via M3b \
+			 GF(2^256) mul) PROVES+VERIFIES == native B256 fold; proof = {size} bytes"
 		);
 	}
 
