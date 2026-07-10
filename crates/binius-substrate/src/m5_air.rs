@@ -574,6 +574,119 @@ pub fn prove_verify_query_open_fold(
 	Ok((sz, root, folded))
 }
 
+/// Prove + verify a TWO-ROUND single FRI query IN-CIRCUIT over B256 — the query-phase
+/// spine. Each round: a codeword leaf is Merkle-AUTHENTICATED to that round's root, bridged
+/// to field, and folded with its coset partner. The cross-round bind (M5-foldchain) asserts
+/// round 0's folded output IS round 1's authenticated leaf value (`next_value ==
+/// values[index%coset]`). Returns `(proof_bytes, [root0, root1], terminal)`; gated == native
+/// roots + native chained fold. Composes M5-queryopen x2 + the consistency assert.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_verify_query_2rounds(
+	v0: OurB256,
+	partner0: OurB256,
+	r0: OurB256,
+	tw0: OurB256,
+	idx0: usize,
+	sib0: &[[u8; 32]],
+	partner1: OurB256,
+	r1: OurB256,
+	tw1: OurB256,
+	idx1: usize,
+	sib1: &[[u8; 32]],
+) -> Result<(usize, [[u8; 32]; 2], OurB256)> {
+	let ser = |x: OurB256| {
+		let mut b = [0u8; 32];
+		b[0..16].copy_from_slice(&x.lo().to_underlier().to_le_bytes());
+		b[16..32].copy_from_slice(&x.hi().to_underlier().to_le_bytes());
+		b
+	};
+	// round 0 folds v0 with partner0 -> value1; round 1's authenticated leaf IS value1.
+	let value1 = fold_pair_native(v0, partner0, r0, tw0);
+	let leaf0 = ser(v0);
+	let leaf1 = ser(value1);
+	let root0_native = merkle_root_from_path(&leaf0, idx0, sib0);
+	let root1_native = merkle_root_from_path(&leaf1, idx1, sib1);
+	let terminal = fold_pair_native(value1, partner1, r1, tw1);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut table = cs.add_table("query: 2-round authenticated fold chain");
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bits = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let bm1 = mkmask(&mut table, "brmask_ff00", 0x0000_FF00);
+	let bm2 = mkmask(&mut table, "brmask_ff0000", 0x00FF_0000);
+	let beta_col = table.add_committed::<B64, 1>("beta");
+
+	// round 0: authenticate leaf0 (namespaced path) -> bridge -> fold with partner0.
+	let path0 = MerklePath::build_in(&mut table.with_namespace("r0"), sib0.len());
+	let lb0 = build_leaf_bridge(&mut table, path0.leaf, bm1, bm2, "lf0_");
+	let cv0 = col4(&mut table, "v0");
+	let cr0 = col4(&mut table, "cr0");
+	let ct0 = col4(&mut table, "ct0");
+	let fp0 = build_b256_fold_pair(&mut table, beta_col, lb0.cc, cv0, cr0, ct0, "fp0_");
+
+	// round 1: authenticate leaf1 -> bridge; consistency: fp0.folded == leaf1 value; fold.
+	let path1 = MerklePath::build_in(&mut table.with_namespace("r1"), sib1.len());
+	let lb1 = build_leaf_bridge(&mut table, path1.leaf, bm1, bm2, "lf1_");
+	for k in 0..4 {
+		table.assert_zero(format!("xround{k}"), fp0.folded[k] - lb1.cc[k]);
+	}
+	let cv1 = col4(&mut table, "v1");
+	let cr1 = col4(&mut table, "cr1");
+	let ct1 = col4(&mut table, "ct1");
+	let fp1 = build_b256_fold_pair(&mut table, beta_col, lb1.cc, cv1, cr1, ct1, "fp1_");
+	let table_id = table.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let (mut root0, mut root1) = ([0u8; 32], [0u8; 32]);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (p0, rr0, t0) = (split256(partner0), split256(r0), split256(tw0));
+		let (p1, rr1, t1) = (split256(partner1), split256(r1), split256(tw1));
+		for row in 0..NROWS {
+			wc(&mut seg, bm1, row, 0x0000_FF00)?;
+			wc(&mut seg, bm2, row, 0x00FF_0000)?;
+			wc64(&mut seg, beta_col, row, beta())?;
+			path0.populate(&mut seg, row, &leaf0, idx0, sib0)?;
+			pop_leaf_bridge(&lb0, &mut seg, row, v0)?;
+			path1.populate(&mut seg, row, &leaf1, idx1, sib1)?;
+			pop_leaf_bridge(&lb1, &mut seg, row, value1)?;
+			for i in 0..4 {
+				wc64(&mut seg, cv0[i], row, p0[i])?;
+				wc64(&mut seg, cr0[i], row, rr0[i])?;
+				wc64(&mut seg, ct0[i], row, t0[i])?;
+				wc64(&mut seg, cv1[i], row, p1[i])?;
+				wc64(&mut seg, cr1[i], row, rr1[i])?;
+				wc64(&mut seg, ct1[i], row, t1[i])?;
+			}
+			pop_b256_fold_pair(&fp0, &mut seg, row, v0, partner0, r0, tw0)?;
+			pop_b256_fold_pair(&fp1, &mut seg, row, value1, partner1, r1, tw1)?;
+		}
+		root0 = path0.read_root(&seg, 0)?;
+		root1 = path1.read_root(&seg, 0)?;
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	assert_eq!(root0, root0_native, "in-circuit root0 != native");
+	assert_eq!(root1, root1_native, "in-circuit root1 != native");
+	Ok((sz, [root0, root1], terminal))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -590,6 +703,42 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-query2 — a TWO-ROUND single FRI query PROVES+VERIFIES in ONE proof over
+	/// B256: each round authenticates its leaf (path->root), bridges, and folds; the
+	/// cross-round assert binds round 0's fold output to round 1's authenticated leaf value.
+	/// The query-phase spine (authenticate -> fold -> consistency -> authenticate -> fold).
+	#[test]
+	fn query_2rounds_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0x21; 32]);
+		use rand::SeedableRng;
+		let v0 = <OurB256 as Field>::random(&mut rng);
+		let partner0 = <OurB256 as Field>::random(&mut rng);
+		let (r0, tw0) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+		let partner1 = <OurB256 as Field>::random(&mut rng);
+		let (r1, tw1) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+		let sib0: [[u8; 32]; 2] = [std::array::from_fn(|i| (i as u8) ^ 0x33), std::array::from_fn(|i| (i as u8).wrapping_mul(5) ^ 0x71)];
+		let sib1: [[u8; 32]; 2] = [std::array::from_fn(|i| (i as u8).wrapping_mul(3) ^ 0x18), std::array::from_fn(|i| (i as u8) ^ 0xc4)];
+		let value1 = fold_pair_native(v0, partner0, r0, tw0);
+		let want_terminal = fold_pair_native(value1, partner1, r1, tw1);
+
+		let (size, roots, terminal) =
+			prove_verify_query_2rounds(v0, partner0, r0, tw0, 2, &sib0, partner1, r1, tw1, 1, &sib1)
+				.expect("2-round query must PROVE+VERIFY");
+		let ser = |x: OurB256| {
+			let mut b = [0u8; 32];
+			b[0..16].copy_from_slice(&x.lo().to_underlier().to_le_bytes());
+			b[16..32].copy_from_slice(&x.hi().to_underlier().to_le_bytes());
+			b
+		};
+		assert_eq!(roots[0], crate::merkle_air::merkle_root_from_path(&ser(v0), 2, &sib0), "root0 != native");
+		assert_eq!(roots[1], crate::merkle_air::merkle_root_from_path(&ser(value1), 1, &sib1), "root1 != native");
+		assert_eq!(terminal, want_terminal, "terminal fold != native");
+		println!(
+			"GATE M5-query2: 2-round single FRI query (authenticate->fold->consistency->\
+			 authenticate->fold) PROVES+VERIFIES over B256 @L1(128) == native; proof = {size} bytes"
+		);
 	}
 
 	/// GATE M5-queryopen — the FULL per-query binding in ONE proof: a codeword leaf is
