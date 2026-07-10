@@ -181,6 +181,92 @@ pub fn prove_verify_query_index(word0: u32, bits: usize) -> Result<(usize, u32)>
 	Ok((sz, index))
 }
 
+/// Prove + verify the CODEWORD-LEAF -> B256-field bridge in-circuit: a FRI codeword value
+/// as it appears in a query opening — its 32 canonical-serialization bytes read big-endian
+/// into 8 SHA-256 message words (the M2 Merkle-leaf representation) — bridges (bswap + pack)
+/// to the 4 B64 field components the fold consumes. Returns `(proof_bytes, [component u64;
+/// 4])`, gated == `split256(value)`. read_scalar_slice deserializes with the SAME
+/// SerializationMode::CanonicalTower as the challenge sampler, so this is the M5 challenge
+/// bridge re-applied to a codeword value — no new primitive for the per-query value path.
+pub fn prove_verify_codeword_bridge(value: OurB256) -> Result<(usize, [u64; 4])> {
+	// canonical serialization: lo(16 LE) ‖ hi(16 LE); read BE into 8 SHA-256 message words.
+	let mut bytes = [0u8; 32];
+	bytes[0..16].copy_from_slice(&value.lo().to_underlier().to_le_bytes());
+	bytes[16..32].copy_from_slice(&value.hi().to_underlier().to_le_bytes());
+	let words: [u32; 8] = std::array::from_fn(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()));
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("codeword leaf -> B256 field bridge");
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bits = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let m1 = mkmask(&mut t, "mask_ff00", 0x0000_FF00);
+	let m2 = mkmask(&mut t, "mask_ff0000", 0x00FF_0000);
+	let cw: [Col<B1, 32>; 8] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("w{i}")));
+	let bsw: [BSwap32; 8] = std::array::from_fn(|i| build_bswap32(&mut t, cw[i], m1, m2, &format!("bs{i}_")));
+	let g: [Col<B1, 64>; 4] = std::array::from_fn(|k| t.add_committed::<B1, 64>(format!("g{k}")));
+	let mut los: Vec<Col<B1, 32>> = Vec::new();
+	let mut his: Vec<Col<B1, 32>> = Vec::new();
+	let mut cc: Vec<Col<B64, 1>> = Vec::new();
+	for k in 0..4 {
+		let lo = t.add_selected_block::<B1, 64, 32>(format!("g{k}_lo"), g[k], 0);
+		let hi = t.add_selected_block::<B1, 64, 32>(format!("g{k}_hi"), g[k], 1);
+		t.assert_zero(format!("g{k}_loc"), lo - bsw[2 * k].out);
+		t.assert_zero(format!("g{k}_hic"), hi - bsw[2 * k + 1].out);
+		cc.push(t.add_packed::<B1, 64, B64, 1>(format!("c{k}"), g[k]));
+		los.push(lo);
+		his.push(hi);
+	}
+	let table_id = t.id();
+
+	// native gate: the bridged components == the B256 tower components of `value`.
+	let want: [u64; 4] = std::array::from_fn(|k| split256(value)[k].to_underlier());
+	let comp = |k: usize| (words[2 * k].swap_bytes() as u64) | ((words[2 * k + 1].swap_bytes() as u64) << 32);
+	for k in 0..4 {
+		assert_eq!(comp(k), want[k], "codeword-leaf bridge native mapping != split256(value)");
+	}
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw.full_segment();
+		for row in 0..NROWS {
+			wc(&mut seg, m1, row, 0x0000_FF00)?;
+			wc(&mut seg, m2, row, 0x00FF_0000)?;
+			for i in 0..8 {
+				wc(&mut seg, cw[i], row, words[i])?;
+				pop_bswap32(&bsw[i], &mut seg, row, words[i])?;
+			}
+			for k in 0..4 {
+				let gbits: Vec<bool> = (0..64).map(|b| (want[k] >> b) & 1 == 1).collect();
+				crate::nonnative::write_col::<64>(&mut seg, g[k], row, &gbits)?;
+				let lob: Vec<bool> = (0..32).map(|b| (want[k] >> b) & 1 == 1).collect();
+				let hib: Vec<bool> = (0..32).map(|b| (want[k] >> (32 + b)) & 1 == 1).collect();
+				crate::nonnative::write_col::<32>(&mut seg, los[k], row, &lob)?;
+				crate::nonnative::write_col::<32>(&mut seg, his[k], row, &hib)?;
+			}
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	let _ = cc;
+	Ok((sz, want))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -197,6 +283,28 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-cwbridge — a FRI codeword leaf value bridges to the fold's field cols
+	/// in-circuit: the 32 canonical-serialization bytes (as M2 hashes them, big-endian SHA
+	/// words) map (bswap + pack) to the 4 B64 components == split256(value). Since
+	/// read_scalar_slice uses the SAME CanonicalTower mode as challenge sampling, the per-
+	/// query VALUE path reuses the M5 bridge — no new primitive.
+	#[test]
+	fn codeword_bridge_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xc0; 32]);
+		use rand::SeedableRng;
+		for _ in 0..3 {
+			let value = <OurB256 as Field>::random(&mut rng);
+			let (size, got) = prove_verify_codeword_bridge(value).expect("codeword bridge must PROVE+VERIFY");
+			let want: [u64; 4] = std::array::from_fn(|k| split256(value)[k].to_underlier());
+			assert_eq!(got, want, "in-circuit codeword bridge != split256(value)");
+			let _ = size;
+		}
+		println!(
+			"GATE M5-cwbridge: FRI codeword leaf (canonical bytes, big-endian SHA words) bridges \
+			 to 4 B64 fold cols == split256(value) over B256 @L1(128) — per-query value path"
+		);
 	}
 
 	/// GATE M5-kernel — a recomputed FS challenge DRIVES the FRI fold in ONE proof: the
