@@ -236,6 +236,42 @@ pub fn prove_verify_b256(n_rows: usize, log_inv_rate: usize, security_bits: usiz
 	build_prove_verify_b256(n_rows, log_inv_rate, security_bits, false)
 }
 
+/// Measure PROVE and VERIFY wall-time + proof size of the `x*x=y` circuit over B256 across
+/// row counts, at the given `log_inv_rate`/`security_bits` (128=L1, 192=L3). Same circuit as
+/// the B512 (L5) measurement, for a fair cross-field verify-scaling / proof-size comparison.
+pub fn measure_square_scaling_b256(
+	rows_list: &[usize],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>> {
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in rows_list {
+		let n_rows = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let table = SquareTable::new(&mut cs, false);
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+		let events = witness_events(n_rows);
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		witness.fill_table_parallel(&table, &events)?;
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, log_inv_rate, security_bits, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof)?;
+		out.push((n_rows, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 /// The kappa_FS soundness signal: the tower-level of the challenge/extension field.
 pub fn b256_top_field_bits() -> usize {
 	<OurB256 as BinaryField>::N_BITS

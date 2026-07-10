@@ -225,6 +225,43 @@ fn dishonest_witness_is_rejected(n_rows: usize, log_inv_rate: usize, security_bi
 	.is_err()
 }
 
+/// Measure PROVE and VERIFY wall-time + proof size of the `x*x=y` circuit over B512 (L5,
+/// security 256) across row counts — the same circuit as `measure_square_scaling_b256`, so
+/// the B256(L1/L3) vs B512(L5) numbers are directly comparable (field bytes 32->64, tower
+/// mul ~3x, deeper Merkle nodes).
+pub fn measure_square_scaling_b512(
+	rows_list: &[usize],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>> {
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in rows_list {
+		let n_rows = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB512>::new();
+		let table = SquareTable::new(&mut cs, false);
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+		let events = witness_events(n_rows);
+		let mut witness = WitnessIndex::<OurB512>::new(&cs, &allocator);
+		witness.fill_table_parallel(&table, &events)?;
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U512, B512TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, log_inv_rate, security_bits, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U512, B512TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof)?;
+		out.push((n_rows, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 /// Public entry: honest prove+verify over B512, returning proof size in bytes.
 pub fn prove_verify_b512(n_rows: usize, log_inv_rate: usize, security_bits: usize) -> Result<usize> {
 	build_prove_verify_b512(n_rows, log_inv_rate, security_bits, false)
@@ -263,6 +300,36 @@ fn mle_eval<F: Field + From<B8>>(values: &[B8], r: &[F]) -> F {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// NIST-LEVEL verify-scaling + proof-size comparison on the SAME `x*x=y` circuit:
+	/// L1 = B256@128, L3 = B256@192, L5 = B512@256 (all blowup=2). Answers the twice-asked
+	/// question — how verify time and proof size scale across the field ladder — with the
+	/// same gate so the field is the only variable. Reported (not asserted).
+	#[test]
+	fn nist_level_verify_scaling() {
+		let rows = [4096usize, 16384, 65536];
+		let l1 = crate::b256_prove::measure_square_scaling_b256(&rows, 1, 128).expect("L1");
+		let l3 = crate::b256_prove::measure_square_scaling_b256(&rows, 1, 192).expect("L3");
+		let l5 = measure_square_scaling_b512(&rows, 1, 256).expect("L5");
+		println!("| level (field@sec) | rows | prove ms | verify ms | proof B |");
+		println!("|:--|---:|---:|---:|---:|");
+		for (tag, res) in [("L1 B256@128", &l1), ("L3 B256@192", &l3), ("L5 B512@256", &l5)] {
+			for (n, p, v, sz) in res {
+				println!("| {tag} | {n} | {p} | {v} | {sz} |");
+			}
+		}
+		// headline ratios at the largest row count (recursion scale proxy).
+		let last = |r: &Vec<(usize, u128, u128, usize)>| *r.last().unwrap();
+		let (_, _, v1, s1) = last(&l1);
+		let (_, _, v3, s3) = last(&l3);
+		let (_, _, v5, s5) = last(&l5);
+		println!(
+			"# @16384 rows: verify L1={v1}ms L3={v3}ms L5={v5}ms (L5/L1={:.1}x); proof L1={s1}B L3={s3}B L5={s5}B (L5/L1={:.1}x). \
+			 Same x*x=y gate; field is the only variable. Recursion hash = SHA-256 (FIPS) at ALL levels; \
+			 the field ladder (B256->B512) is what changes verify/proof.",
+			v5 as f64 / v1.max(1) as f64, s5 as f64 / s1 as f64
+		);
+	}
 
 	/// GATE 1 — the ring-switch generalization RUNS END-TO-END at NIST L5. A real proof
 	/// of the `x*x=y` circuit over the 512-bit challenge field `B512TowerFamily`
