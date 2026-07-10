@@ -195,13 +195,19 @@ pub fn prove_verify_fs_bridge(words: [u32; 8]) -> Result<(usize, [u64; 4])> {
 	let bsw: [BSwap32; 8] = std::array::from_fn(|i| build_bswap32(&mut t, cw[i], m1, m2, &format!("bs{i}_")));
 	// g[k] (B1x64) = bswap(w[2k]) (low 32) || bswap(w[2k+1]) (high 32); c[k] = packed(g[k]).
 	let g: [Col<B1, 64>; 4] = std::array::from_fn(|k| t.add_committed::<B1, 64>(format!("g{k}")));
-	let cc: [Col<B64, 1>; 4] = std::array::from_fn(|k| {
+	let mut los: Vec<Col<B1, 32>> = Vec::new();
+	let mut his: Vec<Col<B1, 32>> = Vec::new();
+	let mut cc: Vec<Col<B64, 1>> = Vec::new();
+	for k in 0..4 {
+		// add_selected_block columns are NOT auto-derived — they are populated below.
 		let lo = t.add_selected_block::<B1, 64, 32>(format!("g{k}_lo"), g[k], 0);
 		let hi = t.add_selected_block::<B1, 64, 32>(format!("g{k}_hi"), g[k], 1);
 		t.assert_zero(format!("g{k}_loc"), lo - bsw[2 * k].out);
 		t.assert_zero(format!("g{k}_hic"), hi - bsw[2 * k + 1].out);
-		t.add_packed::<B1, 64, B64, 1>(format!("c{k}"), g[k])
-	});
+		cc.push(t.add_packed::<B1, 64, B64, 1>(format!("c{k}"), g[k]));
+		los.push(lo);
+		his.push(hi);
+	}
 	let table_id = t.id();
 
 	const NROWS: usize = 64;
@@ -221,7 +227,13 @@ pub fn prove_verify_fs_bridge(words: [u32; 8]) -> Result<(usize, [u64; 4])> {
 				pop_bswap32(&bsw[i], &mut seg, row, words[i])?;
 			}
 			for k in 0..4 {
-				crate::nonnative::write_col::<64>(&mut seg, g[k], row, &(0..64).map(|b| (want[k] >> b) & 1 == 1).collect::<Vec<_>>())?;
+				let gbits: Vec<bool> = (0..64).map(|b| (want[k] >> b) & 1 == 1).collect();
+				crate::nonnative::write_col::<64>(&mut seg, g[k], row, &gbits)?;
+				// the two 32-bit blocks of g[k] must be populated explicitly.
+				let lob: Vec<bool> = (0..32).map(|b| (want[k] >> b) & 1 == 1).collect();
+				let hib: Vec<bool> = (0..32).map(|b| (want[k] >> (32 + b)) & 1 == 1).collect();
+				crate::nonnative::write_col::<32>(&mut seg, los[k], row, &lob)?;
+				crate::nonnative::write_col::<32>(&mut seg, his[k], row, &hib)?;
 			}
 		}
 	}
@@ -317,7 +329,6 @@ mod tests {
 	/// #[ignore]: WIP — add_selected_block/add_packed bit-order convention to resolve
 	/// (native mapping is confirmed by fs_field_bridge_mapping; circuit plumbing pending).
 	#[test]
-	#[ignore = "M5 bridge WIP: add_selected_block/pack bit-order convention to resolve"]
 	fn fs_bridge_proves_over_b256() {
 		use crate::b256_field::B256 as OurB256_;
 		use binius_field::underlier::WithUnderlier as _;
