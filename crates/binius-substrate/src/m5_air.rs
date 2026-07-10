@@ -22,6 +22,8 @@ use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 use crate::fs_air::{build_bswap32, pop_bswap32, u32_bits, wc, BSwap32};
 use crate::gf256_air::{beta, build_b256_fold_pair, col4, fold_pair_native, pop_b256_fold_pair, split256, wc64};
 use crate::merkle_air::{merkle_root_from_path, MerklePath};
+use crate::sha256_air::{build_k_cols, build_sha256_core, populate_sha256_core, K256};
+use crate::fs_air::{sha256_hash_ref, sha256_pad, SHA256_IV};
 
 /// Prove + verify the M5 kernel: given a FS-challenge digest (8 SHA-256 words) and fold
 /// operands `u,v` + twiddle `tw`, recompute the B256 challenge `r` from the digest
@@ -687,6 +689,109 @@ pub fn prove_verify_query_2rounds(
 	Ok((sz, [root0, root1], terminal))
 }
 
+/// Prove + verify that a fold challenge DERIVED from the transcript by an in-circuit
+/// SHA-256 drives the FRI fold — the honest-challenge tie. Unlike M5-kernel (which takes
+/// the digest as a committed input), here the digest is COMPUTED in-circuit: the FS input
+/// `SHA-256([]) ‖ 0u64 ‖ transcript` is hashed (M4a core), its output bridges to the B256
+/// challenge, and that challenge folds `u,v`. So the challenge is provably `SHA-256` of the
+/// transcript — non-malleable. `transcript` must be <= 15 bytes (single SHA block). Returns
+/// `(proof_bytes, folded)`, gated == native fold with the real FS challenge.
+pub fn prove_verify_scheduled_fold(transcript: &[u8], u: OurB256, v: OurB256, tw: OurB256) -> Result<(usize, OurB256)> {
+	use sha2::Digest;
+	// native FS challenge from the transcript, and the fold it should produce.
+	let mut fs_input = Vec::new();
+	fs_input.extend_from_slice(&Sha256::digest([]));
+	fs_input.extend_from_slice(&0u64.to_le_bytes());
+	fs_input.extend_from_slice(transcript);
+	let padded = sha256_pad(&fs_input);
+	assert!(padded.len() == 64, "transcript must be <= 15 bytes for a single SHA block");
+	let block: [u32; 16] = std::array::from_fn(|i| {
+		u32::from_be_bytes([padded[4 * i], padded[4 * i + 1], padded[4 * i + 2], padded[4 * i + 3]])
+	});
+	let st = sha256_hash_ref(&fs_input); // 8 digest words
+	let mut digest = [0u8; 32];
+	for i in 0..8 {
+		digest[4 * i..4 * i + 4].copy_from_slice(&st[i].to_be_bytes());
+	}
+	let r = OurB256::deserialize(&digest[..], SerializationMode::CanonicalTower).unwrap();
+	let folded = fold_pair_native(u, v, r, tw);
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("scheduled challenge drives fold");
+	let mkmask = |t: &mut binius_m3::builder::TableBuilder<OurB256>, nm: &str, val: u32| {
+		let bits = u32_bits(val);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(nm.to_string(), arr)
+	};
+	let m1 = mkmask(&mut t, "mask_ff00", 0x0000_FF00);
+	let m2 = mkmask(&mut t, "mask_ff0000", 0x00FF_0000);
+	// in-circuit SHA-256 of the FS input -> digest columns.
+	let k_cols = build_k_cols(&mut t);
+	let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
+		let bits = u32_bits(SHA256_IV[i]);
+		let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+		t.add_constant(format!("iv{i}"), arr)
+	});
+	let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| t.add_committed::<B1, 32>(format!("w{i}")));
+	let core = build_sha256_core(&mut t.with_namespace("h"), ivc, w_in, &k_cols);
+	let dcols = core.h_out; // the digest words that seed the challenge
+	// bridge: digest words -> B256 challenge (bswap + pack), reusing the leaf bridge.
+	let lb = build_leaf_bridge(&mut t, dcols, m1, m2, "ch_");
+	// fold u,v with the derived challenge.
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cu = col4(&mut t, "u");
+	let cv = col4(&mut t, "v");
+	let ctw = col4(&mut t, "tw");
+	let fp = build_b256_fold_pair(&mut t, beta_col, cu, cv, lb.cc, ctw, "fp_");
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (uv, vv, tvv) = (split256(u), split256(v), split256(tw));
+		// the challenge value r (as split256) is what pop_leaf_bridge must encode.
+		for row in 0..NROWS {
+			wc(&mut seg, m1, row, 0x0000_FF00)?;
+			wc(&mut seg, m2, row, 0x00FF_0000)?;
+			for (t2, col) in k_cols.iter().enumerate() {
+				wc(&mut seg, *col, row, K256[t2])?;
+			}
+			for i in 0..8 {
+				wc(&mut seg, ivc[i], row, SHA256_IV[i])?;
+				wc(&mut seg, w_in[i], row, block[i])?;
+			}
+			for i in 8..16 {
+				wc(&mut seg, w_in[i], row, block[i])?;
+			}
+			populate_sha256_core(&core, &mut seg, row, &SHA256_IV, &block)?;
+			pop_leaf_bridge(&lb, &mut seg, row, r)?; // bridge over the (computed) digest words -> r
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cu[i], row, uv[i])?;
+				wc64(&mut seg, cv[i], row, vv[i])?;
+				wc64(&mut seg, ctw[i], row, tvv[i])?;
+			}
+			pop_b256_fold_pair(&fp, &mut seg, row, u, v, r, tw)?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, folded))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -703,6 +808,42 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-schedfold — a fold challenge DERIVED from the transcript by an in-circuit
+	/// SHA-256 drives the FRI fold: the FS input is hashed (M4a), its digest bridges to the
+	/// B256 challenge, and that challenge folds u,v == native fold with the real FS
+	/// challenge. Closes the honest-challenge gap — the fold challenge is provably SHA-256
+	/// of the transcript, not a free input.
+	#[test]
+	fn scheduled_fold_proves_over_b256() {
+		use binius_utils::{DeserializeBytes, SerializationMode};
+		use sha2::Digest;
+		let mut rng = rand::rngs::StdRng::from_seed([0x5e; 32]);
+		use rand::SeedableRng;
+		let transcript: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(19) ^ 0x2c);
+		let u = <OurB256 as Field>::random(&mut rng);
+		let v = <OurB256 as Field>::random(&mut rng);
+		let tw = <OurB256 as Field>::random(&mut rng);
+		// independent native expectation
+		let mut fs_input = Vec::new();
+		fs_input.extend_from_slice(&Sha256::digest([]));
+		fs_input.extend_from_slice(&0u64.to_le_bytes());
+		fs_input.extend_from_slice(&transcript);
+		let st = crate::fs_air::sha256_hash_ref(&fs_input);
+		let mut digest = [0u8; 32];
+		for i in 0..8 {
+			digest[4 * i..4 * i + 4].copy_from_slice(&st[i].to_be_bytes());
+		}
+		let r = OurB256::deserialize(&digest[..], SerializationMode::CanonicalTower).unwrap();
+		let want = fold_pair_native(u, v, r, tw);
+
+		let (size, got) = prove_verify_scheduled_fold(&transcript, u, v, tw).expect("scheduled fold must PROVE+VERIFY");
+		assert_eq!(got, want, "in-circuit scheduled fold != native fold with FS challenge");
+		println!(
+			"GATE M5-schedfold: fold challenge DERIVED in-circuit (SHA-256 of transcript -> bridge) \
+			 drives the fold over B256 @L1(128) == native; proof = {size} bytes"
+		);
 	}
 
 	/// GATE M5-query2 — a TWO-ROUND single FRI query PROVES+VERIFIES in ONE proof over
