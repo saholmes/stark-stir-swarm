@@ -997,8 +997,9 @@ pub struct RecursionScope {
 	pub n_test_queries: usize,
 }
 
-/// Build a minimal real inner proof (one B256 fold_pair) and report its verification scope.
-pub fn introspect_recursion_scope() -> Result<RecursionScope> {
+/// Build a minimal real inner proof (one B256 fold_pair) at the given `log_inv_rate`
+/// (blowup = 2^log_inv_rate) and report its verification scope.
+pub fn introspect_recursion_scope(log_inv_rate: usize) -> Result<RecursionScope> {
 	use binius_core::merkle_tree::BinaryMerkleTreeScheme;
 	use binius_core::piop;
 	use binius_field::BinaryField32b;
@@ -1045,14 +1046,18 @@ pub fn introspect_recursion_scope() -> Result<RecursionScope> {
 	let witness = witness.into_multilinear_extension_index();
 	let proof = binius_core::constraint_system::prove::<
 		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
-	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	>(&ccs, log_inv_rate, 128, &statement.boundaries, witness, &make_portable_backend())?;
 	let proof_bytes = proof.get_proof_size();
 
 	// reconstruct fri_params exactly as constraint_system::verify does.
 	let merkle_scheme = BinaryMerkleTreeScheme::<OurB256, Sha256, _>::new(Sha256Compression::default());
 	let (commit_meta, _oracle_to_commit) = piop::make_oracle_commit_meta(&ccs.oracles)?;
-	let fri_params =
-		piop::make_commit_params_with_optimal_arity::<OurB256, BinaryField32b, _>(&commit_meta, &merkle_scheme, 128, 1)?;
+	let fri_params = piop::make_commit_params_with_optimal_arity::<OurB256, BinaryField32b, _>(
+		&commit_meta,
+		&merkle_scheme,
+		128,
+		log_inv_rate,
+	)?;
 	let fold_arities = fri_params.fold_arities().to_vec();
 	Ok(RecursionScope {
 		proof_bytes,
@@ -1090,7 +1095,7 @@ mod tests {
 	/// the assembly + ground the benchmark's single-verify cost.
 	#[test]
 	fn recursion_scope_introspection() {
-		let s = introspect_recursion_scope().expect("introspection must succeed");
+		let s = introspect_recursion_scope(1).expect("introspection must succeed");
 		println!(
 			"RECURSION-SCOPE (inner = 1 B256 fold_pair, L1, blowup=2): proof={} B  total_vars={}  \
 			 FRI: {} rounds arities={:?} index_bits={} terminate_len={} n_oracles={} n_queries={}",
@@ -1098,6 +1103,49 @@ mod tests {
 			s.terminate_codeword_len, s.n_oracles, s.n_test_queries
 		);
 		assert!(s.proof_bytes > 0);
+	}
+
+	/// Blowup sweep — n_queries (and thus the in-circuit verifier workload) vs blowup. The
+	/// recursion circuit is dominated by n_queries x per-query [Merkle opens + chunk-folds];
+	/// higher blowup cuts n_queries. Reports the per-op verifier work each blowup implies.
+	#[test]
+	fn recursion_scope_blowup_sweep() {
+		println!(
+			"| blowup | proof B | n_queries | FRI rounds (arities) | per-query SHA-compress | \
+			 per-query fold_pairs | total SHA-compress | total fold_pairs |"
+		);
+		println!("|---:|---:|---:|:--|---:|---:|---:|---:|");
+		for lir in 1..=5usize {
+			let s = match introspect_recursion_scope(lir) {
+				Ok(s) => s,
+				Err(e) => {
+					println!("| {} | (prove failed: {e}) |", 1usize << lir);
+					continue;
+				}
+			};
+			// per query: for each FRI round r, open a coset of size 2^arity via a Merkle path
+			// of depth = index_bits - (sum of prior arities); a depth-d path = d SHA-256
+			// compressions; an arity-a coset fold = (2^a - 1) fold_pairs (chunk-fold).
+			let mut depth = s.index_bits;
+            let mut sha_per_q = 0usize;
+			let mut folds_per_q = 0usize;
+			for &a in &s.fold_arities {
+				sha_per_q += depth; // one authentication path this round
+				folds_per_q += (1usize << a) - 1; // chunk-fold of the 2^a coset
+				depth = depth.saturating_sub(a);
+			}
+			let tot_sha = sha_per_q * s.n_test_queries;
+			let tot_folds = folds_per_q * s.n_test_queries;
+			println!(
+				"| {} | {} | {} | {} {:?} | {} | {} | {} | {} |",
+				1usize << lir, s.proof_bytes, s.n_test_queries, s.n_fri_rounds, s.fold_arities,
+				sha_per_q, folds_per_q, tot_sha, tot_folds
+			);
+		}
+		println!(
+			"# Recursion circuit is dominated by n_queries x per-query work. Higher blowup cuts \
+			 n_queries (fewer in-circuit Merkle opens + folds) at the cost of a larger inner proof."
+		);
 	}
 
 	/// GATE M5-sumchain — a TWO-ROUND sumcheck chain PROVES+VERIFIES in-circuit over B256:
