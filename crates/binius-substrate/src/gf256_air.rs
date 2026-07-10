@@ -401,6 +401,151 @@ pub fn fold_pair_native(u: OurB256, v: OurB256, r: OurB256, t: OurB256) -> OurB2
 	up + (vp - up) * r
 }
 
+// --- reusable fold_pair builder (namespaced, so a chunk-fold can chain many) ------
+
+struct FoldPairCols {
+	vp: [Col<B64, 1>; 4],
+	up: [Col<B64, 1>; 4],
+	d: [Col<B64, 1>; 4],
+	m1: B256MulCols,
+	m2: B256MulCols,
+	folded: [Col<B64, 1>; 4],
+}
+
+fn col4(t: &mut TableBuilder<OurB256>, nm: &str) -> [Col<B64, 1>; 4] {
+	std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{nm}{i}")))
+}
+
+/// Build one fold_pair on given input columns; returns `folded` + intermediates. `pfx`
+/// namespaces columns so a chunk-fold can chain several in one table.
+fn build_b256_fold_pair(
+	t: &mut TableBuilder<OurB256>,
+	beta_col: Col<B64, 1>,
+	cu: [Col<B64, 1>; 4],
+	cv: [Col<B64, 1>; 4],
+	cr: [Col<B64, 1>; 4],
+	ct: [Col<B64, 1>; 4],
+	pfx: &str,
+) -> FoldPairCols {
+	let vp = col4(t, &format!("{pfx}vp"));
+	for i in 0..4 {
+		t.assert_zero(format!("{pfx}vp{i}c"), vp[i] - (cv[i] + cu[i]));
+	}
+	let m1 = build_b256_mul(t, beta_col, vp, ct, &format!("{pfx}m1_"));
+	let up = col4(t, &format!("{pfx}up"));
+	for i in 0..4 {
+		t.assert_zero(format!("{pfx}up{i}c"), up[i] - (cu[i] + m1.c[i]));
+	}
+	let d = col4(t, &format!("{pfx}d"));
+	for i in 0..4 {
+		t.assert_zero(format!("{pfx}d{i}c"), d[i] - (vp[i] + up[i]));
+	}
+	let m2 = build_b256_mul(t, beta_col, d, cr, &format!("{pfx}m2_"));
+	let folded = col4(t, &format!("{pfx}f"));
+	for i in 0..4 {
+		t.assert_zero(format!("{pfx}f{i}c"), folded[i] - (up[i] + m2.c[i]));
+	}
+	FoldPairCols { vp, up, d, m1, m2, folded }
+}
+
+/// Populate a fold_pair from native B256 (u,v,r,t); writes all columns, returns folded.
+fn pop_b256_fold_pair(
+	fp: &FoldPairCols,
+	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
+	row: usize,
+	u: OurB256,
+	v: OurB256,
+	r: OurB256,
+	tw: OurB256,
+) -> Result<OurB256> {
+	let vp = v + u;
+	let up = u + vp * tw;
+	let d = vp - up;
+	let folded = up + d * r;
+	let (vpv, upv, dv, tv, rv) = (split256(vp), split256(up), split256(d), split256(tw), split256(r));
+	for i in 0..4 {
+		wc64(seg, fp.vp[i], row, vpv[i])?;
+		wc64(seg, fp.up[i], row, upv[i])?;
+		wc64(seg, fp.d[i], row, dv[i])?;
+		wc64(seg, fp.folded[i], row, split256(folded)[i])?;
+	}
+	pop_b256_mul(&fp.m1, seg, row, vpv, tv)?;
+	pop_b256_mul(&fp.m2, seg, row, dv, rv)?;
+	Ok(folded)
+}
+
+/// Prove + verify a FRI `fold_chunk` of arity 2 (a coset of 4 values folded to 1 via 3
+/// chained fold_pairs) in-circuit over B256 — the coset-fold `fold_chunk` performs per
+/// query. `challenges[level]`, `tw[fold]` are the round challenges / domain twiddles.
+/// Returns `(proof_bytes, folded)`; gated against the native chunk-fold.
+pub fn prove_verify_b256_fold_chunk4(
+	values: [OurB256; 4],
+	challenges: [OurB256; 2],
+	tw: [OurB256; 3],
+) -> Result<(usize, OurB256)> {
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("fri fold_chunk arity-2 over B256");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cvals: [[Col<B64, 1>; 4]; 4] = std::array::from_fn(|j| col4(&mut t, &format!("val{j}_")));
+	let cch: [[Col<B64, 1>; 4]; 2] = std::array::from_fn(|j| col4(&mut t, &format!("ch{j}_")));
+	let ctw: [[Col<B64, 1>; 4]; 3] = std::array::from_fn(|j| col4(&mut t, &format!("tw{j}_")));
+	// Level 0: fold (v0,v1) and (v2,v3) with challenge 0; Level 1: fold those with challenge 1.
+	let f0 = build_b256_fold_pair(&mut t, beta_col, cvals[0], cvals[1], cch[0], ctw[0], "a_");
+	let f1 = build_b256_fold_pair(&mut t, beta_col, cvals[2], cvals[3], cch[0], ctw[1], "b_");
+	let f2 = build_b256_fold_pair(&mut t, beta_col, f0.folded, f1.folded, cch[1], ctw[2], "c_");
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	// native chunk-fold
+	let a = fold_pair_native(values[0], values[1], challenges[0], tw[0]);
+	let b = fold_pair_native(values[2], values[3], challenges[0], tw[1]);
+	let folded = fold_pair_native(a, b, challenges[1], tw[2]);
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for j in 0..4 {
+				let vv = split256(values[j]);
+				for i in 0..4 {
+					wc64(&mut seg, cvals[j][i], row, vv[i])?;
+				}
+			}
+			for j in 0..2 {
+				let cv = split256(challenges[j]);
+				for i in 0..4 {
+					wc64(&mut seg, cch[j][i], row, cv[i])?;
+				}
+			}
+			for j in 0..3 {
+				let tvv = split256(tw[j]);
+				for i in 0..4 {
+					wc64(&mut seg, ctw[j][i], row, tvv[i])?;
+				}
+			}
+			let av = pop_b256_fold_pair(&f0, &mut seg, row, values[0], values[1], challenges[0], tw[0])?;
+			let bv = pop_b256_fold_pair(&f1, &mut seg, row, values[2], values[3], challenges[0], tw[1])?;
+			pop_b256_fold_pair(&f2, &mut seg, row, av, bv, challenges[1], tw[2])?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, folded))
+}
+
 /// Prove + verify the FULL FRI `fold_pair` (with domain twiddle `t`) in-circuit over
 /// B256 — two GF(2^256) muls (`v'·t` and `(v'-u')·r`) + XORs. This is the exact
 /// per-pair operation `fold_chunk` applies across a coset. Gated against the native.
@@ -577,6 +722,27 @@ mod tests {
 		println!(
 			"GATE M3c fold_pair: the exact FRI fold_pair (v'=v+u; u'=u+v'·t; folded=u'+(v'-u')·r) \
 			 PROVES+VERIFIES over B256 @L1(128) via 2 GF(2^256) muls == binius fold_pair; proof = {size} bytes"
+		);
+	}
+
+	/// GATE M3 chunk-fold — a full FRI fold_chunk (arity 2: coset of 4 values folded to
+	/// 1 via 3 chained fold_pairs) proves+verifies in-circuit over B256 == the native
+	/// chunk-fold. This is the coset-fold the recursive verifier runs per FRI query.
+	#[test]
+	fn b256_fold_chunk_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xC4; 32]);
+		let values: [OurB256; 4] = std::array::from_fn(|_| <OurB256 as Field>::random(&mut rng));
+		let challenges: [OurB256; 2] = std::array::from_fn(|_| <OurB256 as Field>::random(&mut rng));
+		let tw: [OurB256; 3] = std::array::from_fn(|_| <OurB256 as Field>::random(&mut rng));
+		let a = fold_pair_native(values[0], values[1], challenges[0], tw[0]);
+		let b = fold_pair_native(values[2], values[3], challenges[0], tw[1]);
+		let want = fold_pair_native(a, b, challenges[1], tw[2]);
+		let (size, got) = prove_verify_b256_fold_chunk4(values, challenges, tw)
+			.expect("fold_chunk must PROVE+VERIFY over B256");
+		assert_eq!(got, want, "in-circuit fold_chunk != native");
+		println!(
+			"GATE M3 fold_chunk: FRI fold_chunk (arity 2, 4-value coset -> 1 via 3 chained \
+			 fold_pairs = 6 GF(2^256) muls) PROVES+VERIFIES over B256 @L1(128) == native; proof = {size} bytes"
 		);
 	}
 
