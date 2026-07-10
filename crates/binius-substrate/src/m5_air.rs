@@ -20,7 +20,9 @@ use sha2::Sha256;
 
 use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 use crate::fs_air::{build_bswap32, pop_bswap32, u32_bits, wc, BSwap32};
-use crate::gf256_air::{beta, build_b256_fold_pair, col4, fold_pair_native, pop_b256_fold_pair, split256, wc64};
+use crate::gf256_air::{
+	beta, build_b256_fold_pair, build_b256_mul, col4, fold_pair_native, pop_b256_fold_pair, pop_b256_mul, split256, wc64,
+};
 use crate::merkle_air::{merkle_root_from_path, MerklePath};
 use crate::sha256_air::{build_k_cols, build_sha256_core, populate_sha256_core, K256};
 use crate::fs_air::{sha256_hash_ref, sha256_pad, SHA256_IV};
@@ -792,6 +794,192 @@ pub fn prove_verify_scheduled_fold(transcript: &[u8], u: OurB256, v: OurB256, tw
 	Ok((sz, folded))
 }
 
+/// Prove + verify ONE sumcheck round IN-CIRCUIT over B256 — the STARK verifier's other
+/// half (field arithmetic, not FRI). A round univariate `g` of degree <= 2 is given by
+/// coefficients `[c0,c1,c2]` (g(X)=c0+c1·X+c2·X²). The verifier checks the round claim
+/// `g(0)+g(1) == claim` (over GF(2^k), g(0)+g(1)=c1+c2) and reduces to the next claim
+/// `g(x)` at the sampled challenge `x` via Horner (two B256 muls). Returns
+/// `(proof_bytes, next_claim)`; gated == native `g(x)`, with the round check enforced
+/// in-circuit. Composes gf256_air B256 multiply — reusable per sumcheck round.
+pub fn prove_verify_sumcheck_round(c0: OurB256, c1: OurB256, c2: OurB256, x: OurB256) -> Result<(usize, OurB256)> {
+	let claim = c1 + c2; // = g(0)+g(1) in characteristic 2
+	let next = c0 + c1 * x + c2 * x * x; // g(x)
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("sumcheck round: claim check + g(x) reduce");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cc0 = col4(&mut t, "c0");
+	let cc1 = col4(&mut t, "c1");
+	let cc2 = col4(&mut t, "c2");
+	let cx = col4(&mut t, "x");
+	let cclaim = col4(&mut t, "claim");
+	// round check: claim == c1 + c2 (componentwise B64 add).
+	for k in 0..4 {
+		t.assert_zero(format!("roundchk{k}"), cclaim[k] - (cc1[k] + cc2[k]));
+	}
+	// g(x) = c0 + x·(c1 + x·c2)  [Horner].
+	let m1 = build_b256_mul(&mut t, beta_col, cx, cc2, "m1_"); // x·c2
+	let s1 = col4(&mut t, "s1");
+	for k in 0..4 {
+		t.assert_zero(format!("s1c{k}"), s1[k] - (cc1[k] + m1.c[k])); // c1 + x·c2
+	}
+	let m2 = build_b256_mul(&mut t, beta_col, cx, s1, "m2_"); // x·(c1 + x·c2)
+	let gx = col4(&mut t, "gx");
+	for k in 0..4 {
+		t.assert_zero(format!("gxc{k}"), gx[k] - (cc0[k] + m2.c[k])); // c0 + …
+	}
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (v0, v1, v2, vx, vcl) = (split256(c0), split256(c1), split256(c2), split256(x), split256(claim));
+		let xc2 = x * c2;
+		let s1v = c1 + xc2;
+		let vs1 = split256(s1v);
+		let vgx = split256(next);
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cc0[i], row, v0[i])?;
+				wc64(&mut seg, cc1[i], row, v1[i])?;
+				wc64(&mut seg, cc2[i], row, v2[i])?;
+				wc64(&mut seg, cx[i], row, vx[i])?;
+				wc64(&mut seg, cclaim[i], row, vcl[i])?;
+				wc64(&mut seg, s1[i], row, vs1[i])?;
+				wc64(&mut seg, gx[i], row, vgx[i])?;
+			}
+			pop_b256_mul(&m1, &mut seg, row, vx, v2)?;
+			pop_b256_mul(&m2, &mut seg, row, vx, vs1)?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, next))
+}
+
+/// Prove + verify a TWO-ROUND sumcheck CHAIN IN-CIRCUIT over B256 — the sumcheck-phase
+/// spine. Round 0 checks `g0(0)+g0(1)==claim0` and reduces to `g0(x0)`; round 1's claim IS
+/// that reduced value (the cross-round bind: `claim1 == g0(x0)`), which its own round check
+/// `g1(0)+g1(1)==claim1` enforces, before reducing to `g1(x1)` (the final claim). `c2_1` is
+/// derived so the chain is consistent. Returns `(proof_bytes, final_claim)`; gated == native.
+/// Composes M5-sumcheck x2 + the cross-round claim bind.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_verify_sumcheck_2rounds(
+	c0_0: OurB256,
+	c1_0: OurB256,
+	c2_0: OurB256,
+	x0: OurB256,
+	c0_1: OurB256,
+	c1_1: OurB256,
+	x1: OurB256,
+) -> Result<(usize, OurB256)> {
+	// round 0
+	let claim0 = c1_0 + c2_0;
+	let g0x = c0_0 + c1_0 * x0 + c2_0 * x0 * x0;
+	// round 1: claim1 = g0x (carried); pick c2_1 so c1_1 + c2_1 == claim1.
+	let c2_1 = g0x + c1_1; // char 2: c1_1 + c2_1 = g0x
+	let g1x = c0_1 + c1_1 * x1 + c2_1 * x1 * x1;
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("sumcheck 2-round chain");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+
+	// round 0 columns + check + reduce.
+	let a0 = col4(&mut t, "a0_c0");
+	let a1 = col4(&mut t, "a0_c1");
+	let a2 = col4(&mut t, "a0_c2");
+	let ax = col4(&mut t, "a0_x");
+	let acl = col4(&mut t, "a0_claim");
+	for k in 0..4 {
+		t.assert_zero(format!("r0chk{k}"), acl[k] - (a1[k] + a2[k]));
+	}
+	let am1 = build_b256_mul(&mut t, beta_col, ax, a2, "a0m1_");
+	let as1 = col4(&mut t, "a0_s1");
+	for k in 0..4 {
+		t.assert_zero(format!("a0s1c{k}"), as1[k] - (a1[k] + am1.c[k]));
+	}
+	let am2 = build_b256_mul(&mut t, beta_col, ax, as1, "a0m2_");
+	let agx = col4(&mut t, "a0_gx");
+	for k in 0..4 {
+		t.assert_zero(format!("a0gxc{k}"), agx[k] - (a0[k] + am2.c[k]));
+	}
+
+	// round 1 columns; round check uses agx as the claim (the cross-round bind).
+	let b0 = col4(&mut t, "b1_c0");
+	let b1 = col4(&mut t, "b1_c1");
+	let b2 = col4(&mut t, "b1_c2");
+	let bx = col4(&mut t, "b1_x");
+	for k in 0..4 {
+		t.assert_zero(format!("r1chk{k}"), agx[k] - (b1[k] + b2[k])); // claim1 == g0(x0) == c1_1+c2_1
+	}
+	let bm1 = build_b256_mul(&mut t, beta_col, bx, b2, "b1m1_");
+	let bs1 = col4(&mut t, "b1_s1");
+	for k in 0..4 {
+		t.assert_zero(format!("b1s1c{k}"), bs1[k] - (b1[k] + bm1.c[k]));
+	}
+	let bm2 = build_b256_mul(&mut t, beta_col, bx, bs1, "b1m2_");
+	let bgx = col4(&mut t, "b1_gx");
+	for k in 0..4 {
+		t.assert_zero(format!("b1gxc{k}"), bgx[k] - (b0[k] + bm2.c[k]));
+	}
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let s = split256;
+		let (as1v, ag) = (s(c1_0 + x0 * c2_0), s(g0x));
+		let (bs1v, bg) = (s(c1_1 + x1 * c2_1), s(g1x));
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for (col, val) in [
+				(a0, c0_0), (a1, c1_0), (a2, c2_0), (ax, x0), (acl, claim0), (as1, c1_0 + x0 * c2_0), (agx, g0x),
+				(b0, c0_1), (b1, c1_1), (b2, c2_1), (bx, x1), (bs1, c1_1 + x1 * c2_1), (bgx, g1x),
+			] {
+				let sv = s(val);
+				for i in 0..4 {
+					wc64(&mut seg, col[i], row, sv[i])?;
+				}
+			}
+			pop_b256_mul(&am1, &mut seg, row, s(x0), s(c2_0))?;
+			pop_b256_mul(&am2, &mut seg, row, s(x0), as1v)?;
+			pop_b256_mul(&bm1, &mut seg, row, s(x1), s(c2_1))?;
+			pop_b256_mul(&bm2, &mut seg, row, s(x1), bs1v)?;
+		}
+		let _ = (ag, bg);
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, g1x))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -808,6 +996,57 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// GATE M5-sumchain — a TWO-ROUND sumcheck chain PROVES+VERIFIES in-circuit over B256:
+	/// round 1's claim is bound to round 0's reduced value g0(x0) (enforced by round 1's own
+	/// g1(0)+g1(1)==claim1 check), and the final claim g1(x1) == native. The sumcheck-phase
+	/// spine — symmetric to the FRI query-phase spine.
+	#[test]
+	fn sumcheck_2rounds_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0x77; 32]);
+		use rand::SeedableRng;
+		let c0_0 = <OurB256 as Field>::random(&mut rng);
+		let c1_0 = <OurB256 as Field>::random(&mut rng);
+		let c2_0 = <OurB256 as Field>::random(&mut rng);
+		let x0 = <OurB256 as Field>::random(&mut rng);
+		let c0_1 = <OurB256 as Field>::random(&mut rng);
+		let c1_1 = <OurB256 as Field>::random(&mut rng);
+		let x1 = <OurB256 as Field>::random(&mut rng);
+		let g0x = c0_0 + c1_0 * x0 + c2_0 * x0 * x0;
+		let c2_1 = g0x + c1_1;
+		let want = c0_1 + c1_1 * x1 + c2_1 * x1 * x1;
+		let (size, got) =
+			prove_verify_sumcheck_2rounds(c0_0, c1_0, c2_0, x0, c0_1, c1_1, x1).expect("sumcheck chain must PROVE+VERIFY");
+		assert_eq!(got, want, "in-circuit sumcheck chain final claim != native");
+		println!(
+			"GATE M5-sumchain: 2-round sumcheck chain (claim1 bound to g0(x0)) PROVES+VERIFIES over \
+			 B256 @L1(128) == native; proof = {size} bytes"
+		);
+	}
+
+	/// GATE M5-sumcheck — ONE sumcheck round PROVES+VERIFIES in-circuit over B256: the
+	/// round check `g(0)+g(1)==claim` is enforced and the next claim `g(x)` is computed by
+	/// Horner (two B256 muls) == native. The STARK verifier's field-arithmetic half, per
+	/// round — reused across the sumcheck phase.
+	#[test]
+	fn sumcheck_round_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0x11; 32]);
+		use rand::SeedableRng;
+		for _ in 0..2 {
+			let c0 = <OurB256 as Field>::random(&mut rng);
+			let c1 = <OurB256 as Field>::random(&mut rng);
+			let c2 = <OurB256 as Field>::random(&mut rng);
+			let x = <OurB256 as Field>::random(&mut rng);
+			let want = c0 + c1 * x + c2 * x * x;
+			let (size, got) = prove_verify_sumcheck_round(c0, c1, c2, x).expect("sumcheck round must PROVE+VERIFY");
+			assert_eq!(got, want, "in-circuit g(x) != native");
+			let _ = size;
+		}
+		println!(
+			"GATE M5-sumcheck: one sumcheck round (check g(0)+g(1)==claim; reduce to g(x) via \
+			 Horner) PROVES+VERIFIES over B256 @L1(128) == native"
+		);
 	}
 
 	/// GATE M5-schedfold — a fold challenge DERIVED from the transcript by an in-circuit

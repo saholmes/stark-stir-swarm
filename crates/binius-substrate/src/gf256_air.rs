@@ -157,18 +157,18 @@ probe_mul!(probe_b32_mul, BinaryField32b, "B32");
 // --- reusable B256 mul builder (namespaced, so a table can hold several) ----------
 
 /// The committed columns of one in-circuit B256 multiply `c = a·b` (a,b,c as [B64;4]).
-struct B256MulCols {
+pub(crate) struct B256MulCols {
 	z0: B128Mul,
 	z2: B128Mul,
 	s: B128Mul,
 	sa: [Col<B64, 1>; 4], // sa0,sa1,sb0,sb1
 	z2ab: Col<B64, 1>,
-	c: [Col<B64, 1>; 4],
+	pub(crate) c: [Col<B64, 1>; 4],
 }
 
 /// Build `c = a·b` over B256 (nested Karatsuba) on given input columns; commits the 4
 /// result components `c`. `pfx` namespaces the columns so multiple muls coexist.
-fn build_b256_mul(
+pub(crate) fn build_b256_mul(
 	t: &mut TableBuilder<OurB256>,
 	beta_col: Col<B64, 1>,
 	a: [Col<B64, 1>; 4],
@@ -198,7 +198,7 @@ fn build_b256_mul(
 }
 
 /// Populate a B256 mul from operand B64 components; writes `c` and returns its value.
-fn pop_b256_mul(
+pub(crate) fn pop_b256_mul(
 	m: &B256MulCols,
 	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
 	row: usize,
