@@ -135,6 +135,204 @@ struct Sched {
 	add: [Adder<32>; 3], // w[t-16]+σ0, +w[t-7], +σ1  (add[2].sum = w[t])
 }
 
+/// The reusable compression core (message schedule + 64 rounds + feed-forward) over
+/// CALLER-PROVIDED input columns `h_in`/`w_in` in a caller-owned table. Both the M1
+/// compression and the M2b Merkle path build on this, so a path can inline D nodes in
+/// ONE table with each node's output column-wired into the next.
+pub(crate) struct Sha256Core {
+	sched: Vec<Sched>,
+	rounds: Vec<Round>,
+	ff: [Adder<32>; 8],
+	pub(crate) h_out: [Col<B1, 32>; 8],
+}
+
+/// Build the compression core on given input columns; returns the core (retained
+/// columns + `h_out`). `k_cols` are the 64 round-key constant columns (shared).
+pub(crate) fn build_sha256_core(
+	table: &mut TableBuilder<OurB256>,
+	h_in: [Col<B1, 32>; 8],
+	w_in: [Col<B1, 32>; 16],
+	k_cols: &[Col<B1, 32>],
+) -> Sha256Core {
+	let rotr = |t: &mut TableBuilder<OurB256>, nm: String, x: Col<B1, 32>, n: usize| {
+		t.add_shifted(nm, x, 5, (32 - n) % 32, ShiftVariant::CircularLeft)
+	};
+	let shrn = |t: &mut TableBuilder<OurB256>, nm: String, x: Col<B1, 32>, n: usize| {
+		t.add_shifted(nm, x, 5, n, ShiftVariant::LogicalRight)
+	};
+
+	let mut w: Vec<Col<B1, 32>> = w_in.to_vec();
+	let mut sched = Vec::with_capacity(48);
+	for t in 16..64 {
+		let x15 = w[t - 15];
+		let a0 = rotr(table, format!("s0r7_{t}"), x15, 7);
+		let a1 = rotr(table, format!("s0r18_{t}"), x15, 18);
+		let a2 = shrn(table, format!("s0s3_{t}"), x15, 3);
+		let sig0 = table.add_computed(format!("sig0_{t}"), a0 + a1 + a2);
+		let x2 = w[t - 2];
+		let b0 = rotr(table, format!("s1r17_{t}"), x2, 17);
+		let b1 = rotr(table, format!("s1r19_{t}"), x2, 19);
+		let b2 = shrn(table, format!("s1s10_{t}"), x2, 10);
+		let sig1 = table.add_computed(format!("sig1_{t}"), b0 + b1 + b2);
+		let ad0 = Adder::<32>::build(table, w[t - 16], sig0, &format!("wsch0_{t}"));
+		let ad1 = Adder::<32>::build(table, ad0.sum, w[t - 7], &format!("wsch1_{t}"));
+		let ad2 = Adder::<32>::build(table, ad1.sum, sig1, &format!("wsch2_{t}"));
+		w.push(ad2.sum);
+		sched.push(Sched {
+			s0: Mix { i0: a0, i1: a1, i2: a2, out: sig0 },
+			s1: Mix { i0: b0, i1: b1, i2: b2, out: sig1 },
+			add: [ad0, ad1, ad2],
+		});
+	}
+
+	let mut a = h_in[0];
+	let mut b = h_in[1];
+	let mut c = h_in[2];
+	let mut d = h_in[3];
+	let mut e = h_in[4];
+	let mut f = h_in[5];
+	let mut g = h_in[6];
+	let mut h = h_in[7];
+	let mut rounds = Vec::with_capacity(64);
+	for t in 0..64 {
+		let r6 = rotr(table, format!("S1r6_{t}"), e, 6);
+		let r11 = rotr(table, format!("S1r11_{t}"), e, 11);
+		let r25 = rotr(table, format!("S1r25_{t}"), e, 25);
+		let big_s1 = table.add_computed(format!("BigS1_{t}"), r6 + r11 + r25);
+		let ch = table.add_computed(format!("Ch_{t}"), e * f + g + e * g);
+		let ta = Adder::<32>::build(table, h, big_s1, &format!("T1a_{t}"));
+		let tb = Adder::<32>::build(table, ta.sum, ch, &format!("T1b_{t}"));
+		let tc = Adder::<32>::build(table, tb.sum, k_cols[t], &format!("T1c_{t}"));
+		let td = Adder::<32>::build(table, tc.sum, w[t], &format!("T1d_{t}"));
+		let t1 = td.sum;
+		let q2 = rotr(table, format!("S0r2_{t}"), a, 2);
+		let q13 = rotr(table, format!("S0r13_{t}"), a, 13);
+		let q22 = rotr(table, format!("S0r22_{t}"), a, 22);
+		let big_s0 = table.add_computed(format!("BigS0_{t}"), q2 + q13 + q22);
+		let maj = table.add_computed(format!("Maj_{t}"), a * b + a * c + b * c);
+		let t2a = Adder::<32>::build(table, big_s0, maj, &format!("T2_{t}"));
+		let en = Adder::<32>::build(table, d, t1, &format!("en_{t}"));
+		let an = Adder::<32>::build(table, t1, t2a.sum, &format!("an_{t}"));
+		rounds.push(Round {
+			s1: Mix { i0: r6, i1: r11, i2: r25, out: big_s1 },
+			ch,
+			t1: [ta, tb, tc, td],
+			s0: Mix { i0: q2, i1: q13, i2: q22, out: big_s0 },
+			maj,
+			t2: t2a,
+			e_new: en,
+			a_new: an,
+		});
+		h = g;
+		g = f;
+		f = e;
+		e = en.sum;
+		d = c;
+		c = b;
+		b = a;
+		a = an.sum;
+	}
+	let working = [a, b, c, d, e, f, g, h];
+	let ff: [Adder<32>; 8] =
+		std::array::from_fn(|i| Adder::<32>::build(table, h_in[i], working[i], &format!("ff{i}")));
+	let h_out: [Col<B1, 32>; 8] = std::array::from_fn(|i| ff[i].sum);
+	Sha256Core { sched, rounds, ff, h_out }
+}
+
+/// Populate a compression core for one row from the native `state`,`block` u32s.
+pub(crate) fn populate_sha256_core(
+	core: &Sha256Core,
+	seg: &mut TableWitnessSegment<OurB256>,
+	row: usize,
+	state: &[u32; 8],
+	block: &[u32; 16],
+) -> Result<()> {
+	let mut w = [0u32; 64];
+	w[..16].copy_from_slice(block);
+	for (idx, t) in (16..64).enumerate() {
+		let x15 = w[t - 15];
+		let (r7, r18, s3) = (x15.rotate_right(7), x15.rotate_right(18), x15 >> 3);
+		let x2 = w[t - 2];
+		let (r17, r19, s10) = (x2.rotate_right(17), x2.rotate_right(19), x2 >> 10);
+		let sig0 = r7 ^ r18 ^ s3;
+		let sig1 = r17 ^ r19 ^ s10;
+		let sc = &core.sched[idx];
+		wc(seg, sc.s0.i0, row, r7)?;
+		wc(seg, sc.s0.i1, row, r18)?;
+		wc(seg, sc.s0.i2, row, s3)?;
+		wc(seg, sc.s0.out, row, sig0)?;
+		wc(seg, sc.s1.i0, row, r17)?;
+		wc(seg, sc.s1.i1, row, r19)?;
+		wc(seg, sc.s1.i2, row, s10)?;
+		wc(seg, sc.s1.out, row, sig1)?;
+		let a0 = w[t - 16].wrapping_add(sig0);
+		let a1 = a0.wrapping_add(w[t - 7]);
+		let a2 = a1.wrapping_add(sig1);
+		sc.add[0].populate(seg, row, &u32_bits(w[t - 16]), &u32_bits(sig0))?;
+		sc.add[1].populate(seg, row, &u32_bits(a0), &u32_bits(w[t - 7]))?;
+		sc.add[2].populate(seg, row, &u32_bits(a1), &u32_bits(sig1))?;
+		w[t] = a2;
+	}
+	let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+	for t in 0..64 {
+		let rd = &core.rounds[t];
+		let (r6, r11, r25) = (e.rotate_right(6), e.rotate_right(11), e.rotate_right(25));
+		let big_s1 = r6 ^ r11 ^ r25;
+		let ch = (e & f) ^ ((!e) & g);
+		wc(seg, rd.s1.i0, row, r6)?;
+		wc(seg, rd.s1.i1, row, r11)?;
+		wc(seg, rd.s1.i2, row, r25)?;
+		wc(seg, rd.s1.out, row, big_s1)?;
+		wc(seg, rd.ch, row, ch)?;
+		let a_h = h.wrapping_add(big_s1);
+		let a_ch = a_h.wrapping_add(ch);
+		let a_k = a_ch.wrapping_add(K256[t]);
+		let t1 = a_k.wrapping_add(w[t]);
+		rd.t1[0].populate(seg, row, &u32_bits(h), &u32_bits(big_s1))?;
+		rd.t1[1].populate(seg, row, &u32_bits(a_h), &u32_bits(ch))?;
+		rd.t1[2].populate(seg, row, &u32_bits(a_ch), &u32_bits(K256[t]))?;
+		rd.t1[3].populate(seg, row, &u32_bits(a_k), &u32_bits(w[t]))?;
+		let (q2, q13, q22) = (a.rotate_right(2), a.rotate_right(13), a.rotate_right(22));
+		let big_s0 = q2 ^ q13 ^ q22;
+		let maj = (a & b) ^ (a & c) ^ (b & c);
+		wc(seg, rd.s0.i0, row, q2)?;
+		wc(seg, rd.s0.i1, row, q13)?;
+		wc(seg, rd.s0.i2, row, q22)?;
+		wc(seg, rd.s0.out, row, big_s0)?;
+		wc(seg, rd.maj, row, maj)?;
+		let t2 = big_s0.wrapping_add(maj);
+		rd.t2.populate(seg, row, &u32_bits(big_s0), &u32_bits(maj))?;
+		let e_new = d.wrapping_add(t1);
+		let a_new = t1.wrapping_add(t2);
+		rd.e_new.populate(seg, row, &u32_bits(d), &u32_bits(t1))?;
+		rd.a_new.populate(seg, row, &u32_bits(t1), &u32_bits(t2))?;
+		h = g;
+		g = f;
+		f = e;
+		e = e_new;
+		d = c;
+		c = b;
+		b = a;
+		a = a_new;
+	}
+	let working = [a, b, c, d, e, f, g, h];
+	for i in 0..8 {
+		core.ff[i].populate(seg, row, &u32_bits(state[i]), &u32_bits(working[i]))?;
+	}
+	Ok(())
+}
+
+/// Build the 64 SHA-256 round-key constant columns in `table` (shared across nodes).
+pub(crate) fn build_k_cols(table: &mut TableBuilder<OurB256>) -> Vec<Col<B1, 32>> {
+	(0..64)
+		.map(|t| {
+			let bits = u32_bits(K256[t]);
+			let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+			table.add_constant(format!("K{t}"), arr)
+		})
+		.collect()
+}
+
 /// SHA-256 one-block compression AIR: input state `h_in`, message `w_in`, output state
 /// `h_out` (each an 8- resp. 16-word array of `Col<B1,32>`), asserting the FIPS 180-4
 /// compression. `k_cols` are the constant round-key columns.
