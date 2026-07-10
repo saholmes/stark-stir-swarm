@@ -1072,6 +1072,69 @@ pub fn introspect_recursion_scope(log_inv_rate: usize) -> Result<RecursionScope>
 	})
 }
 
+/// Measure how a fold_pair table's PROVE and VERIFY scale with ROW count. The recursion
+/// verifier batches its ~thousands of identical ops (each fold_pair / SHA compression is the
+/// same circuit on different inputs) as ROWS of one op-table, not as width. If verify is
+/// ~row-flat, the Tier-B edge-verify constant stays small even as prove grows — the O(1)
+/// verify we want. Returns `(rows, prove_ms, verify_ms, proof_bytes)` per row count.
+pub fn measure_fold_verify_scaling(rows_list: &[usize]) -> Result<Vec<(usize, u128, u128, usize)>> {
+	use binius_field::Field;
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &nrows in rows_list {
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mut t = cs.add_table("fold_pair batch");
+		let beta_col = t.add_committed::<B64, 1>("beta");
+		let cu = col4(&mut t, "u");
+		let cv = col4(&mut t, "v");
+		let cr = col4(&mut t, "r");
+		let ctw = col4(&mut t, "tw");
+		let fp = build_b256_fold_pair(&mut t, beta_col, cu, cv, cr, ctw, "fp_");
+		let table_id = t.id();
+		let mut rng = rand::rngs::StdRng::from_seed([0x33; 32]);
+		use rand::SeedableRng;
+		let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		{
+			let tw_ = witness.init_table(table_id, nrows)?;
+			let mut seg = tw_.full_segment();
+			for row in 0..nrows {
+				let (u, v, r, tw) = (
+					<OurB256 as Field>::random(&mut rng),
+					<OurB256 as Field>::random(&mut rng),
+					<OurB256 as Field>::random(&mut rng),
+					<OurB256 as Field>::random(&mut rng),
+				);
+				wc64(&mut seg, beta_col, row, beta())?;
+				let (uv, vv, rv, tvv) = (split256(u), split256(v), split256(r), split256(tw));
+				for i in 0..4 {
+					wc64(&mut seg, cu[i], row, uv[i])?;
+					wc64(&mut seg, cv[i], row, vv[i])?;
+					wc64(&mut seg, cr[i], row, rv[i])?;
+					wc64(&mut seg, ctw[i], row, tvv[i])?;
+				}
+				pop_b256_fold_pair(&fp, &mut seg, row, u, v, r, tw)?;
+			}
+		}
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, 1, 128, &statement.boundaries, proof)?;
+		let verify_ms = t1.elapsed().as_millis();
+		out.push((nrows, prove_ms, verify_ms, sz));
+	}
+	Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1103,6 +1166,28 @@ mod tests {
 			s.terminate_codeword_len, s.n_oracles, s.n_test_queries
 		);
 		assert!(s.proof_bytes > 0);
+	}
+
+	/// Verify-vs-rows scaling for a batched fold_pair table — answers whether the recursion
+	/// verify constant stays small as the op count (rows) grows to the ~6.8k-op recursion
+	/// scale. If verify is ~flat while prove grows, the Tier-B O(1)-in-N edge verify is fast.
+	#[test]
+	fn fold_verify_row_scaling() {
+		let rows = [64usize, 256, 1024, 4096, 16384];
+		let res = measure_fold_verify_scaling(&rows).expect("scaling measurement must succeed");
+		println!("| rows | prove ms | verify ms | proof B |");
+		println!("|---:|---:|---:|---:|");
+		for (n, p, v, sz) in &res {
+			println!("| {} | {} | {} | {} |", n, p, v, sz);
+		}
+		let v0 = res.first().map(|r| r.2).unwrap_or(0);
+		let vn = res.last().map(|r| r.2).unwrap_or(0);
+		println!(
+			"# verify {} ms @ {} rows -> {} ms @ {} rows ({:.1}x for {}x rows). Recursion verify \
+			 is row-batched: prove scales with ops, verify stays ~flat -> small O(1) edge verify.",
+			v0, rows[0], vn, rows[rows.len() - 1],
+			if v0 > 0 { vn as f64 / v0 as f64 } else { 0.0 }, rows[rows.len() - 1] / rows[0]
+		);
 	}
 
 	/// Blowup sweep — n_queries (and thus the in-circuit verifier workload) vs blowup. The
