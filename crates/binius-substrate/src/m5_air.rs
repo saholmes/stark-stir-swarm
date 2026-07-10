@@ -980,6 +980,93 @@ pub fn prove_verify_sumcheck_2rounds(
 	Ok((sz, g1x))
 }
 
+/// Structural scope of a real inner proof's verification — reconstructs `fri_params` the
+/// way `constraint_system::verify` does, so we know the exact in-circuit verifier workload
+/// (FRI fold rounds/arities, query domain bits, terminate-codeword size, #oracles) BEFORE
+/// wiring the full recursive verifier. Grounds the benchmark's single-proof-verify cost.
+#[derive(Debug, Clone)]
+pub struct RecursionScope {
+	pub proof_bytes: usize,
+	pub fold_arities: Vec<usize>,
+	pub n_fri_rounds: usize,
+	pub index_bits: usize,
+	pub n_final_challenges: usize,
+	pub terminate_codeword_len: usize,
+	pub n_oracles: usize,
+	pub total_vars: usize,
+	pub n_test_queries: usize,
+}
+
+/// Build a minimal real inner proof (one B256 fold_pair) and report its verification scope.
+pub fn introspect_recursion_scope() -> Result<RecursionScope> {
+	use binius_core::merkle_tree::BinaryMerkleTreeScheme;
+	use binius_core::piop;
+	use binius_field::BinaryField32b;
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("inner: one B256 fold_pair");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let cu = col4(&mut t, "u");
+	let cv = col4(&mut t, "v");
+	let cr = col4(&mut t, "r");
+	let ctw = col4(&mut t, "tw");
+	let fp = build_b256_fold_pair(&mut t, beta_col, cu, cv, cr, ctw, "fp_");
+	let table_id = t.id();
+
+	use binius_field::Field;
+	let mut rng = rand::rngs::StdRng::from_seed([0x1c; 32]);
+	use rand::SeedableRng;
+	let (u, v, r, tw) = (
+		<OurB256 as Field>::random(&mut rng),
+		<OurB256 as Field>::random(&mut rng),
+		<OurB256 as Field>::random(&mut rng),
+		<OurB256 as Field>::random(&mut rng),
+	);
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		let (uv, vv, rv, tvv) = (split256(u), split256(v), split256(r), split256(tw));
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cu[i], row, uv[i])?;
+				wc64(&mut seg, cv[i], row, vv[i])?;
+				wc64(&mut seg, cr[i], row, rv[i])?;
+				wc64(&mut seg, ctw[i], row, tvv[i])?;
+			}
+			pop_b256_fold_pair(&fp, &mut seg, row, u, v, r, tw)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let proof_bytes = proof.get_proof_size();
+
+	// reconstruct fri_params exactly as constraint_system::verify does.
+	let merkle_scheme = BinaryMerkleTreeScheme::<OurB256, Sha256, _>::new(Sha256Compression::default());
+	let (commit_meta, _oracle_to_commit) = piop::make_oracle_commit_meta(&ccs.oracles)?;
+	let fri_params =
+		piop::make_commit_params_with_optimal_arity::<OurB256, BinaryField32b, _>(&commit_meta, &merkle_scheme, 128, 1)?;
+	let fold_arities = fri_params.fold_arities().to_vec();
+	Ok(RecursionScope {
+		proof_bytes,
+		n_fri_rounds: fold_arities.len(),
+		fold_arities,
+		index_bits: fri_params.index_bits(),
+		n_final_challenges: fri_params.n_final_challenges(),
+		terminate_codeword_len: 1 << fri_params.n_final_challenges(),
+		n_oracles: fri_params.n_oracles(),
+		total_vars: commit_meta.total_vars(),
+		n_test_queries: fri_params.n_test_queries(),
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -996,6 +1083,21 @@ mod tests {
 			let _ = size;
 		}
 		println!("GATE M5-qidx: FRI query-index sample_bits PROVES+VERIFIES over B256 @L1(128) == binius sample_bits_reader");
+	}
+
+	/// Introspect a real inner proof's verification scope — the concrete FRI/sumcheck
+	/// structure the recursive verifier must reproduce. Reported (not asserted) to scope
+	/// the assembly + ground the benchmark's single-verify cost.
+	#[test]
+	fn recursion_scope_introspection() {
+		let s = introspect_recursion_scope().expect("introspection must succeed");
+		println!(
+			"RECURSION-SCOPE (inner = 1 B256 fold_pair, L1, blowup=2): proof={} B  total_vars={}  \
+			 FRI: {} rounds arities={:?} index_bits={} terminate_len={} n_oracles={} n_queries={}",
+			s.proof_bytes, s.total_vars, s.n_fri_rounds, s.fold_arities, s.index_bits,
+			s.terminate_codeword_len, s.n_oracles, s.n_test_queries
+		);
+		assert!(s.proof_bytes > 0);
 	}
 
 	/// GATE M5-sumchain — a TWO-ROUND sumcheck chain PROVES+VERIFIES in-circuit over B256:
