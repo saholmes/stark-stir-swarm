@@ -154,6 +154,78 @@ macro_rules! probe_mul {
 probe_mul!(probe_b64_mul, BinaryField64b, "B64");
 probe_mul!(probe_b32_mul, BinaryField32b, "B32");
 
+// --- reusable B256 mul builder (namespaced, so a table can hold several) ----------
+
+/// The committed columns of one in-circuit B256 multiply `c = a·b` (a,b,c as [B64;4]).
+struct B256MulCols {
+	z0: B128Mul,
+	z2: B128Mul,
+	s: B128Mul,
+	sa: [Col<B64, 1>; 4], // sa0,sa1,sb0,sb1
+	z2ab: Col<B64, 1>,
+	c: [Col<B64, 1>; 4],
+}
+
+/// Build `c = a·b` over B256 (nested Karatsuba) on given input columns; commits the 4
+/// result components `c`. `pfx` namespaces the columns so multiple muls coexist.
+fn build_b256_mul(
+	t: &mut TableBuilder<OurB256>,
+	beta_col: Col<B64, 1>,
+	a: [Col<B64, 1>; 4],
+	b: [Col<B64, 1>; 4],
+	pfx: &str,
+) -> B256MulCols {
+	let z0 = build_b128_mul(t, beta_col, a[0], a[1], b[0], b[1], &format!("{pfx}z0"));
+	let z2 = build_b128_mul(t, beta_col, a[2], a[3], b[2], b[3], &format!("{pfx}z2"));
+	let mk = |t: &mut TableBuilder<OurB256>, nm: String, e: Col<B64, 1>, f: Col<B64, 1>| {
+		let c = t.add_committed::<B64, 1>(nm.clone());
+		t.assert_zero(format!("{nm}c"), c - (e + f));
+		c
+	};
+	let sa0 = mk(t, format!("{pfx}sa0"), a[0], a[2]);
+	let sa1 = mk(t, format!("{pfx}sa1"), a[1], a[3]);
+	let sb0 = mk(t, format!("{pfx}sb0"), b[0], b[2]);
+	let sb1 = mk(t, format!("{pfx}sb1"), b[1], b[3]);
+	let s = build_b128_mul(t, beta_col, sa0, sa1, sb0, sb1, &format!("{pfx}s"));
+	let z2ab = t.add_committed::<B64, 1>(format!("{pfx}z2ab"));
+	t.assert_zero(format!("{pfx}z2abc"), z2ab - z2.r1 * beta_col);
+	let c: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{pfx}c{i}")));
+	t.assert_zero(format!("{pfx}c0"), c[0] - (z0.r0 + z2.r0));
+	t.assert_zero(format!("{pfx}c1"), c[1] - (z0.r1 + z2.r1));
+	t.assert_zero(format!("{pfx}c2"), c[2] - ((s.r0 - z0.r0 - z2.r0) + z2.r1));
+	t.assert_zero(format!("{pfx}c3"), c[3] - ((s.r1 - z0.r1 - z2.r1) + (z2.r0 + z2ab)));
+	B256MulCols { z0, z2, s, sa: [sa0, sa1, sb0, sb1], z2ab, c }
+}
+
+/// Populate a B256 mul from operand B64 components; writes `c` and returns its value.
+fn pop_b256_mul(
+	m: &B256MulCols,
+	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
+	row: usize,
+	av: [B64; 4],
+	bv: [B64; 4],
+) -> Result<[B64; 4]> {
+	wc64(seg, m.sa[0], row, av[0] + av[2])?;
+	wc64(seg, m.sa[1], row, av[1] + av[3])?;
+	wc64(seg, m.sa[2], row, bv[0] + bv[2])?;
+	wc64(seg, m.sa[3], row, bv[1] + bv[3])?;
+	let (z0r0, z0r1) = pop_b128_mul(&m.z0, seg, row, av[0], av[1], bv[0], bv[1])?;
+	let (z2r0, z2r1) = pop_b128_mul(&m.z2, seg, row, av[2], av[3], bv[2], bv[3])?;
+	let (sr0, sr1) = pop_b128_mul(&m.s, seg, row, av[0] + av[2], av[1] + av[3], bv[0] + bv[2], bv[1] + bv[3])?;
+	let z2ab = z2r1 * beta();
+	wc64(seg, m.z2ab, row, z2ab)?;
+	let cv = [
+		z0r0 + z2r0,
+		z0r1 + z2r1,
+		(sr0 - z0r0 - z2r0) + z2r1,
+		(sr1 - z0r1 - z2r1) + (z2r0 + z2ab),
+	];
+	for i in 0..4 {
+		wc64(seg, m.c[i], row, cv[i])?;
+	}
+	Ok(cv)
+}
+
 // --- in-circuit B256 mul = nested Karatsuba over B64 native muls ------------------
 
 /// Prove + verify one GF(2^256) multiply `c = a·b` in-circuit over B256 (B256 element =
@@ -321,6 +393,103 @@ pub fn prove_verify_b256_fold(u: OurB256, v: OurB256, r: OurB256) -> Result<(usi
 	Ok((sz, folded_native))
 }
 
+/// Native FRI `fold_pair` (binius fri/common.rs:25): v'=v+u; u'=u+v'·t; folded =
+/// u'+(v'-u')·r, where `t` is the domain twiddle (verifier-computed subspace eval).
+pub fn fold_pair_native(u: OurB256, v: OurB256, r: OurB256, t: OurB256) -> OurB256 {
+	let vp = v + u;
+	let up = u + vp * t;
+	up + (vp - up) * r
+}
+
+/// Prove + verify the FULL FRI `fold_pair` (with domain twiddle `t`) in-circuit over
+/// B256 — two GF(2^256) muls (`v'·t` and `(v'-u')·r`) + XORs. This is the exact
+/// per-pair operation `fold_chunk` applies across a coset. Gated against the native.
+pub fn prove_verify_b256_fold_pair(
+	u: OurB256,
+	v: OurB256,
+	r: OurB256,
+	tw: OurB256,
+) -> Result<(usize, OurB256)> {
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut t = cs.add_table("fri fold_pair over B256 (twiddle-adjusted)");
+	let beta_col = t.add_committed::<B64, 1>("beta");
+	let col4 = |t: &mut TableBuilder<OurB256>, nm: &str| -> [Col<B64, 1>; 4] {
+		std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{nm}{i}")))
+	};
+	let cu = col4(&mut t, "u");
+	let cv = col4(&mut t, "v");
+	let cr = col4(&mut t, "r");
+	let ct = col4(&mut t, "t");
+	let cf = col4(&mut t, "f");
+	// v' = v + u
+	let vp = col4(&mut t, "vp");
+	for i in 0..4 {
+		t.assert_zero(format!("vp{i}c"), vp[i] - (cv[i] + cu[i]));
+	}
+	// p1 = v'·t ; u' = u + p1
+	let m1 = build_b256_mul(&mut t, beta_col, vp, ct, "m1_");
+	let up = col4(&mut t, "up");
+	for i in 0..4 {
+		t.assert_zero(format!("up{i}c"), up[i] - (cu[i] + m1.c[i]));
+	}
+	// d = v' - u' ; p2 = d·r ; folded = u' + p2
+	let cd = col4(&mut t, "d");
+	for i in 0..4 {
+		t.assert_zero(format!("d{i}c"), cd[i] - (vp[i] + up[i]));
+	}
+	let m2 = build_b256_mul(&mut t, beta_col, cd, cr, "m2_");
+	for i in 0..4 {
+		t.assert_zero(format!("f{i}c"), cf[i] - (up[i] + m2.c[i]));
+	}
+	let table_id = t.id();
+
+	const NROWS: usize = 64;
+	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	// native intermediates
+	let vpn = v + u;
+	let upn = u + vpn * tw;
+	let dn = vpn - upn;
+	let folded = upn + dn * r;
+	let (uv, vv, rv, tv, fv, vpv, upv, dv) = (
+		split256(u), split256(v), split256(r), split256(tw), split256(folded), split256(vpn),
+		split256(upn), split256(dn),
+	);
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw_ = witness.init_table(table_id, NROWS)?;
+		let mut seg = tw_.full_segment();
+		for row in 0..NROWS {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..4 {
+				wc64(&mut seg, cu[i], row, uv[i])?;
+				wc64(&mut seg, cv[i], row, vv[i])?;
+				wc64(&mut seg, cr[i], row, rv[i])?;
+				wc64(&mut seg, ct[i], row, tv[i])?;
+				wc64(&mut seg, cf[i], row, fv[i])?;
+				wc64(&mut seg, vp[i], row, vpv[i])?;
+				wc64(&mut seg, up[i], row, upv[i])?;
+				wc64(&mut seg, cd[i], row, dv[i])?;
+			}
+			pop_b256_mul(&m1, &mut seg, row, vpv, tv)?;
+			pop_b256_mul(&m2, &mut seg, row, dv, rv)?;
+		}
+	}
+
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+	>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+	let sz = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+	>(&ccs, 1, 128, &statement.boundaries, proof)?;
+	Ok((sz, folded))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -389,6 +558,25 @@ mod tests {
 		println!(
 			"GATE M3 b256-fold: FRI fold u+(v-u)·r over the FULL B256 field (NIST L1, via M3b \
 			 GF(2^256) mul) PROVES+VERIFIES == native B256 fold; proof = {size} bytes"
+		);
+	}
+
+	/// GATE M3c — the exact FRI fold_pair (with domain twiddle) proves+verifies
+	/// in-circuit over B256 == binius fold_pair; a wrong twiddle changes the result.
+	#[test]
+	fn b256_fold_pair_proves_over_b256() {
+		let mut rng = rand::rngs::StdRng::from_seed([0xFC; 32]);
+		let u = <OurB256 as Field>::random(&mut rng);
+		let v = <OurB256 as Field>::random(&mut rng);
+		let r = <OurB256 as Field>::random(&mut rng);
+		let tw = <OurB256 as Field>::random(&mut rng);
+		let want = fold_pair_native(u, v, r, tw);
+		let (size, got) = prove_verify_b256_fold_pair(u, v, r, tw).expect("fold_pair must PROVE+VERIFY");
+		assert_eq!(got, want, "in-circuit fold_pair != native");
+		assert_ne!(fold_pair_native(u, v, r, tw + <OurB256 as Field>::ONE), want, "not bound to twiddle");
+		println!(
+			"GATE M3c fold_pair: the exact FRI fold_pair (v'=v+u; u'=u+v'·t; folded=u'+(v'-u')·r) \
+			 PROVES+VERIFIES over B256 @L1(128) via 2 GF(2^256) muls == binius fold_pair; proof = {size} bytes"
 		);
 	}
 
