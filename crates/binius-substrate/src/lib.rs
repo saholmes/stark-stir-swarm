@@ -148,6 +148,7 @@ pub mod mldsa_verify; // S1d/e ML-DSA verify assembly + decode
 pub mod ec_verify; // S2 EdDSA / ECDSA verify (7 curves)
 pub mod rsa_verify; // S3 RSA verify (PKCS#1-v1.5 + PSS, 1024–8192)
 pub mod recursion; // R Tier-A aggregation + Tier-B verifier design
+pub mod sha256_air; // Tier-B M1: M3-native SHA-256 compression (FIPS 180-4) recursion hash
 pub mod dns_stark; // D DNS-STARK zone assembly
 
 use std::iter::repeat_with;
