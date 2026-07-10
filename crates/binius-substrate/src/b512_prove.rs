@@ -262,6 +262,46 @@ pub fn measure_square_scaling_b512(
 	Ok(out)
 }
 
+/// Level-parameterized square-circuit measurement over B512 (L5) with an ARBITRARY
+/// commitment/FS hash `H` — use `Sha3_512`@256 so κ_bind/κ_FS clear NIST category 5, not
+/// SHA-256's 128-bit pin. The soundness-honest L5 configuration.
+pub fn measure_square_scaling_b512_hash<H, C>(
+	rows_list: &[usize],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>>
+where
+	H: sha3::digest::Digest + sha3::digest::core_api::BlockSizeUser + sha3::digest::FixedOutputReset + Default + Clone + Send + Sync,
+	C: binius_hash::PseudoCompressionFunction<sha3::digest::Output<H>, 2> + Default + Sync,
+{
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in rows_list {
+		let n_rows = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB512>::new();
+		let table = SquareTable::new(&mut cs, false);
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+		let events = witness_events(n_rows);
+		let mut witness = WitnessIndex::<OurB512>::new(&cs, &allocator);
+		witness.fill_table_parallel(&table, &events)?;
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<U512, B512TowerFamily, H, C, HasherChallenger<H>, _>(
+			&ccs, log_inv_rate, security_bits, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+		)?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<U512, B512TowerFamily, H, C, HasherChallenger<H>>(
+			&ccs, log_inv_rate, security_bits, &statement.boundaries, proof,
+		)?;
+		out.push((n_rows, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 /// Public entry: honest prove+verify over B512, returning proof size in bytes.
 pub fn prove_verify_b512(n_rows: usize, log_inv_rate: usize, security_bits: usize) -> Result<usize> {
 	build_prove_verify_b512(n_rows, log_inv_rate, security_bits, false)
@@ -301,33 +341,38 @@ fn mle_eval<F: Field + From<B8>>(values: &[B8], r: &[F]) -> F {
 mod tests {
 	use super::*;
 
-	/// NIST-LEVEL verify-scaling + proof-size comparison on the SAME `x*x=y` circuit:
-	/// L1 = B256@128, L3 = B256@192, L5 = B512@256 (all blowup=2). Answers the twice-asked
-	/// question — how verify time and proof size scale across the field ladder — with the
-	/// same gate so the field is the only variable. Reported (not asserted).
+	/// NIST-LEVEL verify-scaling on the SAME `x*x=y` circuit, comparing the SOUNDNESS-HONEST
+	/// configuration (commitment/FS hash LADDERED SHA3-256/384/512 with the field, so
+	/// κ_bind=κ_FS clear the same NIST category) against the flawed SHA-256-uniform config
+	/// (κ_bind pinned at 128 → real soundness = category 2 at every level, regardless of field).
 	#[test]
 	fn nist_level_verify_scaling() {
-		let rows = [4096usize, 16384, 65536];
-		let l1 = crate::b256_prove::measure_square_scaling_b256(&rows, 1, 128).expect("L1");
-		let l3 = crate::b256_prove::measure_square_scaling_b256(&rows, 1, 192).expect("L3");
-		let l5 = measure_square_scaling_b512(&rows, 1, 256).expect("L5");
-		println!("| level (field@sec) | rows | prove ms | verify ms | proof B |");
-		println!("|:--|---:|---:|---:|---:|");
-		for (tag, res) in [("L1 B256@128", &l1), ("L3 B256@192", &l3), ("L5 B512@256", &l5)] {
-			for (n, p, v, sz) in res {
-				println!("| {tag} | {n} | {p} | {v} | {sz} |");
-			}
+		use sha3::{Sha3_256, Sha3_384, Sha3_512};
+		use crate::b256_prove::{measure_square_scaling_b256_hash, Sha3Compression};
+		let rows = [16384usize];
+		// SOUNDNESS-HONEST: hash laddered with field.
+		let l1 = measure_square_scaling_b256_hash::<Sha3_256, Sha3Compression<Sha3_256>>(&rows, 1, 128).expect("L1");
+		let l3 = measure_square_scaling_b256_hash::<Sha3_384, Sha3Compression<Sha3_384>>(&rows, 1, 192).expect("L3");
+		let l5 = measure_square_scaling_b512_hash::<Sha3_512, Sha3Compression<Sha3_512>>(&rows, 1, 256).expect("L5");
+		// FLAWED (for contrast): SHA-256 in the commitment role at every level.
+		let l5_flawed = measure_square_scaling_b512(&rows, 1, 256).expect("L5-sha256");
+		println!("| config | level | field@sec | commit hash (κ_bind) | verify ms | proof B |");
+		println!("|:--|:--|:--|:--|---:|---:|");
+		for (lvl, hh, res) in [
+			("L1", "SHA3-256 (cat2)", &l1), ("L3", "SHA3-384 (cat4)", &l3), ("L5", "SHA3-512 (cat5)", &l5),
+		] {
+			let (_, _, v, sz) = res[0];
+			println!("| soundness-honest | {lvl} | {} | {hh} | {v} | {sz} |", if lvl == "L5" { "B512@256" } else { "B256" });
 		}
-		// headline ratios at the largest row count (recursion scale proxy).
-		let last = |r: &Vec<(usize, u128, u128, usize)>| *r.last().unwrap();
-		let (_, _, v1, s1) = last(&l1);
-		let (_, _, v3, s3) = last(&l3);
-		let (_, _, v5, s5) = last(&l5);
+		let (_, _, vf, szf) = l5_flawed[0];
+		println!("| FLAWED SHA-256 | L5 | B512@256 | SHA-256 (cat2!) | {vf} | {szf} |");
+		let (_, _, v1, _) = l1[0];
+		let (_, _, v5, s5) = l5[0];
 		println!(
-			"# @16384 rows: verify L1={v1}ms L3={v3}ms L5={v5}ms (L5/L1={:.1}x); proof L1={s1}B L3={s3}B L5={s5}B (L5/L1={:.1}x). \
-			 Same x*x=y gate; field is the only variable. Recursion hash = SHA-256 (FIPS) at ALL levels; \
-			 the field ladder (B256->B512) is what changes verify/proof.",
-			v5 as f64 / v1.max(1) as f64, s5 as f64 / s1 as f64
+			"# @16384 rows, HONEST hash-laddered: verify L1={v1}ms -> L5={v5}ms ({:.1}x); L5 proof {}KB. \
+			 The SHA-256-uniform L5 ({vf}ms) is CHEAPER but only category-2 sound — you pay B512 cost for \
+			 128-bit security. κ_bind must ladder with the field or the level label is a field label only.",
+			v5 as f64 / v1.max(1) as f64, s5 / 1024
 		);
 	}
 

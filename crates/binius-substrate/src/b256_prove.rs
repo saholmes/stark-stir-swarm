@@ -236,6 +236,67 @@ pub fn prove_verify_b256(n_rows: usize, log_inv_rate: usize, security_bits: usiz
 	build_prove_verify_b256(n_rows, log_inv_rate, security_bits, false)
 }
 
+/// A generic two-to-one Merkle compression `H(a ‖ b)` over any FIPS `Digest` — lets us put
+/// SHA3-256/384/512 in the COMMITMENT role (κ_bind), which binius ships only for SHA-256.
+/// Collision-resistant in the hash-tree setting. Paired with `HasherChallenger<H>` this
+/// ladders the recursion hash (κ_bind, κ_FS) alongside the field, so end-to-end soundness
+/// min(κ_IT, κ_bind, κ_FS) actually reaches the target NIST level instead of pinning at 128.
+#[derive(Clone)]
+pub struct Sha3Compression<D>(core::marker::PhantomData<D>);
+impl<D> Default for Sha3Compression<D> {
+	fn default() -> Self {
+		Self(core::marker::PhantomData)
+	}
+}
+impl<D: sha3::digest::Digest + Clone> binius_hash::PseudoCompressionFunction<sha3::digest::Output<D>, 2> for Sha3Compression<D> {
+	fn compress(&self, input: [sha3::digest::Output<D>; 2]) -> sha3::digest::Output<D> {
+		let mut h = D::new();
+		sha3::digest::Digest::update(&mut h, &input[0]);
+		sha3::digest::Digest::update(&mut h, &input[1]);
+		h.finalize()
+	}
+}
+
+/// Level-parameterized square-circuit measurement over B256 with an ARBITRARY commitment/FS
+/// hash `H` (κ_bind, κ_FS = H). Use `Sha3_256`@128 (L1) or `Sha3_384`@192 (L3) so the hash
+/// clears the same NIST category as the field — the soundness-honest configuration.
+pub fn measure_square_scaling_b256_hash<H, C>(
+	rows_list: &[usize],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>>
+where
+	H: sha3::digest::Digest + sha3::digest::core_api::BlockSizeUser + sha3::digest::FixedOutputReset + Default + Clone + Send + Sync,
+	C: binius_hash::PseudoCompressionFunction<sha3::digest::Output<H>, 2> + Default + Sync,
+{
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in rows_list {
+		let n_rows = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let table = SquareTable::new(&mut cs, false);
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+		let events = witness_events(n_rows);
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		witness.fill_table_parallel(&table, &events)?;
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, H, C, HasherChallenger<H>, _>(
+			&ccs, log_inv_rate, security_bits, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+		)?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<U256, B256TowerFamily, H, C, HasherChallenger<H>>(
+			&ccs, log_inv_rate, security_bits, &statement.boundaries, proof,
+		)?;
+		out.push((n_rows, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 /// Measure PROVE and VERIFY wall-time + proof size of the `x*x=y` circuit over B256 across
 /// row counts, at the given `log_inv_rate`/`security_bits` (128=L1, 192=L3). Same circuit as
 /// the B512 (L5) measurement, for a fair cross-field verify-scaling / proof-size comparison.
