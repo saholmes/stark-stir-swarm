@@ -77,6 +77,39 @@ Useful as the **verify-cost lower bound** to measure A/B against.
 4. **Only then**: does binius's PIOP expose the seam to slot A/B in? (cf. the STIR trace
    — the sumcheck↔FRI lockstep may resist a clean insertion here too.)
 
+## ★ O(1) collapse — RESOLVED analytically (binius already has the machinery)
+
+Investigating the O(1) decider + instance-folding led to a clean resolution: **binius's PCS
+already contains both halves of Nova-style accumulation** — you don't port Nova, you use what's
+there.
+
+1. **Instance-fold ≡ binius's batched multi-claim sumcheck.** `front_loaded::BatchVerifier`
+   samples one random mixing coefficient per claim and combines N evaluation claims (even at
+   different points / n_vars) into ONE sumcheck. That random-linear-combination of claims *is*
+   the fold; my custom point-reduction fold was re-deriving it.
+2. **O(1) decider ≡ binius's interleaved codes.** `fold_interleaved_chunk` (`log_batch_size`)
+   commits a BATCH of codewords and opens the batch at a point in O(1) via the interleave-tensor
+   (the tensor product of the first fold challenges). A batch of N record codewords committed
+   this way IS a commitment to the block-interleaved multilinear P over `inner + log N` vars,
+   openable at ANY point (including the batched-claim point) in one FRI query set — polylog in N.
+
+So **O(1)-verify aggregation over binius is achievable with native machinery**: commit the N
+records as ONE interleaved-code batch, prove the aggregation as ONE binius proof whose N record
+claims are batched by the sumcheck. Edge verify = one sumcheck + one FRI opening = **O(polylog),
+O(1) in N.** No homomorphic commitment, no custom folding scheme.
+
+**Why the detour was still worth it.** The custom narrow fold-verify circuit (accumulation_air,
+~48 ms, FIPS-clean) is the primitive you need for STREAMING / bounded-memory IVC — folding one
+record at a time in a recursion circuit when you can't hold the batch. For a single aggregation
+proof, binius's native batching is simpler and directly O(1). Both live in this branch.
+
+**The residual is RSS, not O(1).** Native batched opening requires the records under ONE
+interleaved commitment. Per-record trace/witness generation still shards (low RSS), and each
+record's codeword is RS-encoded independently — but the *interleave + Merkle commit* step wants
+the codewords together. Whether that commit streams at low RSS (interleave-on-the-fly, à la the
+low-mem streaming prover) is the real open question — the same "commit the batch cheaply" problem
+the sliver work already attacks. That, not the O(1) verify, is what's left.
+
 ## Honesty / risks
 - Binius has **no accumulation today**; this is a from-scratch construction over binary
   fields + hash commitments. The non-homomorphism wall is real — A/B give `O(N)`-cheap,
