@@ -1325,6 +1325,66 @@ pub fn measure_assembled_recursion_verify(scales: &[(usize, usize, usize)]) -> R
 	Ok(out)
 }
 
+/// DIAGNOSTIC: does binius VERIFY scale with committed WIDTH or polylog? Builds `k` stacked
+/// independent B256 multiplies in ONE table at fixed 64 rows (width ∝ k) and times verify.
+/// If verify ∝ k → binius verify is ~linear in committed width, which is WHY a wide FIPS-hash
+/// recursion circuit verifies in seconds (not the ms the polylog theory promises for a narrow
+/// circuit). Returns `(k, verify_ms, proof_bytes)` per width.
+pub fn measure_verify_vs_width(widths: &[usize]) -> Result<Vec<(usize, u128, usize)>> {
+	use binius_field::Field;
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &k in widths {
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mut t = cs.add_table("width sweep: k B256 muls");
+		let beta_col = t.add_committed::<B64, 1>("beta");
+		let mut muls = Vec::with_capacity(k);
+		let mut ops = Vec::with_capacity(k);
+		for i in 0..k {
+			let a = col4(&mut t, &format!("a{i}"));
+			let b = col4(&mut t, &format!("b{i}"));
+			let m = build_b256_mul(&mut t, beta_col, a, b, &format!("m{i}_"));
+			muls.push(m);
+			ops.push((a, b));
+		}
+		let table_id = t.id();
+		const NROWS: usize = 64;
+		let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		let mut rng = rand::rngs::StdRng::from_seed([0x2c; 32]);
+		use rand::SeedableRng;
+		{
+			let tw = witness.init_table(table_id, NROWS)?;
+			let mut seg = tw.full_segment();
+			for row in 0..NROWS {
+				wc64(&mut seg, beta_col, row, beta())?;
+				for i in 0..k {
+					let (av, bv) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+					let (asp, bsp) = (split256(av), split256(bv));
+					for j in 0..4 {
+						wc64(&mut seg, ops[i].0[j], row, asp[j])?;
+						wc64(&mut seg, ops[i].1[j], row, bsp[j])?;
+					}
+					pop_b256_mul(&muls[i], &mut seg, row, asp, bsp)?;
+				}
+			}
+		}
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let proof = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, 1, 128, &statement.boundaries, proof)?;
+		out.push((k, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1356,6 +1416,28 @@ mod tests {
 			s.terminate_codeword_len, s.n_oracles, s.n_test_queries
 		);
 		assert!(s.proof_bytes > 0);
+	}
+
+	/// DIAGNOSTIC: verify vs committed width — is binius verify linear in width or polylog?
+	/// The answer explains why a wide FIPS-hash recursion circuit verifies in seconds.
+	#[test]
+	fn verify_vs_width_diagnostic() {
+		let widths = [1usize, 4, 16, 64, 256];
+		let res = measure_verify_vs_width(&widths).expect("width sweep must succeed");
+		println!("| k (B256 muls) | verify ms | proof KB | ms/k |");
+		println!("|---:|---:|---:|---:|");
+		for (k, v, sz) in &res {
+			println!("| {} | {} | {} | {:.2} |", k, v, sz / 1024, *v as f64 / *k as f64);
+		}
+		let (k0, v0, _) = res[0];
+		let (kn, vn, _) = *res.last().unwrap();
+		println!(
+			"# width x{:.0} -> verify x{:.1}. If ~linear, binius verify is O(committed width): a wide \
+			 FIPS-hash recursion circuit is inherently SECONDS, not the ms polylog theory gives a NARROW \
+			 circuit. Narrow verify needs a narrow-in-circuit hash (Vision/Poseidon, non-FIPS) or an \
+			 accumulation scheme (defer FRI-verify) — not FRI-verify-in-circuit with SHA-256/Keccak.",
+			kn as f64 / k0 as f64, vn as f64 / v0.max(1) as f64
+		);
 	}
 
 	/// Probe: multi-row SHA-256 compression batch verifies (isolates the SHA op-table).
