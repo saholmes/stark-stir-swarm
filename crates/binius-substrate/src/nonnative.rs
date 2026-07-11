@@ -792,10 +792,26 @@ pub struct LimbProduct<const W: usize> {
 	mul_bits: Vec<MulBit<W>>,
 	mul_adders: Vec<Adder<W>>,
 	n: usize,
+	// Output seam (Some for `build_seamed`): the product `p`'s low 4 B64 lanes (256 bits) projected
+	// and PUSHED to a channel, so a downstream COMBINING table can PULL them and bind ONE of its
+	// product-grid limbs to this strand's raw output — the limb-strand seam. 4 lanes = 256 bits
+	// fully covers `p < 2^{2n}` for the L=128 EC limb (2n = 256), so the WHOLE limb value is bound.
+	seam_p_lo: Option<Vec<Col<B1, 64>>>,
 }
 
 impl<const W: usize> LimbProduct<W> {
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, n: usize) -> Self {
+		Self::build_inner(cs, n, None)
+	}
+
+	/// Like [`build`], but additionally PUSHES the product `p`'s low 4 B64 lanes (256 bits) to
+	/// `out_chan` — so a combining/reduction table can PULL one product-grid limb from this
+	/// strand's output (the limb-strand seam). `W` must be ≥ 256 to hold the 4 pushed lanes.
+	pub fn build_seamed(cs: &mut ConstraintSystem<OurB256>, n: usize, out_chan: ChannelId) -> Self {
+		Self::build_inner(cs, n, Some(out_chan))
+	}
+
+	fn build_inner(cs: &mut ConstraintSystem<OurB256>, n: usize, seam: Option<ChannelId>) -> Self {
 		assert!(W.is_power_of_two());
 		assert!(2 * n <= W, "need W >= 2n to hold the product a*b (n={n}, W={W})");
 		let logw = W.trailing_zeros() as usize;
@@ -847,7 +863,21 @@ impl<const W: usize> LimbProduct<W> {
 		// Product identity: the accumulated a*b equals the committed product column p.
 		table.assert_zero("product", acc - p);
 
-		Self { table_id: table.id(), a, b, p, a_hi, b_hi, p_hi, mul_bits, mul_adders, n }
+		// Output seam: project p's low 4 64-bit lanes (256 bits) and PUSH them (as B64). Because the
+		// pushed lanes are `add_selected_block` projections of the SAME committed `p` that the
+		// `product` constraint pins to a*b, a strand cannot push a value it did not compute.
+		let seam_p_lo = seam.map(|chan| {
+			let sel: Vec<Col<B1, 64>> = (0..4)
+				.map(|i| table.add_selected_block::<B1, W, 64>(format!("seam_p_sel{i}"), p, i))
+				.collect();
+			let b64: Vec<Col<B64, 1>> = (0..4)
+				.map(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_p_b64{i}"), sel[i]))
+				.collect();
+			table.push(chan, b64);
+			sel
+		});
+
+		Self { table_id: table.id(), a, b, p, a_hi, b_hi, p_hi, mul_bits, mul_adders, n, seam_p_lo }
 	}
 
 	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, rows: &[LimbProductRow]) -> Result<()> {
@@ -879,6 +909,13 @@ impl<const W: usize> LimbProduct<W> {
 				acc = adder.populate(seg, row, &acc, &pp)?;
 			}
 			let _ = acc;
+
+			// Seam projection: p's low 4 64-bit lanes (pushed to the channel).
+			if let Some(sel) = &self.seam_p_lo {
+				for (i, &s_col) in sel.iter().enumerate() {
+					write_col::<64>(seg, s_col, row, &inp.p[i * 64..i * 64 + 64])?;
+				}
+			}
 		}
 		Ok(())
 	}
@@ -932,6 +969,229 @@ pub fn prove_verify_limb_timed<const W: usize>(
 	let verify_ms = t_verify.elapsed().as_millis();
 
 	Ok((proof_size, prove_ms, verify_ms))
+}
+
+// =====================================================================================
+// FieldMulCombine — the COMBINING / REDUCTION proof that seams the limb strands of a
+// P-256 field multiply `a·b mod p` (256-bit prime, L=128, K=2) back together.
+//
+// The wide `ModMul<1024>` that today proves one EC field multiply carries the whole 256×256
+// schoolbook product AND its `q·p+r` reduction in 1024-bit columns (peak RSS ~GiB). The
+// limb-strand plan instead proves the raw products as narrow `LimbProduct<256>` strands
+// (peak RSS ~44 MiB each) and glues them here: this table takes the K²=4 product-grid limbs
+// `Pij = a_i·b_j` and the K²=4 reduction-grid limbs `Qij = q_i·p_j` (each < 2^256) plus the
+// remainder `r`, and proves — over W=512 columns (wide enough to hold the 512-bit grids with
+// NO wraparound) — the SAME big-integer identity ModMul proves, but from pre-formed limbs:
+//   grid_ab = P00 + (P01+P10)<<128 + P11<<256          [= a·b]
+//   grid_qp = Q00 + (Q01+Q10)<<128 + Q11<<256          [= q·p]
+//   grid_ab == grid_qp + r                             [a·b = q·p + r]
+//   r < p                                              [strict reduction ⇒ r = a·b mod p]
+// (P01+P10) and (Q01+Q10) can carry one bit past 2^256; the full-width `Adder<512>` chain and
+// the `<<128` placement absorb it (the sum fits in 512 bits). Each limb is range-bounded
+// < 2^256 so the `<<128`/`<<256` LogicalLeft placements cannot silently truncate. `r < p` is
+// decided by the SAME sound carry check as ModMul (carry-out of `r + (2^W - p)` at bit W-1).
+//
+// SEAM (`build_seamed_p00`): P00 is committed AND its low 4 B64 lanes are PULLED from a channel,
+// binding P00 to a `LimbProduct<256>` strand that PUSHES its product `p = a0·b0`. In one
+// constraint system the channel must balance (pushed == pulled), so P00 is pinned to the
+// strand's raw output; a strand lying about its product breaks its own `product` constraint AND
+// unbalances the channel. The other 7 limbs are directly committed here (scope: one limb bound to
+// a strand, demonstrating the seam mechanism; the full 8-strand orchestration is the same pattern
+// repeated 8×).
+// =====================================================================================
+
+/// The P-256 `a·b mod p` combining / reduction table over `W`-bit columns (`W = 512`).
+struct FieldMulCombine<const W: usize> {
+	table_id: TableId,
+	// Product-grid limbs (a·b): Pij = a_i·b_j, each < 2^256.
+	p00: Col<B1, W>,
+	p01: Col<B1, W>,
+	p10: Col<B1, W>,
+	p11: Col<B1, W>,
+	// Reduction-grid limbs (q·p): Qij = q_i·p_j, each < 2^256.
+	q00: Col<B1, W>,
+	q01: Col<B1, W>,
+	q10: Col<B1, W>,
+	q11: Col<B1, W>,
+	r: Col<B1, W>,
+	// Range-hi columns for the 8 limbs (each asserted `>> 256 == 0`, i.e. < 2^256), in the fixed
+	// order [P00,P01,P10,P11,Q00,Q01,Q10,Q11].
+	hi: Vec<Col<B1, W>>,
+	// grid_ab = P00 + (P01+P10)<<128 + P11<<256.
+	sab: Adder<W>,
+	sab_sh: Col<B1, W>,
+	p11_sh: Col<B1, W>,
+	acc1: Adder<W>,
+	grid_ab: Adder<W>,
+	// grid_qp = Q00 + (Q01+Q10)<<128 + Q11<<256.
+	sqp: Adder<W>,
+	sqp_sh: Col<B1, W>,
+	q11_sh: Col<B1, W>,
+	acc2: Adder<W>,
+	grid_qp: Adder<W>,
+	// grid_qp + r.
+	qpr: Adder<W>,
+	// r < p carry check (C = 2^W - p; carry-out of r + C at bit W-1 must be 0).
+	c_col: Col<B1, W>,
+	rlt_cout: Col<B1, W>,
+	rlt_cin: Col<B1, W>,
+	rlt_final_carry: Col<B1, 1>,
+	c_bits: Vec<bool>,
+	// Input seam (Some for `build_seamed_p00`): P00's low 4 B64 lanes, PULLED from a channel.
+	seam_p00_lo: Option<Vec<Col<B1, 64>>>,
+}
+
+/// The 9 committed inputs of a `FieldMulCombine` row, each a length-`W` little-endian bit vector:
+/// the 4 product-grid limbs, the 4 reduction-grid limbs, and the remainder `r`.
+struct FieldMulCombineRow {
+	p: [Vec<bool>; 8], // [P00,P01,P10,P11,Q00,Q01,Q10,Q11]
+	r: Vec<bool>,
+}
+
+impl<const W: usize> FieldMulCombine<W> {
+	fn build(cs: &mut ConstraintSystem<OurB256>, p_bits: &[bool]) -> Self {
+		Self::build_inner(cs, p_bits, None)
+	}
+
+	/// Like [`build`], but PULLS P00's low 4 B64 lanes from `in_p00_chan`, binding the P00 limb to a
+	/// `LimbProduct<256>` strand that pushes its product to the same channel (the limb-strand seam).
+	fn build_seamed_p00(cs: &mut ConstraintSystem<OurB256>, p_bits: &[bool], in_p00_chan: ChannelId) -> Self {
+		Self::build_inner(cs, p_bits, Some(in_p00_chan))
+	}
+
+	fn build_inner(cs: &mut ConstraintSystem<OurB256>, p_bits: &[bool], seam_in_p00: Option<ChannelId>) -> Self {
+		assert!(W.is_power_of_two());
+		assert_eq!(p_bits.len(), W, "prime must be given as W bits");
+		assert!(W >= 512, "need W >= 512 to hold the 512-bit product/reduction grids");
+		let logw = W.trailing_zeros() as usize;
+		let mut table = cs.add_table(format!("p256 field-mul combine (grid_ab = grid_qp + r, r<p, W={W})"));
+
+		// The 9 committed inputs.
+		let p00 = table.add_committed::<B1, W>("P00");
+		let p01 = table.add_committed::<B1, W>("P01");
+		let p10 = table.add_committed::<B1, W>("P10");
+		let p11 = table.add_committed::<B1, W>("P11");
+		let q00 = table.add_committed::<B1, W>("Q00");
+		let q01 = table.add_committed::<B1, W>("Q01");
+		let q10 = table.add_committed::<B1, W>("Q10");
+		let q11 = table.add_committed::<B1, W>("Q11");
+		let r = table.add_committed::<B1, W>("r");
+
+		// Range: every limb < 2^256 (so the <<128 / <<256 placements cannot truncate high bits).
+		let mut hi = Vec::with_capacity(8);
+		for (name, col) in [
+			("P00", p00), ("P01", p01), ("P10", p10), ("P11", p11),
+			("Q00", q00), ("Q01", q01), ("Q10", q10), ("Q11", q11),
+		] {
+			let h = table.add_shifted(format!("{name}_hi"), col, logw, 256, ShiftVariant::LogicalRight);
+			table.assert_zero(format!("{name}_range"), h * B1::ONE);
+			hi.push(h);
+		}
+
+		// grid_ab = P00 + (P01+P10)<<128 + P11<<256.
+		let sab = Adder::<W>::build(&mut table, p01, p10, "sab"); // P01 + P10 (< 2^257)
+		let sab_sh = table.add_shifted("sab_sh", sab.sum, logw, 128, ShiftVariant::LogicalLeft);
+		let p11_sh = table.add_shifted("p11_sh", p11, logw, 256, ShiftVariant::LogicalLeft);
+		let acc1 = Adder::<W>::build(&mut table, p00, sab_sh, "acc1"); // P00 + (P01+P10)<<128
+		let grid_ab = Adder::<W>::build(&mut table, acc1.sum, p11_sh, "grid_ab");
+
+		// grid_qp = Q00 + (Q01+Q10)<<128 + Q11<<256.
+		let sqp = Adder::<W>::build(&mut table, q01, q10, "sqp");
+		let sqp_sh = table.add_shifted("sqp_sh", sqp.sum, logw, 128, ShiftVariant::LogicalLeft);
+		let q11_sh = table.add_shifted("q11_sh", q11, logw, 256, ShiftVariant::LogicalLeft);
+		let acc2 = Adder::<W>::build(&mut table, q00, sqp_sh, "acc2");
+		let grid_qp = Adder::<W>::build(&mut table, acc2.sum, q11_sh, "grid_qp");
+
+		// grid_qp + r, then the grid identity a·b == q·p + r.
+		let qpr = Adder::<W>::build(&mut table, grid_qp.sum, r, "qpr");
+		table.assert_zero("grid_identity", grid_ab.sum - qpr.sum);
+
+		// r < p via the carry-out of r + (2^W - p).
+		let c_bits = two_pow_w_minus(p_bits);
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_col = table.add_constant("two_pow_W_minus_p", c_arr);
+		let rlt_cout = table.add_committed::<B1, W>("rlt_cout");
+		let rlt_cin = table.add_shifted("rlt_cin", rlt_cout, logw, 1, ShiftVariant::LogicalLeft);
+		table.assert_zero("rlt_carry", (r + rlt_cin) * (c_col + rlt_cin) + rlt_cin - rlt_cout);
+		let rlt_final_carry = table.add_selected("rlt_final_carry", rlt_cout, W - 1);
+		table.assert_zero("r_lt_p", rlt_final_carry * B1::ONE);
+
+		// Input seam: pull P00's low 4 64-bit lanes (256 bits) — binds P00 to a LimbProduct strand.
+		let seam_p00_lo = seam_in_p00.map(|chan| {
+			let sel: Vec<Col<B1, 64>> = (0..4)
+				.map(|i| table.add_selected_block::<B1, W, 64>(format!("seam_p00_sel{i}"), p00, i))
+				.collect();
+			let b64: Vec<Col<B64, 1>> = (0..4)
+				.map(|i| table.add_packed::<B1, 64, B64, 1>(format!("seam_p00_b64{i}"), sel[i]))
+				.collect();
+			table.pull(chan, b64);
+			sel
+		});
+
+		Self {
+			table_id: table.id(),
+			p00, p01, p10, p11, q00, q01, q10, q11, r,
+			hi,
+			sab, sab_sh, p11_sh, acc1, grid_ab,
+			sqp, sqp_sh, q11_sh, acc2, grid_qp,
+			qpr,
+			c_col, rlt_cout, rlt_cin, rlt_final_carry, c_bits,
+			seam_p00_lo,
+		}
+	}
+
+	/// Fill every column (committed and virtual) for one row by replaying the grid arithmetic.
+	fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, inp: &FieldMulCombineRow) -> Result<()> {
+		let limb_cols = [self.p00, self.p01, self.p10, self.p11, self.q00, self.q01, self.q10, self.q11];
+		// Constant column C = 2^W - p.
+		write_col::<W>(seg, self.c_col, row, &self.c_bits)?;
+		// The 9 committed inputs.
+		for (col, val) in limb_cols.iter().zip(inp.p.iter()) {
+			write_col::<W>(seg, *col, row, val)?;
+		}
+		write_col::<W>(seg, self.r, row, &inp.r)?;
+		// Range-hi columns.
+		for (h, val) in self.hi.iter().zip(inp.p.iter()) {
+			write_col::<W>(seg, *h, row, &shr(val, 256))?;
+		}
+
+		// grid_ab = P00 + (P01+P10)<<128 + P11<<256.
+		let sab_val = self.sab.populate(seg, row, &inp.p[1], &inp.p[2])?; // P01 + P10
+		let sab_sh_val = shl(&sab_val, 128);
+		write_col::<W>(seg, self.sab_sh, row, &sab_sh_val)?;
+		let p11_sh_val = shl(&inp.p[3], 256);
+		write_col::<W>(seg, self.p11_sh, row, &p11_sh_val)?;
+		let acc1_val = self.acc1.populate(seg, row, &inp.p[0], &sab_sh_val)?;
+		let grid_ab_val = self.grid_ab.populate(seg, row, &acc1_val, &p11_sh_val)?;
+		let _ = grid_ab_val;
+
+		// grid_qp = Q00 + (Q01+Q10)<<128 + Q11<<256.
+		let sqp_val = self.sqp.populate(seg, row, &inp.p[5], &inp.p[6])?; // Q01 + Q10
+		let sqp_sh_val = shl(&sqp_val, 128);
+		write_col::<W>(seg, self.sqp_sh, row, &sqp_sh_val)?;
+		let q11_sh_val = shl(&inp.p[7], 256);
+		write_col::<W>(seg, self.q11_sh, row, &q11_sh_val)?;
+		let acc2_val = self.acc2.populate(seg, row, &inp.p[4], &sqp_sh_val)?;
+		let grid_qp_val = self.grid_qp.populate(seg, row, &acc2_val, &q11_sh_val)?;
+
+		// grid_qp + r.
+		let _ = self.qpr.populate(seg, row, &grid_qp_val, &inp.r)?;
+
+		// r < p carry columns.
+		let (_s, cout) = ripple_add(&inp.r, &self.c_bits);
+		let cin = shl(&cout, 1);
+		write_col::<W>(seg, self.rlt_cout, row, &cout)?;
+		write_col::<W>(seg, self.rlt_cin, row, &cin)?;
+		write_bit(seg, self.rlt_final_carry, row, cout[W - 1])?;
+
+		// Seam projection: P00's low 4 64-bit lanes (pulled from the channel).
+		if let Some(sel) = &self.seam_p00_lo {
+			for (i, &s_col) in sel.iter().enumerate() {
+				write_col::<64>(seg, s_col, row, &inp.p[0][i * 64..i * 64 + 64])?;
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Adversarial path: build + populate a (dishonest) witness, then report whether it is
@@ -1314,6 +1574,250 @@ mod tests {
 			 {}+{} = {} LimbProduct<256> strands (a·b grid + q·p reduction grid, L=128 K=2) + carries, \
 			 r == a·b mod p vs num-bigint. The IoT lever for the in-circuit EC verify.",
 			rss_limb as f64 / mib, rss_modmul as f64 / mib, ratio, K * K, K * K, 2 * K * K
+		);
+	}
+
+	/// GATE limb-seam-EC — the IN-CIRCUIT limb-strand SEAM for the P-256 field multiply `a·b mod p`.
+	/// The prior `limb_sliver` gate showed the DECOMPOSITION math (a·b mod p = Σ a_i·b_j·2^{L(i+j)},
+	/// K=2 L=128, reconstructs exactly vs num-bigint). THIS gate proves the recombination IN-CIRCUIT:
+	///
+	///   TASK A — the COMBINING / REDUCTION proof. A `FieldMulCombine<512>` table takes the 4 product-
+	///   grid limbs Pij = a_i·b_j and the 4 reduction-grid limbs Qij = q_i·p_j (each < 2^256) plus r,
+	///   and PROVES over 512-bit columns: grid_ab = P00+(P01+P10)<<128+P11<<256 [= a·b], grid_qp =
+	///   Q00+(Q01+Q10)<<128+Q11<<256 [= q·p], grid_ab == grid_qp + r, and r < p (carry check). Honest
+	///   VALIDATES + PROVES + VERIFIES over B256@L1; the in-circuit r matches num-bigint; a forged
+	///   product limb (P00+1) OR a forged r makes the grid identity unsatisfiable ⇒ REJECTED.
+	///
+	///   TASK B — the SEAM. One product limb, P00, is BOUND across a channel to a `LimbProduct<256>`
+	///   strand: the strand PUSHES its raw product p = a0·b0 (low 4 B64 lanes = 256 bits), the
+	///   combining table PULLS them into its committed P00. In one constraint system the channel must
+	///   balance, so P00 is pinned to the strand's output. Honest (strand + combine) VALIDATES +
+	///   PROVES + VERIFIES; a strand LYING about its product breaks its own `product` constraint AND
+	///   unbalances the channel ⇒ REJECTED. Scope: ONE limb bound to a strand (the other 7 are directly
+	///   committed inputs); the full 8-strand orchestration is this exact seam repeated 8×.
+	///
+	/// Peak RSS is one narrow `LimbProduct<256>` strand (~44 MiB) plus the small W=512 combining table —
+	/// NOT the wide `ModMul<1024>` (~GiB) it replaces. This is the in-circuit lever for the EC verify.
+	#[test]
+	fn limb_seam_ec_field_mul_p256() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		let tb = |v: &BigUint, w: u64| -> Vec<bool> { (0..w).map(|k| v.bit(k)).collect() };
+
+		// P-256 base-field prime p = 2^256 − 2^224 + 2^192 + 2^96 − 1.
+		let p = BigUint::parse_bytes(
+			b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+			16,
+		)
+		.unwrap();
+		let mut rng = StdRng::seed_from_u64(0x5EA3_0C51);
+		let a = rand_below(&mut rng, 256) % &p;
+		let b = rand_below(&mut rng, 256) % &p;
+		let native = (&a * &b) % &p; // the independent num-bigint reference for a·b mod p.
+
+		// Limb decomposition (K=2, L=128): a = a0 + a1·2^128, b = b0 + b1·2^128, q likewise.
+		const L: usize = 128;
+		let lomask = (BigUint::from(1u8) << L) - 1u8;
+		let a0 = &a & &lomask;
+		let a1 = &a >> L;
+		let b0 = &b & &lomask;
+		let b1 = &b >> L;
+		let prod = &a * &b;
+		let q = &prod / &p;
+		let r = &prod % &p;
+		let q0 = &q & &lomask;
+		let q1 = &q >> L;
+		let p0 = &p & &lomask;
+		let p1 = &p >> L;
+		// Product grid Pij = a_i·b_j and reduction grid Qij = q_i·p_j (each < 2^256).
+		let p00 = &a0 * &b0;
+		let p01 = &a0 * &b1;
+		let p10 = &a1 * &b0;
+		let p11 = &a1 * &b1;
+		let q00 = &q0 * &p0;
+		let q01 = &q0 * &p1;
+		let q10 = &q1 * &p0;
+		let q11 = &q1 * &p1;
+		assert_eq!(r, native, "reduction r must equal a·b mod p (num-bigint)");
+
+		// The 9 combining inputs as 512-bit LE bit vectors, in the fixed limb order.
+		let honest_limbs: [Vec<bool>; 8] = [
+			tb(&p00, 512), tb(&p01, 512), tb(&p10, 512), tb(&p11, 512),
+			tb(&q00, 512), tb(&q01, 512), tb(&q10, 512), tb(&q11, 512),
+		];
+		let honest_r = tb(&r, 512);
+		let p_bits512 = tb(&p, 512);
+
+		// -------------------------------------------------------------------------------------
+		// TASK A — the combining / reduction proof, standalone (no seam). `full` = do prove+verify.
+		// Returns (validate_ok, validate_err, n_tables, proof_size, prove_ms, verify_ok).
+		// -------------------------------------------------------------------------------------
+		let run_combine = |limbs: &[Vec<bool>; 8], r_bits: &Vec<bool>, full: bool|
+		 -> (bool, String, usize, usize, u128, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let comb = FieldMulCombine::<512>::build(&mut cs, &p_bits512);
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(comb.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				comb.populate(&mut seg, 0, &FieldMulCombineRow { p: limbs.clone(), r: r_bits.clone() }).unwrap();
+			}
+			let n_tables = cs.tables.len();
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, n_tables, 0, 0, false);
+			}
+			let t = Instant::now();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &[], witness, &binius_hal::make_portable_backend()).unwrap();
+			let prove_ms = t.elapsed().as_millis();
+			let size = proof.get_proof_size();
+			let verify_ok = binius_core::constraint_system::verify::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+			>(&ccs, 1, 128, &[], proof).is_ok();
+			(vok, verr, n_tables, size, prove_ms, verify_ok)
+		};
+
+		// (A1) Honest combining proof: validate + prove + verify.
+		let (vok, verr, n_tables, size, prove_ms, verify_ok) = run_combine(&honest_limbs, &honest_r, true);
+		assert!(vok, "[Task A] honest combining witness must VALIDATE (got: {verr})");
+		assert!(verify_ok, "[Task A] honest combining proof must VERIFY over B256@L1");
+		println!(
+			"GATE A [combine]: honest P-256 a·b mod p combining/reduction proof VALIDATES + VERIFIES \
+			 over B256@L1(128); {n_tables} table (7 ripple Adder<512> + 8 range checks + grid_identity + \
+			 r<p carry); proof = {size} bytes; prove = {prove_ms} ms."
+		);
+
+		// (A2) In-circuit r matches num-bigint (already pinned by `assert_eq!(r, native)`; the combining
+		// proof enforces grid_ab == grid_qp + r with r < p, which uniquely fixes r = a·b mod p).
+		println!("GATE A [native]: in-circuit r == a·b mod p (num-bigint reference) confirmed.");
+
+		// (A3) Forged PRODUCT limb P00+1: grid_ab shifts by 1, grid identity unsatisfiable ⇒ REJECT.
+		let mut forged_limbs = honest_limbs.clone();
+		forged_limbs[0] = tb(&(&p00 + 1u32), 512);
+		let (fvok, fverr, ..) = run_combine(&forged_limbs, &honest_r, false);
+		assert!(!fvok, "[Task A] SOUNDNESS: forged product limb (P00+1) was ACCEPTED");
+		assert!(
+			fverr.contains("grid_identity"),
+			"[Task A] forged-limb reject not isolated to `grid_identity` (got: {fverr})"
+		);
+		println!("GATE A [forged-limb]: forged product limb P00+1 REJECTED, isolated to `grid_identity`.");
+
+		// (A4) Forged r+1: grid_qp + r increases by 1, grid identity unsatisfiable ⇒ REJECT.
+		let forged_r = tb(&(&r + 1u32), 512);
+		let (rvok, rverr, ..) = run_combine(&honest_limbs, &forged_r, false);
+		assert!(!rvok, "[Task A] SOUNDNESS: forged remainder (r+1) was ACCEPTED");
+		assert!(
+			rverr.contains("grid_identity") || rverr.contains("r_lt_p"),
+			"[Task A] forged-r reject not isolated to `grid_identity`/`r_lt_p` (got: {rverr})"
+		);
+		println!(
+			"GATE A [forged-r]: forged remainder r+1 REJECTED (constraint: {}).",
+			if rverr.contains("grid_identity") { "grid_identity" } else { "r_lt_p" }
+		);
+
+		// -------------------------------------------------------------------------------------
+		// TASK B — the SEAM. Bind P00 to a LimbProduct<256> strand across a channel, in ONE
+		// constraint system: strand PUSHES p = a0·b0, combining PULLS it into P00. `lying_strand`
+		// makes the strand claim p' = a0·b0 + 1. Returns (validate_ok, validate_err, verify_ok).
+		// -------------------------------------------------------------------------------------
+		// `mode`: 0 = honest; 1 = lying strand (claims p' = a0·b0 + 1, its own `product` constraint
+		// breaks); 2 = mismatched seam (strand proves a VALID but DIFFERENT product p' = (a0+1)·b0, so
+		// its `product` constraint HOLDS, but the pushed p' ≠ the pulled honest P00 — isolating the
+		// rejection to the CHANNEL flush, proving the seam alone binds P00 to the strand's output).
+		let run_seam = |mode: u8, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let seam = cs.add_channel("p00_seam");
+			// Table 0: the LimbProduct<256> strand (n=128), pushing its product to the seam channel.
+			let strand = LimbProduct::<256>::build_seamed(&mut cs, L, seam);
+			// Table 1: the combining table, pulling P00 from the seam channel.
+			let comb = FieldMulCombine::<512>::build_seamed_p00(&mut cs, &p_bits512, seam);
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// Strand witness operands + claimed product per mode.
+			let (sa, sb, strand_p) = match mode {
+				1 => (a0.clone(), b0.clone(), &p00 + 1u32),         // internally INVALID product
+				2 => (&a0 + 1u32, b0.clone(), (&a0 + 1u32) * &b0),  // internally VALID, ≠ P00
+				_ => (a0.clone(), b0.clone(), p00.clone()),         // honest
+			};
+			{
+				let tw = witness.init_table(strand.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				strand
+					.populate(&mut seg, &[LimbProductRow { a: tb(&sa, 256), b: tb(&sb, 256), p: tb(&strand_p, 256) }])
+					.unwrap();
+			}
+			// Combining witness: the honest combining inputs (P00 = true a0·b0).
+			{
+				let tw = witness.init_table(comb.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				comb.populate(&mut seg, 0, &FieldMulCombineRow { p: honest_limbs.clone(), r: honest_r.clone() }).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full || !vok {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &[], witness, &binius_hal::make_portable_backend()).unwrap();
+			let verify_ok = binius_core::constraint_system::verify::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+			>(&ccs, 1, 128, &[], proof).is_ok();
+			(vok, verr, verify_ok)
+		};
+
+		// (B1) Honest strand + combine: seam balances, everything VALIDATES + PROVES + VERIFIES.
+		let (svok, sverr, sverify) = run_seam(0, true);
+		assert!(svok, "[Task B] honest seamed (strand→P00) witness must VALIDATE (got: {sverr})");
+		assert!(sverify, "[Task B] honest seamed proof must VERIFY over B256@L1");
+		println!(
+			"GATE B [seam-honest]: P00 BOUND to a LimbProduct<256> strand over a channel (strand PUSHES \
+			 p=a0·b0, combine PULLS P00); honest chain VALIDATES + PROVES + VERIFIES over B256@L1(128)."
+		);
+
+		// (B2) Lying strand (claims p' = a0·b0 + 1): its `product` constraint breaks ⇒ REJECTED.
+		let (lvok, lverr, _) = run_seam(1, false);
+		assert!(!lvok, "[Task B] SOUNDNESS: a strand lying about its product was ACCEPTED");
+		println!(
+			"GATE B [seam-lie]: a strand LYING about its product (p'=a0·b0+1) REJECTED at validate \
+			 (constraint: {}).",
+			lverr.lines().next().unwrap_or("").trim()
+		);
+
+		// (B3) Mismatched seam: the strand proves a VALID but DIFFERENT product ((a0+1)·b0) — its own
+		// `product` constraint HOLDS — but pushes a value ≠ the combining's honest P00. The rejection is
+		// isolated to the CHANNEL flush balance, proving the seam ALONE pins P00 to the strand's output.
+		let (mvok, mverr, _) = run_seam(2, false);
+		assert!(!mvok, "[Task B] SOUNDNESS: a seam-mismatched strand (valid product ≠ P00) was ACCEPTED");
+		println!(
+			"GATE B [seam-mismatch]: a strand with a VALID but DIFFERENT product (pushed ≠ pulled P00) \
+			 REJECTED by the CHANNEL flush ({}). The seam alone binds the strand's output to the proof.",
+			mverr.lines().next().unwrap_or("").trim()
+		);
+
+		println!(
+			"GATE limb-seam-EC: P-256 a·b mod p proven as low-RSS limb strands seamed by an in-circuit \
+			 combining/reduction proof — peak RSS is ONE ~44 MiB LimbProduct<256> strand + a small W=512 \
+			 combining table, NOT a wide ModMul<1024>. Task A (combine+reduce) and Task B (P00↔strand \
+			 seam) both GREEN; forged limb, forged r, and lying strand all REJECTED."
 		);
 	}
 }
