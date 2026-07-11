@@ -84,14 +84,55 @@ all N records, edge-verified) is level-independent in the demo:
   [`docs/iot-memory-bounded-prover.md`](./iot-memory-bounded-prover.md) for the
   memory-bounded prover path at production trace sizes.
 
-## Why this motivates accumulation
+## Why this motivates accumulation — the two layers
 
-Because per-record FIPS-hash verify is *seconds* (worse at L5), the win is
-**never first-contact** (fetch + verify): that regime is a wash-to-loss vs a
-warm DNS cache. The win is **steady state** — verify the epoch proof once
-(~18 ms, O(1) in N) then serve every record with a ~1.3 µs local Merkle-path
-check — plus the **O(1)-verify accumulation** collapse, which arithmetizes the
-*narrow* fold-verify rather than the wide FRI-verify. See
+There are **two distinct "verify times"** in this system, and the accumulator
+only fixes one of them. Keeping them separate is what keeps the claim honest.
+
+### Layer 1 — the per-record FIPS-hash in-circuit verify (this table)
+
+Verifying one record's DNSSEC-digest proof is *seconds* (9 s at L1, 41 s at L5),
+because Binius verify is linear in committed hash width and FIPS SHA-3 is the
+widest gadget in the circuit. **The accumulator does NOT make this
+sub-second.** This cost is paid **once, prover-side / at first contact**, and
+then amortized away. It is not on the steady-state path.
+
+### Layer 2 — the epoch verify over N records (accumulation)
+
+What the accumulator buys is that the **edge verifier's work is O(1) in the
+number of records N**, not O(N):
+
+* **Without accumulation**, verifying an epoch of N records recursively means
+  re-verifying N per-record proofs — N × (Layer-1 seconds) ⇒ minutes-to-hours
+  for a real zone.
+* **With accumulation**, the N per-record proofs are *folded into one
+  accumulator instance during proving*. The edge verifier checks **one**
+  aggregated proof against the interleaved-commit Merkle root `R*` — constant
+  in N (~18 ms in this demo, tied to the Merkle lookup tree). Any individual
+  record then resolves via a ~1.3 µs Merkle path against the verified root.
+
+This works precisely because accumulation arithmetizes the **narrow fold-verify
+(~48 ms)**, *not* the wide FRI/hash-verify.
+
+> **Caveat — don't over-read the ~18 ms.** That figure is the aggregation /
+> fold layer, *not* a from-scratch in-circuit re-verification of the FIPS-hash
+> op-table. A fully assembled recursive verify that re-checks the wide FIPS hash
+> in-circuit is still seconds (~12 s Keccak / ~minute SHA-256 at recursion
+> scale). "ms verify" holds for the fold layer and the steady-state Merkle
+> lookups — not for re-proving the FIPS hashes from scratch.
+
+### Net effect
+
+* The win is **never first-contact** (fetch + verify) — that regime is a
+  wash-to-loss vs a warm DNS cache.
+* The win is **(a) O(1) scaling in N** — adding more DNS records to the epoch
+  costs the edge verifier nothing extra — **and (b) steady-state amortization**
+  — verify the epoch once, then serve every record with a ~1.3 µs local
+  Merkle-path check.
+
+In one line: the accumulator means *"more records cost the verifier nothing
+extra, and after the first verify every lookup is µs"* — **not** *"the FIPS-hash
+proof now verifies in milliseconds."* See
 [`docs/accumulation-recursion.md`](./accumulation-recursion.md).
 
 ## Reproducing
