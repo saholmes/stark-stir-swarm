@@ -222,11 +222,42 @@ extra, and after the first verify every lookup is µs"* — **not** *"the FIPS-h
 proof now verifies in milliseconds."* See
 [`docs/accumulation-recursion.md`](./accumulation-recursion.md).
 
-## Projection: `.se` TLD epoch
+## Runnable `.se` epoch demo (real ECDSA-P256 RRSIGs + Merkle + proofs)
 
-**A projection**, extrapolated from the measured 512-record batch unit above plus
-the accumulation model — *not* a measured full-`.se` run (that needs the prover
-fleet). It answers "what would prove/verify cost for a whole TLD epoch?"
+The projection below is anchored by a **complete, runnable `.se` TLD epoch** —
+[`crates/binius-substrate/src/se_tld_epoch_demo.rs`](../crates/binius-substrate/src/se_tld_epoch_demo.rs),
+test `se_tld_epoch_end_to_end`. It runs on **real Tranco `.se` names** and drives
+the full DNSSEC delegation unit:
+
+* per delegation: canonical RFC-4034 DS RRset → RRSIG signing input → **real
+  ECDSA-P256 / SHA-256 signature** (DNSSEC algorithm 13 — the real `.se` ZSK),
+  `m32 = SHA-256(signing_input)`, `leaf = SHA3-N(m32)`;
+* **hybrid** (per the design decision): the ECDSA RRSIG is verified **natively**
+  (`p256` crate — the reference the in-circuit S2 gadget is gated against; the
+  assembled in-circuit ECDSA verify is not yet wired), the FIPS commitment
+  `leaf` is proved **fully in-circuit** (b256/b512 SHA3 gadget, gated == native),
+  and all N leaves feed the **SHA-3 Merkle lookup tree** + interleaved epoch
+  commitment + aggregated epoch proof.
+
+Measured green (256 real delegations, L1): all 256 RRSIGs verify + a tampered
+signing input rejected; every in-circuit digest == the native Merkle leaf;
+sampled membership auth-paths verify + a record-not-in-epoch rejected;
+per-record in-circuit proof 608 KiB / prove 2456 ms / verify 9317 ms / RSS
+0.13 GiB; Merkle tree depth 8; epoch proof 588 KiB / prove 921 ms / **edge
+verify 81 ms, O(1) in N**; steady-state lookup ~1.8 µs. Flip `Sha3Level` for
+L3 / L5.
+
+> The signature check is **native-pending-in-circuit**; everything downstream of
+> the signed message (commitment, aggregation, lookup) is in-circuit /
+> cryptographic. Swapping the native ECDSA verify for the assembled S2 gadget is
+> the only remaining upgrade.
+
+## Projection: full `.se` TLD epoch
+
+**A projection to full `.se`**, extrapolated from the measured 512-record batch
+unit above plus the accumulation model — *not* a measured full-`.se` run (that
+needs the prover fleet). It answers "what would prove/verify cost for the whole
+TLD epoch?"
 
 ### Assumptions
 
