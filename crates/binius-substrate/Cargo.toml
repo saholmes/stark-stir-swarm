@@ -20,6 +20,12 @@ publish = false
 # Detach from the parent workspace (explicit empty workspace root).
 [workspace]
 
+[features]
+# Opt-in multicore proving: enables binius_maybe_rayon's `rayon` feature, which Cargo
+# feature-unification propagates to every binius crate (single-thread by default otherwise).
+# Used to measure the intra-strand (within one proof) rayon speedup vs the 1-core baseline.
+parallel = ["binius_maybe_rayon/rayon"]
+
 [dependencies]
 # Binius (local checkout, path deps — see rust-toolchain.toml for the pinned nightly).
 binius_core     = { path = "../../../binius/crates/core" }
@@ -32,6 +38,10 @@ binius_circuits = { path = "../../../binius/crates/circuits" }
 # (Field super-traits) live in binius_utils; bytemuck/subtle for the local 256-bit
 # underlier's UnderlierType super-traits. Versions pinned to Binius's Cargo.lock.
 binius_utils    = { path = "../../../binius/crates/utils" }
+# Pulled directly (default-features=false = sequential) so the opt-in `parallel` feature
+# below can enable its `rayon` feature; Cargo feature unification then turns on binius's
+# internal multicore prover across all the binius crates. Default build stays single-thread.
+binius_maybe_rayon = { path = "../../../binius/crates/maybe_rayon", default-features = false }
 bytemuck = { version = "1.18.0", features = ["derive", "min_const_generics"] }
 subtle   = "2.5.0"
 

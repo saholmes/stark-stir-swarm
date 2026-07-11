@@ -231,6 +231,7 @@ dependencies = [
  "binius_hash",
  "binius_m3",
  "binius_math",
+ "binius_maybe_rayon",
  "binius_ntt",
  "binius_utils",
  "bumpalo",

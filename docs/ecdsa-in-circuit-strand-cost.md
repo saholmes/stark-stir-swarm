@@ -26,9 +26,10 @@ and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
   across *separate* proofs). Wall-clock = `(512/P)·695 s + agg tree`: **~12 min with
   a full fleet**, ~93 min at P=64. The only serial parts are the µs native trace and
   the log-depth aggregation. Parallelism buys latency, not total work.
-* Each strand is **RSS-bounded** (~0.1–0.2 GiB) → runs on constrained/IoT machines,
-  and across a zone **N signatures are N×512 independent strands** (parallel on top
-  of parallel).
+* Each EC-round strand peaks at **~3.1 GiB RSS** (measured) → per-box concurrency is
+  RAM-limited (~4–5 strands / 16 GB); true IoT scale needs further limb-slivering.
+  Across a zone, **N signatures are N×512 independent strands** (parallel on top of
+  parallel).
 * The `.se` epoch demo still verifies ECDSA **natively** and proves only the FIPS
   commitment in-circuit — because even ~99 core-hours **per delegation** is a large
   energy/$ budget for live epoch assembly (millions of delegations), and native
@@ -73,7 +74,7 @@ is **total work** (invariant) vs **wall-clock latency** (collapses with parallel
 | Atomic double-and-add round | **695 s / 12.2 MiB** (W=1024, 53 tables) |
 | **Total work** / signature (~512 rounds) | 512 × 695 s ≈ **99 core-hours** (const-time; ~68 with skip-add) |
 | Native accumulator trace (only truly serial compute) | **µs** |
-| Per-strand RSS | **~0.1–0.2 GiB** (fits constrained/IoT) |
+| Per-strand RSS (EC round, measured) | **~3.1 GiB** (RAM-bounds per-box concurrency; IoT needs limb-slivering) |
 | **Wall-clock**, P provers | `(512/P)·695 s + agg tree` |
 | — full fleet (P ≈ 512) | **≈ 12 min** + log-depth aggregation |
 | — P = 64 | ≈ 93 min |
@@ -97,39 +98,48 @@ narrow). Optimizations (fixed-base comb for `G`, 4-bit windowing, Shamir's inter
 embarrassingly-parallel, RSS-bounded work — minutes of latency with a full prover
 fleet, but a large total energy/$ budget that parallelism does not reduce.**
 
-### Threading assumption (all numbers are single-thread)
+### Threading — single-thread baseline, and a MEASURED rayon result
 
-Every measurement above is **single-threaded, one core**. Binius's internal
-parallelism runs through `binius_maybe_rayon`, and every binius crate pulls it with
-`default-features = false`; nothing in the `binius-substrate` build re-enables the
-`rayon` feature, so `maybe_rayon` uses its **sequential** path. The `695 s` round is
-therefore a **1-core** figure.
+Every headline number is **single-threaded, one core** (binius's `binius_maybe_rayon`
+is pulled `default-features = false` everywhere, so its sequential path is used unless
+a build opts in). An opt-in `parallel` feature
+(`parallel = ["binius_maybe_rayon/rayon"]`) enables binius's internal multicore prover
+via Cargo feature-unification. **We measured it** on the assembled round (10-core
+M-series):
 
-This gives a third parallelism axis on top of inter-strand and cross-signature:
+| Run | Round prove+verify | Cores used (user/real) | Peak RSS |
+|-----|-------------------:|-----------------------:|---------:|
+| single-thread (default) | **695 s** | 1 | — |
+| `--features parallel` (rayon on, confirmed linked) | **690 s** | **~3.7×** | **3.1 GiB** |
 
-* **Intra-strand (rayon / multicore within one proof)** — *off in these numbers.*
-  STARK provers (NTT, Merkle hashing, sumcheck) parallelize well but sublinearly
-  (memory-bandwidth bound); a realistic multicore speedup is ~4–8× on 8–10 cores, so
-  `695 s → ~90–175 s`/round on one multicore box.
+**Intra-strand rayon buys ~1× (nothing) on these gadgets — and wastes cores** (~3.7×
+CPU for a 0.7% change). The reason is structural: the EC gadgets are **many
+`table_size = 1` tables** (one wide row each), and binius's prover parallelizes over
+trace *rows* — with one row per table there is nothing to parallelize, so the threads
+are bandwidth-/Amdahl-bound. (A *batched* workload with many rows — e.g. the SHA3
+digest tables at `table_size = 512` — would parallelize; the EC round does not.)
 
-The three axes share one core budget, so the honest invariant is:
+**Consequence for deployment:** don't spend cores *inside* an EC strand; spend them on
+**inter-strand concurrency** — one single-thread strand per core → near-linear
+throughput. The invariant holds, realized by inter-strand (not intra-strand)
+parallelism:
 
 > **wall-clock ≈ total-work / total-cores + aggregation-depth overhead**,
 > total-work ≈ **99 core-hours/sig** (thread-invariant *work*).
 
-| Hardware | Wall-clock / signature |
-|----------|------------------------|
+| Hardware (1 single-thread strand / core) | Wall-clock / signature |
+|------------------------------------------|------------------------|
 | 1 core | ~99 h |
-| one 8-core laptop (rayon on) | ~12 h |
+| one 10-core M-series | ~10 h |
 | one 64-core server | ~1.5 h |
 | 512-core fleet | ~12 min |
 
-Rayon is *how a machine's cores are applied within a strand* when independent strands
-don't saturate them — and it shortens the aggregation tree's top levels (few strands
-there). With 512 independent strands the cores saturate regardless, so the governing
-relation is **work / cores**, not a fixed latency. Enabling rayon cuts per-strand
-wall-time (and wall-clock for a fixed machine count); it does **not** reduce total
-work / energy / $. The `695 s` single-thread round is the conservative anchor.
+…**subject to an RSS bound**: each EC-round strand peaks at **~3.1 GiB** (measured — far
+above the ~0.13 GiB SHA3-digest strand, because W=1024 EC tables are wide). So
+per-box concurrency is RAM-limited (~4–5 strands / 16 GB), and true IoT-scale in-circuit
+EC verify needs the further **limb-slivering** (`ModMul<512> → LimbProduct` from the
+low-mem streaming work), not just per-round strands. The `695 s` single-thread round
+is the conservative anchor; enabling rayon does **not** improve it here.
 
 ## What the strand model *does* buy
 
