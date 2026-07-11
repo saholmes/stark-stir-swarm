@@ -44,6 +44,11 @@ rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] 
 sha2    = { version = "0.10.8", features = ["compress", "oid"] }
 # Peak-RSS reporting for the prove/verify split (getrusage ru_maxrss). Unix-only path.
 libc    = "0.2"
+# Real ECDSA-P256 (DNSSEC alg 13) keygen/sign/verify for the .se TLD epoch demo — the
+# native reference the in-circuit S2 gadget is gated against. Deterministic (RFC 6979).
+p256    = { version = "0.13", features = ["ecdsa"] }
+# SHA3-256 native reference for the .se epoch leaf/commitment (FIPS 202).
+sha3    = "0.10.8"
 
 [dev-dependencies]
 bytes   = "1"
@@ -55,7 +60,6 @@ rayon = "1.8.0"
 # Phase-2 cross-check crates (RustCrypto / fips204): the canonical implementations our
 # hand-written native references are gated against, alongside the NIST/RFC vectors. Added
 # incrementally; versions kept conservative for the pinned nightly-2025-04-24 (rustc 1.88).
-p256    = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = "2.1"
 rsa     = "0.9"
 fips204 = "0.4"
@@ -63,7 +67,7 @@ fips204 = "0.4"
 # `merkle_tree_sha3` (the Tier-A aggregation relation R* the in-circuit master is
 # gated against) and to gate the in-circuit sponge against NIST vectors. Both live
 # on the `cargo test --lib` build path. Pinned to Binius's Cargo.lock (0.10.8).
-sha3    = "0.10.8"
+# (sha3 is a normal dependency — see [dependencies] — so it is available here too.)
 # Independent native Keccak-f[1600] reference for the B256 in-circuit gadget's
 # `keccak_b256_matches_native` gate (test-only; isolated to this detached crate's lock).
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }

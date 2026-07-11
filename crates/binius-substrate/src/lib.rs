@@ -160,6 +160,7 @@ pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narr
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
 pub mod dns_epoch_demo; // end-to-end demonstration: a DNS zone → recursive-STARK epoch proof
 pub mod dns_stark; // D DNS-STARK zone assembly
+pub mod se_tld_epoch_demo; // complete .se TLD epoch: real ECDSA-P256 RRSIGs + Merkle tree + proofs
 
 use std::iter::repeat_with;
 

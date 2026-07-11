@@ -230,6 +230,25 @@ pub fn merkle_tree_sha3_leveled(leaves: &[Vec<u8>], level: Sha3Level) -> Vec<Vec
 	levels
 }
 
+/// The authentication path (sibling per layer, bottom→top) for leaf `index` in a leveled tree
+/// built by `merkle_tree_sha3_leveled`. Duplicate-last is reproduced: on an odd layer the last
+/// node's sibling is itself. Feed the result to `merkle_path_verify_leveled`.
+pub fn merkle_auth_path_leveled(tree: &[Vec<Vec<u8>>], mut index: usize) -> Vec<Vec<u8>> {
+	let mut path = Vec::new();
+	for layer in tree.iter().take(tree.len().saturating_sub(1)) {
+		// The prover duplicates the last node on odd layers before pairing.
+		let sib = if index % 2 == 0 {
+			let s = index + 1;
+			if s < layer.len() { layer[s].clone() } else { layer[index].clone() }
+		} else {
+			layer[index - 1].clone()
+		};
+		path.push(sib);
+		index /= 2;
+	}
+	path
+}
+
 /// Verify a leaf against `root` via its authentication `path` at the given level (recompute
 /// the root by hashing up with SHA3-N — what the in-circuit query check does per level).
 pub fn merkle_path_verify_leveled(leaf: &[u8], mut index: usize, path: &[Vec<u8>], root: &[u8], level: Sha3Level) -> bool {
