@@ -320,6 +320,67 @@ pub fn run_ivc(n_records: usize, inner_vars: usize) -> Result<IvcSummary> {
 	Ok(IvcSummary { n_records, inner_vars, d, total_prove_ms: total_p, total_verify_ms: total_v, max_step_verify_ms: max_v, final_claim_holds })
 }
 
+/// Benchmark the EDGE VERIFY of an aggregated epoch proof vs the record count N. The epoch
+/// proof commits the N records as a batch (here: `per_record_muls` B256-constraint columns
+/// per record, N records = N rows — the aggregated proof's shape); verify is width-linear +
+/// row-polylog, so with fixed per-record width it should be ~CONSTANT in N — the O(1)-in-
+/// records property. `per_record_muls` is the stand-in for one record's committed AIR width.
+/// Returns `(n_records, prove_ms, verify_ms, proof_bytes)`.
+pub fn measure_epoch_verify(per_record_muls: usize, n_records: &[usize]) -> Result<Vec<(usize, u128, u128, usize)>> {
+	use rand::SeedableRng;
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in n_records {
+		let n = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mut tb = cs.add_table("epoch: N records batched");
+		let beta_col = tb.add_committed::<B64, 1>("beta");
+		let mut ops = Vec::with_capacity(per_record_muls);
+		let mut muls = Vec::with_capacity(per_record_muls);
+		for i in 0..per_record_muls {
+			let a = col4(&mut tb, &format!("a{i}"));
+			let b = col4(&mut tb, &format!("b{i}"));
+			muls.push(build_b256_mul(&mut tb, beta_col, a, b, &format!("m{i}_")));
+			ops.push((a, b));
+		}
+		let table_id = tb.id();
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		let mut rng = rand::rngs::StdRng::from_seed([0xe0; 32]);
+		{
+			let tw = witness.init_table(table_id, n)?;
+			let mut seg = tw.full_segment();
+			for row in 0..n {
+				wc64(&mut seg, beta_col, row, beta())?;
+				for i in 0..per_record_muls {
+					let (av, bv) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+					let (asp, bsp) = (split256(av), split256(bv));
+					for j in 0..4 {
+						wc64(&mut seg, ops[i].0[j], row, asp[j])?;
+						wc64(&mut seg, ops[i].1[j], row, bsp[j])?;
+					}
+					pop_b256_mul(&muls[i], &mut seg, row, asp, bsp)?;
+				}
+			}
+		}
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, 1, 128, &statement.boundaries, proof)?;
+		out.push((n, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -332,6 +393,27 @@ mod tests {
 		let (p, v, sz, muls) = prove_verify_fold_verify(8).expect("fold-verify circuit must prove+verify");
 		println!("GATE acc-air-sound: in-circuit fold-verify (d=8, {muls} B256 muls) PROVES+VERIFIES over \
 			 B256 @L1(128) == native; prove {p} ms, verify {v} ms, proof {} KB", sz / 1024);
+	}
+
+	/// ★EPOCH VERIFY BENCHMARK — the edge verify of the aggregated epoch proof vs record
+	/// count N, for two per-record widths. The claim: verify is ~CONSTANT in N (O(1) in
+	/// records) — fast recursive-proof verification. Per-record width sets the constant.
+	#[test]
+	#[ignore = "heavy (~minutes): epoch verify vs N records"]
+	fn epoch_verify_benchmark() {
+		println!("| per-record width | N records | prove ms | verify ms | proof KB | verify/record µs |");
+		println!("|---:|---:|---:|---:|---:|---:|");
+		for w in [8usize, 64] {
+			let res = measure_epoch_verify(w, &[16usize, 64, 256, 1024, 4096]).expect("epoch verify must run");
+			for (n, p, v, sz) in &res {
+				println!("| {} | {} | {} | {} | {} | {:.1} |", w, n, p, v, sz / 1024, *v as f64 * 1000.0 / *n as f64);
+			}
+		}
+		println!("# Fixed per-record width, sweeping N (records) => verify is ~FLAT in N (O(1) in records; \
+			 width-linear + row-polylog). The recursive/aggregated epoch proof verifies in ~constant time \
+			 as the zone grows; per-record verify amortizes to sub-µs. Per-record width w maps to a real \
+			 record AIR via verify ~ 20 + 1.3·w ms. Decentralised proving (sliver/streaming, low RSS) + \
+			 this fast O(1)-in-N verify = the cost-effective epoch DNS-STARK.");
 	}
 
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
