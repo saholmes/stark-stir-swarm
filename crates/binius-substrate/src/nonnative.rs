@@ -1234,4 +1234,86 @@ mod tests {
 			K * K, K * K, 2 * K * K
 		);
 	}
+
+	/// GATE limb-sliver-EC — the EC field-multiply `a·b mod p` (P-256, 256-bit prime) sliver'd
+	/// toward IoT RSS. The assembled EC round's ~3.1 GiB peak is dominated by wide `ModMul<1024>`
+	/// tables (one per field multiply). Slivering each into narrow `LimbProduct<256>` limb strands
+	/// (L=128, W=256) cuts per-strand RSS toward tens of MiB — MEASURED here (getrusage), narrow
+	/// strand vs wide ModMul — and the P-256 multiply is proven to decompose EXACTLY into K²+K²
+	/// limb strands (a·b grid + q·p reduction grid, K=2) vs num-bigint. This is the atomic IoT
+	/// lever for the in-circuit EC verify: replace each ModMul<1024> with low-RSS limb strands.
+	#[test]
+	fn limb_sliver_ec_field_mul_p256() {
+		use crate::b256_sha3::peak_rss_bytes;
+		use num_bigint::BigUint;
+		let tb = |v: &BigUint, w: usize| -> Vec<bool> { (0..w as u64).map(|k| v.bit(k)).collect() };
+		let mib = 1024.0 * 1024.0;
+
+		// P-256 base-field prime p = 2^256 − 2^224 + 2^192 + 2^96 − 1.
+		let p = BigUint::parse_bytes(
+			b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+			16,
+		)
+		.unwrap();
+		let mut rng = StdRng::seed_from_u64(0x0EC0_51AB);
+		let a = rand_below(&mut rng, 256) % &p;
+		let b = rand_below(&mut rng, 256) % &p;
+		let native = (&a * &b) % &p;
+
+		let base = peak_rss_bytes();
+
+		// (1) narrow LimbProduct<256> strand: one 128×128→256 raw limb multiply (L=128). Proved
+		//     first so its RSS peak is isolated below the wide strand's.
+		let l = 128usize;
+		let lomask = (BigUint::from(1u8) << l) - 1u8;
+		let al0 = &a & &lomask;
+		let bl0 = &b & &lomask;
+		let lp = &al0 * &bl0;
+		let row = super::LimbProductRow { a: tb(&al0, 256), b: tb(&bl0, 256), p: tb(&lp, 256) };
+		super::prove_verify_limb_timed::<256>(l, &[row]).expect("limb strand must PROVE over B256");
+		let rss_limb = peak_rss_bytes().saturating_sub(base);
+
+		// (2) wide ModMul<1024> strand: the CURRENT EC field-multiply a·b mod p (n=256).
+		let prod = &a * &b;
+		let q = &prod / &p;
+		let r = &prod % &p;
+		let mmrow = super::ModMulRow { a: tb(&a, 1024), b: tb(&b, 1024), q: tb(&q, 1024), r: tb(&r, 1024) };
+		super::prove_verify::<1024>(&tb(&p, 1024), 256, &[mmrow]).expect("ModMul<1024> strand must PROVE");
+		let rss_modmul = peak_rss_bytes().saturating_sub(base);
+
+		// (3) a·b mod p decomposes EXACTLY into K²+K² LimbProduct<256> strands (K=2, L=128).
+		const L: usize = 128;
+		const K: usize = 2;
+		let mask = (BigUint::from(1u8) << L) - 1u8;
+		let limbs = |v: &BigUint| -> Vec<BigUint> { (0..K).map(|i| (v >> (i * L)) & &mask).collect() };
+		let (al, bl) = (limbs(&a), limbs(&b));
+		let mut grid = BigUint::from(0u8);
+		for i in 0..K {
+			for j in 0..K {
+				grid += (&al[i] * &bl[j]) << (L * (i + j));
+			}
+		}
+		assert_eq!(grid, &a * &b, "limb grid != a*b");
+		let q2 = &grid / &p;
+		let r2 = &grid % &p;
+		let (ql, pl) = (limbs(&q2), limbs(&p));
+		let mut qp = BigUint::from(0u8);
+		for i in 0..K {
+			for j in 0..K {
+				qp += (&ql[i] * &pl[j]) << (L * (i + j));
+			}
+		}
+		assert_eq!(&qp + &r2, grid, "q*p + r != product");
+		assert!(r2 < p, "remainder not reduced");
+		assert_eq!(r2, native, "LimbMul result != a·b mod p (num-bigint)");
+
+		let ratio = rss_modmul as f64 / (rss_limb.max(1) as f64);
+		println!(
+			"GATE limb-sliver-EC: P-256 a·b mod p sliver'd — narrow LimbProduct<256> strand ~{:.0} MiB \
+			 vs wide ModMul<1024> ~{:.0} MiB ({:.1}× less RSS/strand); a·b mod p decomposes EXACTLY into \
+			 {}+{} = {} LimbProduct<256> strands (a·b grid + q·p reduction grid, L=128 K=2) + carries, \
+			 r == a·b mod p vs num-bigint. The IoT lever for the in-circuit EC verify.",
+			rss_limb as f64 / mib, rss_modmul as f64 / mib, ratio, K * K, K * K, 2 * K * K
+		);
+	}
 }
