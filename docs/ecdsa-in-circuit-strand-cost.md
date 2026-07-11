@@ -48,6 +48,7 @@ and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
 | Point **DOUBLE** `[2]P` (X,Y,Z) | `ec_weierstrass_double_full…` | ✓ | 19 tables |
 | Point **ADD** `P+Q` (X,Y,Z) | `ec_weierstrass_add_full…` | ✓ | 30 tables, **453 s, 9.39 MB** |
 | Assembled **double-and-add round** `A'=b?[2]A+P:[2]A` | `ec_weierstrass_dbl_add_round…` | ✓ | 53 tables, **695 s, 12.2 MiB** |
+| **O-aware round** `A'=(A==O)?(b?P:O):…` (sound `Z==0` flag) | `ec_weierstrass_dbl_add_round_oaware…` | ✓ | 56 tables, **720 s, 13.2 MB** |
 | **R.x→accept** (`jac_to` affine-x, then `x≡r mod n`) | `ecdsa_jac_to_affine_x_accept…` | ✓ | (see gate) |
 | Multi-round **composition** (N rounds, separate proofs) | `prove-S2-chain` (3 rounds) | ✓ | per-round bounded RSS |
 | **Message hash** `e = SHA-256(signing input)`, bound into `u1=e·w` | `ecdsa_sha256_to_e_over_b256` | ✓ | 2-block chain: 1.05 MiB / 12.6 s; +u1 bind 3.67 MiB / 47.3 s |
@@ -67,9 +68,20 @@ over 2 soundly-chained blocks (block *k*'s input state column-wired to block *k�
 output — the sound multi-block chain, not a constant-IV per block) and **bound into
 `u1 = e·w mod n`**, so `e` is the hash output, not a free witness. The reduction is
 therefore in-circuit **end to end** — SHA-256→`e`→`u1/u2`→double-and-add rounds→`R.x`
-`jac_to`→`x≡r` accept. The **only** remaining native piece is the **point-at-infinity /
-`u1==u2` exception handling** (the `jac_dbl`/`jac_add` gadgets don't encode O), which a
-production gadget adds as constant-time special-case selectors.
+`jac_to`→`x≡r` accept.
+
+The **point-at-infinity (O)** case is also handled now: `ec_weierstrass_dbl_add_round_oaware`
+makes the round O-aware — `A' = (A==O) ? (b?P:O) : (b?[2]A+P:[2]A)` with `O = Z=0`,
+detected by a **sound `Z==0` flag** (a seamed `fe_inv` `Z·Zinv` pinned both directions
+so the flag can't be mis-set) and an output mux; the discarded generic branch is
+populated with raw-formula values (satisfiable for `Z=0`, no division). 56 tables,
+720 s / 13.2 MB, all four `{A=O, A≠O}×{b∈{0,1}}` cases gated vs native `round_o`,
+forged-flag and forged-coordinate rejected. This is what the constant-time ladder needs
+(the accumulator starts at O and passes through it in the leading rounds).
+
+The **only** remaining native piece is the **`u1==u2` / A=±P doubling-exception** in
+`jac_add` — negligible probability for random signature points, so a production gadget
+adds it as a further constant-time special-case selector.
 
 ## The measured cost — total work vs wall-clock
 
@@ -194,6 +206,7 @@ cargo test --release --lib ec_weierstrass_add_full_over_b256          -- --nocap
 cargo test --release --lib ec_weierstrass_dbl_add_round_over_b256     -- --nocapture       # ~695 s
 cargo test --release --lib ecdsa_jac_to_affine_x_accept_over_b256     -- --nocapture       # ~84 s
 cargo test --release --lib ecdsa_sha256_to_e_over_b256               -- --nocapture       # ~47 s
+cargo test --release --lib ec_weierstrass_dbl_add_round_oaware_over_b256 -- --nocapture    # ~720 s (O-aware)
 ```
 
 Measurement host: Apple M-series (`darwin`), release profile, single machine, W=1024,
