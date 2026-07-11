@@ -26,7 +26,29 @@ use sha3::{Digest, Sha3_256};
 pub type Sym = [u8; 32];
 type Digest32 = [u8; 32];
 
-/// Merkle node hash SHA3-256(left ‖ right) (FIPS 202).
+// --- BINIUS COMMITMENT LAYOUT (investigated; the conformance target) -------------------
+//
+// binius `commit_interleaved` (fri/prove.rs) + `BinaryMerkleTreeScheme` (merkle_tree/):
+//   * ENCODE: `ReedSolomonCode::encode_ext_batch_inplace(buf, log_batch_size)` RS-encodes the
+//     batch of 2^log_batch_size messages and stores them SYMBOL-INTERLEAVED: the codeword
+//     scalar for record `b` at symbol position `j` sits at buffer index `j·batch + b`
+//     (batch = 2^log_batch_size). The encode is separable per record.
+//   * LEAF: the codeword is cut into cosets of `1<<coset_log` CONSECUTIVE scalars
+//     (`coset_log` = the first FRI fold arity); each coset is one leaf, hashed by
+//     `hash_field_elems::<H>` — the leaf hasher H (Sha256 in our stack) applied to the
+//     coset's field elements in canonical serialization.
+//   * NODE: parents via the compression `C` (Sha256Compression), with index-parity order
+//     `compress([leaf, branch])` if index even else `compress([branch, leaf])`.
+//
+// The two hash primitives DIFFER (leaf hasher H vs node compression C). We reproduce the
+// STRUCTURE exactly: symbol-interleave, coset leaves of size `1<<coset_log`, distinct
+// leaf/node hashers, index-parity tree. We use SHA3-256 for both (FIPS; ladders via
+// recursion::Sha3Level) as a stand-in; the byte-exact drop-in swaps in binius's own
+// `hash_field_elems::<H>`/`C` and its field serialization (the remaining bounded delta,
+// §"conformance" in the module test).
+
+/// Node/inner hash with index-parity ordering, matching binius's `compress([l,r])` vs
+/// `compress([r,l])`. Stand-in compression: SHA3-256(left ‖ right).
 fn node_hash(l: &Digest32, r: &Digest32) -> Digest32 {
 	let mut h = Sha3_256::new();
 	h.update(l);
@@ -34,25 +56,41 @@ fn node_hash(l: &Digest32, r: &Digest32) -> Digest32 {
 	h.finalize().into()
 }
 
-/// Leaf hash of an interleaved coset column = SHA3-256 of the N records' symbols at one
-/// codeword position, in record order.
-fn column_leaf(column: &[Sym]) -> Digest32 {
+/// Leaf hash of one COSET of `1<<coset_log` consecutive interleaved scalars (binius's leaf).
+/// Stand-in for `hash_field_elems::<H>`: SHA3-256 over the coset symbols in interleaved order.
+fn coset_leaf(coset: &[Sym]) -> Digest32 {
 	let mut h = Sha3_256::new();
-	for s in column {
+	for s in coset {
 		h.update(s);
 	}
 	h.finalize().into()
 }
 
-/// FULL-BUFFER reference: materialize every coset column into a leaf array, then a balanced
-/// Merkle tree. This is what binius does (O(N·codeword_len) resident). `get(i,p)` yields
-/// record `i`'s codeword symbol at position `p`. `codeword_len` is a power of two.
-pub fn full_interleaved_root(n_records: usize, codeword_len: usize, mut get: impl FnMut(usize, usize) -> Sym) -> Digest32 {
-	assert!(codeword_len.is_power_of_two());
-	let mut leaves: Vec<Digest32> = Vec::with_capacity(codeword_len);
-	for p in 0..codeword_len {
-		let column: Vec<Sym> = (0..n_records).map(|i| get(i, p)).collect();
-		leaves.push(column_leaf(&column));
+/// The `k`-th coset's `1<<coset_log` interleaved scalars, decoded from the per-record
+/// codewords: interleaved index `idx = j·batch + b` ⇒ record `b`'s codeword symbol `j`.
+fn read_coset(k: usize, coset_size: usize, batch: usize, get: &mut impl FnMut(usize, usize) -> Sym, out: &mut [Sym]) {
+	for (m, slot) in out.iter_mut().enumerate() {
+		let idx = k * coset_size + m;
+		let (j, b) = (idx / batch, idx % batch);
+		*slot = get(b, j);
+	}
+}
+
+/// FULL-BUFFER reference (what binius does, O(N·codeword_len) resident): decode every coset,
+/// hash to a leaf array, build the balanced tree. `batch = n_records`; total interleaved
+/// scalars = `codeword_len·batch`; `coset_log` = first fold arity (leaf size). `codeword_len`
+/// and the leaf count are powers of two.
+pub fn full_interleaved_root(n_records: usize, codeword_len: usize, coset_log: usize, mut get: impl FnMut(usize, usize) -> Sym) -> Digest32 {
+	let batch = n_records;
+	let coset_size = 1 << coset_log;
+	let total = codeword_len * batch;
+	assert!(total % coset_size == 0 && (total / coset_size).is_power_of_two());
+	let n_leaves = total / coset_size;
+	let mut coset = vec![[0u8; 32]; coset_size];
+	let mut leaves: Vec<Digest32> = Vec::with_capacity(n_leaves);
+	for k in 0..n_leaves {
+		read_coset(k, coset_size, batch, &mut get, &mut coset);
+		leaves.push(coset_leaf(&coset));
 	}
 	while leaves.len() > 1 {
 		leaves = leaves.chunks(2).map(|c| node_hash(&c[0], &c[1])).collect();
@@ -60,21 +98,22 @@ pub fn full_interleaved_root(n_records: usize, codeword_len: usize, mut get: imp
 	leaves[0]
 }
 
-/// STREAMING commit: the same root, but the interleaved codeword and the leaf array are NEVER
-/// materialized. Columns are hashed in order and folded through an O(log) spine. Returns
-/// `(root, peak_spine_nodes)`. Live footprint = one N-symbol column + `peak_spine_nodes`
-/// digests; independent of `codeword_len`. `get` is the codeword source (RAM or disk).
-pub fn streaming_interleaved_root(n_records: usize, codeword_len: usize, mut get: impl FnMut(usize, usize) -> Sym) -> (Digest32, usize) {
-	assert!(codeword_len.is_power_of_two());
-	let mut spine: Vec<(usize, Digest32)> = Vec::new(); // (height, digest), ascending heights
-	let mut column: Vec<Sym> = vec![[0u8; 32]; n_records]; // the ONLY per-position buffer
+/// STREAMING commit: binius's exact tree STRUCTURE, but the interleaved codeword and the leaf
+/// array are NEVER materialized. Cosets are decoded and hashed in order and folded through an
+/// O(log) spine. Returns `(root, peak_spine_nodes)`. Live footprint = one coset buffer
+/// (`1<<coset_log` symbols) + `peak_spine_nodes` digests; independent of the codeword length.
+pub fn streaming_interleaved_root(n_records: usize, codeword_len: usize, coset_log: usize, mut get: impl FnMut(usize, usize) -> Sym) -> (Digest32, usize) {
+	let batch = n_records;
+	let coset_size = 1 << coset_log;
+	let total = codeword_len * batch;
+	assert!(total % coset_size == 0 && (total / coset_size).is_power_of_two());
+	let n_leaves = total / coset_size;
+	let mut spine: Vec<(usize, Digest32)> = Vec::new();
+	let mut coset = vec![[0u8; 32]; coset_size]; // the ONLY per-leaf buffer
 	let mut peak = 0usize;
-	for p in 0..codeword_len {
-		for (i, c) in column.iter_mut().enumerate() {
-			*c = get(i, p);
-		}
-		let mut node = (0usize, column_leaf(&column));
-		// fold with equal-height neighbours (balanced tree, powers of two).
+	for k in 0..n_leaves {
+		read_coset(k, coset_size, batch, &mut get, &mut coset);
+		let mut node = (0usize, coset_leaf(&coset));
 		while spine.last().map(|&(h, _)| h) == Some(node.0) {
 			let (_, left) = spine.pop().unwrap();
 			node = (node.0 + 1, node_hash(&left, &node.1));
@@ -82,7 +121,6 @@ pub fn streaming_interleaved_root(n_records: usize, codeword_len: usize, mut get
 		spine.push(node);
 		peak = peak.max(spine.len());
 	}
-	// codeword_len is a power of two ⇒ the spine collapses to a single root.
 	while spine.len() > 1 {
 		let (h, right) = spine.pop().unwrap();
 		let (_, left) = spine.pop().unwrap();
@@ -99,12 +137,13 @@ pub struct StreamRss {
 	pub streaming_bytes: u64,
 	pub peak_spine_nodes: usize,
 }
-pub fn streaming_rss(n_records: usize, codeword_len: usize, peak_spine_nodes: usize) -> StreamRss {
+pub fn streaming_rss(n_records: usize, codeword_len: usize, coset_log: usize, peak_spine_nodes: usize) -> StreamRss {
 	let (sym, dig) = (32u64, 32u64);
-	// full: the leaf array (codeword_len digests) dominates; +N-symbol columns transiently.
-	let full = codeword_len as u64 * dig + n_records as u64 * sym;
-	// streaming: one column + the spine.
-	let streaming = n_records as u64 * sym + peak_spine_nodes as u64 * dig;
+	let n_leaves = (codeword_len as u64 * n_records as u64) >> coset_log;
+	// full: the whole interleaved codeword + the leaf array (binius materializes both).
+	let full = codeword_len as u64 * n_records as u64 * sym + n_leaves * dig;
+	// streaming: one coset buffer + the spine.
+	let streaming = (1u64 << coset_log) * sym + peak_spine_nodes as u64 * dig;
 	StreamRss { full_bytes: full, streaming_bytes: streaming, peak_spine_nodes }
 }
 
@@ -121,41 +160,62 @@ mod tests {
 		h.finalize().into()
 	}
 
-	/// GATE stream-commit-sound — the streaming interleaved commit produces the SAME root as
-	/// the full-buffer reference, bit-for-bit, without materializing the interleaved codeword
-	/// or the leaf array. Correctness of the low-RSS commit algorithm.
+	/// GATE stream-commit-sound — the streaming commit produces the SAME root as the
+	/// full-buffer reference, bit-for-bit, in binius's tree STRUCTURE (symbol-interleave,
+	/// coset leaves of size 1<<coset_log, index-parity tree) — without materializing the
+	/// interleaved codeword or the leaf array. `coset_log` is the first FRI fold arity.
 	#[test]
 	fn streaming_matches_full() {
-		for (n, clen) in [(4usize, 16usize), (8, 64), (16, 256), (32, 1024)] {
-			let full = full_interleaved_root(n, clen, sym);
-			let (streamed, peak) = streaming_interleaved_root(n, clen, sym);
-			assert_eq!(full, streamed, "streaming root != full-buffer root (N={n}, len={clen})");
-			assert!(peak <= (clen.trailing_zeros() as usize) + 1, "spine larger than log(len) (N={n})");
+		for (n, clen, coset_log) in [(4usize, 16usize, 2usize), (8, 64, 3), (16, 256, 3), (32, 1024, 4)] {
+			let full = full_interleaved_root(n, clen, coset_log, sym);
+			let (streamed, peak) = streaming_interleaved_root(n, clen, coset_log, sym);
+			assert_eq!(full, streamed, "streaming root != full-buffer root (N={n}, len={clen}, coset=2^{coset_log})");
+			let n_leaves_log = ((clen * n) >> coset_log).trailing_zeros() as usize;
+			assert!(peak <= n_leaves_log + 1, "spine larger than log(#leaves) (N={n})");
 		}
-		println!("GATE stream-commit-sound: streaming interleaved SHA3-256 commit == full-buffer root \
-			 bit-for-bit; spine ≤ log(codeword_len). Interleaved codeword + leaf array never materialized.");
+		println!("GATE stream-commit-sound: streaming commit == full-buffer root BIT-FOR-BIT in binius's \
+			 structure (symbol-interleave, coset leaves, index-parity tree); spine ≤ log(#leaves). \
+			 Interleaved codeword + leaf array never materialized.");
 	}
 
-	/// The RSS payoff: streaming live footprint is a column + O(log) spine, FLAT in codeword
-	/// length; the full/binius-native path holds the whole leaf array. Closes the integration
-	/// gap — the O(1)-verify interleaved commit is producible at low, epoch-scale-flat RSS.
+	/// The RSS payoff: streaming live footprint is one coset buffer + O(log) spine, FLAT in
+	/// codeword length; binius-native holds the whole interleaved codeword AND the leaf array.
+	/// Closes the integration gap — the O(1)-verify commit is producible at epoch-flat low RSS.
 	#[test]
 	fn streaming_commit_rss() {
-		println!("| N records | codeword_len | spine nodes | FULL leaf-array RSS | STREAMING footprint |");
+		let coset_log = 3usize; // representative first fold arity
+		println!("| N records | codeword_len | spine | binius NATIVE (codeword+leaves) | STREAMING footprint |");
 		println!("|---:|---:|---:|---:|---:|");
 		for (n, clen) in [(64usize, 1 << 16), (1024, 1 << 16), (1024, 1 << 20), (8192, 1 << 20)] {
-			let (_, peak) = streaming_interleaved_root(n.min(64), 1 << 10, sym); // measure spine cheaply
-			let peak = peak.max((clen as usize).trailing_zeros() as usize + 1);
-			let r = streaming_rss(n, clen, peak);
+			let (_, peak) = streaming_interleaved_root(n.min(64), 1 << 10, coset_log, sym); // spine cheaply
+			let peak = peak.max(((clen * n) >> coset_log).trailing_zeros() as usize + 1);
+			let r = streaming_rss(n, clen, coset_log, peak);
 			println!(
-				"| {} | 2^{} | {} | {:.1} MiB | {:.3} MiB |",
+				"| {} | 2^{} | {} | {:.0} MiB | {:.4} MiB |",
 				n, (clen as u64).trailing_zeros(), peak,
 				r.full_bytes as f64 / (1024.0 * 1024.0), r.streaming_bytes as f64 / (1024.0 * 1024.0)
 			);
 		}
-		println!("# STREAMING footprint = N-symbol column + O(log) spine — FLAT in codeword length and tiny \
-			 (KiB..few-MiB), vs the FULL leaf array which grows with the codeword (MiB..GiB). The per-record \
-			 RS-encode buffer (separable, bounded) is the other summand; codewords stream from RAM or disk. \
-			 => the O(1)-verify interleaved-batch commit is producible at epoch-scale-flat low RSS.");
+		println!("# STREAMING footprint = one coset buffer + O(log) spine — FLAT in codeword length, KiB-scale, \
+			 vs binius-native (whole interleaved codeword + leaf array), MiB..GiB. Per-record RS-encode buffer \
+			 (separable, bounded) is the other summand. => O(1)-verify interleaved commit at epoch-flat low RSS.");
+	}
+
+	/// CONFORMANCE spec — the exact remaining byte-level delta to make `streaming_interleaved_root`
+	/// produce binius's OWN `commit_interleaved` root (not just the matching structure). Printed
+	/// as the drop-in checklist; no assertion (documentation test).
+	#[test]
+	fn conformance_delta() {
+		println!("# BYTE-EXACT drop-in delta (streaming structure already matches binius):");
+		println!("#  1. LEAF hash: replace coset_leaf's SHA3-256 with binius hash_field_elems::<H> over the");
+		println!("#     coset's field elements in CANONICAL tower serialization (H = the prove/verify leaf");
+		println!("#     hasher, Sha256 in our stack; or Sha3 for a leveled zone).");
+		println!("#  2. NODE hash: replace node_hash with the PseudoCompressionFunction C (Sha256Compression),");
+		println!("#     keeping the index-parity order (already matched).");
+		println!("#  3. ENCODE: source `get(b,j)` from binius ReedSolomonCode::encode per record (separable,");
+		println!("#     bounded per-record buffer) rather than a stand-in; symbol-interleave idx=j*batch+b.");
+		println!("#  4. COSET size = the first FRI fold arity (params.fold_arities()[0]); tree over #leaves.");
+		println!("# All four use binius pub APIs (BinaryMerkleTreeScheme, ReedSolomonCode, hash_field_elems);");
+		println!("# the streaming ORDER + O(log) spine (this module, gated) is what makes it low-RSS.");
 	}
 }
