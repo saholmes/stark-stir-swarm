@@ -163,12 +163,24 @@ parallelism:
 | one 64-core server | ~1.5 h |
 | 512-core fleet | ~12 min |
 
-…**subject to an RSS bound**: each EC-round strand peaks at **~3.1 GiB** (measured — far
-above the ~0.13 GiB SHA3-digest strand, because W=1024 EC tables are wide). So
-per-box concurrency is RAM-limited (~4–5 strands / 16 GB), and true IoT-scale in-circuit
-EC verify needs the further **limb-slivering** (`ModMul<512> → LimbProduct` from the
-low-mem streaming work), not just per-round strands. The `695 s` single-thread round
-is the conservative anchor; enabling rayon does **not** improve it here.
+…**subject to an RSS bound**: the ~3.1 GiB is the **monolithic-round peak** (all 56 tables
+proved in one shot). Two levers bring it down toward IoT scale — and the first is now
+measured:
+
+* **Strand separation** — prove each field multiply as a *separate* seamed proof (peak =
+  one strand, not the summed round), exactly as `prove-S2-chain` does for rounds. A single
+  wide `ModMul<1024>` field-multiply strand is **~196 MiB** (measured), not 3.1 GiB.
+* **Limb-slivering** — replace each wide `ModMul<1024>` with narrow `LimbProduct<256>` limb
+  strands. Measured (`limb_sliver_ec_field_mul_p256`): the P-256 `a·b mod p` decomposes
+  **exactly** into 8 `LimbProduct<256>` strands (4 product + 4 `q·p` reduction, L=128 K=2,
+  gated vs num-bigint), each **~44 MiB** — **4.4× below** the wide `ModMul<1024>` strand.
+  L=64 (W=128) is a further knob (~25 MiB, per the RSA-side measurements).
+
+So the achievable per-strand RSS is **~44 MiB** (44× below the monolithic round), IoT-fittable.
+The remaining build is the **in-circuit seam** — composing the 8 limb strands into a
+reconstructed `a·b mod p` across boundaries so a round proves as a sequence of ~44 MiB
+strands rather than one 3.1 GiB proof. The `695 s` single-thread round is the conservative
+anchor for *work*; enabling rayon does **not** improve it here.
 
 ## What the strand model *does* buy
 
