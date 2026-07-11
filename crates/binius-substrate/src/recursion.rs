@@ -140,6 +140,107 @@ pub fn merkle_path_verify(leaf: [u8; 32], mut index: usize, path: &[[u8; 32]], r
 	node == root
 }
 
+// --- NIST-LEVELED zone-tree hash --------------------------------------------------------
+//
+// The `merkle_root_sha3`/`merkle_tree_sha3` above are HARDCODED SHA3-256 → 128-bit zone
+// binding (κ_bind = collision resistance = output/2) at every level. To bind a zone tree at
+// NIST L3/L5 the hash must ladder to SHA3-384/512 (192/256-bit collision), matching the
+// field (B256/B512) and the recursion hash. These leveled variants do exactly that; the
+// digest length grows 32→48→64 B, so they work over `Vec<u8>` nodes. L1 reproduces the
+// existing `[u8;32]` root bit-for-bit (gated). Same Keccak-f[1600] permutation at every
+// level — only the sponge rate/output differ — so the in-circuit gadget levels by sponge
+// parameters, not a new permutation.
+
+/// NIST security level for the zone-tree hash → SHA3 variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sha3Level {
+	L1, // SHA3-256, 128-bit collision
+	L3, // SHA3-384, 192-bit collision
+	L5, // SHA3-512, 256-bit collision
+}
+impl Sha3Level {
+	/// Digest length in bytes (32/48/64).
+	pub fn digest_len(self) -> usize {
+		match self {
+			Sha3Level::L1 => 32,
+			Sha3Level::L3 => 48,
+			Sha3Level::L5 => 64,
+		}
+	}
+	/// Collision resistance in bits (= digest_len·8/2): 128/192/256 = NIST L1/L3/L5.
+	pub fn collision_bits(self) -> usize {
+		self.digest_len() * 8 / 2
+	}
+	/// Two-to-one node hash `SHA3-N(left ‖ right)` at this level.
+	pub fn hash2(self, l: &[u8], r: &[u8]) -> Vec<u8> {
+		use sha3::{Digest, Sha3_256, Sha3_384, Sha3_512};
+		match self {
+			Sha3Level::L1 => {
+				let mut h = Sha3_256::new();
+				h.update(l);
+				h.update(r);
+				h.finalize().to_vec()
+			}
+			Sha3Level::L3 => {
+				let mut h = Sha3_384::new();
+				h.update(l);
+				h.update(r);
+				h.finalize().to_vec()
+			}
+			Sha3Level::L5 => {
+				let mut h = Sha3_512::new();
+				h.update(l);
+				h.update(r);
+				h.finalize().to_vec()
+			}
+		}
+	}
+}
+
+/// NIST-leveled binary Merkle root over N leaves (duplicate-last on odd layers), using
+/// SHA3-256/384/512 per `level`. L1 == `merkle_root_sha3` on the same leaves.
+pub fn merkle_root_sha3_leveled(leaves: &[Vec<u8>], level: Sha3Level) -> Vec<u8> {
+	if leaves.is_empty() {
+		return vec![0u8; level.digest_len()];
+	}
+	let mut layer: Vec<Vec<u8>> = leaves.to_vec();
+	while layer.len() > 1 {
+		if layer.len() % 2 == 1 {
+			let last = layer.last().unwrap().clone();
+			layer.push(last);
+		}
+		layer = layer.chunks(2).map(|p| level.hash2(&p[0], &p[1])).collect();
+	}
+	layer.into_iter().next().unwrap()
+}
+
+/// The full NIST-leveled Merkle tree (level 0 = leaves, up to `[root]`). The in-circuit
+/// master reproduces this node-for-node with SHA3-N (Keccak-f) gadgets.
+pub fn merkle_tree_sha3_leveled(leaves: &[Vec<u8>], level: Sha3Level) -> Vec<Vec<Vec<u8>>> {
+	let mut levels = vec![leaves.to_vec()];
+	while levels.last().unwrap().len() > 1 {
+		let mut cur = levels.last().unwrap().clone();
+		if cur.len() % 2 == 1 {
+			let last = cur.last().unwrap().clone();
+			cur.push(last);
+		}
+		let next: Vec<Vec<u8>> = cur.chunks(2).map(|p| level.hash2(&p[0], &p[1])).collect();
+		levels.push(next);
+	}
+	levels
+}
+
+/// Verify a leaf against `root` via its authentication `path` at the given level (recompute
+/// the root by hashing up with SHA3-N — what the in-circuit query check does per level).
+pub fn merkle_path_verify_leveled(leaf: &[u8], mut index: usize, path: &[Vec<u8>], root: &[u8], level: Sha3Level) -> bool {
+	let mut node = leaf.to_vec();
+	for sib in path {
+		node = if index % 2 == 0 { level.hash2(&node, sib) } else { level.hash2(sib, &node) };
+		index /= 2;
+	}
+	node == root
+}
+
 /// The concrete aggregation targets: which inner AIRs the master batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregationTarget {
@@ -208,6 +309,51 @@ mod tests {
 
 	fn leaf(byte: u8) -> [u8; 32] {
 		[byte; 32]
+	}
+
+	/// GATE zone-hash-leveled — the zone-tree hash ladders SHA3-256/384/512 with the NIST
+	/// level: (a) L1-leveled == the existing hardcoded SHA3-256 root bit-for-bit; (b) L3/L5
+	/// give 48/64-byte roots with 192/256-bit collision resistance; (c) auth-path verify
+	/// round-trips at every level and rejects a tampered leaf. Closes the zone-binding
+	/// asterisk — at level N every trust-path hash clears category-N collision.
+	#[test]
+	fn zone_hash_sha3_leveling() {
+		let leaves32: Vec<[u8; 32]> = (0..7u8).map(|b| leaf(b.wrapping_mul(37) ^ 0x5a)).collect();
+		let leaves_v: Vec<Vec<u8>> = leaves32.iter().map(|l| l.to_vec()).collect();
+
+		// (a) L1-leveled reproduces the existing [u8;32] root exactly.
+		let l1 = merkle_root_sha3_leveled(&leaves_v, Sha3Level::L1);
+		assert_eq!(l1, merkle_root_sha3(&leaves32).to_vec(), "L1-leveled != existing SHA3-256 root");
+
+		// (b) collision resistance + digest length ladder with the level.
+		for (lvl, bits, len) in [(Sha3Level::L1, 128, 32), (Sha3Level::L3, 192, 48), (Sha3Level::L5, 256, 64)] {
+			assert_eq!(lvl.collision_bits(), bits, "wrong collision bits");
+			assert_eq!(lvl.digest_len(), len, "wrong digest len");
+			// leaves sized to the level (per-record commitments would be level-sized in the pipeline).
+			let lv: Vec<Vec<u8>> = (0..7u8).map(|b| vec![b.wrapping_mul(11) ^ 0x3c; len]).collect();
+			let root = merkle_root_sha3_leveled(&lv, lvl);
+			assert_eq!(root.len(), len, "root not level-sized");
+
+			// (c) auth-path round-trip + tamper rejection at this level.
+			let tree = merkle_tree_sha3_leveled(&lv, lvl);
+			let idx = 3usize;
+			// build the path from the leveled tree (index-mux, same shape as merkle_auth_path).
+			let mut path = Vec::new();
+			let mut i = idx;
+			for level_nodes in &tree[..tree.len() - 1] {
+				let sib = i ^ 1;
+				path.push(if sib < level_nodes.len() { level_nodes[sib].clone() } else { level_nodes[i].clone() });
+				i /= 2;
+			}
+			assert!(merkle_path_verify_leveled(&lv[idx], idx, &path, &root, lvl), "path verify failed @{bits}");
+			let mut bad = lv[idx].clone();
+			bad[0] ^= 0xff;
+			assert!(!merkle_path_verify_leveled(&bad, idx, &path, &root, lvl), "tampered leaf accepted @{bits}");
+		}
+		println!(
+			"GATE zone-hash-leveled: zone tree ladders SHA3-256/384/512 (128/192/256-bit collision); \
+			 L1 == existing root; L3/L5 roots 48/64 B; path verify + tamper-reject at every level"
+		);
 	}
 
 	/// GATE ref-R-1 — the Merkle-over-roots reference: N=1 root is the leaf itself, the
