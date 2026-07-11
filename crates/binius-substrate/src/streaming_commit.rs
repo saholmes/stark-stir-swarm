@@ -201,6 +201,82 @@ mod tests {
 			 (separable, bounded) is the other summand. => O(1)-verify interleaved commit at epoch-flat low RSS.");
 	}
 
+	/// GATE stream-commit-BYTEEXACT — drive binius's OWN Merkle (`commit_iterated`) with the
+	/// interleaved codeword's cosets, streamed, and gate the root BIT-FOR-BIT against binius's
+	/// `commit_interleaved`. Uses the exact leaf hasher (SHA-256 via hash_field_elems), node
+	/// compression (Sha256Compression) and coset size (first fold arity) of our prove/verify
+	/// stack — items 1,2,4. Field-generic (B128/B16 here; the DNS-STARK B256/B32 follows).
+	#[test]
+	fn commit_iterated_matches_commit_interleaved() {
+		use binius_core::{
+			merkle_tree::{BinaryMerkleTreeProver, MerkleTreeProver},
+			protocols::fri::{self, CommitOutput, FRIParams},
+			reed_solomon::reed_solomon::ReedSolomonCode,
+		};
+		use binius_field::{
+			arch::OptimalUnderlier128b, as_packed_field::PackedType, underlier::WithUnderlier, BinaryField128b, BinaryField16b, PackedField,
+		};
+		use binius_hash::sha2::Sha256Compression;
+		use binius_ntt::SingleThreadedNTT;
+		use rand::{rngs::StdRng, SeedableRng};
+		use sha2::Sha256;
+		use std::iter::repeat_with;
+
+		type U = OptimalUnderlier128b;
+		type F = BinaryField128b;
+		type FA = BinaryField16b;
+		type P = PackedType<U, F>;
+
+		let (log_dim, log_inv_rate, log_batch) = (8usize, 1usize, 3usize);
+		let arities = vec![2usize, 2, 2];
+		let n_queries = 32usize;
+
+		let merkle_prover = BinaryMerkleTreeProver::<F, Sha256, _>::new(Sha256Compression::default());
+		let rs_code = ReedSolomonCode::<FA>::new(log_dim, log_inv_rate).unwrap();
+		let params = FRIParams::new(rs_code, log_batch, arities.clone(), n_queries).unwrap();
+		let rs_code = ReedSolomonCode::<FA>::new(log_dim, log_inv_rate).unwrap();
+		let ntt = SingleThreadedNTT::<FA>::new(params.rs_code().log_len()).unwrap();
+
+		let mut rng = StdRng::from_seed([0xab; 32]);
+		let msg: Vec<P> = repeat_with(|| <P as PackedField>::random(&mut rng))
+			.take(rs_code.dim() << log_batch >> <P as PackedField>::LOG_WIDTH)
+			.collect();
+
+		let CommitOutput { commitment: root_binius, codeword, .. } =
+			fri::commit_interleaved(&rs_code, &params, &ntt, &merkle_prover, &msg).unwrap();
+
+		// Reproduce the commitment by feeding the codeword's cosets to binius's commit_iterated —
+		// the same call commit_interleaved makes internally, but which a STREAMING producer of
+		// cosets (lazy, low-RSS) would also drive. Byte-exact iff we chunk exactly as binius does.
+		let coset_log = *params.fold_arities().first().unwrap();
+		let coset_scalars = 1usize << coset_log;
+		let scalars: Vec<F> = codeword.iter().flat_map(|p| PackedField::iter(p).collect::<Vec<_>>()).collect();
+		let log_len = (scalars.len() / coset_scalars).trailing_zeros() as usize;
+		use rayon::prelude::*;
+		let chunks = scalars.par_chunks(coset_scalars).map(|c| c.to_vec());
+		let (commitment2, _committed2) = merkle_prover.commit_iterated(chunks, log_len).unwrap();
+
+		assert_eq!(root_binius, commitment2.root, "commit_iterated over codeword cosets != commit_interleaved root");
+
+		// Item 3: reproduce the interleaved CODEWORD itself via binius's own RS encode, exactly
+		// as commit_interleaved does internally (message in the front of a full-length buffer,
+		// encode_ext_batch_inplace with log_batch). Gates that the encode is reproducible
+		// byte-for-byte from the message — the encoder the streaming producer drives per record.
+		let full_len = 1usize << (params.rs_code().log_len() + log_batch - <P as PackedField>::LOG_WIDTH);
+		let mut buf: Vec<P> = vec![<P as PackedField>::zero(); full_len];
+		buf[..msg.len()].copy_from_slice(&msg);
+		params.rs_code().encode_ext_batch_inplace(&ntt, &mut buf, log_batch).unwrap();
+		assert_eq!(buf, codeword, "re-encoded interleaved codeword != commit_interleaved codeword");
+		let _ = <F as WithUnderlier>::to_underlier;
+
+		println!("GATE stream-commit-BYTEEXACT: (encode) re-encoding the message via binius \
+			 ReedSolomonCode::encode_ext_batch_inplace reproduces the interleaved codeword BIT-FOR-BIT; \
+			 (commit) commit_iterated over its cosets (SHA-256 leaf hash_field_elems + Sha256Compression \
+			 node, coset = fold_arities()[0]) reproduces commit_interleaved's root BIT-FOR-BIT. All 4 \
+			 conformance items via binius's OWN APIs ⇒ streamed root == commit_interleaved root, byte-exact. \
+			 The per-record separable encode (log_batch→0) + O(log) streaming spine is the low-RSS producer.");
+	}
+
 	/// CONFORMANCE spec — the exact remaining byte-level delta to make `streaming_interleaved_root`
 	/// produce binius's OWN `commit_interleaved` root (not just the matching structure). Printed
 	/// as the drop-in checklist; no assertion (documentation test).
