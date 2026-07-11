@@ -49,6 +49,7 @@ and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
 | Point **ADD** `P+Q` (X,Y,Z) | `ec_weierstrass_add_full…` | ✓ | 30 tables, **453 s, 9.39 MB** |
 | Assembled **double-and-add round** `A'=b?[2]A+P:[2]A` | `ec_weierstrass_dbl_add_round…` | ✓ | 53 tables, **695 s, 12.2 MiB** |
 | **O-aware round** `A'=(A==O)?(b?P:O):…` (sound `Z==0` flag) | `ec_weierstrass_dbl_add_round_oaware…` | ✓ | 56 tables, **720 s, 13.2 MB** |
+| **Complete add** `T=(h==0)?((w==0)?[2]P:O):add` (`u1==u2` handled) | `ec_weierstrass_add_complete…` | ✓ | 54 tables, **904 s, 13.6 MB** |
 | **R.x→accept** (`jac_to` affine-x, then `x≡r mod n`) | `ecdsa_jac_to_affine_x_accept…` | ✓ | (see gate) |
 | Multi-round **composition** (N rounds, separate proofs) | `prove-S2-chain` (3 rounds) | ✓ | per-round bounded RSS |
 | **Message hash** `e = SHA-256(signing input)`, bound into `u1=e·w` | `ecdsa_sha256_to_e_over_b256` | ✓ | 2-block chain: 1.05 MiB / 12.6 s; +u1 bind 3.67 MiB / 47.3 s |
@@ -79,9 +80,16 @@ populated with raw-formula values (satisfiable for `Z=0`, no division). 56 table
 forged-flag and forged-coordinate rejected. This is what the constant-time ladder needs
 (the accumulator starts at O and passes through it in the leading rounds).
 
-The **only** remaining native piece is the **`u1==u2` / A=±P doubling-exception** in
-`jac_add` — negligible probability for random signature points, so a production gadget
-adds it as a further constant-time special-case selector.
+The **`u1==u2` / A=±P doubling-exception** is now handled too:
+`ec_weierstrass_add_complete_over_b256` is an exception-free Jacobian add —
+`T = (h==0) ? ((w==0) ? [2]P : O) : jac_add(P,Q)` with `h=u2−u1`, `w=s2−s1`, detected
+by two sound zero-flags (same two-direction fe_inv pin), 3-way mux, discarded branches
+raw-formula-satisfiable. 54 tables, 904 s / 13.6 MB, all three cases (generic / P==Q⇒[2]P
+/ P==−Q⇒O) gated vs native `jac_add`, forged-flag (both) and forged-coordinate rejected.
+
+**With the O-aware round (Inc8) and the complete add (Inc9), the in-circuit ECDSA-P256
+verify has NO remaining native exceptions** — every case of the point arithmetic (O,
+`P==Q`, `P==−Q`, generic) is handled and gated in-circuit over B256 at NIST L1.
 
 ## The measured cost — total work vs wall-clock
 
@@ -207,6 +215,7 @@ cargo test --release --lib ec_weierstrass_dbl_add_round_over_b256     -- --nocap
 cargo test --release --lib ecdsa_jac_to_affine_x_accept_over_b256     -- --nocapture       # ~84 s
 cargo test --release --lib ecdsa_sha256_to_e_over_b256               -- --nocapture       # ~47 s
 cargo test --release --lib ec_weierstrass_dbl_add_round_oaware_over_b256 -- --nocapture    # ~720 s (O-aware)
+cargo test --release --lib ec_weierstrass_add_complete_over_b256         -- --nocapture    # ~904 s (u1==u2 complete add)
 ```
 
 Measurement host: Apple M-series (`darwin`), release profile, single machine, W=1024,
