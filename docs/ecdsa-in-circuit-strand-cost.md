@@ -50,7 +50,7 @@ and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
 | Assembled **double-and-add round** `A'=b?[2]A+P:[2]A` | `ec_weierstrass_dbl_add_round…` | ✓ | 53 tables, **695 s, 12.2 MiB** |
 | **R.x→accept** (`jac_to` affine-x, then `x≡r mod n`) | `ecdsa_jac_to_affine_x_accept…` | ✓ | (see gate) |
 | Multi-round **composition** (N rounds, separate proofs) | `prove-S2-chain` (3 rounds) | ✓ | per-round bounded RSS |
-| Message hash `e = SHA-256(signing input) mod n` | `binius_circuits::sha256` | ✗ (native) | the one remaining wire |
+| **Message hash** `e = SHA-256(signing input)`, bound into `u1=e·w` | `ecdsa_sha256_to_e_over_b256` | ✓ | 2-block chain: 1.05 MiB / 12.6 s; +u1 bind 3.67 MiB / 47.3 s |
 
 The assembled round welds the two point primitives: the **double** exports `D=[2]A`
 over fan-out channels into the **add** computing `T=D+P`, and a per-coordinate GF(2)
@@ -61,6 +61,15 @@ rejected (channel-balance break). The **R.x binding** closes the last soundness 
 the accept gate previously took `R.x` as a free witness; now `R.x` is forced to be
 the affine-x (`X·Z⁻²`) of the committed scalar-mul output point, bound via an input
 boundary — so a prover cannot inject an `R.x` that isn't the real `u1·G+u2·Q`.
+
+The **message hash** is also in-circuit now: `e = SHA-256(signing input)` is proved
+over 2 soundly-chained blocks (block *k*'s input state column-wired to block *k−1*'s
+output — the sound multi-block chain, not a constant-IV per block) and **bound into
+`u1 = e·w mod n`**, so `e` is the hash output, not a free witness. The reduction is
+therefore in-circuit **end to end** — SHA-256→`e`→`u1/u2`→double-and-add rounds→`R.x`
+`jac_to`→`x≡r` accept. The **only** remaining native piece is the **point-at-infinity /
+`u1==u2` exception handling** (the `jac_dbl`/`jac_add` gadgets don't encode O), which a
+production gadget adds as constant-time special-case selectors.
 
 ## The measured cost — total work vs wall-clock
 
@@ -81,7 +90,7 @@ is **total work** (invariant) vs **wall-clock latency** (collapses with parallel
 | — P = 16 | ≈ 6 h |
 | + scalar prep mod n | 63 s |
 | + `jac_to` / `x≡r` accept | **83.7 s / 3.79 MB** (measured, 5 tables) |
-| + `e = SHA-256(signing input)` | native today |
+| + `e = SHA-256(signing input)` → bound into `u1` | **12.6 s** (hash) / **47.3 s** (hash+u1 bind), measured |
 
 **Rounds are sequential in the *values* but parallel to *prove*.** Round *k+1*'s
 accumulator `A_{k+1} = [2]A_k + b_k·P` depends on `A_k` — but the *native* scalar-mul
@@ -183,7 +192,8 @@ cd crates/binius-substrate
 cargo test --release --lib ecdsa_p256_scalar_prep_mod_n_proves_over_b256 -- --nocapture   # 63 s
 cargo test --release --lib ec_weierstrass_add_full_over_b256          -- --nocapture       # ~453 s
 cargo test --release --lib ec_weierstrass_dbl_add_round_over_b256     -- --nocapture       # ~695 s
-cargo test --release --lib ecdsa_jac_to_affine_x_accept_over_b256     -- --nocapture
+cargo test --release --lib ecdsa_jac_to_affine_x_accept_over_b256     -- --nocapture       # ~84 s
+cargo test --release --lib ecdsa_sha256_to_e_over_b256               -- --nocapture       # ~47 s
 ```
 
 Measurement host: Apple M-series (`darwin`), release profile, single machine, W=1024,
