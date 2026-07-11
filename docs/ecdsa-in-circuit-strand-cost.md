@@ -183,10 +183,21 @@ limbs + `r`, proves `grid_ab = P00+(P01+P10)<<128+P11<<256`, `grid_qp` likewise,
 `grid_ab == grid_qp + r`, and `r < p` (41.7 KB / 75 ms / 1 table), gated vs native
 `a·b mod p`; a `LimbProduct::build_seamed` strand pushes its product over a channel that the
 combine pulls, and a lying strand is rejected two ways — its own `product` zerocheck **and**
-channel imbalance (the seam alone binds the strand's output). One of 8 limbs is bound as the
-seam demonstration; the full field-multiply is this seam repeated 8× (peak RSS = one ~44 MiB
-strand + the small W=512 combine table). The `695 s` single-thread round is the conservative
-anchor for *work*; enabling rayon does **not** improve it here.
+channel imbalance (the seam alone binds the strand's output).
+
+**The full field-multiply is now proven end to end** (`limb_field_mul_full_sliver_p256`): the
+whole P-256 `a·b mod p` as **9 separate proofs** — 8 `LimbProduct<256>` strands (4 `a·b`-grid +
+4 `q·p`-grid) each publishing its product limb on an output boundary, + 1 `FieldMulCombine<512>`
+consuming all 8 on input boundaries, cross-proof-bound by boundaries (the `prove-S2-chain`
+pattern), all 8 published==consumed. **Measured peak RSS = 59 MiB across the whole 9-proof
+sequence** (one ~44 MiB strand + the small combine, *not* the ~352 MiB an all-in-one seamed
+proof would cost — each proof's `Bump` drops before the next, so the high-water stays at one
+strand), **3.3× below the wide `ModMul<1024>` (~195 MiB)** it replaces. `r == a·b mod p` vs
+num-bigint; a lying strand is rejected two ways (cross-proof boundary mismatch **and** the
+combine's `grid_identity`). This is the IoT sliver win realized: the in-circuit EC field
+multiply proves at **one-strand RSS** instead of a monolithic wide multiply. The `695 s`
+single-thread round is the conservative anchor for *work*; enabling rayon does **not** improve
+it here.
 
 ## What the strand model *does* buy
 
