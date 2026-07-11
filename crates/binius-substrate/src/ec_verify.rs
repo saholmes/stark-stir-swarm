@@ -927,6 +927,74 @@ mod tests {
 		println!("GATE ref-S2-11: ECDSA verify assembly (SHA-256→e, fe_inv w, Jacobian u1·G+u2·Q, x≡r) == ref; tampers reject");
 	}
 
+	/// GATE prove-S2-modn (S2 verify, scalar prep) — the ECDSA-P256 SCALAR-PREP arithmetic proven
+	/// IN-CIRCUIT over B256 at W=1024. From a genuine signature: w = s⁻¹ mod n (fe_inv, residue
+	/// pinned to 1), u1 = e·w mod n, u2 = r·w mod n — each an S0 ModMul mod n whose residue is
+	/// FORCED by the identity a·b == q·n + r ∧ r < n (so a wrong w with r pinned to 1 makes
+	/// s·w == q·n + 1 unsatisfiable ⇒ REJECT). u1,u2 are exactly the scalars the double-and-add
+	/// loop consumes; this closes the mod-n leg of the ECDSA verify. n is 256-bit ⇒ 2n+1 = 513 ≤ W
+	/// ⇒ W = 1024 (the P-256 ModMul width). Honest prep PROVES+VERIFIES over B256 at NIST L1; a
+	/// tampered s⁻¹ is REJECTED. (Cross-binding the shared w across the three products is a channel
+	/// seam, wired in the full assembly; here each relation is an independently gated in-circuit fact.)
+	#[test]
+	fn ecdsa_p256_scalar_prep_mod_n_proves_over_b256() {
+		use crate::nonnative::{prove_verify, ModMulRow};
+
+		const W: usize = 1024;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let p = prime(S2Curve::P256);
+		let n = order(S2Curve::P256);
+		let nb = n.bits() as usize; // 256
+		let n_bits = to_bits(&n);
+		let g = p256_g();
+
+		// A genuine ECDSA-P256 signature (same construction as the assembly gate).
+		let e = BigUint::from_bytes_be(&crate::sha512_gadget::sha256_ref(b"ECDSA-P256 scalar-prep")) % &n;
+		let d = BigUint::parse_bytes(b"c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721", 16).unwrap();
+		let k = BigUint::parse_bytes(b"7a1a7e52797fc8caaa435d2a4dace39158504bf204fbe19f14dbb427faee50ae", 16).unwrap();
+		let r = match p256_scalar_mul(&k, &g, &p) {
+			Some((x, _)) => x % &n,
+			None => panic!("k·G = O"),
+		};
+		let s = (&k.modpow(&(&n - 2u32), &n) * ((&e + &r * &d) % &n)) % &n;
+
+		// Native scalar prep (the witness values the circuit verifies).
+		let w = s.modpow(&(&n - 2u32), &n); // s⁻¹ mod n
+		let u1 = (&e * &w) % &n;
+		let u2 = (&r * &w) % &n;
+		let one = BigUint::from(1u32);
+		assert_eq!((&s * &w) % &n, one, "native s⁻¹ broken");
+
+		let row = |a: &BigUint, b: &BigUint, res: &BigUint| -> ModMulRow {
+			let prod = a * b;
+			ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&(&prod / &n)), r: to_bits(res) }
+		};
+		let inv_row = row(&s, &w, &one); // s·w ≡ 1  (w = s⁻¹)
+		let u1_row = row(&e, &w, &u1); // e·w ≡ u1
+		let u2_row = row(&r, &w, &u2); // r·w ≡ u2
+		// The ModMul batch size must be a power of two; pad to 4 with a benign 1·1≡1 row.
+		let pad_row = row(&one, &one, &one);
+		let (sz, _) = prove_verify::<W>(&n_bits, nb, &[inv_row, u1_row, u2_row, pad_row])
+			.expect("ECDSA scalar prep (s⁻¹, u1, u2 mod n) must PROVE+VERIFY over B256");
+
+		// Tamper: a wrong inverse with the residue still pinned to 1 → s·w' == q·n + 1 has no
+		// integer solution (true residue ≠ 1) → identity unsatisfiable → REJECT.
+		let bad_w = (&w + 1u32) % &n;
+		let bad_prod = &s * &bad_w;
+		let bad_inv = ModMulRow { a: to_bits(&s), b: to_bits(&bad_w), q: to_bits(&(&bad_prod / &n)), r: to_bits(&one) };
+		assert!(
+			prove_verify::<W>(&n_bits, nb, &[bad_inv]).is_err(),
+			"SOUNDNESS FAILURE: a wrong s⁻¹ (residue pinned to 1) was ACCEPTED mod n over B256"
+		);
+
+		println!(
+			"GATE prove-S2-modn: ECDSA scalar prep w=s⁻¹, u1=e·w, u2=r·w mod n PROVEN+VERIFIED over B256 @L1(128) W=1024; {sz} B; wrong s⁻¹ REJECTED. The scalars the double-and-add loop consumes."
+		);
+	}
+
 	/// Extended-coordinate scalar-mul returning the UN-converted EdExt (so the cofactored
 	/// equation's two sides are compared projectively — no final inversion).
 	fn ed_ext_scalar(k: &BigUint, pt: &(BigUint, BigUint), p: &BigUint) -> EdExt {
