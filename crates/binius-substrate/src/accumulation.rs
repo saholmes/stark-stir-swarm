@@ -173,11 +173,59 @@ pub fn accumulate_verify(records_claims: &[EvalClaim], proofs: &[FoldProof], cha
 	Some(acc)
 }
 
+/// RSS model for the interleaved-batch commit that gives O(1)-verify aggregation.
+/// `inner_log_rows` = log2 of one record's trace rows; `log_n` = log2(#records);
+/// `log_blowup` = FRI rate exponent; `field_bytes` = committed element size.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitRss {
+	pub per_record_codeword_bytes: u64, // one record's RS codeword (encodes independently)
+	pub native_full_bytes: u64,         // binius one-shot buffer = the whole interleaved codeword
+	pub streamed_floor_bytes: u64,      // custom streaming: N column symbols + one record buffer + Merkle spine
+}
+pub fn interleaved_commit_rss(inner_log_rows: usize, log_n: usize, log_blowup: usize, field_bytes: u64) -> CommitRss {
+	let per_record = (1u64 << (inner_log_rows + log_blowup)) * field_bytes;
+	let n = 1u64 << log_n;
+	let native_full = per_record * n; // 2^(inner+logN)·blowup·bytes
+	// streaming: encode each record independently (one per-record buffer), stash codewords, then
+	// stream the interleaved-coset Merkle: each coset column needs one symbol from all N records.
+	let merkle_spine = (inner_log_rows + log_n + log_blowup) as u64 * field_bytes; // O(log) pending nodes
+	let column = n * field_bytes; // N symbols in flight per interleaved coset
+	let streamed_floor = per_record + column + merkle_spine;
+	CommitRss { per_record_codeword_bytes: per_record, native_full_bytes: native_full, streamed_floor_bytes: streamed_floor }
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use rand::{rngs::StdRng, RngCore, SeedableRng};
 	use std::time::Instant;
+
+	fn mib(b: u64) -> f64 {
+		b as f64 / (1024.0 * 1024.0)
+	}
+
+	/// The RSS answer for the O(1)-verify interleaved commit: native (one-shot) grows with N;
+	/// streamed floor is O(N symbols + one record) — LOW and N-flat in the big term. The
+	/// streaming needs a custom commit path (binius allocates the full buffer), but the encode
+	/// is separable (encode_ext_batch_inplace per record) so it's the sliver/low-mem-streaming
+	/// technique applied to the interleaved-coset Merkle.
+	#[test]
+	fn interleaved_commit_rss_model() {
+		println!("| record 2^rows | N records | per-record cw | NATIVE full RSS | STREAMED floor |");
+		println!("|:--|---:|---:|---:|---:|");
+		for (inner, log_n) in [(10usize, 7usize), (10, 10), (15, 10), (15, 13)] {
+			let r = interleaved_commit_rss(inner, log_n, 1, 32); // blowup 2, B256 (32B)
+			println!(
+				"| 2^{} | {} | {:.2} MiB | {:.1} MiB | {:.2} MiB |",
+				inner, 1usize << log_n, mib(r.per_record_codeword_bytes), mib(r.native_full_bytes), mib(r.streamed_floor_bytes)
+			);
+		}
+		println!("# NATIVE (binius one-shot, full buffer) RSS = O(N x per-record) — GROWS with N (128MiB..8GiB). \
+			 STREAMED floor = per-record buffer + N column symbols + Merkle spine — LOW + N-flat in the big \
+			 term (the N-symbol column is KB). ⇒ O(1)-VERIFY interleaved commit CAN be low-RSS, but NOT with \
+			 binius native (materializes the batch); needs a custom streaming commit — the encode is separable \
+			 so this is the sliver/low-mem-streaming problem applied to the interleaved-coset Merkle.");
+	}
 
 	fn rand_f(rng: &mut StdRng) -> F {
 		F::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128)
