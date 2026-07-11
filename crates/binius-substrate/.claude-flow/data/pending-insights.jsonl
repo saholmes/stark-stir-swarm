@@ -307,3 +307,4 @@
 {"type":"edit","file":"/Volumes/SAHexternal 1/Documents/stark-binius-swarm/docs/ecdsa-in-circuit-strand-cost.md","timestamp":1783775428952,"sessionId":null}
 {"type":"edit","file":"/Volumes/SAHexternal 1/Documents/stark-binius-swarm/docs/ecdsa-in-circuit-strand-cost.md","timestamp":1783775438851,"sessionId":null}
 {"type":"edit","file":"/Volumes/SAHexternal 1/Documents/stark-binius-swarm/docs/ecdsa-in-circuit-strand-cost.md","timestamp":1783775443690,"sessionId":null}
+{"type":"edit","file":"/Volumes/SAHexternal 1/Documents/stark-binius-swarm/crates/binius-substrate/src/ec_verify.rs","timestamp":1783781970164,"sessionId":null}

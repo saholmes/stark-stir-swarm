@@ -7157,6 +7157,380 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-e (S2 verify gate) — CLOSES the last native leg of the in-circuit ECDSA-P256
+	/// verify: the message digest `e` is proven IN-CIRCUIT as `e = SHA-256(RRSIG signing input)` over
+	/// B256 (same M3-native SHA-256 the recursion hash uses — no cross-field seam), and that 256-bit
+	/// digest is BOUND as the `a` operand of the scalar-prep `u1 = e·w mod n` ModMul. If `e` were a
+	/// free committed value, an adversary could pick any `e` and never tie it to the signed message;
+	/// this gadget forces `e` to be the true SHA-256 of the RFC 4034 §3.1.8.1 signing input.
+	///
+	/// TASK A (SHA-256 → e): the RRSIG signing input is ~62 B ⇒ FIPS 180-4 padding (append 0x80, zero-
+	///   pad to 56 mod 64, 64-bit big-endian bit length) spans TWO SHA-256 blocks. Block 0 is
+	///   compressed from the SHA-256 IV (0x6a09e667…); block 1's input state is block 0's OUTPUT state,
+	///   column-wired directly (`build_sha256_core` chaining, block k's `h_in` = block k−1's `h_out`) so
+	///   a change anywhere in block 0 propagates to the final state — not a hardcoded constant IV. The
+	///   final 8-word output state (SHA-256 big-endian word order) IS `e`; it is PINNED in-circuit to
+	///   the native `sha256_ref(signing_input)` (constant columns + `assert_zero`), so a flipped input
+	///   byte produces a different digest ⇒ the pin fails ⇒ `validate_witness` REJECTS.
+	/// TASK B (bind e→u1): a genuine ECDSA-P256 signature gives w = s⁻¹ mod n; u1 = e·w mod n is one S0
+	///   ModMul<1024> (n is 256-bit ⇒ 2n+1 = 513 ≤ W). `e` is the RAW 256-bit digest (u1 = e·w mod n =
+	///   (e mod n)·w mod n, so no pre-reduction is needed and `a` equals the digest bit-for-bit). The
+	///   SHA table commits `e` as a W-bit column, ASSERTS its low 256 bits equal the eight digest words
+	///   (endianness: SHA-256 emits big-endian bytes, so digest word i — the MOST significant — lands in
+	///   `e`'s bits [32·(7−i), 32·(7−i)+32); the little-endian ModMul operand's block j = digest word
+	///   7−j), and PUSHES `e`'s low four 64-bit lanes to a seam channel that the ModMul PULLS as operand
+	///   `a` (`build_seamed_in`). So u1 is computed over the IN-CIRCUIT hash output, not a free `e`. The
+	///   in-circuit u1 matches native (e·w mod n); a tampered digest paired with the honest u1 makes the
+	///   ModMul identity a·b == q·n + r unsatisfiable ⇒ REJECT.
+	#[test]
+	fn ecdsa_sha256_to_e_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{read_col, write_col, ModMul, ModMulRow};
+		use crate::sha256_air::{build_k_cols, build_sha256_core, compress256_ref, Sha256Core};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 1024;
+		// SHA-256 initial hash values (FIPS 180-4 §5.3.3) and round keys (shared with sha256_air).
+		const SHA_IV: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+		use crate::sha256_air::K256;
+
+		// 32-bit little-endian bit vector of a u32; write it into a Col<B1,32>.
+		fn u32_bits_(v: u32) -> Vec<bool> {
+			(0..32).map(|k| (v >> k) & 1 == 1).collect()
+		}
+		let wc = |seg: &mut TableWitnessSegment<OurB256>, col: Col<B1, 32>, row: usize, v: u32| {
+			write_col::<32>(seg, col, row, &u32_bits_(v)).unwrap();
+		};
+		// FIPS 180-4 padding: 0x80, zero-pad to 56 mod 64, 64-bit big-endian bit length.
+		fn sha_pad(msg: &[u8]) -> Vec<u8> {
+			let bitlen = (msg.len() as u64) * 8;
+			let mut m = msg.to_vec();
+			m.push(0x80);
+			while m.len() % 64 != 56 {
+				m.push(0);
+			}
+			m.extend_from_slice(&bitlen.to_be_bytes());
+			m
+		}
+		// The 16 big-endian u32 words of a 64-byte block (the SHA-256 message schedule order).
+		fn blk_words(b: &[u8]) -> [u32; 16] {
+			std::array::from_fn(|i| u32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+		}
+		let to_bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|i| x.bit(i)).collect() };
+
+		// A REAL RRSIG signing input (RFC 4034 §3.1.8.1) for an ECDSA-P256/SHA-256 record (alg 13):
+		// RRSIG_RDATA(no sig) ‖ canonical A-RR. 62 bytes ⇒ TWO SHA-256 blocks after padding.
+		let rrsig = crate::dns_stark::RrsigFields {
+			type_covered: 1, // A
+			algorithm: 13,   // ECDSA-P256-SHA-256
+			labels: 3,
+			orig_ttl: 3600,
+			sig_expiration: 1_700_000_000,
+			sig_inception: 1_690_000_000,
+			key_tag: 59409,
+			signer_name: "example.com".into(),
+		};
+		let rr = crate::dns_stark::CanonicalRr {
+			name: "www.example.com".into(),
+			rr_type: 1,
+			class: 1,
+			orig_ttl: 3600,
+			rdata: vec![192, 0, 2, 1], // 192.0.2.1
+		};
+		let signing_input = crate::dns_stark::rrsig_signing_input(&rrsig, &[rr]);
+
+		// Native reference digest (gated against `sha256_ref`); its eight big-endian words are `e`.
+		let digest = crate::sha512_gadget::sha256_ref(&signing_input);
+		let want_words: [u32; 8] = std::array::from_fn(|i| u32::from_be_bytes([digest[4 * i], digest[4 * i + 1], digest[4 * i + 2], digest[4 * i + 3]]));
+		let padded = sha_pad(&signing_input);
+		let n_blocks = padded.len() / 64;
+		assert!(n_blocks >= 2, "signing input must span ≥2 SHA-256 blocks");
+
+		// ───────────────────────── TASK A: prove e = SHA-256(signing_input) in-circuit ─────────────────
+		// One table: FIPS IV → chained M1 compression per padded block → final state pinned to the
+		// native digest words. `tamper` flips a signing-input byte (same block shape) so the digest
+		// changes and the pin fails.
+		let run_a = |tamper: bool, full: bool| -> (bool, String, bool, usize, [u32; 8]) {
+			let msg = if tamper {
+				let mut m = signing_input.clone();
+				m[0] ^= 1;
+				m
+			} else {
+				signing_input.clone()
+			};
+			let padded = sha_pad(&msg);
+			let nb = padded.len() / 64;
+
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut table = cs.add_table("ECDSA e = multi-block SHA-256(signing input)");
+			let k_cols = build_k_cols(&mut table);
+			// Block-0 input state = the SHA-256 IV (constant columns).
+			let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
+				let bits = u32_bits_(SHA_IV[i]);
+				let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+				table.add_constant(format!("iv{i}"), arr)
+			});
+			// Chain: block k's input state = block k−1's OUTPUT state (block 0 = IV); w_in = block words.
+			let mut cores: Vec<Sha256Core> = Vec::with_capacity(nb);
+			let mut win_all: Vec<[Col<B1, 32>; 16]> = Vec::with_capacity(nb);
+			let mut h_in = ivc;
+			for k in 0..nb {
+				let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("w{k}_{i}")));
+				let core = build_sha256_core(&mut table.with_namespace(format!("blk{k}")), h_in, w_in, &k_cols);
+				h_in = core.h_out;
+				win_all.push(w_in);
+				cores.push(core);
+			}
+			let out_state = cores[nb - 1].h_out;
+			// Pin the final state to the native digest words (constant columns): out_state[i] == e_i.
+			let e_pin: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
+				let bits = u32_bits_(want_words[i]);
+				let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+				table.add_constant(format!("e{i}"), arr)
+			});
+			for i in 0..8 {
+				table.assert_zero(format!("e_pin{i}"), out_state[i] - e_pin[i]);
+			}
+			let table_id = table.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let mut got = [0u32; 8];
+			{
+				let tw = witness.init_table(table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				for i in 0..8 {
+					wc(&mut seg, ivc[i], 0, SHA_IV[i]);
+					wc(&mut seg, e_pin[i], 0, want_words[i]);
+				}
+				for (t, col) in k_cols.iter().enumerate() {
+					wc(&mut seg, *col, 0, K256[t]);
+				}
+				let mut state = SHA_IV;
+				for k in 0..nb {
+					let blk = blk_words(&padded[k * 64..k * 64 + 64]);
+					for i in 0..16 {
+						wc(&mut seg, win_all[k][i], 0, blk[i]);
+					}
+					crate::sha256_air::populate_sha256_core(&cores[k], &mut seg, 0, &state, &blk).unwrap();
+					state = compress256_ref(&state, &blk);
+				}
+				got = std::array::from_fn(|i| {
+					let bits = read_col::<32>(&seg, out_state[i], 0).unwrap();
+					(0..32).fold(0u32, |a, k| a | ((bits[k] as u32) << k))
+				});
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false, 0, got);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let (verify_ok, sz) = match proof {
+				Err(_) => (false, 0),
+				Ok(pf) => {
+					let sz = pf.get_proof_size();
+					let ok = binius_core::constraint_system::verify::<
+						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
+					(ok, sz)
+				}
+			};
+			(vok, verr, verify_ok, sz, got)
+		};
+
+		// validate-only iterate (fast): honest accepts + matches native; a flipped input byte REJECTS.
+		let (va, ea, _, _, got) = run_a(false, false);
+		assert!(va, "honest e = SHA-256(signing input) failed validate_witness: {ea}");
+		assert_eq!(got, want_words, "in-circuit SHA-256 output != native sha256_ref(signing input)");
+		let (vt, _et, _, _, _) = run_a(true, false);
+		assert!(!vt, "SOUNDNESS FAILURE: a flipped signing-input byte (different digest) was ACCEPTED over B256");
+
+		// one full prove+verify (honest).
+		let t0 = std::time::Instant::now();
+		let (vok, verr, verify_ok, sz_a, _) = run_a(false, true);
+		let elapsed_a = t0.elapsed();
+		assert!(vok, "honest (full) failed validate_witness: {verr}");
+		assert!(verify_ok, "in-circuit e = SHA-256(signing input) must PROVE+VERIFY over B256");
+		println!(
+			"GATE prove-S2-e/A: e = SHA-256(RRSIG signing input) PROVEN+VERIFIED over B256 @L1(128) in {elapsed_a:?}; {sz_a} B; \
+			 {n_blocks} chained SHA-256 blocks ({} B signing input) in 1 table, block k's state = block k−1's output, final state PINNED to native sha256_ref; in-circuit e == native; a flipped input byte REJECTED.",
+			signing_input.len()
+		);
+
+		// ───────────────────────── TASK B: bind e → u1 = e·w mod n ──────────────────────────────────────
+		// Genuine ECDSA-P256 signature ⇒ w = s⁻¹ mod n; u1 = e·w mod n with `a` = e PULLED from the SHA
+		// table's digest seam channel. `e` is the RAW 256-bit digest (u1 unchanged vs a pre-reduced e).
+		let p = prime(S2Curve::P256);
+		let n = order(S2Curve::P256);
+		let nb_bits = n.bits() as usize; // 256
+		let n_bits = to_bits(&n);
+		let g = p256_g();
+		let raw_e = BigUint::from_bytes_be(&digest); // the 256-bit e (< 2^256), NOT reduced mod n
+		let d = BigUint::parse_bytes(b"c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721", 16).unwrap();
+		let k = BigUint::parse_bytes(b"7a1a7e52797fc8caaa435d2a4dace39158504bf204fbe19f14dbb427faee50ae", 16).unwrap();
+		let r_sig = match p256_scalar_mul(&k, &g, &p) {
+			Some((x, _)) => x % &n,
+			None => panic!("k·G = O"),
+		};
+		let e_modn = &raw_e % &n;
+		let s = (&k.modpow(&(&n - 2u32), &n) * ((&e_modn + &r_sig * &d) % &n)) % &n;
+		let w = s.modpow(&(&n - 2u32), &n); // s⁻¹ mod n
+		let u1 = (&raw_e * &w) % &n; // = e·w mod n (the scalar the double-and-add loop consumes)
+		let q_u1 = (&raw_e * &w) / &n;
+
+		// Build the combined cs: SHA table (pushes e) + ModMul (pulls a = e). `tamper` flips a SHA input
+		// byte so the pushed/asserted digest becomes e′ while the ModMul still claims the honest u1 —
+		// the identity e′·w == q·n + u1 has no solution ⇒ REJECT.
+		let run_b = |tamper: bool, full: bool| -> (bool, String, bool, usize, Vec<bool>) {
+			let msg = if tamper {
+				let mut m = signing_input.clone();
+				m[0] ^= 1;
+				m
+			} else {
+				signing_input.clone()
+			};
+			let padded = sha_pad(&msg);
+			let nb = padded.len() / 64;
+			let tdigest = crate::sha512_gadget::sha256_ref(&msg);
+			let e_use = BigUint::from_bytes_be(&tdigest); // digest actually in-circuit (honest or tampered)
+
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let ch_e = cs.add_channel("chE"); // SHA digest e (low 256 bits, 4 B64 lanes) → ModMul.a
+
+			// SHA table.
+			let mut table = cs.add_table("ECDSA e = SHA-256(signing input) [seamed to u1]");
+			let k_cols = build_k_cols(&mut table);
+			let ivc: [Col<B1, 32>; 8] = std::array::from_fn(|i| {
+				let bits = u32_bits_(SHA_IV[i]);
+				let arr: [B1; 32] = std::array::from_fn(|k| if bits[k] { B1::ONE } else { B1::ZERO });
+				table.add_constant(format!("iv{i}"), arr)
+			});
+			let mut cores: Vec<Sha256Core> = Vec::with_capacity(nb);
+			let mut win_all: Vec<[Col<B1, 32>; 16]> = Vec::with_capacity(nb);
+			let mut h_in = ivc;
+			for kk in 0..nb {
+				let w_in: [Col<B1, 32>; 16] = std::array::from_fn(|i| table.add_committed::<B1, 32>(format!("w{kk}_{i}")));
+				let core = build_sha256_core(&mut table.with_namespace(format!("blk{kk}")), h_in, w_in, &k_cols);
+				h_in = core.h_out;
+				win_all.push(w_in);
+				cores.push(core);
+			}
+			let out_state = cores[nb - 1].h_out;
+			// `e` as a W-bit committed column; its low 256 bits are BOUND to the digest words and its low
+			// four 64-bit lanes are PUSHED to ch_e as the ModMul's operand `a`.
+			let e_col = table.add_committed::<B1, W>("e");
+			// Endianness: SHA-256 digest word i (most significant) occupies e's bits [32·(7−i), …); so
+			// e's 32-bit block j equals digest word 7−j.
+			let e_blk: [Col<B1, 32>; 8] = std::array::from_fn(|j| table.add_selected_block::<B1, W, 32>(format!("e_blk{j}"), e_col, j));
+			for j in 0..8 {
+				table.assert_zero(format!("e_bind{j}"), e_blk[j] - out_state[7 - j]);
+			}
+			let e_lane: [Col<B1, 64>; 4] = std::array::from_fn(|i| table.add_selected_block::<B1, W, 64>(format!("e_lane{i}"), e_col, i));
+			let e_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| table.add_packed::<B1, 64, B64, 1>(format!("e_b64{i}"), e_lane[i]));
+			table.push(ch_e, e_b64);
+			let sha_id = table.id();
+
+			// ModMul u1 = e·w mod n; operand `a` PULLED from ch_e (bound to the SHA digest).
+			let mm = ModMul::<W>::build_seamed_in(&mut cs, &n_bits, nb_bits, ch_e);
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1; 2] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let mut read_r_bits: Vec<bool> = Vec::new();
+			// SHA table witness.
+			{
+				let tw = witness.init_table(sha_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				for i in 0..8 {
+					wc(&mut seg, ivc[i], 0, SHA_IV[i]);
+				}
+				for (t, col) in k_cols.iter().enumerate() {
+					wc(&mut seg, *col, 0, K256[t]);
+				}
+				let mut state = SHA_IV;
+				for kk in 0..nb {
+					let blk = blk_words(&padded[kk * 64..kk * 64 + 64]);
+					for i in 0..16 {
+						wc(&mut seg, win_all[kk][i], 0, blk[i]);
+					}
+					crate::sha256_air::populate_sha256_core(&cores[kk], &mut seg, 0, &state, &blk).unwrap();
+					state = compress256_ref(&state, &blk);
+				}
+				// e_col = the in-circuit digest (honest or tampered); project blocks + lanes.
+				let eb = to_bits(&e_use);
+				write_col::<W>(&mut seg, e_col, 0, &eb).unwrap();
+				for j in 0..8 {
+					write_col::<32>(&mut seg, e_blk[j], 0, &eb[32 * j..32 * j + 32]).unwrap();
+				}
+				for i in 0..4 {
+					write_col::<64>(&mut seg, e_lane[i], 0, &eb[64 * i..64 * i + 64]).unwrap();
+				}
+			}
+			// ModMul witness: a = e actually in-circuit (channel-balanced), but b/r/q pinned to the
+			// HONEST signature — under tamper (e′ ≠ e) the identity e′·w == q·n + u1 fails.
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(&e_use), b: to_bits(&w), q: to_bits(&q_u1), r: to_bits(&u1) }]).unwrap();
+				read_r_bits = mm.read_r(&seg, 0).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false, 0, read_r_bits);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let (verify_ok, sz) = match proof {
+				Err(_) => (false, 0),
+				Ok(pf) => {
+					let sz = pf.get_proof_size();
+					let ok = binius_core::constraint_system::verify::<
+						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
+					(ok, sz)
+				}
+			};
+			(vok, verr, verify_ok, sz, read_r_bits)
+		};
+
+		// validate-only iterate (fast): honest accepts + in-circuit u1 == native; a tampered digest REJECTS.
+		let (vb, eb, _, _, rbits) = run_b(false, false);
+		assert!(vb, "honest e→u1 = e·w mod n binding failed validate_witness: {eb}");
+		assert_eq!(rbits, to_bits(&u1), "in-circuit u1 (ModMul r) != native e·w mod n");
+		let (vbt, _ebt, _, _, _) = run_b(true, false);
+		assert!(!vbt, "SOUNDNESS FAILURE: a tampered digest paired with the honest u1 was ACCEPTED over B256");
+
+		// one full prove+verify (honest, combined SHA + ModMul).
+		let t1 = std::time::Instant::now();
+		let (vok2, verr2, verify_ok2, sz_b, _) = run_b(false, true);
+		let elapsed_b = t1.elapsed();
+		assert!(vok2, "honest (full) B failed validate_witness: {verr2}");
+		assert!(verify_ok2, "in-circuit e→u1 binding must PROVE+VERIFY over B256");
+		println!(
+			"GATE prove-S2-e/B: u1 = e·w mod n with e BOUND to the in-circuit SHA-256 digest PROVEN+VERIFIED over B256 @L1(128) in {elapsed_b:?}; {sz_b} B; \
+			 2 tables (multi-block SHA-256 pushes e's low 256 bits over a seam channel → ModMul<1024> pulls operand a = e), in-circuit u1 == native e·w mod n, a tampered digest (e′≠e) makes the ModMul identity unsatisfiable ⇒ REJECTED. Closes the last native leg of the in-circuit ECDSA-P256 verify (e no longer a free witness)."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
