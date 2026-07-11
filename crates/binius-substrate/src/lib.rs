@@ -158,6 +158,7 @@ pub mod keccak800_air; // Tier-B: Keccak-f[800] narrow recursion hash (~half the
 pub mod accumulation; // Option-3 exploration: accumulation/folding for ms-verify recursion (see docs/accumulation-recursion.md)
 pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narrow? (the ms-recursion measurement)
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
+pub mod dns_epoch_demo; // end-to-end demonstration: a DNS zone → recursive-STARK epoch proof
 pub mod dns_stark; // D DNS-STARK zone assembly
 
 use std::iter::repeat_with;
