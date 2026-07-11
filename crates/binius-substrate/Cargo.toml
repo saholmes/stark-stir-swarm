@@ -42,6 +42,8 @@ rand    = { version = "0.8.5", default-features = false, features = ["std_rng"] 
 # `compress` exposes sha2::{compress256, compress512}; binius_hash already enables
 # this feature on the same sha2 version, so unifying it here adds no lock churn.
 sha2    = { version = "0.10.8", features = ["compress", "oid"] }
+# Peak-RSS reporting for the prove/verify split (getrusage ru_maxrss). Unix-only path.
+libc    = "0.2"
 
 [dev-dependencies]
 bytes   = "1"

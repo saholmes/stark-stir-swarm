@@ -18,8 +18,8 @@ use anyhow::Result;
 use sha3::{Digest, Sha3_256};
 
 use crate::accumulation_air::measure_epoch_verify;
-use crate::b256_sha3::prove_verify_sha3_b256;
-use crate::b512_sha3::prove_verify_sha3_b512;
+use crate::b256_sha3::prove_verify_sha3_b256_timed;
+use crate::b512_sha3::prove_verify_sha3_b512_timed;
 use crate::dns_stark::wire_name;
 use crate::recursion::Sha3Level;
 use crate::sha3_variants::Sha3Variant;
@@ -81,7 +81,9 @@ pub struct DemoReport {
 	pub real_n_digests: usize,
 	pub real_msg_len: usize,
 	pub real_proof_bytes: usize,
-	pub real_prove_verify_ms: u128,
+	pub real_prove_ms: u128,
+	pub real_verify_ms: u128,
+	pub real_peak_rss_bytes: u64,
 	pub real_digest: Vec<u8>,
 	// NIST-level instantiation of the in-circuit DNSSEC-digest gadget.
 	pub level: Sha3Level,
@@ -141,12 +143,12 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize, level: Sh
 		canons.push(canons[canons.len() % n_real].clone());
 	}
 	// blowup=2 (log_inv_rate=1); r auto-derived by binius to meet `security_bits`.
-	let t0 = std::time::Instant::now();
-	let (real_proof_bytes, digests) = match level {
-		Sha3Level::L5 => prove_verify_sha3_b512(variant, &canons, 1, security_bits)?,
-		_ => prove_verify_sha3_b256(variant, &canons, 1, security_bits)?,
+	// The timed entry splits prover time / verifier time and samples peak RSS after prove.
+	let (digests, real_metrics) = match level {
+		Sha3Level::L5 => prove_verify_sha3_b512_timed(variant, &canons, 1, security_bits)?,
+		_ => prove_verify_sha3_b256_timed(variant, &canons, 1, security_bits)?,
 	};
-	let real_prove_verify_ms = t0.elapsed().as_millis();
+	let real_proof_bytes = real_metrics.proof_bytes;
 	let real_digest = digests[real_idx].clone();
 
 	// (3) epoch commitment: interleave the N records into ONE byte-exact, low-RSS commitment.
@@ -174,7 +176,9 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize, level: Sh
 		real_n_digests: n_real,
 		real_msg_len,
 		real_proof_bytes,
-		real_prove_verify_ms,
+		real_prove_ms: real_metrics.prove_ms,
+		real_verify_ms: real_metrics.verify_ms,
+		real_peak_rss_bytes: real_metrics.peak_rss_bytes,
 		real_digest,
 		level,
 		field_name,
@@ -223,12 +227,13 @@ mod tests {
 		println!("  e.g. record {} ({} {} / {}, {}-byte canonical form): in-circuit digest = {}…",
 			report.real_record_idx + 1, rr.name, rr.rtype, rr.sig_alg, report.real_msg_len, hex8(&report.real_digest));
 		println!("       (== native {}, gated inside the in-circuit sponge)", report.variant_name);
-		println!("  REAL proof: {} KiB, prove+verify {} ms — committed over {} @ {}-bit\n\
-			 (query count r auto-derived by binius to meet the target; min(κ_IT,κ_bind,κ_FS) = {}). A genuine\n\
-			 FIPS in-circuit component of every record's DNSSEC verification (the full signature check per\n\
-			 record = the S-layer AIRs).",
-			report.real_proof_bytes / 1024, report.real_prove_verify_ms,
-			report.field_name, report.security_bits, report.security_bits);
+		println!("  REAL proof   : {} KiB — committed over {} @ {}-bit", report.real_proof_bytes / 1024, report.field_name, report.security_bits);
+		println!("  PROVE time   : {} ms  (prover — memory-dominant phase)", report.real_prove_ms);
+		println!("  VERIFY time  : {} ms  (verifier — the per-record in-circuit digest check)", report.real_verify_ms);
+		println!("  PEAK RSS     : {:.2} GiB  (process high-water during prove)", report.real_peak_rss_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+		println!("  (query count r auto-derived by binius to meet the target; min(κ_IT,κ_bind,κ_FS) = {}). A\n\
+			 genuine FIPS in-circuit component of every record's DNSSEC verification (the full signature check\n\
+			 per record = the S-layer AIRs).", report.security_bits);
 		println!("\n--- (3) epoch commitment (byte-exact interleaved commit; streaming ~KiB RSS) ---");
 		println!("  epoch root R* = {}…  (one artifact binding all {} records)", hex8(&report.epoch_root), report.n_records);
 		println!("\n--- (4) aggregated epoch proof (one recursive STARK, edge-verified) ---");

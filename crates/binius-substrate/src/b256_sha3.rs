@@ -96,13 +96,22 @@ impl Sha3B256Table {
 /// If `tamper_transcript` is set, a clone of the honest proof has one transcript
 /// byte flipped and this fn errors unless that tampered proof is REJECTED by
 /// verify (an in-band soundness gate).
+/// Prove+verify timing + peak-RSS split for an in-circuit SHA-3 batch.
+#[derive(Clone, Copy, Debug)]
+pub struct ProveVerifyMetrics {
+	pub proof_bytes: usize,
+	pub prove_ms: u128,
+	pub verify_ms: u128,
+	pub peak_rss_bytes: u64, // process high-water RSS after prove (getrusage)
+}
+
 fn build_prove_verify_sha3_b256(
 	variant: Sha3Variant,
 	messages: &[Vec<u8>],
 	log_inv_rate: usize,
 	security_bits: usize,
 	tamper_transcript: bool,
-) -> Result<(usize, Vec<Vec<u8>>)> {
+) -> Result<(usize, Vec<Vec<u8>>, ProveVerifyMetrics)> {
 	let allocator = Bump::new();
 	let mut cs = ConstraintSystem::<OurB256>::new();
 	let table = Sha3B256Table::new(&mut cs, variant);
@@ -139,6 +148,7 @@ fn build_prove_verify_sha3_b256(
 	let witness = witness.into_multilinear_extension_index();
 
 	// FIPS commitment + transcript; challenge/extension field = B256 (2^256).
+	let t_prove = std::time::Instant::now();
 	let proof = binius_core::constraint_system::prove::<
 		U256,
 		B256TowerFamily,
@@ -154,9 +164,14 @@ fn build_prove_verify_sha3_b256(
 		witness,
 		&binius_hal::make_portable_backend(),
 	)?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	// Peak RSS is a process high-water mark; sample it right after prove (the prover
+	// is the memory-dominant phase — witness + LDE + Merkle trees).
+	let peak_rss_bytes = peak_rss_bytes();
 
 	let proof_size = proof.get_proof_size();
 
+	let t_verify = std::time::Instant::now();
 	binius_core::constraint_system::verify::<
 		U256,
 		B256TowerFamily,
@@ -164,6 +179,8 @@ fn build_prove_verify_sha3_b256(
 		Sha256Compression,
 		HasherChallenger<Sha256>,
 	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof.clone())?;
+	let verify_ms = t_verify.elapsed().as_millis();
+	let metrics = ProveVerifyMetrics { proof_bytes: proof_size, prove_ms, verify_ms, peak_rss_bytes };
 
 	if tamper_transcript {
 		let mut bad = proof;
@@ -184,7 +201,32 @@ fn build_prove_verify_sha3_b256(
 		);
 	}
 
-	Ok((proof_size, digests))
+	Ok((proof_size, digests, metrics))
+}
+
+/// Process peak resident-set size in bytes (getrusage `ru_maxrss`). macOS reports
+/// bytes; Linux reports kilobytes — normalise both to bytes. 0 if unavailable.
+pub fn peak_rss_bytes() -> u64 {
+	#[cfg(unix)]
+	unsafe {
+		let mut ru: libc::rusage = std::mem::zeroed();
+		if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+			return 0;
+		}
+		let maxrss = ru.ru_maxrss as u64;
+		#[cfg(target_os = "macos")]
+		{
+			maxrss // already bytes on Darwin
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			maxrss * 1024 // kilobytes on Linux/BSD
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		0
+	}
 }
 
 /// Public entry: honest prove+verify of a single-block SHA-3 `variant` batch
@@ -195,7 +237,19 @@ pub fn prove_verify_sha3_b256(
 	log_inv_rate: usize,
 	security_bits: usize,
 ) -> Result<(usize, Vec<Vec<u8>>)> {
-	build_prove_verify_sha3_b256(variant, messages, log_inv_rate, security_bits, false)
+	let (sz, d, _m) = build_prove_verify_sha3_b256(variant, messages, log_inv_rate, security_bits, false)?;
+	Ok((sz, d))
+}
+
+/// Timed entry: same as `prove_verify_sha3_b256` but returns the prove/verify/RSS split.
+pub fn prove_verify_sha3_b256_timed(
+	variant: Sha3Variant,
+	messages: &[Vec<u8>],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<(Vec<Vec<u8>>, ProveVerifyMetrics)> {
+	let (_sz, d, m) = build_prove_verify_sha3_b256(variant, messages, log_inv_rate, security_bits, false)?;
+	Ok((d, m))
 }
 
 /// Build a DISHONEST witness: after honest population, flip one bit of the perm-0
@@ -397,7 +451,7 @@ mod tests {
 			dishonest_sha3_b256_is_rejected(v, 1, 128),
 			"SOUNDNESS FAILURE: a corrupted SHA3-256 state_out lane was accepted over B256"
 		);
-		let (size, _) = build_prove_verify_sha3_b256(v, &[b"abc".to_vec()], 1, 128, true)
+		let (size, _, _) = build_prove_verify_sha3_b256(v, &[b"abc".to_vec()], 1, 128, true)
 			.expect("honest proof must verify AND tampered transcript must be rejected");
 		println!(
 			"DELIVERABLE 4: corrupted-output-lane AND flipped-transcript both REJECTED over B256 \

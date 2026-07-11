@@ -105,7 +105,7 @@ fn build_prove_verify_sha3_b512(
 	log_inv_rate: usize,
 	security_bits: usize,
 	tamper_transcript: bool,
-) -> Result<(usize, Vec<Vec<u8>>)> {
+) -> Result<(usize, Vec<Vec<u8>>, crate::b256_sha3::ProveVerifyMetrics)> {
 	let allocator = Bump::new();
 	let mut cs = ConstraintSystem::<OurB512>::new();
 	let table = Sha3B512Table::new(&mut cs, variant);
@@ -142,6 +142,7 @@ fn build_prove_verify_sha3_b512(
 	let witness = witness.into_multilinear_extension_index();
 
 	// FIPS commitment + transcript; challenge/extension field = B512 (2^512).
+	let t_prove = std::time::Instant::now();
 	let proof = binius_core::constraint_system::prove::<
 		U512,
 		B512TowerFamily,
@@ -157,9 +158,12 @@ fn build_prove_verify_sha3_b512(
 		witness,
 		&binius_hal::make_portable_backend(),
 	)?;
+	let prove_ms = t_prove.elapsed().as_millis();
+	let peak_rss_bytes = crate::b256_sha3::peak_rss_bytes();
 
 	let proof_size = proof.get_proof_size();
 
+	let t_verify = std::time::Instant::now();
 	binius_core::constraint_system::verify::<
 		U512,
 		B512TowerFamily,
@@ -167,6 +171,8 @@ fn build_prove_verify_sha3_b512(
 		Sha256Compression,
 		HasherChallenger<Sha256>,
 	>(&ccs, log_inv_rate, security_bits, &statement.boundaries, proof.clone())?;
+	let verify_ms = t_verify.elapsed().as_millis();
+	let metrics = crate::b256_sha3::ProveVerifyMetrics { proof_bytes: proof_size, prove_ms, verify_ms, peak_rss_bytes };
 
 	if tamper_transcript {
 		let mut bad = proof;
@@ -187,7 +193,7 @@ fn build_prove_verify_sha3_b512(
 		);
 	}
 
-	Ok((proof_size, digests))
+	Ok((proof_size, digests, metrics))
 }
 
 /// Public entry: honest prove+verify of a single-block SHA-3 `variant` batch
@@ -198,7 +204,19 @@ pub fn prove_verify_sha3_b512(
 	log_inv_rate: usize,
 	security_bits: usize,
 ) -> Result<(usize, Vec<Vec<u8>>)> {
-	build_prove_verify_sha3_b512(variant, messages, log_inv_rate, security_bits, false)
+	let (sz, d, _m) = build_prove_verify_sha3_b512(variant, messages, log_inv_rate, security_bits, false)?;
+	Ok((sz, d))
+}
+
+/// Timed entry: same as `prove_verify_sha3_b512` but returns the prove/verify/RSS split.
+pub fn prove_verify_sha3_b512_timed(
+	variant: Sha3Variant,
+	messages: &[Vec<u8>],
+	log_inv_rate: usize,
+	security_bits: usize,
+) -> Result<(Vec<Vec<u8>>, crate::b256_sha3::ProveVerifyMetrics)> {
+	let (_sz, d, m) = build_prove_verify_sha3_b512(variant, messages, log_inv_rate, security_bits, false)?;
+	Ok((d, m))
 }
 
 /// Build a DISHONEST witness: after honest population, flip one bit of the perm-0
@@ -395,7 +413,7 @@ mod tests {
 			dishonest_sha3_b512_is_rejected(v, 1, 256),
 			"SOUNDNESS FAILURE: a corrupted SHA3-256 state_out lane was accepted over B512 at L5"
 		);
-		let (size, _) = build_prove_verify_sha3_b512(v, &[b"abc".to_vec()], 1, 256, true)
+		let (size, _, _) = build_prove_verify_sha3_b512(v, &[b"abc".to_vec()], 1, 256, true)
 			.expect("honest proof must verify AND tampered transcript must be rejected");
 		println!(
 			"DELIVERABLE (L5): corrupted-output-lane AND flipped-transcript both REJECTED over B512 \
