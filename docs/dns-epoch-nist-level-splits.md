@@ -222,6 +222,73 @@ extra, and after the first verify every lookup is µs"* — **not** *"the FIPS-h
 proof now verifies in milliseconds."* See
 [`docs/accumulation-recursion.md`](./accumulation-recursion.md).
 
+## Projection: `.se` TLD epoch
+
+**A projection**, extrapolated from the measured 512-record batch unit above plus
+the accumulation model — *not* a measured full-`.se` run (that needs the prover
+fleet). It answers "what would prove/verify cost for a whole TLD epoch?"
+
+### Assumptions
+
+* **Scale:** `.se` ≈ **1.5 M signed delegation records** (~1.4–1.5 M registered,
+  fully DNSSEC-signed; the TLD-zone epoch is the NS / DS / NSEC3 RRsets under
+  `.se`'s own ZSK). Use `N = 1.5 M`, **L1 (128-bit)**.
+* **Measured unit** (L1 split above): a 512-record single-block SHA3-256 batch =
+  one Binius proof, prove 2455 ms, verify 9318 ms, 608 KiB. Amortized prove =
+  **4.79 ms/record**.
+* **Granularity caveat:** 4.79 ms/record is the SHA3 *digest* proof, not the full
+  RRSIG *signature* verify. The full S-layer sig-AIR (`.se` ZSK = ECDSA-P256 or
+  RSA) is heavier — RSA-2048 ModMul is seconds/record, ECDSA lighter — and pushes
+  the prove side up proportionally (still fleet-parallel). Nail this down with a
+  real ZSK-algorithm measurement before quoting full-signature numbers.
+* Anchor: the real `.se` HNPL sample (857 records → 207 KiB package, **1.36 ms
+  edge verify**) supports the O(1) ms edge-verify at the leaf model.
+
+### Prove — fleet-parallel, publisher-side (once per epoch)
+
+Slivers/batches are embarrassingly parallel (independent proofs); wall-clock =
+(2.0 core-hours)/P + one accumulation tree.
+
+| Provers P | Wall-clock prove for N = 1.5 M |
+|:---------:|:------------------------------:|
+| 1 core    | 2930 batches × 2.455 s ≈ **2.0 h** |
+| 100       | ≈ **72 s** |
+| 1000      | ≈ **7.2 s** |
+
+Folding 2930 batch-instances is a ~log₂(2930) ≈ 11.5-deep narrow-fold tree
+(~48 ms arithmetized fold-verify per node) → **adds seconds, not hours**; one
+epoch proof `Π` out the end.
+
+### Verify — O(1) in N, edge-side (does not scale with 1.5 M)
+
+| Quantity | Value | Note |
+|:---------|:------|:-----|
+| Epoch verify (fold layer)         | **~18 ms** | O(1) in N; consistent with the 1.36 ms HNPL edge package |
+| Epoch verify (assembled, in-circuit hash re-check) | **seconds** (~12 s Keccak) | the honest caveat — see the two-layer framing |
+| Per-record lookup                 | **~3 µs**  | Merkle path, depth ≈ log₂(2¹⁰·1.5 M) ≈ 30 SHA-3 hashes |
+
+A resolver verifies the **entire `.se` epoch once** in ms (fold layer) —
+*independent of whether it is 857 records or 1.5 M* — then answers any of the
+1.5 M delegations in ~3 µs.
+
+### L5 multiplier
+
+Prove ×2.1, Layer-1 verify ×4.4, RSS ×1.6 (B256 → B512). The edge/epoch verify
+stays **O(1) in N** regardless of level.
+
+### Bottom line
+
+* **Prove:** ~2 core-hours at digest granularity for full `.se`, collapsing to
+  **seconds on a ~1000-prover fleet** — the decentralised, censorship-resistant
+  proving path. (Full-signature granularity is heavier; needs the ZSK-algo
+  S-layer number.)
+* **Verify:** **~18 ms once, O(1) in N**, then ~3 µs/lookup — the 1.5 M scale is
+  invisible to the verifier.
+
+Two reviewer caveats restated: (1) the ~18 ms is the fold layer, not assembled
+in-circuit hash re-verification (seconds); (2) 4.79 ms/record is the SHA3 digest,
+not the full RRSIG signature verify.
+
 ## Reproducing
 
 The demo defaults to L1. Flip `let level = Sha3Level::L1;` in the
