@@ -7937,6 +7937,984 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-waddcomplete (S2 Weierstrass EXCEPTION-FREE point op) — a COMPLETE P-256 Jacobian
+	/// point ADD T = jac_add(P,Q) that WIRES the u1==u2 doubling-exception in-circuit, closing the last
+	/// native leg of the in-circuit ECDSA verify. The generic add-2007-bl formula is only correct when
+	/// h=u2−u1 ≠ 0; when h==0 the two points share an x-coordinate in the common frame and are either
+	/// EQUAL (w=s2−s1 == 0 ⇒ P+Q = [2]P) or INVERSES (w ≠ 0 ⇒ P+Q = O). This gadget proves
+	///     T = (h==0) ? ( (w==0) ? jac_dbl(P) : O=(1,1,0) ) : jac_add_generic(P,Q).
+	/// It welds three strands by channels: (i) the 30-table GENERIC ADD (16 seamed ModMuls + 7 fan-outs
+	/// + 7 fe glue) computes jac_add_generic(P,Q) and, in addition to EXPORTING its result over
+	/// a_chX3/a_chY3/a_chZ3, EXPORTS its internal h=u2−u1 (over a_chH, mult bumped to 4) and w=s2−s1
+	/// (over a_chW, formerly a dead column); (ii) the 19-table DOUBLE (8 ModMuls + 2 fan-outs + 9 fe
+	/// glue) computes D=[2]P with the RAW add-2007-bl/dbl formulas (division-free ⇒ well-defined for ALL
+	/// inputs) and exports D over d_chX3/d_chY3/d_chZ3; (iii) TWO SOUND zero-flags — h_is_zero and
+	/// w_is_zero — each a seamed fe_inv ModMul (h·hInv / w·wInv) + an inverse-source table + a two-
+	/// direction pin (direction A: flag=0 ⇒ prod==1 ⇒ val≠0; direction B: flag=1 ⇒ val==0 ⇒ flag=(val==0));
+	/// and (iv) a 3-WAY OUTPUT MUX table that computes inner = w_is_zero?D:O per coordinate (O=(1,1,0)) and
+	/// T = h_is_zero?inner:add per coordinate, all GF(2) boolean muxes (the round's kbc-broadcast trick),
+	/// exposing T=(X3,Y3,Z3) on output boundaries. CRITICAL (as in the O-aware round): the discarded
+	/// branches stay SATISFIABLE for ALL inputs because their witnesses use the RAW division-free formulas
+	/// (never a native short-circuit) — at h==0 the add strand still commits valid mod-p products (its
+	/// output is simply muxed away). P feeds both strands (double-P and add-P) and Q the add's second
+	/// point, all injected on input boundaries carrying the same public coordinates. 54 tables total (30
+	/// add + 19 dbl + 2 fe_inv flags [ModMul+source ×2] + 1 mux, wait: 26 ModMul + 9 fan-out + 16 glue + 2
+	/// source + 1 mux). All three cases — GENERIC P≠±Q, P==Q ⇒ [2]P, P==−Q ⇒ O — VALIDATE against the
+	/// native `jac_add` (which already branches on u1==u2/s1==s2); a forged h_is_zero or w_is_zero flag
+	/// (mis-set vs the true h/w, BOTH directions) and a forged input coordinate are REJECTED. The P==Q ⇒
+	/// [2]P case (both flags true + the double branch + the discarded-generic satisfiability) is full-
+	/// proven+verified at NIST L1. This makes the in-circuit ECDSA point add exception-free.
+	#[test]
+	fn ec_weierstrass_add_complete_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder, ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::{ChannelId, FlushDirection};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 1024;
+		const WLOG: usize = 10;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::P256);
+		let np = p.bits() as usize;
+		let p_bits = to_bits(&p);
+		let p_arr = arr(&p);
+		let c_p_bits = two_pow_w_minus(&to_bits(&p));
+		let c_p_arr: [B1; W] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+		// flag/O constants: `ones` = all-ones (per-lane NOT of the flag), `oneval` = the integer 1 (bit0);
+		// O.x/O.y and the fe_inv residue-1 pin both reuse `oneval`.
+		let ones_arr: [B1; W] = [B1::ONE; W];
+		let oneval_arr: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
+
+		// P=(px,py,pz): the point being doubled AND the add's first point. A proper P-256-shaped Jacobian
+		// triple (Z≠0, Y≠0) — the double strand's raw formula then equals native jac_dbl(P).
+		let px = BigUint::parse_bytes(b"5a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f001", 16).unwrap() % &p;
+		let py = BigUint::parse_bytes(b"7f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee02", 16).unwrap() % &p;
+		let pz = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+		// generic Q (u1≠u2 ⇒ h≠0): an independent triple (same as the standalone add gadget's Q).
+		let qx_gen = BigUint::parse_bytes(b"11335577991bb3d5f7192a4c6e8090a1c3e5072941638507a9cbed0f21436587", 16).unwrap() % &p;
+		let qy_gen = BigUint::parse_bytes(b"6e5d4c3b2a1908f7e6d5c4b3a29180716f5e4d3c2b1a0918273645362718f0e3", 16).unwrap() % &p;
+		let qz_gen = BigUint::parse_bytes(b"03fedcba98765432100123456789abcdef0f1e2d3c4b5a69788796a5b4c3d2e1", 16).unwrap() % &p;
+
+		struct Glue {
+			out: Col<B1, W>,
+			k: Col<B1, 1>,
+			kbc: Col<B1, W>,
+			kbcr: Col<B1, W>,
+			kl0: Col<B1, 1>,
+			p_col: Col<B1, W>,
+			kp: Col<B1, W>,
+			lhs: Adder<W>,
+			rhs: Adder<W>,
+			cp: Col<B1, W>,
+			co: Col<B1, W>,
+			ci: Col<B1, W>,
+			fc: Col<B1, 1>,
+			psel: Option<[Col<B1, 64>; 4]>,
+		}
+
+		// case: 0=generic P≠±Q, 1=P==Q (h==0,w==0 ⇒ [2]P), 2=P==−Q (h==0,w≠0 ⇒ O).
+		// forge: 0=none, 1=h_is_zero flag, 2=w_is_zero flag, 3=input coordinate.
+		let run = |case: u8, forge: u8, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+
+			// Q for this case: independent (generic), P itself (P==Q), or −P=(px,p−py,pz) (P==−Q).
+			let (qx, qy, qz) = match case {
+				1 => (px.clone(), py.clone(), pz.clone()),
+				2 => (px.clone(), ((&p - &py) % &p), pz.clone()),
+				_ => (qx_gen.clone(), qy_gen.clone(), qz_gen.clone()),
+			};
+
+			// ── RAW double strand D=[2]P (add-2007-bl/dbl, NO short-circuit — well-defined for all P). ──
+			let d_delta = (&pz * &pz) % &p;
+			let d_gamma = (&py * &py) % &p;
+			let d_beta = (&px * &d_gamma) % &p;
+			let d_xmd = ((&px + &p) - &d_delta) % &p;
+			let d_xpd = (&px + &d_delta) % &p;
+			let d_t = (&d_xmd * &d_xpd) % &p;
+			let d_alpha = (&d_t * 3u32) % &p;
+			let d_alpha_sq = (&d_alpha * &d_alpha) % &p;
+			let d_eight_beta = (&d_beta * 8u32) % &p;
+			let d_four_beta = (&d_beta * 4u32) % &p;
+			let d_x3 = ((&d_alpha_sq + &p) - &d_eight_beta) % &p; // Dx
+			let d_yz = (&py + &pz) % &p;
+			let d_yz_sq = (&d_yz * &d_yz) % &p;
+			let d_z3 = {
+				let tmp = ((&d_yz_sq + &p) - &d_gamma) % &p;
+				((&tmp + &p) - &d_delta) % &p
+			}; // Dz
+			let d_fbmx3 = ((&d_four_beta + &p) - &d_x3) % &p;
+			let d_y3t = (&d_alpha * &d_fbmx3) % &p;
+			let d_gamma_sq = (&d_gamma * &d_gamma) % &p;
+			let d_eight_gsq = (&d_gamma_sq * 8u32) % &p;
+			let d_y3 = ((&d_y3t + &p) - &d_eight_gsq) % &p; // Dy
+
+			// ── RAW generic add strand jac_add_generic(P,Q) (add-2007-bl; point1=P, point2=Q). At h==0
+			//    every product/difference is still a valid mod-p element ⇒ SATISFIABLE (the result is muxed
+			//    away). h=a_h=u2−u1, w=a_sd=s2−s1 feed the two zero-flags. ──
+			let a_z1z1 = (&pz * &pz) % &p;
+			let a_z2z2 = (&qz * &qz) % &p;
+			let a_u1 = (&px * &a_z2z2) % &p;
+			let a_u2 = (&qx * &a_z1z1) % &p;
+			let a_t1 = (&py * &qz) % &p; // Y1·Z2
+			let a_s1 = (&a_t1 * &a_z2z2) % &p;
+			let a_t2 = (&qy * &pz) % &p; // Y2·Z1
+			let a_s2 = (&a_t2 * &a_z1z1) % &p;
+			let a_h = ((&a_u2 + &p) - &a_u1) % &p; // h = u2−u1
+			let a_two_h = (&a_h * 2u32) % &p;
+			let a_i = (&a_two_h * &a_two_h) % &p;
+			let a_jj = (&a_h * &a_i) % &p;
+			let a_sd = ((&a_s2 + &p) - &a_s1) % &p; // w = s2−s1
+			let a_r = (&a_sd * 2u32) % &p; // 2(s2−s1)
+			let a_v = (&a_u1 * &a_i) % &p;
+			let a_r_sq = (&a_r * &a_r) % &p;
+			let a_x3b = ((&a_r_sq + &p) - &a_jj) % &p;
+			let a_two_v = (&a_v * 2u32) % &p;
+			let a_x3 = ((&a_x3b + &p) - &a_two_v) % &p; // gen X3
+			let a_vmx3 = ((&a_v + &p) - &a_x3) % &p;
+			let a_y3a = (&a_r * &a_vmx3) % &p;
+			let a_s1jj = (&a_s1 * &a_jj) % &p;
+			let a_two_s1jj = (&a_s1jj * 2u32) % &p;
+			let a_y3 = ((&a_y3a + &p) - &a_two_s1jj) % &p; // gen Y3
+			let a_z1z2 = (&pz + &qz) % &p;
+			let a_z1z2_sq = (&a_z1z2 * &a_z1z2) % &p;
+			let a_zta = ((&a_z1z2_sq + &p) - &a_z1z1) % &p;
+			let a_zt = ((&a_zta + &p) - &a_z2z2) % &p;
+			let a_z3 = (&a_zt * &a_h) % &p; // gen Z3 (=0 when h==0)
+
+			// The raw double must equal native jac_dbl(P) (P is a proper point in every case).
+			let d_pt = jac_dbl(&(px.clone(), py.clone(), pz.clone()), &p);
+			assert_eq!((d_x3.clone(), d_y3.clone(), d_z3.clone()), d_pt, "double strand D != native jac_dbl(P)");
+			// In the generic case the raw add strand must equal native jac_add (and dodge u1==u2).
+			if case == 0 {
+				let g_pt = jac_add(&(px.clone(), py.clone(), pz.clone()), &(qx.clone(), qy.clone(), qz.clone()), &p);
+				assert_eq!((a_x3.clone(), a_y3.clone(), a_z3.clone()), g_pt, "add strand != native jac_add (generic)");
+				assert_ne!(a_u1, a_u2, "generic P,Q hit the u1==u2 special case — pick a different Q");
+			} else {
+				assert_eq!(a_u1, a_u2, "P==±Q case must have u1==u2 (h==0)");
+			}
+
+			// Native exception-aware reference T = jac_add(P,Q) — the boundary the complete add gates on.
+			let out_pt = jac_add(&(px.clone(), py.clone(), pz.clone()), &(qx.clone(), qy.clone(), qz.clone()), &p);
+
+			// ── zero-flag fe_inv witnesses: hInv=h⁻¹ (prod_h=h·hInv=1) when h≠0, else hInv=0/prod_h=0
+			//    (the direction-A pin catches a prod≠1 claim of flag=0); likewise for w. ──
+			let h_zero = is_zero(&a_h);
+			let w_zero = is_zero(&a_sd);
+			let hinv = if h_zero { zero_big() } else { fe_inv(&a_h, &p) };
+			let winv = if w_zero { zero_big() } else { fe_inv(&a_sd, &p) };
+			let prod_h = (&a_h * &hinv) % &p; // 1 iff h≠0
+			let prod_w = (&a_sd * &winv) % &p; // 1 iff w≠0
+			let h_flag = if forge == 1 { !h_zero } else { h_zero };
+			let w_flag = if forge == 2 { !w_zero } else { w_zero };
+
+			// mux intermediates under the WITNESS flags (== native when the flags are honest): O=(1,1,0),
+			// inner = w_flag ? D : O, T = h_flag ? inner : gen(add).
+			let one = BigUint::from(1u32);
+			let inner_x = if w_flag { d_x3.clone() } else { one.clone() };
+			let inner_y = if w_flag { d_y3.clone() } else { one.clone() };
+			let inner_z = if w_flag { d_z3.clone() } else { zero_big() };
+			let t_x = if h_flag { inner_x.clone() } else { a_x3.clone() };
+			let t_y = if h_flag { inner_y.clone() } else { a_y3.clone() };
+			let t_z = if h_flag { inner_z.clone() } else { a_z3.clone() };
+			if forge == 0 {
+				assert_eq!((t_x.clone(), t_y.clone(), t_z.clone()), out_pt.clone(), "muxed T != native jac_add(P,Q)");
+			}
+
+			// ── double-strand channels (d_ prefix) ──
+			let d_chx1 = cs.add_channel("d_chX1");
+			let d_chy1 = cs.add_channel("d_chY1");
+			let d_chz1 = cs.add_channel("d_chZ1");
+			let d_chdelta = cs.add_channel("d_chDelta");
+			let d_chgamma = cs.add_channel("d_chGamma");
+			let d_chbeta = cs.add_channel("d_chBeta");
+			let d_chxmd = cs.add_channel("d_chXmd");
+			let d_chxpd = cs.add_channel("d_chXpd");
+			let d_cht = cs.add_channel("d_chT");
+			let d_chalpha = cs.add_channel("d_chAlpha");
+			let d_chasq = cs.add_channel("d_chAsq");
+			let d_ch8beta = cs.add_channel("d_ch8beta");
+			let d_ch4beta = cs.add_channel("d_ch4beta");
+			let d_chx3 = cs.add_channel("d_chX3");
+			let d_chyz = cs.add_channel("d_chYZ");
+			let d_chyzsq = cs.add_channel("d_chYZsq");
+			let d_chz3 = cs.add_channel("d_chZ3");
+			let d_chfbmx3 = cs.add_channel("d_chFbmx3");
+			let d_chy3t = cs.add_channel("d_chY3t");
+			let d_chgsq = cs.add_channel("d_chGsq");
+			let d_ch8gsq = cs.add_channel("d_ch8gsq");
+			let d_chy3 = cs.add_channel("d_chY3");
+			let d_chdelta_raw = cs.add_channel("d_chDeltaRaw");
+			let d_chgamma_raw = cs.add_channel("d_chGammaRaw");
+
+			// ── add-strand channels (a_ prefix); first point P, second point Q ──
+			let a_chx1 = cs.add_channel("a_chX1");
+			let a_chy1 = cs.add_channel("a_chY1");
+			let a_chz1 = cs.add_channel("a_chZ1");
+			let a_chx2 = cs.add_channel("a_chX2");
+			let a_chy2 = cs.add_channel("a_chY2");
+			let a_chz2 = cs.add_channel("a_chZ2");
+			let a_chz1z1_raw = cs.add_channel("a_chZ1Z1Raw");
+			let a_chz2z2_raw = cs.add_channel("a_chZ2Z2Raw");
+			let a_chu1_raw = cs.add_channel("a_chU1Raw");
+			let a_chs1_raw = cs.add_channel("a_chS1Raw");
+			let a_chi_raw = cs.add_channel("a_chIRaw");
+			let a_chjj_raw = cs.add_channel("a_chJJRaw");
+			let a_chv_raw = cs.add_channel("a_chVRaw");
+			let a_chz1z1 = cs.add_channel("a_chZ1Z1");
+			let a_chz2z2 = cs.add_channel("a_chZ2Z2");
+			let a_chu1 = cs.add_channel("a_chU1");
+			let a_chs1 = cs.add_channel("a_chS1");
+			let a_chi = cs.add_channel("a_chI");
+			let a_chjj = cs.add_channel("a_chJJ");
+			let a_chv = cs.add_channel("a_chV");
+			let a_chu2 = cs.add_channel("a_chU2");
+			let a_cht1 = cs.add_channel("a_chT1");
+			let a_cht2 = cs.add_channel("a_chT2");
+			let a_chs2 = cs.add_channel("a_chS2");
+			let a_chr_sq = cs.add_channel("a_chRsq");
+			let a_chy3a = cs.add_channel("a_chY3a");
+			let a_chs1jj = cs.add_channel("a_chS1JJ");
+			let a_chz1z2_sq = cs.add_channel("a_chZ1Z2sq");
+			let a_chz3 = cs.add_channel("a_chZ3");
+			let a_chh = cs.add_channel("a_chH"); // h=u2−u1 export (mm_jj, mm_z3, mm_hinv, mux ⇒ ×4)
+			let a_chtwo_h = cs.add_channel("a_chTwoH");
+			let a_chr = cs.add_channel("a_chR");
+			let a_chz1z2 = cs.add_channel("a_chZ1Z2");
+			let a_chzt = cs.add_channel("a_chZt");
+			let a_chx3 = cs.add_channel("a_chX3");
+			let a_chvmx3 = cs.add_channel("a_chVmX3");
+			let a_chy3 = cs.add_channel("a_chY3");
+			let a_chw = cs.add_channel("a_chW"); // w=s2−s1 export (mm_winv, mux ⇒ ×2)
+
+			// ── zero-flag channels (fe_inv source → mm_?inv.b, mm_?inv.r → flag residue-1 pin) ──
+			let ch_hinv = cs.add_channel("chHinv");
+			let ch_hprod = cs.add_channel("chHprod");
+			let ch_winv = cs.add_channel("chWinv");
+			let ch_wprod = cs.add_channel("chWprod");
+
+			// ── T output channels (mux → output boundaries) ──
+			let chxp = cs.add_channel("chXout");
+			let chyp = cs.add_channel("chYout");
+			let chzp = cs.add_channel("chZout");
+
+			// 8 doubling ModMuls (δ, γ fan out; the rest seam mult-1).
+			let mm_d_delta = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chz1, d_chz1, d_chdelta_raw);
+			let mm_d_gamma = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chy1, d_chy1, d_chgamma_raw);
+			let mm_d_beta = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chx1, d_chgamma, d_chbeta);
+			let mm_d_t = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chxmd, d_chxpd, d_cht);
+			let mm_d_asq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chalpha, d_chalpha, d_chasq);
+			let mm_d_yzsq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chyz, d_chyz, d_chyzsq);
+			let mm_d_y3t = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chalpha, d_chfbmx3, d_chy3t);
+			let mm_d_gsq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, d_chgamma, d_chgamma, d_chgsq);
+
+			// 16 addition ModMuls (first point P, second point Q).
+			let mm_z1z1 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chz1, a_chz1, a_chz1z1_raw);
+			let mm_z2z2 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chz2, a_chz2, a_chz2z2_raw);
+			let mm_u1 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chx1, a_chz2z2, a_chu1_raw);
+			let mm_u2 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chx2, a_chz1z1, a_chu2);
+			let mm_t1 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chy1, a_chz2, a_cht1);
+			let mm_s1 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_cht1, a_chz2z2, a_chs1_raw);
+			let mm_t2 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chy2, a_chz1, a_cht2);
+			let mm_s2 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_cht2, a_chz1z1, a_chs2);
+			let mm_i = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chtwo_h, a_chtwo_h, a_chi_raw);
+			let mm_jj = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chh, a_chi, a_chjj_raw);
+			let mm_v = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chu1, a_chi, a_chv_raw);
+			let mm_rsq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chr, a_chr, a_chr_sq);
+			let mm_y3a = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chr, a_chvmx3, a_chy3a);
+			let mm_s1jj = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chs1, a_chjj, a_chs1jj);
+			let mm_z1z2sq = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chz1z2, a_chz1z2, a_chz1z2_sq);
+			let mm_z3 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chzt, a_chh, a_chz3);
+
+			// fe_inv gate ModMuls: prod = val·valInv (mod p) — pushed to each flag's residue-1 pin.
+			let mm_hinv = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chh, ch_hinv, ch_hprod);
+			let mm_winv = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, a_chw, ch_winv, ch_wprod);
+
+			let pull_word = |t: &mut TableBuilder<OurB256>, chan: ChannelId, nm: &str| -> (Col<B1, W>, [Col<B1, 64>; 4]) {
+				let c = t.add_committed::<B1, W>(nm.to_string());
+				let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{nm}_sel{i}"), c, i));
+				let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64{i}"), sel[i]));
+				t.pull(chan, b64);
+				(c, sel)
+			};
+			let build_combine = |t: &mut TableBuilder<OurB256>, a1: Col<B1, W>, a2: Col<B1, W>, is_sub: bool, push: Option<(ChannelId, u32)>, tag: &str| -> Glue {
+				let out = t.add_committed::<B1, W>(format!("{tag}_out"));
+				let k = t.add_committed::<B1, 1>(format!("{tag}_k"));
+				let kbc = t.add_committed::<B1, W>(format!("{tag}_kbc"));
+				let kbcr = t.add_shifted(format!("{tag}_kbcr"), kbc, WLOG, 1, ShiftVariant::CircularLeft);
+				t.assert_zero(format!("{tag}_kbc_eq"), kbc - kbcr);
+				let kl0 = t.add_selected(format!("{tag}_kl0"), kbc, 0);
+				t.assert_zero(format!("{tag}_kbc_bind"), kl0 - k);
+				let p_col = t.add_constant(format!("{tag}_p"), p_arr);
+				let kp = t.add_computed(format!("{tag}_kp"), kbc * p_col);
+				let (lhs, rhs) = if is_sub {
+					(Adder::<W>::build(t, out, a2, &format!("{tag}_lhs")), Adder::<W>::build(t, a1, kp, &format!("{tag}_rhs")))
+				} else {
+					(Adder::<W>::build(t, out, kp, &format!("{tag}_lhs")), Adder::<W>::build(t, a1, a2, &format!("{tag}_rhs")))
+				};
+				t.assert_zero(format!("{tag}_combine"), lhs.sum - rhs.sum);
+				let cp = t.add_constant(format!("{tag}_c_p"), c_p_arr);
+				let co = t.add_committed::<B1, W>(format!("{tag}_co"));
+				let ci = t.add_shifted(format!("{tag}_ci"), co, WLOG, 1, ShiftVariant::LogicalLeft);
+				t.assert_zero(format!("{tag}_carry"), (out + ci) * (cp + ci) + ci - co);
+				let fc = t.add_selected(format!("{tag}_fc"), co, W - 1);
+				t.assert_zero(format!("{tag}_lt_p"), fc * B1::ONE);
+				let psel = push.map(|(chan, mult)| {
+					let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{tag}_psel{i}"), out, i));
+					let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{tag}_pb64{i}"), sel[i]));
+					t.push_with_opts(chan, b64, FlushOpts { multiplicity: mult, selector: None });
+					sel
+				});
+				Glue { out, k, kbc, kbcr, kl0, p_col, kp, lhs, rhs, cp, co, ci, fc, psel }
+			};
+			// fan-out: pull X_raw once, re-push at the consumed multiplicity.
+			let mut push_word = |t: &mut TableBuilder<OurB256>, chan: ChannelId, col: Col<B1, W>, nm: &str, mult: u32| -> [Col<B1, 64>; 4] {
+				let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{nm}_psel{i}"), col, i));
+				let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{nm}_pb64{i}"), sel[i]));
+				t.push_with_opts(chan, b64, FlushOpts { multiplicity: mult, selector: None });
+				sel
+			};
+
+			// ── doubling fan-out tables (δ ×2, γ ×4) ──
+			let mut fd = cs.add_table("fanout δ");
+			let (fd_c, fd_pull) = pull_word(&mut fd, d_chdelta_raw, "fd");
+			let fd_push = push_word(&mut fd, d_chdelta, fd_c, "fd", 2);
+			let fd_id = fd.id();
+			let mut fg = cs.add_table("fanout γ");
+			let (fg_c, fg_pull) = pull_word(&mut fg, d_chgamma_raw, "fg");
+			let fg_push = push_word(&mut fg, d_chgamma, fg_c, "fg", 4);
+			let fg_id = fg.id();
+
+			// ── addition fan-out tables (z1z1 ×3, z2z2 ×3, u1/s1/i/jj/v ×2) ──
+			let mut f_z1z1 = cs.add_table("fanout z1z1");
+			let (fz1z1_c, fz1z1_pull) = pull_word(&mut f_z1z1, a_chz1z1_raw, "fz1z1");
+			let fz1z1_push = push_word(&mut f_z1z1, a_chz1z1, fz1z1_c, "fz1z1", 3);
+			let fz1z1_id = f_z1z1.id();
+			let mut f_z2z2 = cs.add_table("fanout z2z2");
+			let (fz2z2_c, fz2z2_pull) = pull_word(&mut f_z2z2, a_chz2z2_raw, "fz2z2");
+			let fz2z2_push = push_word(&mut f_z2z2, a_chz2z2, fz2z2_c, "fz2z2", 3);
+			let fz2z2_id = f_z2z2.id();
+			let mut f_u1 = cs.add_table("fanout u1");
+			let (fu1_c, fu1_pull) = pull_word(&mut f_u1, a_chu1_raw, "fu1");
+			let fu1_push = push_word(&mut f_u1, a_chu1, fu1_c, "fu1", 2);
+			let fu1_id = f_u1.id();
+			let mut f_s1 = cs.add_table("fanout s1");
+			let (fs1_c, fs1_pull) = pull_word(&mut f_s1, a_chs1_raw, "fs1");
+			let fs1_push = push_word(&mut f_s1, a_chs1, fs1_c, "fs1", 2);
+			let fs1_id = f_s1.id();
+			let mut f_i = cs.add_table("fanout i");
+			let (fi_c, fi_pull) = pull_word(&mut f_i, a_chi_raw, "fi");
+			let fi_push = push_word(&mut f_i, a_chi, fi_c, "fi", 2);
+			let fi_id = f_i.id();
+			let mut f_jj = cs.add_table("fanout jj");
+			let (fjj_c, fjj_pull) = pull_word(&mut f_jj, a_chjj_raw, "fjj");
+			let fjj_push = push_word(&mut f_jj, a_chjj, fjj_c, "fjj", 2);
+			let fjj_id = f_jj.id();
+			let mut f_v = cs.add_table("fanout v");
+			let (fv_c, fv_pull) = pull_word(&mut f_v, a_chv_raw, "fv");
+			let fv_push = push_word(&mut f_v, a_chv, fv_c, "fv", 2);
+			let fv_id = f_v.id();
+
+			// ── doubling glue (d_ channels; identical wiring to the standalone doubling gadget) ──
+			let mut gpm = cs.add_table("Wdbl X1∓δ");
+			let (pm_x1, pm_x1_sel) = pull_word(&mut gpm, d_chx1, "X1");
+			let (pm_d, pm_d_sel) = pull_word(&mut gpm, d_chdelta, "delta");
+			let g_xmd = build_combine(&mut gpm, pm_x1, pm_d, true, Some((d_chxmd, 1)), "xmd");
+			let g_xpd = build_combine(&mut gpm, pm_x1, pm_d, false, Some((d_chxpd, 1)), "xpd");
+			let gpm_id = gpm.id();
+			let mut gyz = cs.add_table("Wdbl Y1+Z1");
+			let (yz_y, yz_y_sel) = pull_word(&mut gyz, d_chy1, "Y1");
+			let (yz_z, yz_z_sel) = pull_word(&mut gyz, d_chz1, "Z1");
+			let g_yz = build_combine(&mut gyz, yz_y, yz_z, false, Some((d_chyz, 2)), "yz");
+			let gyz_id = gyz.id();
+			let mut gal = cs.add_table("Wdbl α=3t");
+			let (al_t, al_t_sel) = pull_word(&mut gal, d_cht, "t");
+			let g_twot = build_combine(&mut gal, al_t, al_t, false, None, "twot");
+			let g_alpha = build_combine(&mut gal, g_twot.out, al_t, false, Some((d_chalpha, 3)), "alpha");
+			let gal_id = gal.id();
+			let mut gb = cs.add_table("Wdbl 4β,8β");
+			let (b_beta, b_beta_sel) = pull_word(&mut gb, d_chbeta, "beta");
+			let g_2b = build_combine(&mut gb, b_beta, b_beta, false, None, "twob");
+			let g_4b = build_combine(&mut gb, g_2b.out, g_2b.out, false, Some((d_ch4beta, 1)), "fourb");
+			let g_8b = build_combine(&mut gb, g_4b.out, g_4b.out, false, Some((d_ch8beta, 1)), "eightb");
+			let gb_id = gb.id();
+			let mut gx = cs.add_table("Wdbl X3=α²−8β");
+			let (x_asq, x_asq_sel) = pull_word(&mut gx, d_chasq, "asq");
+			let (x_8b, x_8b_sel) = pull_word(&mut gx, d_ch8beta, "eightb");
+			let g_x3 = build_combine(&mut gx, x_asq, x_8b, true, Some((d_chx3, 2)), "x3");
+			let gx_id = gx.id();
+			let mut gz = cs.add_table("Wdbl Z3");
+			let (z_yzsq, z_yzsq_sel) = pull_word(&mut gz, d_chyzsq, "yzsq");
+			let (z_g, z_g_sel) = pull_word(&mut gz, d_chgamma, "gamma");
+			let (z_d, z_d_sel) = pull_word(&mut gz, d_chdelta, "delta");
+			let g_zt = build_combine(&mut gz, z_yzsq, z_g, true, None, "zt");
+			let g_z3 = build_combine(&mut gz, g_zt.out, z_d, true, Some((d_chz3, 1)), "z3");
+			let gz_id = gz.id();
+			let mut gf = cs.add_table("Wdbl 4β−X3");
+			let (f_4b, f_4b_sel) = pull_word(&mut gf, d_ch4beta, "fourb");
+			let (f_x3, f_x3_sel) = pull_word(&mut gf, d_chx3, "x3");
+			let g_fbmx3 = build_combine(&mut gf, f_4b, f_x3, true, Some((d_chfbmx3, 1)), "fbmx3");
+			let gf_id = gf.id();
+			let mut gg = cs.add_table("Wdbl 8γ²");
+			let (gg_gsq, gg_gsq_sel) = pull_word(&mut gg, d_chgsq, "gsq");
+			let g_2g = build_combine(&mut gg, gg_gsq, gg_gsq, false, None, "twog");
+			let g_4g = build_combine(&mut gg, g_2g.out, g_2g.out, false, None, "fourg");
+			let g_8g = build_combine(&mut gg, g_4g.out, g_4g.out, false, Some((d_ch8gsq, 1)), "eightg");
+			let gg_id = gg.id();
+			let mut gy = cs.add_table("Wdbl Y3");
+			let (y_y3t, y_y3t_sel) = pull_word(&mut gy, d_chy3t, "y3t");
+			let (y_8g, y_8g_sel) = pull_word(&mut gy, d_ch8gsq, "eightg");
+			let g_y3 = build_combine(&mut gy, y_y3t, y_8g, true, Some((d_chy3, 1)), "y3");
+			let gy_id = gy.id();
+
+			// ── addition glue (a_ channels; identical wiring to the standalone add gadget, EXCEPT g_h now
+			//    exports h ×4 [+mm_hinv +mux] and g_sd now exports w ×2 [mm_winv +mux]). ──
+			let mut g1 = cs.add_table("Wadd h,2h");
+			let (g1_u2, g1_u2_sel) = pull_word(&mut g1, a_chu2, "hU2");
+			let (g1_u1, g1_u1_sel) = pull_word(&mut g1, a_chu1, "hU1");
+			let g_h = build_combine(&mut g1, g1_u2, g1_u1, true, Some((a_chh, 4)), "h");
+			let g_2h = build_combine(&mut g1, g_h.out, g_h.out, false, Some((a_chtwo_h, 2)), "twoh");
+			let g1_id = g1.id();
+			let mut g2 = cs.add_table("Wadd r=2(s2−s1)");
+			let (g2_s2, g2_s2_sel) = pull_word(&mut g2, a_chs2, "rS2");
+			let (g2_s1, g2_s1_sel) = pull_word(&mut g2, a_chs1, "rS1");
+			let g_sd = build_combine(&mut g2, g2_s2, g2_s1, true, Some((a_chw, 2)), "sd");
+			let g_r = build_combine(&mut g2, g_sd.out, g_sd.out, false, Some((a_chr, 3)), "r");
+			let g2_id = g2.id();
+			let mut g3 = cs.add_table("Wadd z1z2");
+			let (g3_z1, g3_z1_sel) = pull_word(&mut g3, a_chz1, "zzZ1");
+			let (g3_z2, g3_z2_sel) = pull_word(&mut g3, a_chz2, "zzZ2");
+			let g_z1z2 = build_combine(&mut g3, g3_z1, g3_z2, false, Some((a_chz1z2, 2)), "z1z2");
+			let g3_id = g3.id();
+			let mut g4 = cs.add_table("Wadd zt");
+			let (g4_zsq, g4_zsq_sel) = pull_word(&mut g4, a_chz1z2_sq, "ztZsq");
+			let (g4_z1z1, g4_z1z1_sel) = pull_word(&mut g4, a_chz1z1, "ztZ1Z1");
+			let (g4_z2z2, g4_z2z2_sel) = pull_word(&mut g4, a_chz2z2, "ztZ2Z2");
+			let g_zta = build_combine(&mut g4, g4_zsq, g4_z1z1, true, None, "zta");
+			let g_zt2 = build_combine(&mut g4, g_zta.out, g4_z2z2, true, Some((a_chzt, 1)), "zt");
+			let g4_id = g4.id();
+			let mut g5 = cs.add_table("Wadd X3");
+			let (g5_rsq, g5_rsq_sel) = pull_word(&mut g5, a_chr_sq, "x3Rsq");
+			let (g5_jj, g5_jj_sel) = pull_word(&mut g5, a_chjj, "x3JJ");
+			let (g5_v, g5_v_sel) = pull_word(&mut g5, a_chv, "x3V");
+			let g_x3b = build_combine(&mut g5, g5_rsq, g5_jj, true, None, "x3b");
+			let g_2v = build_combine(&mut g5, g5_v, g5_v, false, None, "twov");
+			let g_ax3 = build_combine(&mut g5, g_x3b.out, g_2v.out, true, Some((a_chx3, 2)), "x3");
+			let g5_id = g5.id();
+			let mut g6 = cs.add_table("Wadd V−X3");
+			let (g6_v, g6_v_sel) = pull_word(&mut g6, a_chv, "vmV");
+			let (g6_x3, g6_x3_sel) = pull_word(&mut g6, a_chx3, "vmX3");
+			let g_vmx3 = build_combine(&mut g6, g6_v, g6_x3, true, Some((a_chvmx3, 1)), "vmx3");
+			let g6_id = g6.id();
+			let mut g7 = cs.add_table("Wadd Y3");
+			let (g7_y3a, g7_y3a_sel) = pull_word(&mut g7, a_chy3a, "y3Y3a");
+			let (g7_s1jj, g7_s1jj_sel) = pull_word(&mut g7, a_chs1jj, "y3S1JJ");
+			let g_2sjj = build_combine(&mut g7, g7_s1jj, g7_s1jj, false, None, "twosjj");
+			let g_ay3 = build_combine(&mut g7, g7_y3a, g_2sjj.out, true, Some((a_chy3, 1)), "y3");
+			let g7_id = g7.id();
+
+			// ── hInv / wInv SOURCE tables: commit each inverse once and push to its fe_inv gate. ──
+			let mut hisrc = cs.add_table("h⁻¹ source (push ×1)");
+			let hi_col = hisrc.add_committed::<B1, W>("hinv");
+			let hi_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| hisrc.add_selected_block::<B1, W, 64>(format!("hinv_psel{i}"), hi_col, i));
+			let hi_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| hisrc.add_packed::<B1, 64, B64, 1>(format!("hinv_pb64{i}"), hi_sel[i]));
+			hisrc.push_with_opts(ch_hinv, hi_b64, FlushOpts { multiplicity: 1, selector: None });
+			let hisrc_id = hisrc.id();
+			let mut wisrc = cs.add_table("w⁻¹ source (push ×1)");
+			let wi_col = wisrc.add_committed::<B1, W>("winv");
+			let wi_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| wisrc.add_selected_block::<B1, W, 64>(format!("winv_psel{i}"), wi_col, i));
+			let wi_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| wisrc.add_packed::<B1, 64, B64, 1>(format!("winv_pb64{i}"), wi_sel[i]));
+			wisrc.push_with_opts(ch_winv, wi_b64, FlushOpts { multiplicity: 1, selector: None });
+			let wisrc_id = wisrc.id();
+
+			// ── 3-WAY OUTPUT MUX + TWO SOUND ZERO-FLAGS (one table): binds h_is_zero to (h==0) and
+			//    w_is_zero to (w==0), then T = h_is_zero ? (w_is_zero ? D : O) : gen(add). ──
+			let mut mux = cs.add_table("complete-add 3-way MUX + h==0/w==0 flags");
+			// prod_h/prod_w from the fe_inv gates, h/w re-pulled (direction-B), the gen(add) result, and D.
+			let (o_prod_h, o_prod_h_sel) = pull_word(&mut mux, ch_hprod, "oProdH");
+			let (o_h, o_h_sel) = pull_word(&mut mux, a_chh, "oH");
+			let (o_prod_w, o_prod_w_sel) = pull_word(&mut mux, ch_wprod, "oProdW");
+			let (o_w, o_w_sel) = pull_word(&mut mux, a_chw, "oW");
+			let (o_genx, o_genx_sel) = pull_word(&mut mux, a_chx3, "oGenX");
+			let (o_geny, o_geny_sel) = pull_word(&mut mux, a_chy3, "oGenY");
+			let (o_genz, o_genz_sel) = pull_word(&mut mux, a_chz3, "oGenZ");
+			let (o_dblx, o_dblx_sel) = pull_word(&mut mux, d_chx3, "oDblX");
+			let (o_dbly, o_dbly_sel) = pull_word(&mut mux, d_chy3, "oDblY");
+			let (o_dblz, o_dblz_sel) = pull_word(&mut mux, d_chz3, "oDblZ");
+			// h_is_zero flag broadcast to W bits (kbc trick: CircularLeft self-eq bound to one bit).
+			let h_flag_c = mux.add_committed::<B1, 1>("h_flag");
+			let h_flag_bc = mux.add_committed::<B1, W>("h_flag_bc");
+			let h_flag_bcr = mux.add_shifted("h_flag_bcr", h_flag_bc, WLOG, 1, ShiftVariant::CircularLeft);
+			mux.assert_zero("h_flag_eq", h_flag_bc - h_flag_bcr);
+			let h_flag_l0 = mux.add_selected("h_flag_l0", h_flag_bc, 0);
+			mux.assert_zero("h_flag_bind", h_flag_l0 - h_flag_c);
+			// w_is_zero flag broadcast.
+			let w_flag_c = mux.add_committed::<B1, 1>("w_flag");
+			let w_flag_bc = mux.add_committed::<B1, W>("w_flag_bc");
+			let w_flag_bcr = mux.add_shifted("w_flag_bcr", w_flag_bc, WLOG, 1, ShiftVariant::CircularLeft);
+			mux.assert_zero("w_flag_eq", w_flag_bc - w_flag_bcr);
+			let w_flag_l0 = mux.add_selected("w_flag_l0", w_flag_bc, 0);
+			mux.assert_zero("w_flag_bind", w_flag_l0 - w_flag_c);
+			// constants: `ones` = per-lane NOT(flag); `oneval` = the integer 1 (O.x/O.y + residue pin).
+			let o_ones = mux.add_constant("o_ones", ones_arr);
+			let o_oneval = mux.add_constant("o_oneval", oneval_arr);
+			// FLAG SOUNDNESS (h) — direction A: flag=0 ⇒ prod==1 → (1+flag)·(prod+1)==0; direction B:
+			// flag=1 ⇒ h==0 → flag·h==0. ⇒ h_is_zero=(h==0). Same two-direction pin for w.
+			mux.assert_zero("h_dirA", (o_ones + h_flag_bc) * (o_prod_h + o_oneval));
+			mux.assert_zero("h_dirB", h_flag_bc * o_h);
+			mux.assert_zero("w_dirA", (o_ones + w_flag_bc) * (o_prod_w + o_oneval));
+			mux.assert_zero("w_dirB", w_flag_bc * o_w);
+			// inner = w_is_zero ? D : O  with O=(1,1,0): inner = O + w·(O+D), per coordinate (O.z=0).
+			let mux_ix = mux.add_committed::<B1, W>("mux_ix");
+			mux.assert_zero("mux_ix_eq", mux_ix - (o_oneval + w_flag_bc * (o_oneval + o_dblx)));
+			let mux_iy = mux.add_committed::<B1, W>("mux_iy");
+			mux.assert_zero("mux_iy_eq", mux_iy - (o_oneval + w_flag_bc * (o_oneval + o_dbly)));
+			let mux_iz = mux.add_committed::<B1, W>("mux_iz");
+			mux.assert_zero("mux_iz_eq", mux_iz - w_flag_bc * o_dblz);
+			// T = h_is_zero ? inner : gen  →  T = gen + h·(gen+inner); expose T.
+			let o_tx = mux.add_committed::<B1, W>("o_tx");
+			mux.assert_zero("o_tx_eq", o_tx - (o_genx + h_flag_bc * (o_genx + mux_ix)));
+			let o_tx_push = push_word(&mut mux, chxp, o_tx, "oTx", 1);
+			let o_ty = mux.add_committed::<B1, W>("o_ty");
+			mux.assert_zero("o_ty_eq", o_ty - (o_geny + h_flag_bc * (o_geny + mux_iy)));
+			let o_ty_push = push_word(&mut mux, chyp, o_ty, "oTy", 1);
+			let o_tz = mux.add_committed::<B1, W>("o_tz");
+			mux.assert_zero("o_tz_eq", o_tz - (o_genz + h_flag_bc * (o_genz + mux_iz)));
+			let o_tz_push = push_word(&mut mux, chzp, o_tz, "oTz", 1);
+			let mux_id = mux.id();
+
+			// forge==3 ⇒ corrupt the add's P.x boundary (witness stays honest ⇒ a_chX1 channel imbalance).
+			let a_px_pub = if forge == 3 { (&px + 1u32) % &p } else { px.clone() };
+			let boundaries = vec![
+				// double-strand P (dP): X ×2 (mm_d_beta + gpm), Y ×3 (mm_d_gamma×2 + gyz), Z ×3 (mm_d_delta×2 + gyz).
+				Boundary { values: to_boundary(&px), channel_id: d_chx1, direction: FlushDirection::Push, multiplicity: 2 },
+				Boundary { values: to_boundary(&py), channel_id: d_chy1, direction: FlushDirection::Push, multiplicity: 3 },
+				Boundary { values: to_boundary(&pz), channel_id: d_chz1, direction: FlushDirection::Push, multiplicity: 3 },
+				// add-strand P (first point): X ×1 (mm_u1), Y ×1 (mm_t1), Z ×4 (mm_z1z1×2 + mm_t2 + g3).
+				Boundary { values: to_boundary(&a_px_pub), channel_id: a_chx1, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&py), channel_id: a_chy1, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&pz), channel_id: a_chz1, direction: FlushDirection::Push, multiplicity: 4 },
+				// add-strand Q (second point): X ×1 (mm_u2), Y ×1 (mm_t2), Z ×4 (mm_z2z2×2 + mm_t1 + g3).
+				Boundary { values: to_boundary(&qx), channel_id: a_chx2, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&qy), channel_id: a_chy2, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&qz), channel_id: a_chz2, direction: FlushDirection::Push, multiplicity: 4 },
+				// T out (= native jac_add(P,Q)).
+				Boundary { values: to_boundary(&out_pt.0), channel_id: chxp, direction: FlushDirection::Pull, multiplicity: 1 },
+				Boundary { values: to_boundary(&out_pt.1), channel_id: chyp, direction: FlushDirection::Pull, multiplicity: 1 },
+				Boundary { values: to_boundary(&out_pt.2), channel_id: chzp, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			// 26 ModMul (8 dbl + 16 add + 2 fe_inv) + 9 fan-out (2 dbl + 7 add) + 16 glue (9 dbl + 7 add)
+			// + 2 inverse-source + 1 mux = 54.
+			let statement = Statement { boundaries, table_sizes: vec![1; 54] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let fill = |seg: &mut TableWitnessSegment<OurB256>, sel: &[Col<B1, 64>; 4], bits: &[bool]| {
+				for (i, &s) in sel.iter().enumerate() {
+					write_col::<64>(seg, s, 0, &bits[i * 64..i * 64 + 64]).unwrap();
+				}
+			};
+			let pop_glue = |seg: &mut TableWitnessSegment<OurB256>, g: &Glue, out_bits: &[bool], k_bit: bool, lx: &[bool], ly: &[bool], rx: &[bool], ry: &[bool]| {
+				write_col::<W>(seg, g.out, 0, out_bits).unwrap();
+				write_bit(seg, g.k, 0, k_bit).unwrap();
+				let kb = vec![k_bit; W];
+				write_col::<W>(seg, g.kbc, 0, &kb).unwrap();
+				write_col::<W>(seg, g.kbcr, 0, &kb).unwrap();
+				write_bit(seg, g.kl0, 0, k_bit).unwrap();
+				write_col::<W>(seg, g.p_col, 0, &to_bits(&p)).unwrap();
+				let kpv = if k_bit { to_bits(&p) } else { vec![false; W] };
+				write_col::<W>(seg, g.kp, 0, &kpv).unwrap();
+				let _ = g.lhs.populate(seg, 0, lx, ly).unwrap();
+				let _ = g.rhs.populate(seg, 0, rx, ry).unwrap();
+				write_col::<W>(seg, g.cp, 0, &c_p_bits).unwrap();
+				let (_z, co) = ripple_add(out_bits, &c_p_bits);
+				write_col::<W>(seg, g.co, 0, &co).unwrap();
+				write_col::<W>(seg, g.ci, 0, &shl(&co, 1)).unwrap();
+				write_bit(seg, g.fc, 0, co[W - 1]).unwrap();
+				if let Some(sel) = &g.psel {
+					fill(seg, sel, out_bits);
+				}
+			};
+			let pop_add = |seg: &mut TableWitnessSegment<OurB256>, g: &Glue, a: &BigUint, b: &BigUint| {
+				let out = (a + b) % &p;
+				let kbit = a + b >= p;
+				let kpv = if kbit { to_bits(&p) } else { vec![false; W] };
+				pop_glue(seg, g, &to_bits(&out), kbit, &to_bits(&out), &kpv, &to_bits(a), &to_bits(b));
+			};
+			let pop_sub = |seg: &mut TableWitnessSegment<OurB256>, g: &Glue, a: &BigUint, b: &BigUint| {
+				let out = ((a + &p) - b) % &p;
+				let kbit = a < b;
+				let kpv = if kbit { to_bits(&p) } else { vec![false; W] };
+				pop_glue(seg, g, &to_bits(&out), kbit, &to_bits(&out), &to_bits(b), &to_bits(a), &kpv);
+			};
+			let fill_mm = |wit: &mut WitnessIndex<OurB256>, mm: &ModMul<W>, a: &BigUint, b: &BigUint, r: &BigUint| {
+				let tw = wit.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = &(a * b) / &p;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&q), r: to_bits(r) }]).unwrap();
+			};
+			let mut pop_fanout = |witness: &mut WitnessIndex<OurB256>, id, c: Col<B1, W>, pull: &[Col<B1, 64>; 4], push: &[Col<B1, 64>; 4], val: &BigUint| {
+				let tw = witness.init_table(id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let vb = to_bits(val);
+				write_col::<W>(&mut seg, c, 0, &vb).unwrap();
+				fill(&mut seg, pull, &vb);
+				fill(&mut seg, push, &vb);
+			};
+
+			// doubling ModMuls
+			fill_mm(&mut witness, &mm_d_delta, &pz, &pz, &d_delta);
+			fill_mm(&mut witness, &mm_d_gamma, &py, &py, &d_gamma);
+			fill_mm(&mut witness, &mm_d_beta, &px, &d_gamma, &d_beta);
+			fill_mm(&mut witness, &mm_d_t, &d_xmd, &d_xpd, &d_t);
+			fill_mm(&mut witness, &mm_d_asq, &d_alpha, &d_alpha, &d_alpha_sq);
+			fill_mm(&mut witness, &mm_d_yzsq, &d_yz, &d_yz, &d_yz_sq);
+			fill_mm(&mut witness, &mm_d_y3t, &d_alpha, &d_fbmx3, &d_y3t);
+			fill_mm(&mut witness, &mm_d_gsq, &d_gamma, &d_gamma, &d_gamma_sq);
+			// addition ModMuls
+			fill_mm(&mut witness, &mm_z1z1, &pz, &pz, &a_z1z1);
+			fill_mm(&mut witness, &mm_z2z2, &qz, &qz, &a_z2z2);
+			fill_mm(&mut witness, &mm_u1, &px, &a_z2z2, &a_u1);
+			fill_mm(&mut witness, &mm_u2, &qx, &a_z1z1, &a_u2);
+			fill_mm(&mut witness, &mm_t1, &py, &qz, &a_t1);
+			fill_mm(&mut witness, &mm_s1, &a_t1, &a_z2z2, &a_s1);
+			fill_mm(&mut witness, &mm_t2, &qy, &pz, &a_t2);
+			fill_mm(&mut witness, &mm_s2, &a_t2, &a_z1z1, &a_s2);
+			fill_mm(&mut witness, &mm_i, &a_two_h, &a_two_h, &a_i);
+			fill_mm(&mut witness, &mm_jj, &a_h, &a_i, &a_jj);
+			fill_mm(&mut witness, &mm_v, &a_u1, &a_i, &a_v);
+			fill_mm(&mut witness, &mm_rsq, &a_r, &a_r, &a_r_sq);
+			fill_mm(&mut witness, &mm_y3a, &a_r, &a_vmx3, &a_y3a);
+			fill_mm(&mut witness, &mm_s1jj, &a_s1, &a_jj, &a_s1jj);
+			fill_mm(&mut witness, &mm_z1z2sq, &a_z1z2, &a_z1z2, &a_z1z2_sq);
+			fill_mm(&mut witness, &mm_z3, &a_zt, &a_h, &a_z3);
+			// fe_inv gate ModMuls (h·hInv, w·wInv).
+			fill_mm(&mut witness, &mm_hinv, &a_h, &hinv, &prod_h);
+			fill_mm(&mut witness, &mm_winv, &a_sd, &winv, &prod_w);
+
+			// doubling fan-outs
+			pop_fanout(&mut witness, fd_id, fd_c, &fd_pull, &fd_push, &d_delta);
+			pop_fanout(&mut witness, fg_id, fg_c, &fg_pull, &fg_push, &d_gamma);
+			// addition fan-outs
+			pop_fanout(&mut witness, fz1z1_id, fz1z1_c, &fz1z1_pull, &fz1z1_push, &a_z1z1);
+			pop_fanout(&mut witness, fz2z2_id, fz2z2_c, &fz2z2_pull, &fz2z2_push, &a_z2z2);
+			pop_fanout(&mut witness, fu1_id, fu1_c, &fu1_pull, &fu1_push, &a_u1);
+			pop_fanout(&mut witness, fs1_id, fs1_c, &fs1_pull, &fs1_push, &a_s1);
+			pop_fanout(&mut witness, fi_id, fi_c, &fi_pull, &fi_push, &a_i);
+			pop_fanout(&mut witness, fjj_id, fjj_c, &fjj_pull, &fjj_push, &a_jj);
+			pop_fanout(&mut witness, fv_id, fv_c, &fv_pull, &fv_push, &a_v);
+
+			// doubling glue witnesses
+			{
+				let tw = witness.init_table(gpm_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, pm_x1, 0, &to_bits(&px)).unwrap();
+				fill(&mut seg, &pm_x1_sel, &to_bits(&px));
+				write_col::<W>(&mut seg, pm_d, 0, &to_bits(&d_delta)).unwrap();
+				fill(&mut seg, &pm_d_sel, &to_bits(&d_delta));
+				pop_sub(&mut seg, &g_xmd, &px, &d_delta);
+				pop_add(&mut seg, &g_xpd, &px, &d_delta);
+			}
+			{
+				let tw = witness.init_table(gyz_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, yz_y, 0, &to_bits(&py)).unwrap();
+				fill(&mut seg, &yz_y_sel, &to_bits(&py));
+				write_col::<W>(&mut seg, yz_z, 0, &to_bits(&pz)).unwrap();
+				fill(&mut seg, &yz_z_sel, &to_bits(&pz));
+				pop_add(&mut seg, &g_yz, &py, &pz);
+			}
+			{
+				let tw = witness.init_table(gal_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, al_t, 0, &to_bits(&d_t)).unwrap();
+				fill(&mut seg, &al_t_sel, &to_bits(&d_t));
+				let twot = (&d_t * 2u32) % &p;
+				pop_add(&mut seg, &g_twot, &d_t, &d_t);
+				pop_add(&mut seg, &g_alpha, &twot, &d_t);
+			}
+			{
+				let tw = witness.init_table(gb_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, b_beta, 0, &to_bits(&d_beta)).unwrap();
+				fill(&mut seg, &b_beta_sel, &to_bits(&d_beta));
+				let twob = (&d_beta * 2u32) % &p;
+				pop_add(&mut seg, &g_2b, &d_beta, &d_beta);
+				pop_add(&mut seg, &g_4b, &twob, &twob);
+				pop_add(&mut seg, &g_8b, &d_four_beta, &d_four_beta);
+			}
+			{
+				let tw = witness.init_table(gx_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, x_asq, 0, &to_bits(&d_alpha_sq)).unwrap();
+				fill(&mut seg, &x_asq_sel, &to_bits(&d_alpha_sq));
+				write_col::<W>(&mut seg, x_8b, 0, &to_bits(&d_eight_beta)).unwrap();
+				fill(&mut seg, &x_8b_sel, &to_bits(&d_eight_beta));
+				pop_sub(&mut seg, &g_x3, &d_alpha_sq, &d_eight_beta);
+			}
+			{
+				let tw = witness.init_table(gz_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, z_yzsq, 0, &to_bits(&d_yz_sq)).unwrap();
+				fill(&mut seg, &z_yzsq_sel, &to_bits(&d_yz_sq));
+				write_col::<W>(&mut seg, z_g, 0, &to_bits(&d_gamma)).unwrap();
+				fill(&mut seg, &z_g_sel, &to_bits(&d_gamma));
+				write_col::<W>(&mut seg, z_d, 0, &to_bits(&d_delta)).unwrap();
+				fill(&mut seg, &z_d_sel, &to_bits(&d_delta));
+				let zt = ((&d_yz_sq + &p) - &d_gamma) % &p;
+				pop_sub(&mut seg, &g_zt, &d_yz_sq, &d_gamma);
+				pop_sub(&mut seg, &g_z3, &zt, &d_delta);
+			}
+			{
+				let tw = witness.init_table(gf_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, f_4b, 0, &to_bits(&d_four_beta)).unwrap();
+				fill(&mut seg, &f_4b_sel, &to_bits(&d_four_beta));
+				write_col::<W>(&mut seg, f_x3, 0, &to_bits(&d_x3)).unwrap();
+				fill(&mut seg, &f_x3_sel, &to_bits(&d_x3));
+				pop_sub(&mut seg, &g_fbmx3, &d_four_beta, &d_x3);
+			}
+			{
+				let tw = witness.init_table(gg_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, gg_gsq, 0, &to_bits(&d_gamma_sq)).unwrap();
+				fill(&mut seg, &gg_gsq_sel, &to_bits(&d_gamma_sq));
+				let twog = (&d_gamma_sq * 2u32) % &p;
+				let fourg = (&d_gamma_sq * 4u32) % &p;
+				pop_add(&mut seg, &g_2g, &d_gamma_sq, &d_gamma_sq);
+				pop_add(&mut seg, &g_4g, &twog, &twog);
+				pop_add(&mut seg, &g_8g, &fourg, &fourg);
+			}
+			{
+				let tw = witness.init_table(gy_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, y_y3t, 0, &to_bits(&d_y3t)).unwrap();
+				fill(&mut seg, &y_y3t_sel, &to_bits(&d_y3t));
+				write_col::<W>(&mut seg, y_8g, 0, &to_bits(&d_eight_gsq)).unwrap();
+				fill(&mut seg, &y_8g_sel, &to_bits(&d_eight_gsq));
+				pop_sub(&mut seg, &g_y3, &d_y3t, &d_eight_gsq);
+			}
+
+			// addition glue witnesses
+			{
+				let tw = witness.init_table(g1_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g1_u2, 0, &to_bits(&a_u2)).unwrap();
+				fill(&mut seg, &g1_u2_sel, &to_bits(&a_u2));
+				write_col::<W>(&mut seg, g1_u1, 0, &to_bits(&a_u1)).unwrap();
+				fill(&mut seg, &g1_u1_sel, &to_bits(&a_u1));
+				pop_sub(&mut seg, &g_h, &a_u2, &a_u1);
+				pop_add(&mut seg, &g_2h, &a_h, &a_h);
+			}
+			{
+				let tw = witness.init_table(g2_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g2_s2, 0, &to_bits(&a_s2)).unwrap();
+				fill(&mut seg, &g2_s2_sel, &to_bits(&a_s2));
+				write_col::<W>(&mut seg, g2_s1, 0, &to_bits(&a_s1)).unwrap();
+				fill(&mut seg, &g2_s1_sel, &to_bits(&a_s1));
+				pop_sub(&mut seg, &g_sd, &a_s2, &a_s1);
+				pop_add(&mut seg, &g_r, &a_sd, &a_sd);
+			}
+			{
+				let tw = witness.init_table(g3_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g3_z1, 0, &to_bits(&pz)).unwrap();
+				fill(&mut seg, &g3_z1_sel, &to_bits(&pz));
+				write_col::<W>(&mut seg, g3_z2, 0, &to_bits(&qz)).unwrap();
+				fill(&mut seg, &g3_z2_sel, &to_bits(&qz));
+				pop_add(&mut seg, &g_z1z2, &pz, &qz);
+			}
+			{
+				let tw = witness.init_table(g4_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g4_zsq, 0, &to_bits(&a_z1z2_sq)).unwrap();
+				fill(&mut seg, &g4_zsq_sel, &to_bits(&a_z1z2_sq));
+				write_col::<W>(&mut seg, g4_z1z1, 0, &to_bits(&a_z1z1)).unwrap();
+				fill(&mut seg, &g4_z1z1_sel, &to_bits(&a_z1z1));
+				write_col::<W>(&mut seg, g4_z2z2, 0, &to_bits(&a_z2z2)).unwrap();
+				fill(&mut seg, &g4_z2z2_sel, &to_bits(&a_z2z2));
+				pop_sub(&mut seg, &g_zta, &a_z1z2_sq, &a_z1z1);
+				pop_sub(&mut seg, &g_zt2, &a_zta, &a_z2z2);
+			}
+			{
+				let tw = witness.init_table(g5_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g5_rsq, 0, &to_bits(&a_r_sq)).unwrap();
+				fill(&mut seg, &g5_rsq_sel, &to_bits(&a_r_sq));
+				write_col::<W>(&mut seg, g5_jj, 0, &to_bits(&a_jj)).unwrap();
+				fill(&mut seg, &g5_jj_sel, &to_bits(&a_jj));
+				write_col::<W>(&mut seg, g5_v, 0, &to_bits(&a_v)).unwrap();
+				fill(&mut seg, &g5_v_sel, &to_bits(&a_v));
+				pop_sub(&mut seg, &g_x3b, &a_r_sq, &a_jj);
+				pop_add(&mut seg, &g_2v, &a_v, &a_v);
+				pop_sub(&mut seg, &g_ax3, &a_x3b, &a_two_v);
+			}
+			{
+				let tw = witness.init_table(g6_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g6_v, 0, &to_bits(&a_v)).unwrap();
+				fill(&mut seg, &g6_v_sel, &to_bits(&a_v));
+				write_col::<W>(&mut seg, g6_x3, 0, &to_bits(&a_x3)).unwrap();
+				fill(&mut seg, &g6_x3_sel, &to_bits(&a_x3));
+				pop_sub(&mut seg, &g_vmx3, &a_v, &a_x3);
+			}
+			{
+				let tw = witness.init_table(g7_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, g7_y3a, 0, &to_bits(&a_y3a)).unwrap();
+				fill(&mut seg, &g7_y3a_sel, &to_bits(&a_y3a));
+				write_col::<W>(&mut seg, g7_s1jj, 0, &to_bits(&a_s1jj)).unwrap();
+				fill(&mut seg, &g7_s1jj_sel, &to_bits(&a_s1jj));
+				pop_add(&mut seg, &g_2sjj, &a_s1jj, &a_s1jj);
+				pop_sub(&mut seg, &g_ay3, &a_y3a, &a_two_s1jj);
+			}
+
+			// inverse-source witnesses
+			{
+				let tw = witness.init_table(hisrc_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let hib = to_bits(&hinv);
+				write_col::<W>(&mut seg, hi_col, 0, &hib).unwrap();
+				fill(&mut seg, &hi_sel, &hib);
+			}
+			{
+				let tw = witness.init_table(wisrc_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let wib = to_bits(&winv);
+				write_col::<W>(&mut seg, wi_col, 0, &wib).unwrap();
+				fill(&mut seg, &wi_sel, &wib);
+			}
+
+			// 3-way mux + flags witness
+			{
+				let tw = witness.init_table(mux_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let prodhb = to_bits(&prod_h);
+				write_col::<W>(&mut seg, o_prod_h, 0, &prodhb).unwrap();
+				fill(&mut seg, &o_prod_h_sel, &prodhb);
+				let hb = to_bits(&a_h);
+				write_col::<W>(&mut seg, o_h, 0, &hb).unwrap();
+				fill(&mut seg, &o_h_sel, &hb);
+				let prodwb = to_bits(&prod_w);
+				write_col::<W>(&mut seg, o_prod_w, 0, &prodwb).unwrap();
+				fill(&mut seg, &o_prod_w_sel, &prodwb);
+				let wb = to_bits(&a_sd);
+				write_col::<W>(&mut seg, o_w, 0, &wb).unwrap();
+				fill(&mut seg, &o_w_sel, &wb);
+				write_col::<W>(&mut seg, o_genx, 0, &to_bits(&a_x3)).unwrap();
+				fill(&mut seg, &o_genx_sel, &to_bits(&a_x3));
+				write_col::<W>(&mut seg, o_geny, 0, &to_bits(&a_y3)).unwrap();
+				fill(&mut seg, &o_geny_sel, &to_bits(&a_y3));
+				write_col::<W>(&mut seg, o_genz, 0, &to_bits(&a_z3)).unwrap();
+				fill(&mut seg, &o_genz_sel, &to_bits(&a_z3));
+				write_col::<W>(&mut seg, o_dblx, 0, &to_bits(&d_x3)).unwrap();
+				fill(&mut seg, &o_dblx_sel, &to_bits(&d_x3));
+				write_col::<W>(&mut seg, o_dbly, 0, &to_bits(&d_y3)).unwrap();
+				fill(&mut seg, &o_dbly_sel, &to_bits(&d_y3));
+				write_col::<W>(&mut seg, o_dblz, 0, &to_bits(&d_z3)).unwrap();
+				fill(&mut seg, &o_dblz_sel, &to_bits(&d_z3));
+				// h flag broadcast
+				write_bit(&mut seg, h_flag_c, 0, h_flag).unwrap();
+				let hfb = vec![h_flag; W];
+				write_col::<W>(&mut seg, h_flag_bc, 0, &hfb).unwrap();
+				write_col::<W>(&mut seg, h_flag_bcr, 0, &hfb).unwrap();
+				write_bit(&mut seg, h_flag_l0, 0, h_flag).unwrap();
+				// w flag broadcast
+				write_bit(&mut seg, w_flag_c, 0, w_flag).unwrap();
+				let wfb = vec![w_flag; W];
+				write_col::<W>(&mut seg, w_flag_bc, 0, &wfb).unwrap();
+				write_col::<W>(&mut seg, w_flag_bcr, 0, &wfb).unwrap();
+				write_bit(&mut seg, w_flag_l0, 0, w_flag).unwrap();
+				// constants
+				write_col::<W>(&mut seg, o_ones, 0, &vec![true; W]).unwrap();
+				let onevalb: Vec<bool> = (0..W).map(|i| i == 0).collect();
+				write_col::<W>(&mut seg, o_oneval, 0, &onevalb).unwrap();
+				// inner = w?D:O and T = h?inner:gen
+				write_col::<W>(&mut seg, mux_ix, 0, &to_bits(&inner_x)).unwrap();
+				write_col::<W>(&mut seg, mux_iy, 0, &to_bits(&inner_y)).unwrap();
+				write_col::<W>(&mut seg, mux_iz, 0, &to_bits(&inner_z)).unwrap();
+				write_col::<W>(&mut seg, o_tx, 0, &to_bits(&t_x)).unwrap();
+				fill(&mut seg, &o_tx_push, &to_bits(&t_x));
+				write_col::<W>(&mut seg, o_ty, 0, &to_bits(&t_y)).unwrap();
+				fill(&mut seg, &o_ty_push, &to_bits(&t_y));
+				write_col::<W>(&mut seg, o_tz, 0, &to_bits(&t_z)).unwrap();
+				fill(&mut seg, &o_tz_push, &to_bits(&t_z));
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => {
+					println!("Wadd-complete proof size: {} bytes", pf.get_proof_size());
+					binius_core::constraint_system::verify::<
+						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok()
+				}
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// validate-only (fast): all three honest cases match native jac_add.
+		let (v_gen, e_gen, _) = run(0, 0, false);
+		assert!(v_gen, "honest GENERIC P≠±Q (T=jac_add) failed validate_witness: {e_gen}");
+		let (v_eq, e_eq, _) = run(1, 0, false);
+		assert!(v_eq, "honest P==Q (T=[2]P) failed validate_witness: {e_eq}");
+		let (v_neg, e_neg, _) = run(2, 0, false);
+		assert!(v_neg, "honest P==−Q (T=O) failed validate_witness: {e_neg}");
+
+		// soundness: a forged h_is_zero flag is REJECTED in BOTH directions.
+		let (vfh_g, _e, _) = run(0, 1, false); // generic: h≠0 but flag claims h==0 ⇒ direction B fails
+		assert!(!vfh_g, "SOUNDNESS FAILURE: forged h_is_zero (h≠0 claimed ==0) accepted");
+		let (vfh_e, _e, _) = run(1, 1, false); // P==Q: h==0 but flag claims ≠0 ⇒ direction A fails
+		assert!(!vfh_e, "SOUNDNESS FAILURE: forged h_is_zero (h==0 claimed ≠0) accepted");
+		// soundness: a forged w_is_zero flag is REJECTED in BOTH directions.
+		let (vfw_e, _e, _) = run(1, 2, false); // P==Q: w==0 but flag claims ≠0 ⇒ direction A fails
+		assert!(!vfw_e, "SOUNDNESS FAILURE: forged w_is_zero (w==0 claimed ≠0) accepted");
+		let (vfw_n, _e, _) = run(2, 2, false); // P==−Q: w≠0 but flag claims ==0 ⇒ direction B fails
+		assert!(!vfw_n, "SOUNDNESS FAILURE: forged w_is_zero (w≠0 claimed ==0) accepted");
+		// soundness: a forged input coordinate is REJECTED (channel imbalance).
+		let (vfc, _e, _) = run(0, 3, false);
+		assert!(!vfc, "SOUNDNESS FAILURE: a forged input coordinate accepted in the complete add");
+
+		// one full prove+verify: P==Q ⇒ [2]P (both flags true + double branch + discarded-generic sat).
+		let t0 = std::time::Instant::now();
+		let (vok, verr, verify_ok) = run(1, 0, true);
+		let elapsed = t0.elapsed();
+		assert!(vok, "honest P==Q complete add (full) failed validate_witness: {verr}");
+		assert!(verify_ok, "assembled EXCEPTION-FREE P-256 complete add must PROVE+VERIFY over B256");
+
+		println!(
+			"GATE prove-S2-waddcomplete: EXCEPTION-FREE P-256 Jacobian complete ADD T=(h==0)?((w==0)?[2]P:O):jac_add(P,Q) PROVEN+VERIFIED over B256 @L1(128) in {elapsed:?}; the 30-table generic add exports h=u2−u1 (a_chH ×4) and w=s2−s1 (a_chW ×2), the 19-table double exports D=[2]P, two seamed fe_inv ModMuls (h·hInv, w·wInv) + inverse-source tables detect the exception via SOUND h_is_zero/w_is_zero flags (direction A: flag=0⇒prod==1; direction B: flag=1⇒val==0 ⇒ flag=(val==0)), and a 3-way output mux computes inner=w?D:O over O=(1,1,0) and T=h?inner:gen — 54 tables. All three cases (generic / P==Q ⇒ [2]P / P==−Q ⇒ O) match native jac_add; the P==Q⇒[2]P case was full-proven; a forged h/w flag (both directions) and a forged input coordinate are REJECTED. Wires the u1==u2 doubling-exception in-circuit — the last native leg of the in-circuit ECDSA verify."
+		);
+	}
+
 	/// GATE prove-S2-xaff (S2 verify gate) — CLOSES the ECDSA "R.x is a free witness" soundness gap.
 	/// The scalar-mul output point R lives in JACOBIAN coords (X,Y,Z); the affine x used in the ECDSA
 	/// check is x_aff = X·(Z⁻¹)² (mod p). If R.x were injected as a free committed value, an adversary
