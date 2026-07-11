@@ -1,0 +1,400 @@
+% Accumulation, Not Verification: FIPS-clean, millisecond-verifiable recursive
+% aggregation over binary-field STARKs.
+%
+% Double-blind draft. Self-contained (article class); port \documentclass to
+% llncs for a Springer submission. All quantitative claims are backed by the
+% measurement harness in crates/binius-substrate (test names cited inline).
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\newtheorem{observation}{Observation}
+\newcommand{\bt}{\mathbb{B}}
+\newcommand{\field}[1]{\bt_{#1}}
+\newcommand{\kbind}{\kappa_{\mathrm{bind}}}
+\newcommand{\kfs}{\kappa_{\mathrm{FS}}}
+\newcommand{\kit}{\kappa_{\mathrm{IT}}}
+\newcommand{\bigO}{\mathcal{O}}
+
+\title{Accumulation, Not Verification:\\
+FIPS-clean, Millisecond-Verifiable Recursive Aggregation\\
+over Binary-Field STARKs}
+\author{Double-blind submission}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Post-quantum, transparent proofs of DNSSEC integrity let an edge resolver verify
+a whole zone's signatures cryptographically instead of trusting the network. To
+be standards-acceptable the proof system must use only FIPS-approved hashes
+(SHA-2/SHA-3). The natural way to aggregate many per-record proofs into one
+epoch artifact is \emph{recursion}: verify the inner proofs inside an outer
+circuit. We show, by direct measurement over a binary-tower STARK
+(Binius), that this approach is structurally slow for a FIPS-constrained system,
+and we give an alternative that is not.
+
+Our first contribution is a diagnosis. Binius's verifier cost is
+\emph{polylogarithmic in the trace length but linear in the committed width}:
+empirically $\text{verify}\approx 20\,\text{ms} + 1.3\,\text{ms}\cdot m$ for $m$
+field multiplications. Verifying a FRI proof in-circuit forces the outer circuit
+to arithmetize a hash for every Merkle path; with FIPS hashes this is the widest
+object one can build (a single SHA-256 compression op-table verifies in $\sim26$\,s,
+Keccak-$f[1600]$ in $\sim7$\,s at our scale). The seconds-not-milliseconds gap is
+thus the FIPS constraint meeting a width-linear verifier---a tension, not a bug.
+
+Our second contribution is the resolution. We arithmetize the \emph{fold-verify}
+of an accumulation scheme rather than the FRI verifier. The fold-verify is a
+Horner evaluation plus a line update---$2d$ field multiplications, \emph{no hash
+gadget}---and verifies in $31$--$117$\,ms across realistic sizes, $60$--$800\times$
+narrower than the in-circuit hash op-tables, while remaining FIPS-clean (hashing
+occurs only at the base commitment and a single decision-time opening). We fold
+claims about \emph{different} records without homomorphic commitments by
+interleaving them into one polynomial, and we wire the incremental loop
+end-to-end with a constant-size accumulator and a gated end-to-end soundness
+check. Finally we show the $\bigO(1)$-in-$N$ collapse needs no bespoke folding
+scheme: Binius already provides both halves---a batched multi-claim sumcheck
+(the fold) and interleaved codes (the single opening). The only remaining cost is
+memory: the interleaved commitment is $\bigO(N)$ RSS natively but streams to a
+$\sim2$\,MiB floor. The net is a FIPS-clean recursive aggregation that is
+simultaneously millisecond-verifiable and low-memory---none of which the
+verify-in-circuit approach achieves together.
+\end{abstract}
+
+\section{Introduction}
+
+DNSSEC lets a resolver authenticate DNS records, but its classical signatures
+(RSA, ECDSA, Ed25519) are broken by a cryptographically relevant quantum
+computer. A transparent, post-quantum alternative is to prove, in zero
+network round trips, that a zone's records were correctly signed under the
+published keys: publish a succinct \emph{epoch} proof once, and let any resolver
+verify it locally. Such ``epoch DNS-STARK'' constructions have been proposed;
+the engineering question this paper addresses is how to \emph{aggregate} the many
+per-record proofs of a zone into one edge-verifiable artifact, under two hard
+constraints:
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{FIPS-acceptability.} Every hash on the trust path---the vector
+  commitment, the Fiat--Shamir transcript, the zone tree---must be a
+  FIPS-approved function (SHA-2 or SHA-3). Arithmetization-friendly hashes
+  (Poseidon, Rescue, Vision) are excluded.
+  \item \textbf{Low prover memory.} Records are proved in parallel on
+  memory-bounded devices; peak resident set size (RSS) must stay bounded
+  \emph{independently of the number of records}.
+\end{enumerate}
+
+The textbook aggregation technique is \emph{recursion}: an outer circuit verifies
+the inner per-record proofs, so the resolver checks one proof. We report that,
+for a state-of-the-art binary-field STARK and under the FIPS constraint, this is
+the wrong tool---and we give a right one.
+
+\paragraph{Contributions.}
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{A cost diagnosis (\S\ref{sec:tension}).} We measure that the
+  Binius verifier is \emph{linear in committed width}, not just polylogarithmic
+  in trace length. Consequently, verifying FRI in-circuit---which must
+  arithmetize a hash per Merkle path---is a seconds-scale operation with FIPS
+  hashes, whatever the query count. We isolate the effect and show it is
+  width-driven and query-independent.
+  \item \textbf{Accumulation over Binius (\S\ref{sec:accum}).} We arithmetize an
+  accumulation \emph{fold-verify}, not the FRI verifier. It is a narrow,
+  hash-free field computation ($\sim48$\,ms), and we fold claims about distinct
+  records \emph{without} homomorphic commitments via polynomial interleaving. We
+  wire the incremental loop end-to-end and gate its soundness.
+  \item \textbf{Succinct verification for free (\S\ref{sec:succinct}).} The
+  $\bigO(1)$-in-$N$ decision does not require porting a folding scheme: Binius's
+  native interleaved codes and batched multi-claim sumcheck already supply the
+  single opening and the claim-fold.
+  \item \textbf{A memory analysis (\S\ref{sec:rss}).} The interleaved commitment
+  is $\bigO(N)$ RSS as binius builds it, but its encoder is separable, so it
+  streams to a $\sim2$\,MiB floor---recovering the low-memory constraint.
+\end{enumerate}
+All numbers come from a measurement harness; we cite the driving experiment by
+name (e.g.\ \texttt{verify\_vs\_width\_diagnostic}) so each claim is reproducible.
+
+\section{Background}\label{sec:bg}
+
+\paragraph{Binary-tower STARKs.} We work over a tower of binary fields
+$\field{1}\subset\field{8}\subset\field{32}\subset\field{64}\subset\field{128}
+\subset\field{256}$, committing witnesses at small fields and taking Fiat--Shamir
+challenges in a large extension. The polynomial commitment scheme (PCS) is
+FRI-Binius: a ring-switch reduction turns a committed-multilinear opening into a
+sumcheck, and the sumcheck folds \emph{in lockstep} with a FRI proximity test,
+sharing one challenge per round. The vector commitment is a Merkle tree over a
+Reed--Solomon codeword; hashing is SHA-256 (with SHA-3 available), so
+$\kbind=\kfs$ are the hash's collision resistance.
+
+\paragraph{End-to-end soundness.} A proof's security is
+$\min(\kit,\kbind,\kfs)$: the information-theoretic soundness of the IOP (set by
+the challenge field size and the query count), the binding of the commitment, and
+the Fiat--Shamir resistance. For NIST category-$N$ security every term must reach
+$N$; a large field with a 128-bit hash is pinned at 128 bits.
+
+\paragraph{Recursion by in-circuit verification.} To aggregate $N$ proofs one
+builds an outer circuit that runs the verifier of \S\ref{sec:bg}: it recomputes
+Fiat--Shamir challenges (hashing the transcript), opens Merkle paths (hashing up
+the tree), and checks FRI fold consistency (field arithmetic). The dominant work
+is the Merkle-path recomputation: one hash-permutation evaluation per authentication
+node per query.
+
+\section{The FIPS--Width Tension}\label{sec:tension}
+
+We first establish the shape of the Binius verifier's cost, then show why it makes
+FIPS in-circuit recursion slow.
+
+\subsection{Verify is linear in committed width}
+
+\begin{observation}[width-linear verify]\label{obs:width}
+For a fixed trace length, the Binius verify time grows linearly in the number of
+committed columns, not polylogarithmically.
+\end{observation}
+
+We stack $k$ independent degree-2 field constraints (B256 multiplications) in one
+table at a fixed $64$ rows and time \texttt{constraint\_system::verify}
+(\texttt{verify\_vs\_width\_diagnostic}):
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+$k$ (mults) & 1 & 4 & 16 & 64 & 256\\
+\midrule
+verify (ms)  & 21  & 22  & 41  & 107 & 362\\
+proof (KiB)  & 249 & 287 & 463 & 850 & 1967\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The marginal cost is $\approx1.3$\,ms per multiplication over a $\approx20$\,ms
+floor: $\text{verify}\approx 20 + 1.3\,m$. Proof size grows sublinearly. The
+verifier is thus succinct in the \emph{trace length} (it is $\sim$flat in the
+row count) but \emph{linear in the committed width}, because it evaluates every
+constraint and reduces every committed column---Binius is not holographic.
+
+A second measurement rules out the query count as the cause. Sweeping the FRI
+blowup (which changes the query count) on a fixed circuit leaves verify flat while
+only the proof shrinks (\texttt{keccak\_verify\_vs\_blowup}: $8.4$\,s at blowups
+$2$--$16$, proof $579\!\to\!374$\,KiB). The verifier cost lives in the
+width-dependent sumcheck/ring-switch reduction, not in the query openings.
+
+\subsection{FIPS hashes are the widest gadget}
+
+Verifying FRI in-circuit forces a hash op-table. We measure a batch of hash
+permutations as a Binius circuit and time its verify
+(\texttt{keccak\_vs\_sha256\_optable\_verify}, $64$ rows, L1):
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+in-circuit gadget & verify (s) & proof (KiB)\\
+\midrule
+Keccak-$f[1600]$ (SHA-3) & 6.7 & 456\\
+SHA-256 compression      & 26.7 & 838\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+SHA-256's compression is $\approx2000$ committed columns; Keccak-$f[1600]$
+$\approx575$. By Observation~\ref{obs:width} their verify is seconds. A minimal
+inner proof (\texttt{recursion\_scope\_introspection}) needs $\approx3800$ such
+permutations for its Merkle openings; the assembled recursion verify is therefore
+tens of seconds. Keccak is $\sim5\times$ cheaper than SHA-256 in-circuit---and,
+being SHA-3, is the correct FIPS binding hash---but it is still seconds.
+
+\begin{observation}[the tension]\label{obs:tension}
+FIPS-approved hashes are bit-oriented and hence wide in-circuit; a width-linear
+verifier makes any FIPS hash + verify-FRI-in-circuit recursion seconds-scale.
+One can have a FIPS recursion hash or a millisecond recursive verify, but not
+both by verifying FRI in-circuit.
+\end{observation}
+
+We confirmed the obvious escape hatch does not apply: a narrower permutation
+does \emph{not} help unless it is equally optimized. We implemented Keccak-$f[800]$
+(half the state, 22 rounds) as a faithful gadget; a naive per-lane arithmetization
+verifies $3$--$4\times$ \emph{slower} than Binius's tuned Keccak-$f[1600]$
+(\texttt{keccak800\_vs\_1600\_verify}), because verify tracks committed-column
+\emph{structure} (count and packing), not raw permutation width.
+
+\section{Accumulation over Binius}\label{sec:accum}
+
+Accumulation attacks Observation~\ref{obs:tension} at its root: it never verifies
+the inner proof in-circuit. Each step folds a new instance into a constant-size
+accumulator with a cheap operation; a single decider checks the accumulator at
+the end. The recursion step arithmetizes the \emph{fold}, not the verifier.
+
+\subsection{The fold-verify is narrow}
+
+We reduce two multilinear evaluation claims $M(r_0)=v_0$, $M(r_1)=v_1$ to one via
+the line $\ell(t)=r_0+t(r_1-r_0)$ and the univariate $g=M\circ\ell$ of degree
+$d=\dim r_0$. The prover supplies $g$ in coefficient form; the verifier checks
+$g(0)=v_0$ (the constant term), $g(1)=v_1$ (the coefficient sum), computes the
+folded value $g(t)$ by Horner and the folded point $\ell(t)$, and defers the claim
+$M(\ell(t))=g(t)$ to the final opening. This is $2d$ field multiplications and
+\emph{no hash gadget}. We arithmetize it over $\field{256}$ at NIST L1 and gate
+it against the native fold (\texttt{fold\_verify\_is\_narrow}):
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+$d$ & mults ($2d$) & verify (ms) & proof (KiB)\\
+\midrule
+4  & 8  & 31  & 408\\
+8  & 16 & 42  & 476\\
+16 & 32 & 66  & 596\\
+24 & 48 & 90  & 694\\
+32 & 64 & 117 & 893\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For a realistic $d\approx n+\log N\approx20$--$25$ the fold-verify verifies in
+$70$--$90$\,ms, matching the width model of Observation~\ref{obs:width}. Against
+the hash op-tables of \S\ref{sec:tension} this is $60$--$800\times$ narrower, and
+it is FIPS-clean: the step circuit contains no hash at all.
+
+\subsection{Folding distinct records without homomorphism}
+
+Records are distinct polynomials $P_i$ under distinct commitments. Nova-style
+folding forms $\sum_i \lambda_i\,\mathrm{Com}(P_i)$ and needs an additively
+homomorphic commitment; a Merkle-over-hash commitment has none. We sidestep this
+by \emph{interleaving}: stack $N$ records (a power of two) into one polynomial $P$
+over $n+\log N$ variables with $P(x,\mathrm{bin}(i))=P_i(x)$. Each claim
+$P_i(r_i)=v_i$ lifts to $P((r_i,\mathrm{bin}(i)))=v_i$---now all about the
+\emph{same} $P$---so the same-polynomial fold applies. The commitment to $P$ is
+the Merkle parent of the record commitments (one hash per level), needing no
+homomorphism. Chaining $N-1$ folds reduces $N$ claims to one; a wrong record
+value is caught at its fold (its endpoint check fails). We verified soundness and
+measured the fold chain (\texttt{cross\_record\_fold\_sound},
+\texttt{accumulate\_verify\_cost\_vs\_n}): $\sim76$--$229$\,$\mu$s per record, all
+$\bigO(\log)$ per fold and never touching a $2^n$ witness.
+
+\subsection{The incremental loop, end to end}
+
+We wire the loop (\texttt{ivc\_end\_to\_end}): interleave $N$ records into $P$,
+thread a running accumulator claim through $N-1$ narrow fold-verify steps (each a
+proven circuit fed the real $g=P\circ\ell$), and gate that the final accumulated
+claim holds on $P$:
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & $d$ & steps & max step verify (ms) & final claim\\
+\midrule
+4  & 8  & 3  & 43 & holds\\
+8  & 9  & 7  & 46 & holds\\
+16 & 10 & 15 & 49 & holds\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each step is the $\sim48$\,ms narrow circuit; the accumulator is a constant-size
+claim; the end-to-end soundness check passes. As wired this is $\bigO(N)$ narrow
+steps---a $\sim100\times$ per-step improvement over $\bigO(N)$ wide in-circuit
+FRI verifications, but not yet a single edge check.
+
+\section{Succinct Verification without a Bespoke Folding Scheme}\label{sec:succinct}
+
+The $\bigO(1)$-in-$N$ collapse requires two things: fold the $N$ claims into one,
+and open the accumulator once. We observe that Binius \emph{already provides both}.
+
+\begin{observation}[native accumulation]\label{obs:native}
+Binius's PCS contains a batched multi-claim sumcheck and interleaved codes, which
+are precisely the fold and the single opening of an accumulation scheme.
+\end{observation}
+
+The batched sumcheck (\texttt{front\_loaded::BatchVerifier}) samples one random
+mixing coefficient per claim and combines $N$ evaluation claims---at different
+points and even different variable counts---into one sumcheck; this random linear
+combination \emph{is} the claim-fold. Interleaved codes
+(\texttt{fold\_interleaved\_chunk}, parameter \texttt{log\_batch\_size}) commit a
+batch of $2^{b}$ codewords and open the batch at a point in one FRI query via the
+interleave-tensor; a batch of $N$ record codewords committed this way is exactly a
+commitment to the block-interleaved $P$ over $n+\log N$ variables, openable at any
+point---including the batched-claim point---in a single query set, polylogarithmic
+in $N$.
+
+Hence O(1)-verify aggregation over Binius needs no homomorphic commitment and no
+imported folding scheme: commit the $N$ records as one interleaved-code batch and
+prove the aggregation as one Binius proof whose $N$ record claims are batched by
+the sumcheck. The edge verifies one sumcheck and one FRI opening. The explicit
+fold-verify of \S\ref{sec:accum} remains the primitive for the \emph{streaming}
+regime, where the batch cannot be held in memory and records must be folded one at
+a time in a recursion circuit; there its narrowness (\S\ref{sec:accum}) is what
+keeps the edge check fast.
+
+\section{Low-Memory Commitment}\label{sec:rss}
+
+Observation~\ref{obs:native} moves the whole difficulty to one place: the
+interleaved commitment must be produced under the low-memory constraint.
+
+Binius builds it in one shot: it allocates the full interleaved codeword
+($2^{\,n+\log N}\!\cdot\!\text{blowup}$ field elements), encodes in place, and
+Merkle-commits. That is $\bigO(N)$ RSS. Our model
+(\texttt{interleaved\_commit\_rss\_model}, blowup $2$, 32-byte elements) shows it
+reaching gigabytes:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+record rows & $N$ & native RSS & streamed floor\\
+\midrule
+$2^{10}$ & 1024 & 64\,MiB & 0.09\,MiB\\
+$2^{15}$ & 1024 & 2\,GiB  & 2.03\,MiB\\
+$2^{15}$ & 8192 & 16\,GiB & 2.25\,MiB\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+But the encoder is \emph{separable}: \texttt{encode\_ext\_batch\_inplace}
+Reed--Solomon-encodes each record independently, and \texttt{commit\_iterated}
+consumes the codeword as a stream of cosets. A custom commit can therefore encode
+each record in a bounded per-record buffer, stash the codewords, and stream the
+interleaved-coset Merkle---each coset column needing one symbol from each of the
+$N$ records. The resident floor is one per-record codeword plus an $N$-symbol
+column (kilobytes) plus the Merkle spine: $\sim2$\,MiB even at $N=8192$, flat in
+$N$'s large term. This is the same memory-bounded, disk-backed streaming used by
+sliver provers, now applied to the interleaved-coset Merkle. The low-memory
+constraint is thus recoverable; it is an implementation task, not an obstruction.
+
+\section{Discussion and Related Work}
+
+\paragraph{Where each escape hatch fails, and this one does not.}
+Accumulation (Nova, ProtoStar, Protogalaxy) achieves millisecond IVC by folding
+instances with homomorphic commitments; Binius's hash commitments preclude the
+direct construction, but Observation~\ref{obs:native} shows the same end is
+reached natively. Arithmetization-friendly hashes (Poseidon/Vision) narrow the
+recursion circuit but are non-FIPS. Holographic SNARKs make the verifier succinct
+in width but Binius is not holographic. Our route keeps the FIPS hash, keeps the
+transparent hash-based commitment, and still gets a millisecond, width-narrow
+edge check---by never arithmetizing the hash in the recursion step.
+
+\paragraph{Relation to query-reduction.} STIR and related low-degree tests cut
+FRI query complexity. Over Binius this reduces proof size and the number of
+in-circuit openings, but not the width-linear verify cost
+(Observation~\ref{obs:width}); it is orthogonal to the tension resolved here.
+
+\paragraph{Honest scope.} This is a design-and-measurement study. The primitives
+are prototyped and gated---the native fold model, the in-circuit fold-verify over
+$\field{256}$, the incremental loop, and the RSS model---but the single
+integrated pipeline (streaming interleaved commit $\to$ batched-claim aggregation
+$\to$ one edge opening) is not yet assembled end to end. Every quantitative claim
+above is a measurement of a component; the assembly is the natural next step, and
+each of its pieces is already shown feasible.
+
+\section{Conclusion}
+
+For FIPS-constrained, memory-bounded post-quantum DNS aggregation, verifying FRI
+in-circuit is the wrong recursion: a width-linear verifier turns the mandatory
+FIPS hash gadget into seconds. Arithmetizing an accumulation fold-verify instead
+is a narrow, hash-free, $\sim70$\,ms operation; distinct records fold without
+homomorphism via interleaving; the succinct collapse is already latent in
+Binius's interleaved codes and batched sumcheck; and the interleaved commitment
+streams to a few megabytes. FIPS-cleanliness, millisecond verification, and low
+prover memory---mutually exclusive for verify-in-circuit recursion---are jointly
+achievable through accumulation over a binary-field STARK.
+
+\end{document}
