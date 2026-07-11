@@ -84,6 +84,93 @@ all N records, edge-verified) is level-independent in the demo:
   [`docs/iot-memory-bounded-prover.md`](./iot-memory-bounded-prover.md) for the
   memory-bounded prover path at production trace sizes.
 
+## Flow model & security
+
+**Actors:** the zone *publisher* (prover — does the expensive work once per
+epoch), the *edge resolver* (verifier — O(1) work), the *client* (µs lookups).
+
+```
+PUBLISH  (prover, once per epoch)
+  each DNS record  r_i
+    │  canonical wire form   (name ‖ type ‖ rdata)
+    ▼
+  S-layer AIR: proves in-circuit  "RRSIG(r_i) verifies under alg A_i, key K_i"
+               + FIPS SHA-3 digest over the canonical form           ← Layer 1
+    │  per-record proof π_i  +  commitment c_i
+    ▼
+  interleave {r_i} → one polynomial P → streaming interleaved commit
+    │  Merkle root  R*   (byte-exact == binius commit_interleaved)   ← the lookup tree
+    ▼
+  ACCUMULATOR: fold {π_i} into ONE accumulator instance; arithmetize the
+               narrow fold-verify (~48 ms), NOT the wide FRI/hash-verify
+    │  one epoch proof  Π  binding all N records to R*               ← Layer 2
+    ▼
+  artifact = (R*, Π)      [+ the record set / Merkle leaves]
+
+VERIFY   (edge resolver, once)
+  check Π against R*         → O(1) in N,  ~18 ms (fold layer)
+
+SERVE    (client, every lookup after the first)
+  record r_i  +  Merkle path to R*   → ~1.3 µs SHA-3 path check
+```
+
+Layer 1 and Layer 2 below are exactly the two stages of this flow: Layer 1 is
+the per-record S-layer proof (seconds, paid once at publish — the table above);
+Layer 2 is the accumulator + epoch verify (O(1) in N).
+
+### Why it is secure — three independent guarantees
+
+**1. Proof-system soundness — unconditional / post-quantum.**
+End-to-end soundness is `κ_sys = min(κ_IT, κ_bind, κ_FS)`, every term laddered
+to the target (L1/L3/L5 = 128/192/256):
+
+* `κ_IT` — STARK/FRI interactive-oracle soundness from field size + query count
+  `r` (auto-derived by Binius). Information-theoretic; no computational
+  assumption.
+* `κ_bind` — Merkle commitment binding = SHA-3 collision resistance
+  (`digest_bits / 2`).
+* `κ_FS` — Fiat–Shamir, same SHA-3.
+
+Resting only on **STARK IT-soundness + SHA-3 collision resistance**, this layer
+is post-quantum *unconditionally* — no algebraic hash, no number-theoretic
+assumption on the soundness path. No adversary (classical or quantum) can forge
+a valid epoch proof `Π`, make `Π` attest to a record not in the epoch, or tamper
+a witness (the corrupted-lane / flipped-transcript soundness tests gate exactly
+this).
+
+**2. Aggregation & lookup integrity — unconditional / PQ.**
+`R*` is a collision-resistant SHA-3 commitment to the *entire* interleaved
+record set, and `Π` proves the accumulator was folded correctly (the fold-verify
+is itself in-circuit, so a dishonest fold is caught). Once a resolver has
+verified `Π` against `R*`, **no record can be substituted, added, or dropped**
+in steady state — every µs lookup is a SHA-3 Merkle path back to the *proven*
+root. Adding records changes `R*` and needs a new `Π`; it cannot be forged onto
+an existing verified root. This is the O(1)-in-N win *and* the anti-substitution
+guarantee, PQ for the same reason as (1).
+
+**3. Signature trust — algorithm-dependent (the honest caveat).**
+The STARK proves *"this RRSIG verified under algorithm A"*; it does **not**
+upgrade the signature's own security:
+
+* **ML-DSA-signed records → post-quantum end to end.** A CRQC cannot forge the
+  RRSIG, so it cannot produce a record the S-layer accepts. (This is what the
+  quantum-MITM demo shows: the CRQC forgery classical DNSSEC accepts is rejected
+  on the ML-DSA path.)
+* **RSA / ECDSA / Ed25519 records → classical trust root.** The STARK faithfully
+  proves a *classical* signature check; a CRQC that forges the underlying RRSIG
+  yields a proof that honestly verifies. The proof system is still PQ-sound
+  about the *statement* — the trust root is only as quantum-safe as the
+  signature algorithm.
+
+> **Precise statement.** The **transport, aggregation, and lookup integrity are
+> post-quantum unconditional** (STARK + SHA-3): you cannot forge the epoch
+> proof, substitute records, or tamper the witness, even with a quantum
+> computer. **End-to-end trust is post-quantum only for records signed with a PQ
+> algorithm (ML-DSA);** for classical algorithms the STARK inherits the
+> signature's classical security — it makes DNSSEC *verifiable and aggregatable
+> at µs cost*, not *quantum-safe by itself*. The distinction is a PQ-sound
+> *envelope* vs. an algorithm-bound *trust root*.
+
 ## Why this motivates accumulation — the two layers
 
 There are **two distinct "verify times"** in this system, and the accumulator
