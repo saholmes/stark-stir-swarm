@@ -97,6 +97,40 @@ narrow). Optimizations (fixed-base comb for `G`, 4-bit windowing, Shamir's inter
 embarrassingly-parallel, RSS-bounded work — minutes of latency with a full prover
 fleet, but a large total energy/$ budget that parallelism does not reduce.**
 
+### Threading assumption (all numbers are single-thread)
+
+Every measurement above is **single-threaded, one core**. Binius's internal
+parallelism runs through `binius_maybe_rayon`, and every binius crate pulls it with
+`default-features = false`; nothing in the `binius-substrate` build re-enables the
+`rayon` feature, so `maybe_rayon` uses its **sequential** path. The `695 s` round is
+therefore a **1-core** figure.
+
+This gives a third parallelism axis on top of inter-strand and cross-signature:
+
+* **Intra-strand (rayon / multicore within one proof)** — *off in these numbers.*
+  STARK provers (NTT, Merkle hashing, sumcheck) parallelize well but sublinearly
+  (memory-bandwidth bound); a realistic multicore speedup is ~4–8× on 8–10 cores, so
+  `695 s → ~90–175 s`/round on one multicore box.
+
+The three axes share one core budget, so the honest invariant is:
+
+> **wall-clock ≈ total-work / total-cores + aggregation-depth overhead**,
+> total-work ≈ **99 core-hours/sig** (thread-invariant *work*).
+
+| Hardware | Wall-clock / signature |
+|----------|------------------------|
+| 1 core | ~99 h |
+| one 8-core laptop (rayon on) | ~12 h |
+| one 64-core server | ~1.5 h |
+| 512-core fleet | ~12 min |
+
+Rayon is *how a machine's cores are applied within a strand* when independent strands
+don't saturate them — and it shortens the aggregation tree's top levels (few strands
+there). With 512 independent strands the cores saturate regardless, so the governing
+relation is **work / cores**, not a fixed latency. Enabling rayon cuts per-strand
+wall-time (and wall-clock for a fixed machine count); it does **not** reduce total
+work / energy / $. The `695 s` single-thread round is the conservative anchor.
+
 ## What the strand model *does* buy
 
 The total work is large but the design is deliberate — the scalar-mul is the **strand
