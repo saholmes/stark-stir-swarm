@@ -1,0 +1,157 @@
+% Bibliography for accumulation-binius.tex.
+%
+% NOTE (author): compiled OFFLINE. Author/title/venue/year are as best recalled;
+% ePrint IDs and exact venue details should be VERIFIED against the IACR ePrint
+% archive / DBLP before submission. Entries flagged "verify:" have metadata the
+% author is least certain of.
+
+@misc{epochdnsstark,
+  author = {{Anonymous}},
+  title  = {Epoch {DNS}-{STARK}: transparent post-quantum {DNSSEC} integrity (citation omitted for double-blind review)},
+  year   = {2026},
+  note   = {Reference to the authors' own prior work, withheld for anonymous review}
+}
+
+% --- STARKs, FRI, proximity, sumcheck ---
+@misc{stark,
+  author = {Eli Ben-Sasson and Iddo Bentov and Yinon Horesh and Michael Riabzev},
+  title  = {Scalable, Transparent, and Post-Quantum Secure Computational Integrity},
+  year   = {2018},
+  note   = {IACR ePrint 2018/046}
+}
+@inproceedings{fri,
+  author    = {Eli Ben-Sasson and Iddo Bentov and Yinon Horesh and Michael Riabzev},
+  title     = {Fast {Reed-Solomon} Interactive Oracle Proofs of Proximity},
+  booktitle = {ICALP},
+  year      = {2018}
+}
+@inproceedings{proximitygaps,
+  author    = {Eli Ben-Sasson and Dan Carmon and Yuval Ishai and Swastik Kopparty and Shubhangi Saraf},
+  title     = {Proximity Gaps for {Reed-Solomon} Codes},
+  booktitle = {FOCS},
+  year      = {2020},
+  note      = {IACR ePrint 2020/654; verify}
+}
+@article{sumcheck,
+  author  = {Carsten Lund and Lance Fortnow and Howard Karloff and Noam Nisan},
+  title   = {Algebraic Methods for Interactive Proof Systems},
+  journal = {Journal of the ACM},
+  volume  = {39},
+  number  = {4},
+  year    = {1992}
+}
+@inproceedings{stir,
+  author    = {Gal Arnon and Alessandro Chiesa and Giacomo Fenzi and Eylon Yogev},
+  title     = {{STIR}: {Reed-Solomon} Proximity Testing with Fewer Queries},
+  booktitle = {CRYPTO},
+  year      = {2024},
+  note      = {IACR ePrint 2024/390}
+}
+
+% --- Binius / binary-field STARKs ---
+@misc{binius,
+  author = {Benjamin E. Diamond and Jim Posen},
+  title  = {Succinct Arguments over Towers of Binary Fields},
+  year   = {2023},
+  note   = {IACR ePrint 2023/1784}
+}
+@misc{fribinius,
+  author = {Benjamin E. Diamond and Jim Posen},
+  title  = {Polylogarithmic Proofs for Multilinears over Binary Towers},
+  year   = {2024},
+  note   = {IACR ePrint 2024/504; verify}
+}
+
+% --- Accumulation / folding / IVC / PCD ---
+@inproceedings{ivc,
+  author    = {Paul Valiant},
+  title     = {Incrementally Verifiable Computation, or Proofs of Knowledge Imply Time/Space Efficiency},
+  booktitle = {TCC},
+  year      = {2008}
+}
+@inproceedings{nova,
+  author    = {Abhiram Kothapalli and Srinath Setty and Ioanna Tzialla},
+  title     = {{Nova}: Recursive Zero-Knowledge Arguments from Folding Schemes},
+  booktitle = {CRYPTO},
+  year      = {2022},
+  note      = {IACR ePrint 2021/370}
+}
+@inproceedings{protostar,
+  author    = {Benedikt B\"unz and Binyi Chen},
+  title     = {{ProtoStar}: Generic Efficient Accumulation/Folding for Special-Sound Protocols},
+  booktitle = {ASIACRYPT},
+  year      = {2023},
+  note      = {IACR ePrint 2023/620}
+}
+@misc{protogalaxy,
+  author = {Liam Eagen and Ariel Gabizon},
+  title  = {{ProtoGalaxy}: Efficient {ProtoStar}-Style Folding of Multiple Instances},
+  year   = {2023},
+  note   = {IACR ePrint 2023/1106}
+}
+@misc{halo,
+  author = {Sean Bowe and Jack Grigg and Daira Hopwood},
+  title  = {Halo: Recursive Proof Composition without a Trusted Setup},
+  year   = {2019},
+  note   = {IACR ePrint 2019/1021}
+}
+@inproceedings{pcdaccum,
+  author    = {Benedikt B\"unz and Alessandro Chiesa and Pratyush Mishra and Nicholas Spooner},
+  title     = {Proof-Carrying Data from Accumulation Schemes},
+  booktitle = {TCC},
+  year      = {2020},
+  note      = {IACR ePrint 2020/499}
+}
+
+% --- Holographic / preprocessing SNARK ---
+@inproceedings{marlin,
+  author    = {Alessandro Chiesa and Yuncong Hu and Mary Maller and Pratyush Mishra and Noah Vesely and Nicholas Ward},
+  title     = {{Marlin}: Preprocessing {zkSNARKs} with Universal and Updatable {SRS}},
+  booktitle = {EUROCRYPT},
+  year      = {2020},
+  note      = {IACR ePrint 2019/1047; verify}
+}
+
+% --- Arithmetization-friendly hashes ---
+@inproceedings{poseidon,
+  author    = {Lorenzo Grassi and Dmitry Khovratovich and Christian Rechberger and Arnab Roy and Markus Schofnegger},
+  title     = {{Poseidon}: A New Hash Function for Zero-Knowledge Proof Systems},
+  booktitle = {USENIX Security},
+  year      = {2021}
+}
+@article{marvellous,
+  author  = {Abdelrahaman Aly and Tomer Ashur and Eli Ben-Sasson and Siemen Dhooghe and Alan Szepieniec},
+  title   = {Design of Symmetric-Key Primitives for Advanced Cryptographic Protocols ({Rescue}, {Vision})},
+  journal = {IACR Trans. Symmetric Cryptol. (ToSC)},
+  year    = {2020},
+  note    = {verify}
+}
+
+% --- Standards ---
+@techreport{fips1804,
+  author      = {{National Institute of Standards and Technology}},
+  title       = {Secure Hash Standard ({SHS})},
+  institution = {NIST},
+  number      = {FIPS PUB 180-4},
+  year        = {2015}
+}
+@techreport{fips202,
+  author      = {{National Institute of Standards and Technology}},
+  title       = {{SHA-3} Standard: Permutation-Based Hash and Extendable-Output Functions},
+  institution = {NIST},
+  number      = {FIPS PUB 202},
+  year        = {2015}
+}
+@techreport{nistpqc,
+  author      = {{National Institute of Standards and Technology}},
+  title       = {Submission Requirements and Evaluation Criteria for the Post-Quantum Cryptography Standardization Process},
+  institution = {NIST},
+  year        = {2016},
+  note        = {defines security categories 1--5}
+}
+@misc{dnssec,
+  author = {Roy Arends and Rob Austein and Matt Larson and Dan Massey and Scott Rose},
+  title  = {{DNS} Security Introduction and Requirements},
+  year   = {2005},
+  note   = {RFC 4033 (with RFC 4034, 4035)}
+}

@@ -69,20 +69,22 @@ verify-in-circuit approach achieves together.
 
 \section{Introduction}
 
-DNSSEC lets a resolver authenticate DNS records, but its classical signatures
-(RSA, ECDSA, Ed25519) are broken by a cryptographically relevant quantum
-computer. A transparent, post-quantum alternative is to prove, in zero
+DNSSEC~\cite{dnssec} lets a resolver authenticate DNS records, but its classical
+signatures (RSA, ECDSA, Ed25519) are broken by a cryptographically relevant
+quantum computer. A transparent, post-quantum alternative is to prove, in zero
 network round trips, that a zone's records were correctly signed under the
-published keys: publish a succinct \emph{epoch} proof once, and let any resolver
-verify it locally. Such ``epoch DNS-STARK'' constructions have been proposed;
-the engineering question this paper addresses is how to \emph{aggregate} the many
+published keys, using a transparent STARK~\cite{stark}: publish a succinct
+\emph{epoch} proof once, and let any resolver verify it locally. Such ``epoch
+DNS-STARK'' constructions have been proposed~\cite{epochdnsstark}; the
+engineering question this paper addresses is how to \emph{aggregate} the many
 per-record proofs of a zone into one edge-verifiable artifact, under two hard
 constraints:
 \begin{enumerate}[nosep,leftmargin=*]
   \item \textbf{FIPS-acceptability.} Every hash on the trust path---the vector
   commitment, the Fiat--Shamir transcript, the zone tree---must be a
-  FIPS-approved function (SHA-2 or SHA-3). Arithmetization-friendly hashes
-  (Poseidon, Rescue, Vision) are excluded.
+  FIPS-approved function (SHA-2~\cite{fips1804} or SHA-3~\cite{fips202}).
+  Arithmetization-friendly hashes (Poseidon~\cite{poseidon}, Rescue and
+  Vision~\cite{marvellous}) are excluded.
   \item \textbf{Low prover memory.} Records are proved in parallel on
   memory-bounded devices; peak resident set size (RSS) must stay bounded
   \emph{independently of the number of records}.
@@ -119,21 +121,23 @@ name (e.g.\ \texttt{verify\_vs\_width\_diagnostic}) so each claim is reproducibl
 
 \section{Background}\label{sec:bg}
 
-\paragraph{Binary-tower STARKs.} We work over a tower of binary fields
+\paragraph{Binary-tower STARKs.} We work over a tower of binary
+fields~\cite{binius}
 $\field{1}\subset\field{8}\subset\field{32}\subset\field{64}\subset\field{128}
 \subset\field{256}$, committing witnesses at small fields and taking Fiat--Shamir
 challenges in a large extension. The polynomial commitment scheme (PCS) is
-FRI-Binius: a ring-switch reduction turns a committed-multilinear opening into a
-sumcheck, and the sumcheck folds \emph{in lockstep} with a FRI proximity test,
-sharing one challenge per round. The vector commitment is a Merkle tree over a
+FRI-Binius~\cite{fribinius}: a ring-switch reduction turns a
+committed-multilinear opening into a sumcheck~\cite{sumcheck}, and the sumcheck
+folds \emph{in lockstep} with a FRI~\cite{fri} proximity test, sharing one
+challenge per round. The vector commitment is a Merkle tree over a
 Reed--Solomon codeword; hashing is SHA-256 (with SHA-3 available), so
 $\kbind=\kfs$ are the hash's collision resistance.
 
 \paragraph{End-to-end soundness.} A proof's security is
 $\min(\kit,\kbind,\kfs)$: the information-theoretic soundness of the IOP (set by
 the challenge field size and the query count), the binding of the commitment, and
-the Fiat--Shamir resistance. For NIST category-$N$ security every term must reach
-$N$; a large field with a 128-bit hash is pinned at 128 bits.
+the Fiat--Shamir resistance. For NIST category-$N$ security~\cite{nistpqc} every
+term must reach $N$; a large field with a 128-bit hash is pinned at 128 bits.
 
 \paragraph{Recursion by in-circuit verification.} To aggregate $N$ proofs one
 builds an outer circuit that runs the verifier of \S\ref{sec:bg}: it recomputes
@@ -221,10 +225,12 @@ verifies $3$--$4\times$ \emph{slower} than Binius's tuned Keccak-$f[1600]$
 
 \section{Accumulation over Binius}\label{sec:accum}
 
-Accumulation attacks Observation~\ref{obs:tension} at its root: it never verifies
-the inner proof in-circuit. Each step folds a new instance into a constant-size
-accumulator with a cheap operation; a single decider checks the accumulator at
-the end. The recursion step arithmetizes the \emph{fold}, not the verifier.
+Accumulation~\cite{nova,protostar,pcdaccum}---the modern route to incrementally
+verifiable computation~\cite{ivc}---attacks Observation~\ref{obs:tension} at its
+root: it never verifies the inner proof in-circuit. Each step folds a new
+instance into a constant-size accumulator with a cheap operation; a single
+decider checks the accumulator at the end. The recursion step arithmetizes the
+\emph{fold}, not the verifier.
 
 \subsection{The fold-verify is narrow}
 
@@ -259,8 +265,8 @@ it is FIPS-clean: the step circuit contains no hash at all.
 \subsection{Folding distinct records without homomorphism}
 
 Records are distinct polynomials $P_i$ under distinct commitments. Nova-style
-folding forms $\sum_i \lambda_i\,\mathrm{Com}(P_i)$ and needs an additively
-homomorphic commitment; a Merkle-over-hash commitment has none. We sidestep this
+folding~\cite{nova} forms $\sum_i \lambda_i\,\mathrm{Com}(P_i)$ and needs an
+additively homomorphic commitment; a Merkle-over-hash commitment has none. We sidestep this
 by \emph{interleaving}: stack $N$ records (a power of two) into one polynomial $P$
 over $n+\log N$ variables with $P(x,\mathrm{bin}(i))=P_i(x)$. Each claim
 $P_i(r_i)=v_i$ lifts to $P((r_i,\mathrm{bin}(i)))=v_i$---now all about the
@@ -363,19 +369,24 @@ constraint is thus recoverable; it is an implementation task, not an obstruction
 \section{Discussion and Related Work}
 
 \paragraph{Where each escape hatch fails, and this one does not.}
-Accumulation (Nova, ProtoStar, Protogalaxy) achieves millisecond IVC by folding
-instances with homomorphic commitments; Binius's hash commitments preclude the
-direct construction, but Observation~\ref{obs:native} shows the same end is
-reached natively. Arithmetization-friendly hashes (Poseidon/Vision) narrow the
-recursion circuit but are non-FIPS. Holographic SNARKs make the verifier succinct
-in width but Binius is not holographic. Our route keeps the FIPS hash, keeps the
+Accumulation and folding schemes (Nova~\cite{nova}, ProtoStar~\cite{protostar},
+Protogalaxy~\cite{protogalaxy}; and the earlier accumulation of
+Halo~\cite{halo} and proof-carrying data~\cite{pcdaccum}) achieve millisecond IVC
+by folding instances with homomorphic commitments; Binius's hash commitments
+preclude the direct construction, but Observation~\ref{obs:native} shows the same
+end is reached natively. Arithmetization-friendly hashes
+(Poseidon~\cite{poseidon}, Vision~\cite{marvellous}) narrow the recursion circuit
+but are non-FIPS. Holographic SNARKs~\cite{marlin} make the verifier succinct in
+width but Binius is not holographic. Our route keeps the FIPS hash, keeps the
 transparent hash-based commitment, and still gets a millisecond, width-narrow
 edge check---by never arithmetizing the hash in the recursion step.
 
-\paragraph{Relation to query-reduction.} STIR and related low-degree tests cut
-FRI query complexity. Over Binius this reduces proof size and the number of
-in-circuit openings, but not the width-linear verify cost
-(Observation~\ref{obs:width}); it is orthogonal to the tension resolved here.
+\paragraph{Relation to query-reduction.} STIR~\cite{stir} and related low-degree
+tests cut FRI query complexity. Over Binius this reduces proof size and the
+number of in-circuit openings, but not the width-linear verify cost
+(Observation~\ref{obs:width}); it is orthogonal to the tension resolved here. The
+soundness of the point-reduction fold and of the FRI proximity test rests on
+proximity gaps for Reed--Solomon codes~\cite{proximitygaps}.
 
 \paragraph{Honest scope.} This is a design-and-measurement study. The primitives
 are prototyped and gated---the native fold model, the in-circuit fold-verify over
@@ -396,5 +407,9 @@ Binius's interleaved codes and batched sumcheck; and the interleaved commitment
 streams to a few megabytes. FIPS-cleanliness, millisecond verification, and low
 prover memory---mutually exclusive for verify-in-circuit recursion---are jointly
 achievable through accumulation over a binary-field STARK.
+
+% For an LNCS submission switch to \bibliographystyle{splncs04}.
+\bibliographystyle{plain}
+\bibliography{accumulation-binius}
 
 \end{document}
