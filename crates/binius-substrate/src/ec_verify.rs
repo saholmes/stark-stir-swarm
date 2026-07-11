@@ -6908,6 +6908,255 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-S2-xaff (S2 verify gate) — CLOSES the ECDSA "R.x is a free witness" soundness gap.
+	/// The scalar-mul output point R lives in JACOBIAN coords (X,Y,Z); the affine x used in the ECDSA
+	/// check is x_aff = X·(Z⁻¹)² (mod p). If R.x were injected as a free committed value, an adversary
+	/// could pick ANY x satisfying x ≡ r (mod n) and never tie it to the committed R — the accept
+	/// gate would prove nothing about the real point. This gadget performs the Jacobian→affine
+	/// conversion IN-CIRCUIT and pins the result to the accept condition, so R.x is FORCED to be the
+	/// true affine-x of the boundary-committed Jacobian point:
+	///   (1) fe_inv   Z·zi ≡ 1 (mod p)   — one seamed ModMul, output r PINNED to the constant 1 by a
+	///       boundary that PULLS `1` off the output channel (a wrong zi makes Z·zi ≡ 1 unsatisfiable);
+	///   (2) z2 = zi·zi (mod p)          — one seamed ModMul, both operands the SAME committed zi;
+	///   (3) x_aff = X·z2 (mod p)        — one seamed ModMul; x_aff < p < 2n so it feeds straight in;
+	///   (4) x_aff ≡ r (mod n)           — the ECDSA ACCEPT gate x_aff == r + k·n (k∈{0,1}, r<n), the
+	///       exact construction of prove-S2-xr, but with x PULLED from the mm_xaff output seam and r
+	///       PULLED from an input boundary (so neither is free).
+	/// zi is committed ONCE in a source table and pushed ×3 (mm_zi.b, mm_z2.a, mm_z2.b) so all three
+	/// uses share one witness — the Z·zi≡1 identity then binds that single zi to Z⁻¹, and z2/x_aff
+	/// chain off it over seam channels. X and Z enter on INPUT boundaries (binding R); r enters on an
+	/// input boundary; nothing new is exposed. 5 tables (3 ModMuls + zi source + accept gate), all size
+	/// 1, W=1024 (P-256 needs 2n+1 ≤ W). Honest (R, r=jac_to(R).x mod n) PROVES+VERIFIES at NIST L1 and
+	/// the in-circuit x_aff matches native `jac_to`; a WRONG r (r+1) makes x_aff ≡ r unsatisfiable
+	/// (REJECT), and a FORGED Z on the boundary (Z+1) breaks the chZ channel balance against the honest
+	/// witness (REJECT). This is the boundary the full ECDSA assembly closes over its scalar-mul output.
+	#[test]
+	fn ecdsa_jac_to_affine_x_accept_over_b256() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col, Adder, ModMul, ModMulRow};
+		use binius_core::constraint_system::channel::{ChannelId, FlushDirection};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+
+		const W: usize = 1024;
+		const WLOG: usize = 10;
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+		let arr = |x: &BigUint| -> [B1; W] {
+			std::array::from_fn(|i| if x.bit(i as u64) { B1::ONE } else { B1::ZERO })
+		};
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(32, 0);
+			(0..4).map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))).collect()
+		};
+
+		let p = prime(S2Curve::P256); // P-256 base field prime
+		let np = p.bits() as usize; // 256
+		let n = order(S2Curve::P256); // P-256 group order
+		let p_bits = to_bits(&p);
+		let n_arr = arr(&n);
+		let c_n_bits = two_pow_w_minus(&to_bits(&n)); // 2^W − n  (r < n range)
+		let c_n_arr: [B1; W] = std::array::from_fn(|i| if c_n_bits[i] { B1::ONE } else { B1::ZERO });
+
+		// A Jacobian point R=(X,Y,Z), Z≠0 (Y is unused by the x-coordinate but is part of R).
+		let x_jac = BigUint::parse_bytes(b"5a6b7c8d9e0f10213243546576879a0b1c2d3e4f5061728394a5b6c7d8e9f001", 16).unwrap() % &p;
+		let y_jac = BigUint::parse_bytes(b"7f0e1d2c3b4a5968778695a4b3c2d1e0f00112233445566778899aabbccddee02", 16).unwrap() % &p;
+		let z_jac = BigUint::parse_bytes(b"026d3e4a5b6c7d8e9fa0b1c2d3e4f5060718293a4b5c6d7e8f90a1b2c3d4e5f6", 16).unwrap() % &p;
+
+		// Native jac_to internals, mirrored by the three in-circuit ModMuls.
+		let zi = fe_inv(&z_jac, &p); // Z⁻¹ mod p
+		let z2 = fe_mul(&zi, &zi, &p); // (Z⁻¹)²
+		let x_aff = fe_mul(&x_jac, &z2, &p); // X·(Z⁻¹)² = affine x  (< p < 2n)
+		// Gate against the native `jac_to`: the in-circuit affine-x must equal jac_to(R).x.
+		let aff = jac_to(&(x_jac.clone(), y_jac.clone(), z_jac.clone()), &p).expect("Z≠0 ⇒ affine exists");
+		assert_eq!(aff.0, x_aff, "in-circuit x_aff must equal native jac_to(R).x");
+		let r = &x_aff % &n; // r = jac_to(R).x mod n  (the ECDSA signature value)
+		let k_bit = x_aff >= n; // x_aff < p < 2n ⇒ the quotient is a single bit
+
+		// `bad_r` feeds r+1 on the boundary AND into the gate (channel stays balanced, but x_aff==r+k·n
+		// has no k∈{0,1}); `bad_z` forges only the boundary Z (Z+1) while the witness stays honest, so
+		// the chZ channel push (Z+1) ≠ mm_zi's pulled operand (Z) and the balance breaks.
+		let run = |bad_r: bool, bad_z: bool, full: bool| -> (bool, String, bool, usize) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+
+			// Seam channels for the fe_inv → z2 → x_aff → accept chain.
+			let ch_z = cs.add_channel("chZ"); // input Z         (boundary push → mm_zi.a)
+			let ch_zi = cs.add_channel("chZi"); // Z⁻¹ shared      (zi source push ×3 → mm_zi.b, mm_z2.a/b)
+			let ch_one = cs.add_channel("chOne"); // pinned 1       (mm_zi.r push → boundary pull of `1`)
+			let ch_z2 = cs.add_channel("chZ2"); // (Z⁻¹)²          (mm_z2.r push → mm_xaff.b)
+			let ch_x = cs.add_channel("chX"); // input X          (boundary push → mm_xaff.a)
+			let ch_xaff = cs.add_channel("chXaff"); // affine x    (mm_xaff.r push → gate.x)
+			let ch_r = cs.add_channel("chR"); // signature r      (boundary push → gate.r)
+
+			// (1) fe_inv: Z·zi ≡ 1 (mod p) — pull a=Z (chZ), b=zi (chZi), push r to chOne where a
+			//     boundary pulls the constant 1, PINNING the residue to 1 (a wrong zi ⇒ unsatisfiable).
+			let mm_zi = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, ch_z, ch_zi, ch_one);
+			// (2) z2 = zi·zi (mod p) — both operands the SAME committed zi (chZi), push z2 to chZ2.
+			let mm_z2 = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, ch_zi, ch_zi, ch_z2);
+			// (3) x_aff = X·z2 (mod p) — pull a=X (chX), b=z2 (chZ2), push x_aff to chXaff.
+			let mm_xaff = ModMul::<W>::build_seamed_in2_chain(&mut cs, &p_bits, np, ch_x, ch_z2, ch_xaff);
+
+			// Pull a W-bit word's low 256 bits off `chan`, binding a fresh committed column to it.
+			let pull_word = |t: &mut TableBuilder<OurB256>, chan: ChannelId, nm: &str| -> (Col<B1, W>, [Col<B1, 64>; 4]) {
+				let c = t.add_committed::<B1, W>(nm.to_string());
+				let sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| t.add_selected_block::<B1, W, 64>(format!("{nm}_sel{i}"), c, i));
+				let b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64{i}"), sel[i]));
+				t.pull(chan, b64);
+				(c, sel)
+			};
+
+			// zi SOURCE: commit Z⁻¹ once and push it ×3 so mm_zi.b, mm_z2.a and mm_z2.b all reference the
+			// SAME witness — the Z·zi≡1 identity then binds that single value to Z⁻¹.
+			let mut zsrc = cs.add_table("Z⁻¹ source (push ×3)");
+			let zi_col = zsrc.add_committed::<B1, W>("zi");
+			let zi_sel: [Col<B1, 64>; 4] = std::array::from_fn(|i| zsrc.add_selected_block::<B1, W, 64>(format!("zi_psel{i}"), zi_col, i));
+			let zi_b64: [Col<B64, 1>; 4] = std::array::from_fn(|i| zsrc.add_packed::<B1, 64, B64, 1>(format!("zi_pb64{i}"), zi_sel[i]));
+			zsrc.push_with_opts(ch_zi, zi_b64, FlushOpts { multiplicity: 3, selector: None });
+			let zsrc_id = zsrc.id();
+
+			// ACCEPT gate: x_aff ≡ r (mod n) via x_aff == r + k·n, k∈{0,1}, r<n. x is PULLED from the
+			// mm_xaff output seam (chXaff) and r from an input boundary (chR) — neither is a free witness.
+			let mut gate = cs.add_table("x_aff ≡ r mod n accept");
+			let (x, x_sel) = pull_word(&mut gate, ch_xaff, "x");
+			let (r_col, r_sel) = pull_word(&mut gate, ch_r, "r");
+			let k = gate.add_committed::<B1, 1>("k");
+			// k·n via a bcast conditional-add of the constant n.
+			let bcast = gate.add_committed::<B1, W>("kbc");
+			let bcast_rot = gate.add_shifted("kbc_rot", bcast, WLOG, 1, ShiftVariant::CircularLeft);
+			gate.assert_zero("kbc_eq", bcast - bcast_rot);
+			let bc_l0 = gate.add_selected("kbc_l0", bcast, 0);
+			gate.assert_zero("kbc_bind", bc_l0 - k);
+			let n_col = gate.add_constant("n", n_arr);
+			let kn = gate.add_computed("kn", bcast * n_col);
+			// identity: r + k·n == x_aff.
+			let sum = Adder::<W>::build(&mut gate, r_col, kn, "rk");
+			gate.assert_zero("x_eq", sum.sum - x);
+			// r < n.
+			let cn = gate.add_constant("c_n", c_n_arr);
+			let rcout = gate.add_committed::<B1, W>("rcout");
+			let rcin = gate.add_shifted("rcin", rcout, WLOG, 1, ShiftVariant::LogicalLeft);
+			gate.assert_zero("r_carry", (r_col + rcin) * (cn + rcin) + rcin - rcout);
+			let rfc = gate.add_selected("rfc", rcout, W - 1);
+			gate.assert_zero("r_lt_n", rfc * B1::ONE);
+			let gate_id = gate.id();
+
+			// Boundaries: X, Z, r injected (Push); the constant 1 Pulled off chOne to pin mm_zi's residue.
+			let z_pub = if bad_z { &z_jac + 1u32 } else { z_jac.clone() };
+			let r_pub = if bad_r { &r + 1u32 } else { r.clone() };
+			let boundaries = vec![
+				Boundary { values: to_boundary(&x_jac), channel_id: ch_x, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&z_pub), channel_id: ch_z, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&r_pub), channel_id: ch_r, direction: FlushDirection::Push, multiplicity: 1 },
+				Boundary { values: to_boundary(&BigUint::from(1u32)), channel_id: ch_one, direction: FlushDirection::Pull, multiplicity: 1 },
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1; 5] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let fill = |seg: &mut TableWitnessSegment<OurB256>, sel: &[Col<B1, 64>; 4], bits: &[bool]| {
+				for (i, &s) in sel.iter().enumerate() {
+					write_col::<64>(seg, s, 0, &bits[i * 64..i * 64 + 64]).unwrap();
+				}
+			};
+			// ModMul witnesses (a·b = q·p + r).
+			let fill_mm = |wit: &mut WitnessIndex<OurB256>, mm: &ModMul<W>, a: &BigUint, b: &BigUint, r: &BigUint| {
+				let tw = wit.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let q = &(a * b) / &p;
+				mm.populate(&mut seg, &[ModMulRow { a: to_bits(a), b: to_bits(b), q: to_bits(&q), r: to_bits(r) }]).unwrap();
+			};
+			let one = BigUint::from(1u32);
+			fill_mm(&mut witness, &mm_zi, &z_jac, &zi, &one); // Z·zi ≡ 1  (witness a=Z stays honest under bad_z)
+			fill_mm(&mut witness, &mm_z2, &zi, &zi, &z2); // z2 = zi²
+			fill_mm(&mut witness, &mm_xaff, &x_jac, &z2, &x_aff); // x_aff = X·z2
+
+			// zi source: commit Z⁻¹, project its low 256 bits (pushed ×3).
+			{
+				let tw = witness.init_table(zsrc_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let zib = to_bits(&zi);
+				write_col::<W>(&mut seg, zi_col, 0, &zib).unwrap();
+				fill(&mut seg, &zi_sel, &zib);
+			}
+
+			// accept gate: x = x_aff (from mm_xaff), r = r_pub (from boundary), k/k·n/r<n for the HONEST
+			// pair — so a wrong r (r+1) leaves x_aff == r+k·n unsatisfiable and the identity fails.
+			{
+				let tw = witness.init_table(gate_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let xb = to_bits(&x_aff);
+				write_col::<W>(&mut seg, x, 0, &xb).unwrap();
+				fill(&mut seg, &x_sel, &xb);
+				let rvb = to_bits(&r_pub);
+				write_col::<W>(&mut seg, r_col, 0, &rvb).unwrap();
+				fill(&mut seg, &r_sel, &rvb);
+				write_bit(&mut seg, k, 0, k_bit).unwrap();
+				let kb = vec![k_bit; W];
+				write_col::<W>(&mut seg, bcast, 0, &kb).unwrap();
+				write_col::<W>(&mut seg, bcast_rot, 0, &kb).unwrap();
+				write_bit(&mut seg, bc_l0, 0, k_bit).unwrap();
+				write_col::<W>(&mut seg, n_col, 0, &to_bits(&n)).unwrap();
+				let knv = if k_bit { to_bits(&n) } else { vec![false; W] };
+				write_col::<W>(&mut seg, kn, 0, &knv).unwrap();
+				let _ = sum.populate(&mut seg, 0, &rvb, &knv).unwrap();
+				write_col::<W>(&mut seg, cn, 0, &c_n_bits).unwrap();
+				let (_s, co) = ripple_add(&rvb, &c_n_bits);
+				write_col::<W>(&mut seg, rcout, 0, &co).unwrap();
+				write_col::<W>(&mut seg, rcin, 0, &shl(&co, 1)).unwrap();
+				write_bit(&mut seg, rfc, 0, co[W - 1]).unwrap();
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false, 0);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let (verify_ok, sz) = match proof {
+				Err(_) => (false, 0),
+				Ok(pf) => {
+					let sz = pf.get_proof_size();
+					let ok = binius_core::constraint_system::verify::<
+						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
+					(ok, sz)
+				}
+			};
+			(vok, verr, verify_ok, sz)
+		};
+
+		// validate-only iterate (fast): honest accepts, wrong-r and forged-Z both reject.
+		let (v0, e0, _, _) = run(false, false, false);
+		assert!(v0, "honest jac→affine-x ≡ r accept failed validate_witness: {e0}");
+		let (vr, _er, _, _) = run(true, false, false);
+		assert!(!vr, "SOUNDNESS FAILURE: a wrong ECDSA r (x_aff≢r mod n) was ACCEPTED over B256");
+		let (vz, _ez, _, _) = run(false, true, false);
+		assert!(!vz, "SOUNDNESS FAILURE: a forged R.Z on the boundary was ACCEPTED over B256");
+
+		// one full prove+verify (honest).
+		let t0 = std::time::Instant::now();
+		let (vok, verr, verify_ok, sz) = run(false, false, true);
+		let elapsed = t0.elapsed();
+		assert!(vok, "honest (full) failed validate_witness: {verr}");
+		assert!(verify_ok, "in-circuit jac→affine-x ≡ r accept must PROVE+VERIFY over B256");
+
+		println!(
+			"GATE prove-S2-xaff: in-circuit JACOBIAN→affine-x ≡ r (mod n) accept PROVEN+VERIFIED over B256 @L1(128) in {elapsed:?}; {sz} B; 5 tables (fe_inv Z·zi≡1 pinned to 1, z2=zi², x_aff=X·z2, zi source ×3, x_aff≡r accept), in-circuit x_aff matches native jac_to(R).x, X/Z/r injected via boundaries, wrong r (r+1) REJECTED and forged Z (Z+1) REJECTED. Closes the ECDSA 'R.x is a free witness' soundness gap."
+		);
+	}
+
 	/// GATE prove-S2-1 (PENDING) — ECDSA-P256 verify proves over B256; genuine `p256` sig
 	/// accepts, tampered r/s/e reject (isolated to the x≡r boundary). Needs S0 field
 	/// gadgets wired into EC point ops + binius_circuits::sha256 + p256 dev-dep.
