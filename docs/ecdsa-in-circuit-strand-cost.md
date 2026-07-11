@@ -177,9 +177,15 @@ measured:
   L=64 (W=128) is a further knob (~25 MiB, per the RSA-side measurements).
 
 So the achievable per-strand RSS is **~44 MiB** (44× below the monolithic round), IoT-fittable.
-The remaining build is the **in-circuit seam** — composing the 8 limb strands into a
-reconstructed `a·b mod p` across boundaries so a round proves as a sequence of ~44 MiB
-strands rather than one 3.1 GiB proof. The `695 s` single-thread round is the conservative
+The **in-circuit seam is now built** (`limb_seam_ec_field_mul_p256`): a `FieldMulCombine<512>`
+combining/reduction proof consumes the 4 `a·b` product-grid limbs + 4 `q·p` reduction-grid
+limbs + `r`, proves `grid_ab = P00+(P01+P10)<<128+P11<<256`, `grid_qp` likewise,
+`grid_ab == grid_qp + r`, and `r < p` (41.7 KB / 75 ms / 1 table), gated vs native
+`a·b mod p`; a `LimbProduct::build_seamed` strand pushes its product over a channel that the
+combine pulls, and a lying strand is rejected two ways — its own `product` zerocheck **and**
+channel imbalance (the seam alone binds the strand's output). One of 8 limbs is bound as the
+seam demonstration; the full field-multiply is this seam repeated 8× (peak RSS = one ~44 MiB
+strand + the small W=512 combine table). The `695 s` single-thread round is the conservative
 anchor for *work*; enabling rayon does **not** improve it here.
 
 ## What the strand model *does* buy
