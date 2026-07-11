@@ -1,0 +1,20 @@
+=== rsa2048_bench: stacked RSA-2048 verify AIR (1 record), rayon_threads=10 ===
+trace cols: 11041, rows: 4096, constraints: 11280, blowup: 4, r: 54, ldt: stir
+       14.49 real        17.61 user         4.49 sys
+          3446128640  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              683060  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+              555490  involuntary context switches
+        231234314189  instructions retired
+         87790518412  cycles elapsed
+          3647310896  peak memory footprint

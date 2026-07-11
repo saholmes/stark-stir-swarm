@@ -1,0 +1,52 @@
+═══════════════════════════════════════════════════════════════
+ECDSA SWARM RECURSION — STARK-of-STARK compression
+  G ECDSA strands (SubAirProofWithTrace + F2b seams)
+     → G recursive strand-STARKs → 1 master STARK
+═══════════════════════════════════════════════════════════════
+Config: K=8  G=4  inner blowup=4 r=144  outer/master blowup=4 r=135
+
+[0/4] Build the G-strand stranded ECDSA-verify proof …
+  full AIR width: 196193  per-strand widths: [49323, 49328, 48908, 49036]
+  seam groups: 4
+  strand prove (all G): 2379 ms
+  DIRECT stranded proof size : 906.04 MiB
+  DIRECT verify              : PASS  (3506.4 ms)
+
+[1/4] Recursively wrap each strand (Stage 1 inner-FRI + Stage 2 seams) …
+  strand  0: wrap     382 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  1: wrap     458 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  2: wrap     325 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  3: wrap     193 ms · rec_size 1607.7 KiB · n_trace 8192
+  Σ recursive-wrap: 1358 ms · Σ rec size 6430.9 KiB
+
+[2/4] Aggregate the G recursive strand-STARKs into ONE master STARK …
+  master prove : 3163 ms
+  master verify: 7.72 ms   → ACCEPT
+  master size  : 2224.0 KiB   n_trace 131072
+
+[3/4] SOUNDNESS GATES
+
+  (a) HONEST: master ACCEPT = true  (attests all 4 strands' inner
+      FRI DEEP-quotient + all F2b seam OOD equalities, bound to h(m),PK)
+
+  (b) TAMPER-REJECT
+      corrupt strand 0 inner FRI proof → REJECT (wrap fails / master rejects) ✓
+      break seam group 0 col 60 (strand 0) → REJECT (OOD self-check fails) ✓
+
+  (c) Master soundness = min(inner, outer).
+      inner strand FRI : blowup=4 r=144  (per-query trace-cell +
+                         DEEP-quotient, ≥ L1 by num_queries_for_blowup)
+      outer/master FRI : blowup=4 r=135 (L1-calibrated at bw=4)
+
+[4/4] HEADLINE — succinct-verify restored
+
+  stranded (direct)  : 906.04 MiB · 3506.4 ms verify
+  master (recursive) : 2224.0 KiB · 7.72 ms verify
+  compression        : 417.2× smaller · 454.0× faster verify
+
+  Reference (K=256 real swarm, from task context): stranded ~4 GB /
+  ~31 s direct verify → master ~few MiB / ms-scale verify (same shape).
+
+═══════════════════════════════════════════════════════════════
+  RESULT: ECDSA swarm proof compressed to ONE succinct master STARK — honest ACCEPT, tamper REJECT.
+═══════════════════════════════════════════════════════════════

@@ -1,0 +1,24 @@
+[v2_bench] level=L3 scheme=ML-DSA-65 r=81 blowup=4 rayon_threads=4
+[v2_bench] prove_ms = 4614.0
+[v2_bench] proof_kib = 42239.2
+[v2_bench] verify 1 ms = 1206.04
+[v2_bench] verify 2 ms = 1175.06
+[v2_bench] verify 3 ms = 1181.99
+       16.25 real        16.89 user         0.46 sys
+          1035845632  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              108204  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               11866  involuntary context switches
+        261139393171  instructions retired
+         70226586697  cycles elapsed
+           704365840  peak memory footprint

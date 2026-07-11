@@ -1,0 +1,29 @@
+[rss] start: cur=2 MiB
+=== ed25519_verify_stranded_gway_bench: G=10-STRAND low-mem prover, k_scalar=256, width=41519, n_trace=1024, NIST L1, Fp6, r=144, blowup=4, ldt=FRI, fill=solo ===
+    full AIR: width = 41519 cells, constraints = 70606
+[rss] full trace built (~324 MiB): cur=688 MiB
+    [gate c] Σ strand_nc = 70606  vs  monolith = 70606  -> MATCH
+    [cut] per-strand widths = [4606, 4478, 4600, 3628, 4260, 4170, 4335, 4260, 4335, 3935]
+    [cut] width min=3628 max=4606 (max/min = 1.270)
+    [cut] per-strand nc = [20462, 8900, 9280, 6339, 4350, 4240, 4335, 4330, 4365, 4005]
+    [cut] seam GROUPS = 20, distinct seam COLUMNS = 958, held-col overlap = 1088
+    [rss] full dropped, only strand 0 (w=4606) held: cur=468 MiB
+    [rss] SOLO strand 0 PROVE-ONLY PEAK (full excluded) = 1335 MiB  (per-element projection)
+       13.69 real        18.93 user         1.88 sys
+          1402683392  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              172125  page reclaims
+                 242  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   3  voluntary context switches
+              165819  involuntary context switches
+        391459515660  instructions retired
+         82598485923  cycles elapsed
+          1006683984  peak memory footprint

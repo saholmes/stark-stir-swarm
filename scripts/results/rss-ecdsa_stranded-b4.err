@@ -1,0 +1,30 @@
+=== ecdsa_verify_stranded_bench: 2-STRAND low-mem prover, K=256, n_trace=512, NIST L1, Fp6, r=144, blowup=4, ldt=FRI ===
+[native] ecdsa_verify(A) = true
+    full AIR: per-row width = 196193 cells, constraints = 202058
+    [cut] strand A cols = 75667 (chain A + r_a_proj), num_constraints_a = 77908
+    [cut] strand B cols = 120556 (chain B + r_a_proj + r_b_proj + TAIL), num_constraints_b = 124150
+    [cut] col sum = 196223 vs full width = 196193 (overlap = shared r_a_proj = 30 cols)
+    [trace] full dropped; strand A trace = 75667x512, strand B trace = 120556x512
+    [prove] strand A done, strand-A trace freed
+    [prove] strand B done, strand-B trace freed
+[honest]  prove 27930.3 ms, verify 1384.44 ms, fri_A 1147 KiB, fri_B 1147 KiB, seam limbs 30 -> verify=true None
+[tamper]  flip chain-B cell -> verify_err=Some("strand B: query 0 (pos=919, row=229): constraint formula mismatch.\n  c_eval·Z_H = QuadExt(CubeExt(BigInt([2900063496268249184, 0]), BigInt([0, 0]), BigInt([0, 0])), CubeExt(BigInt([0, 0]), BigInt([0, 0]), BigInt([0, 0])))\n  phi = QuadExt(CubeExt(BigInt([17973831228779162632, 0]), BigInt([0, 0]), BigInt([0, 0])), CubeExt(BigInt([0, 0]), BigInt([0, 0]), BigInt([0, 0])))") (reject=true)
+[tamper]  flip r_a_proj (strand A) -> verify_err=Some("strand A: query 0 (pos=627, row=156): constraint formula mismatch.\n  c_eval·Z_H = QuadExt(CubeExt(BigInt([3147934729536373907, 0]), BigInt([0, 0]), BigInt([0, 0])), CubeExt(BigInt([0, 0]), BigInt([0, 0]), BigInt([0, 0])))\n  phi = QuadExt(CubeExt(BigInt([17416212007190529519, 0]), BigInt([0, 0]), BigInt([0, 0])), CubeExt(BigInt([0, 0]), BigInt([0, 0]), BigInt([0, 0])))") (reject=true)
+       61.27 real        95.88 user        14.02 sys
+          6044188672  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1600260  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+              287695  involuntary context switches
+       1075632634808  instructions retired
+        416617216571  cycles elapsed
+          6392813112  peak memory footprint

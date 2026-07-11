@@ -1,0 +1,1 @@
+SOLO_ED25519 G=10 strand=0 width=4606 full_width=41519 n_trace=1024 sum_nc=70606 mono=70606 r=144 blowup=4 prove_ms=13453 prove_only_peak_mib=1335 (use /usr/bin/time -l for true process peak)

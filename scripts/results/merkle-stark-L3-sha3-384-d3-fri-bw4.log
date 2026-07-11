@@ -353,17 +353,17 @@ warning: unused import: `ark_ff::Field`
    |     ^^^^^^^^^^^^^
 
 warning: unused imports: `UniformAirConstraints`, `selector_pattern`, and `state_threading_constraints`
-    --> crates/wrapper-stark/src/merkle_path_air.rs:1102:9
+    --> crates/wrapper-stark/src/merkle_path_air.rs:1134:9
      |
-1102 |         UniformAirConstraints, global_booleanity_constraints,
+1134 |         UniformAirConstraints, global_booleanity_constraints,
      |         ^^^^^^^^^^^^^^^^^^^^^
-1103 |         state_threading_constraints, selector_pattern,
+1135 |         state_threading_constraints, selector_pattern,
      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
 
 warning: unused import: `crate::bit_constraint::FieldTraceAccess`
-    --> crates/wrapper-stark/src/merkle_path_air.rs:1105:9
+    --> crates/wrapper-stark/src/merkle_path_air.rs:1137:9
      |
-1105 |     use crate::bit_constraint::FieldTraceAccess;
+1137 |     use crate::bit_constraint::FieldTraceAccess;
      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: unused import: `ark_ff::Field`
@@ -379,9 +379,9 @@ warning: unused import: `Zero`
     |                         ^^^^
 
 warning: unused import: `ark_ff::Zero`
-   --> crates/wrapper-stark/src/merkle_path_air.rs:902:9
+   --> crates/wrapper-stark/src/merkle_path_air.rs:934:9
     |
-902 |     use ark_ff::Zero;
+934 |     use ark_ff::Zero;
     |         ^^^^^^^^^^^^
 
 warning: value assigned to `left` is never read
@@ -406,8 +406,8 @@ warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib 
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-368dfef0c71fe90e)
 
 running 1 test
-merkle_stark variant=L1 depth=3 blowup=4 r=79 ldt=fri prove_ms=1659 verify_ms=2.86 proof_kib=838.8 n_trace=512
+merkle_stark variant=L1 depth=3 blowup=4 r=79 ldt=fri prove_ms=1673 verify_ms=2.92 proof_kib=838.8 n_trace=512
 test merkle_prover::tests::bench_merkle_path_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 1.67s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 246 filtered out; finished in 1.68s
 

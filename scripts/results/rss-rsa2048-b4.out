@@ -1,0 +1,1 @@
+rsa2048_bench n_trace=4096 blowup=4 r=54 threads=10 prove_ms=13945 verify_ms=3.51 proof_kib=693.1

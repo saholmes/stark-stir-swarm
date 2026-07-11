@@ -1,0 +1,40 @@
+=== ecdsa_verify_stranded_gway_bench: G=4-STRAND low-mem prover, K=256, n_trace=512, NIST L1, Fp6, r=144, blowup=4, ldt=FRI, fill=rebuild ===
+[native] ecdsa_verify = true
+    full AIR: width = 196193 cells, constraints = 202058
+    [gate c] Σ strand_nc = 202058  vs  monolith = 202058  -> MATCH
+    [cut] per-strand widths = [49323, 49328, 48908, 49036]
+    [cut] width min=48908 max=49328 (max/min = 1.009), per-strand nc = [50463, 50747, 50378, 50470]
+    [cut] seam GROUPS = 4, distinct seam COLUMNS = 402, held-col overlap = 402
+    [rss] start: cur=14 MiB
+    [rss] strand 0 (w=49323) proved+freed: cur=642 MiB peak=2470 MiB
+    [rss] strand 1 (w=49328) proved+freed: cur=1338 MiB peak=3101 MiB
+    [rss] strand 2 (w=48908) proved+freed: cur=1869 MiB peak=3577 MiB
+    [rss] strand 3 (w=49036) proved+freed: cur=2315 MiB peak=3991 MiB
+    [rss] HONEST-PROVE PEAK (sampler) = 3991 MiB
+[honest]  prove 42805 ms, verify 6688.6 ms, fri_total 4590 KiB -> verify=true None
+[tamper]  strand 0 interior col 0 -> reject=true
+[tamper]  strand 1 interior col 49293 -> reject=true
+[tamper]  strand 2 interior col 98460 -> reject=true
+[tamper]  strand 3 interior col 147248 -> reject=true
+[tamper]  seam group 0 (holders [0, 1]) col 60 -> reject=true
+[tamper]  seam group 1 (holders [1, 2]) col 75647 -> reject=true
+[tamper]  seam group 2 (holders [1, 3]) col 75697 -> reject=true
+[tamper]  seam group 3 (holders [2, 3]) col 101888 -> reject=true
+      145.22 real       206.18 user        52.79 sys
+          5539528704  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3595065  page reclaims
+                 759  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  16  voluntary context switches
+             4926770  involuntary context switches
+       2873349993467  instructions retired
+        958214543618  cycles elapsed
+          4851225928  peak memory footprint

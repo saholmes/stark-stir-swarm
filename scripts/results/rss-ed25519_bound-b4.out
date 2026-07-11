@@ -1,0 +1,2 @@
+ed25519_verify_bound level=L1 field=Fp6 k_scalar=256 n_trace=1024 blowup=4 r=130 prove_ms=10116.8 verify_ms=189.76 fri_kib=1277.2 proof_mib=84.0 honest_verify=true tampered_verify=false
+=> WITNESS-BINDING WORKS: honest accepts, tampered REJECTS (sound in-circuit Ed25519)

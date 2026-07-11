@@ -372,6 +372,12 @@ warning: unused import: `ark_ff::Field`
 372 |     use ark_ff::Field;
     |         ^^^^^^^^^^^^^
 
+warning: unused import: `intt as intt_layout`
+  --> crates/wrapper-stark/src/v2_recursion_bridge.rs:85:58
+   |
+85 | use deep_ali::ml_dsa_verify_air_v2_layout::{coeff_chain, intt as intt_layout, transcript as transcript_layout};
+   |                                                          ^^^^^^^^^^^^^^^^^^^
+
 warning: unused import: `ark_ff::Zero`
    --> crates/wrapper-stark/src/merkle_path_air.rs:934:9
     |
@@ -401,13 +407,13 @@ warning: value assigned to `right` is never read
      |
      = help: maybe it is overwritten before being read?
 
-warning: `wrapper-stark` (lib test) generated 13 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 9 suggestions)
+warning: `wrapper-stark` (lib test) generated 14 warnings (run `cargo fix --lib -p wrapper-stark --tests` to apply 10 suggestions)
     Finished `release` profile [optimized] target(s) in 0.05s
      Running unittests src/lib.rs (target/release/deps/wrapper_stark-48a283becd11ea89)
 
 running 1 test
-recursive_stark variant=L5 blowup=32 r=105 ldt=stir prove_ms=2.0 verify_ms=1.05 proof_kib=280.1 n_trace=8 n_constraints=6 n_ood=7 n_perm=5
+recursive_stark variant=L5 blowup=32 r=105 ldt=stir prove_ms=2.1 verify_ms=1.02 proof_kib=280.1 n_trace=8 n_constraints=6 n_ood=7 n_perm=5
 test recursive_prover::tests::bench_recursive_stark ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 301 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 320 filtered out; finished in 0.01s
 

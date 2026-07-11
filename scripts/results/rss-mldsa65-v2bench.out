@@ -1,0 +1,7 @@
+
+running 1 test
+v2_bench level=L3 scheme=ML-DSA-65 ext=Fp6 hash=SHA3-384 r=81 blowup=4 threads=4 prove_ms=4614 verify_ms=1181.99 proof_kib=42239.2
+test ml_dsa_verify_air_v2_orchestration::tests::v2_bench ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 717 filtered out; finished in 16.07s
+

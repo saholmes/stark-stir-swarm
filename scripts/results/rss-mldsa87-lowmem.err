@@ -1,0 +1,20 @@
+[v2_bench_lowmem] level=L5 scheme=ML-DSA-87 blowup=4 threads=4
+[v2_bench_lowmem] prove_ms=8738.6 proof_kib=75474.0
+       24.22 real        26.98 user         0.69 sys
+          1423769600  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              131243  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               14122  involuntary context switches
+        429109823277  instructions retired
+        115939877637  cycles elapsed
+           740771760  peak memory footprint

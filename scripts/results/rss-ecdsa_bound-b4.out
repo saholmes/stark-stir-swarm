@@ -1,0 +1,2 @@
+ecdsa_verify_multirow_pub K=256 n_trace=512 per_row_width=196193 r=130 blowup=4 prove_ms=89742.1 verify_ms=737.73 fri_kib=1129 proof_mib=390.66 native=true honest_A=true honest_B=true cross_A_under_B=false cross_B_under_A=false internal_tamper=false
+=> PUBLIC-INPUT BINDING WORKS: honest accepts; cross-signature + internal tamper REJECT; native agrees

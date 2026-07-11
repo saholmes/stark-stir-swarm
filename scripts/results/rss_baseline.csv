@@ -1,0 +1,4 @@
+scheme,nist_level,features,blowup,ldt,peak_rss_mib,prove_ms,proof_kib,trace_dims,note
+rsa_bound,L1,"parallel sha3-256 mldsa-44",4,stir,272.1,836.0,NA,"NA",
+ecdsa_bound,L1,"parallel sha3-256 mldsa-44",4,stir,5859.4,89742.1,NA," per-row width = 196193 cells; constraints = 202058",
+ed25519_bound,L1,"parallel sha3-256 mldsa-44",4,stir,6189.3,10116.8,NA," per-row width = 41519 cells; constraints = 70606",

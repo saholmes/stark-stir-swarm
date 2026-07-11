@@ -1,0 +1,15 @@
+{
+  "id": "session-1781342102626",
+  "startedAt": "2026-06-13T09:15:02.626Z",
+  "cwd": "/Volumes/SAHexternal 1/Documents/stark-stir-swarm",
+  "context": {},
+  "metrics": {
+    "edits": 153,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "restoredAt": "2026-06-23T10:48:53.342Z",
+  "endedAt": "2026-06-23T22:54:40.270Z",
+  "duration": 913177647
+}

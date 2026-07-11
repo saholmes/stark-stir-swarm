@@ -1,14 +1,13 @@
 # Recursive ML-DSA STARK Bench
 
-**Host:** `192.168.1.152` · **Cores:** `10` · **Blowup:** `8` · **Git:** `c90b902`
+**Host:** `192.168.1.152` · **Cores:** `10` · **Blowup:** `8` · **Git:** `33ce712`
 
 Each row is one prove + verify of the **composed** recursive STARK statement (constraint composition ∧ binding-cells OOD ∧ perm-arg multiset equality), produced as a single outer DeepFriProof<SexticExt>.
 
 | Variant | NIST L | Blowup | r | LDT | Prove (ms) | Verify (ms) | Proof (KiB) | n_trace | n_constraints | n_ood | n_perm |
 |---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| sha3-256 | L1 | 8 | 90 | stir | 0.8 | 0.47 | 123.0 | 8 | 6 | 7 | 5 |
-| sha3-384 | L3 | 8 | 132 | stir | 0.8 | 0.90 | 256.2 | 8 | 6 | 7 | 5 |
-| sha3-512 | L5 | 8 | 175 | stir | 1.1 | 1.56 | 440.5 | 8 | 6 | 7 | 5 |
+| sha3-512 | L1 | 8 | 90 | stir | 0.9 | 0.79 | 227.2 | 8 | 6 | 7 | 5 |
+| sha3-512 | L3 | 8 | 132 | stir | 1.0 | 1.14 | 332.6 | 8 | 6 | 7 | 5 |
 
 ## Notes
 - Statement proven: "I know witnesses such that Σ α·Φ = expected (composition) ∧ Σ α·(f − g) = 0 (binding-cells OOD) ∧ ∏(γ + l) = ∏(γ + r) (perm-arg)".

@@ -1,0 +1,4 @@
+ecdsa_verify_stranded K=256 n_trace=512 full_width=196193 strand_A cols=75667 strand_B cols=120556 col_sum=196223 seam_limbs=30 r=144 blowup=4 prove_ms=27930.3 verify_ms=1384.44 fri_A_kib=1147 fri_B_kib=1147 native=true honest=true tamper_chainB_reject=true tamper_ra_proj_reject=true
+strand=A cols=75667 n_trace=512 r=144 blowup=4 (peak RSS from /usr/bin/time)
+strand=B cols=120556 n_trace=512 r=144 blowup=4 (peak RSS from /usr/bin/time)
+=> STRANDED PROVER WORKS: honest accepts; chain-B + r_a_proj tampers REJECT; 2 strands @ ~half width each

@@ -1,0 +1,22 @@
+=== ed25519_verify_bound_bench: WITNESS-BINDING Ed25519 verify-air v16, k_scalar=256, width=41519, height=1024, n_trace=1024, NIST L1, Fp6, r=130, blowup=4 ===
+    per-row width = 41519 cells, constraints = 70606
+[honest]   prove 10116.8 ms, verify 189.76 ms, fri 1277.2 KiB, FULL sound proof 84.0 MiB -> verify=true
+[tampered] flip dbl_1.input[X] @ dbl_1_row -> verify=false
+       21.07 real        29.29 user         1.61 sys
+          6489980928  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              745015  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+               24911  involuntary context switches
+        409753774579  instructions retired
+        116873344404  cycles elapsed
+          6793696752  peak memory footprint

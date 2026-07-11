@@ -1,0 +1,28 @@
+=== ecdsa_verify_stranded_gway_bench: G=16-STRAND low-mem prover, K=256, n_trace=512, NIST L1, Fp6, r=144, blowup=4, ldt=FRI, fill=direct ===
+[native] ecdsa_verify = true
+    full AIR: width = 196193 cells, constraints = 202058
+    [gate c] Σ strand_nc = 202058  vs  monolith = 202058  -> MATCH
+    [cut] per-strand widths = [12549, 13262, 11708, 12074, 12556, 12268, 12050, 12634, 12210, 12402, 12064, 12422, 12569, 12094, 12576, 12047]
+    [cut] width min=11708 max=13262 (max/min = 1.133), per-strand nc = [12621, 13701, 11668, 12473, 13091, 12570, 12001, 13085, 12244, 12799, 12494, 12841, 12601, 12494, 13070, 12305]
+    [cut] seam GROUPS = 37, distinct seam COLUMNS = 972, held-col overlap = 1292
+    [rss] start: cur=11 MiB
+    [rss] DIRECT-filled strand 1 (w=13262) in 176 ms — NO full trace built: cur=123 MiB
+    [rss] DIRECT strand 1 whole-run PEAK (sampler; no full-trace build) = 867 MiB
+        4.38 real         6.38 user         2.63 sys
+           911917056  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               68557  page reclaims
+                  75  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+              239394  involuntary context switches
+         96426930848  instructions retired
+         32419175928  cycles elapsed
+           720291040  peak memory footprint

@@ -1,0 +1,21 @@
+Denial-of-existence structural sweep — .se Tranco, seed=20260627
+Sample: 1000 existing names x 8 types = 8000 (name,type) queries
+
+Among EXISTING names (name,type) queries:
+  POSITIVE (answer present): 4484 (56.0%)
+  NODATA   (name exists, type absent -> needs denial): 1840 (23.0%)
+  NXDOMAIN: 971 (12.1%)
+  OTHER: 705 (8.8%)
+
+NXDOMAIN probe (random non-existent label per name):
+  NXDOMAIN returned: 464/1000 (46.4%)
+
+Per-type among existing names (POSITIVE / NODATA / total):
+  A     : pos= 914 nodata=  26  -> NODATA 3%
+  AAAA  : pos= 413 nodata= 528  -> NODATA 53%
+  MX    : pos= 718 nodata= 226  -> NODATA 23%
+  TXT   : pos= 475 nodata= 208  -> NODATA 21%
+  NS    : pos= 940 nodata=   2  -> NODATA 0%
+  SOA   : pos= 937 nodata=   1  -> NODATA 0%
+  CAA   : pos=  80 nodata= 847  -> NODATA 85%
+  HTTPS : pos=   7 nodata=   2  -> NODATA 0%

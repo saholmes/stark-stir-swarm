@@ -1,0 +1,29 @@
+=== ecdsa_verify_stranded_bench: 2-STRAND low-mem prover, K=256, n_trace=512, NIST L1, Fp6, r=144, blowup=4, ldt=FRI ===
+[native] ecdsa_verify(A) = true
+    full AIR: per-row width = 196193 cells, constraints = 202058
+    [cut] strand A cols = 75667 (chain A + r_a_proj), num_constraints_a = 77908
+    [cut] strand B cols = 120556 (chain B + r_a_proj + r_b_proj + TAIL), num_constraints_b = 124150
+    [cut] col sum = 196223 vs full width = 196193 (overlap = shared r_a_proj = 30 cols)
+    [trace] full dropped; strand A trace = 75667x512, strand B trace = 120556x512
+    [prove] strand A done, strand-A trace freed
+    [prove] strand B done, strand-B trace freed
+[honest]  prove 28078.5 ms, verify 1387.24 ms, fri_A 1147 KiB, fri_B 1147 KiB, seam limbs 30 -> verify=true None
+[tamper]  SKIPPED (BENCH_TAMPER=0) — measuring clean honest-prove peak
+       30.64 real        48.29 user         7.92 sys
+          5607505920  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              732984  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+              150548  involuntary context switches
+        550297268715  instructions retired
+        212393319442  cycles elapsed
+          5795239000  peak memory footprint

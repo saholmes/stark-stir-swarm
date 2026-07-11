@@ -18,8 +18,11 @@ use anyhow::Result;
 use sha3::{Digest, Sha3_256};
 
 use crate::accumulation_air::measure_epoch_verify;
+use crate::b256_sha3::prove_verify_sha3_b256;
+use crate::b512_sha3::prove_verify_sha3_b512;
 use crate::dns_stark::wire_name;
-use crate::sha3_gadget::prove_verify_sha3_256;
+use crate::recursion::Sha3Level;
+use crate::sha3_variants::Sha3Variant;
 use crate::streaming_commit::{streaming_interleaved_root, Sym};
 
 /// A DNSSEC zone record.
@@ -73,34 +76,60 @@ pub struct DemoReport {
 	pub epoch_verify_ms: u128,
 	pub epoch_proof_bytes: usize,
 	pub steady_state_us: f64,
-	// ONE record proved for REAL in-circuit (its DNSSEC digest, SHA3-256 / FIPS 202).
+	// ONE record proved for REAL in-circuit (its DNSSEC digest, SHA3-N / FIPS 202).
 	pub real_record_idx: usize,
 	pub real_n_digests: usize,
 	pub real_msg_len: usize,
 	pub real_proof_bytes: usize,
 	pub real_prove_verify_ms: u128,
-	pub real_digest: [u8; 32],
+	pub real_digest: Vec<u8>,
+	// NIST-level instantiation of the in-circuit DNSSEC-digest gadget.
+	pub level: Sha3Level,
+	pub field_name: &'static str,   // committed tower field (B256 for L1/L3, B512 for L5)
+	pub variant_name: &'static str, // FIPS 202 variant (SHA3-256/384/512)
+	pub security_bits: usize,       // FS/commitment target (128/192/256)
+	pub sponge_rate: usize,         // Keccak sponge rate r in bytes (136/104/72)
 }
 
-/// Run the end-to-end demonstration on `zone`. `per_record_width` stands in for one record's
-/// DNSSEC-verify AIR width (verify ~ 20 + 1.3·width ms). Returns the measured report.
-pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize) -> Result<DemoReport> {
+/// Run the end-to-end demonstration on `zone` at NIST security `level`. `per_record_width`
+/// stands in for one record's DNSSEC-verify AIR width (verify ~ 20 + 1.3·width ms). Returns
+/// the measured report. The in-circuit DNSSEC-digest gadget is instantiated at the correct
+/// field + FIPS 202 variant + FS/commitment target for the level:
+///   L1 → B256 · SHA3-256 · 128-bit,  L3 → B256 · SHA3-384 · 192-bit,  L5 → B512 · SHA3-512 · 256-bit.
+/// (The query count r is auto-derived by binius `make_commit_params` to meet `security_bits`.)
+pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize, level: Sha3Level) -> Result<DemoReport> {
 	let n = zone.len().next_power_of_two();
 	let codeword_len = 1usize << 10; // representative per-record codeword length
 
 	// (2) per-record commitments (sliver: each proved independently, low RSS).
 	let per_record_roots: Vec<Sym> = zone.iter().map(|r| record_commitment(r, codeword_len)).collect();
 
-	// (2b) plug in a fully-REAL in-circuit proof: EVERY record's DNSSEC digest — SHA3-256
+	// (2b) plug in a fully-REAL in-circuit proof: EVERY record's DNSSEC digest — SHA3-N
 	//      (FIPS 202, Keccak-f[1600]) over its canonical wire form, the message the RRSIG signs.
-	//      prove_verify_sha3_256 proves AND verifies it and checks each digest == native SHA3-256.
+	//      The gadget proves AND verifies it and checks each digest == native SHA3-N.
 	//      The full signature check is the S-layer; this is a genuine, gated, in-circuit component
-	//      of every record's verification. (The trace is padded so FRI reaches 128-bit security.)
+	//      of every record's verification, instantiated at the level's field + variant + target.
+	//
+	// Level → (variant, committed field, FS/commitment target, sponge rate r):
+	//   L1: SHA3-256 · B256 · 128-bit · r = 136 B      (min(κ_IT,κ_bind,κ_FS) = 128)
+	//   L3: SHA3-384 · B256 · 192-bit · r = 104 B      (192)
+	//   L5: SHA3-512 · B512 · 256-bit · r =  72 B      (256)
+	// B256 holds the 128/192-bit FS floor (binius accepts security_bits ≤ 192); L5's 256-bit
+	// floor needs B512. The commitment/FS hash is laddered to the variant so the collision term
+	// κ_bind = κ_FS = digest_bits/2 also reaches the target — no term drops below the level.
+	let (variant, field_name, variant_name, security_bits, sponge_rate) = match level {
+		Sha3Level::L1 => (Sha3Variant::Sha3_256, "B256", "SHA3-256", 128, 136usize),
+		Sha3Level::L3 => (Sha3Variant::Sha3_384, "B256", "SHA3-384", 192, 104usize),
+		Sha3Level::L5 => (Sha3Variant::Sha3_512, "B512", "SHA3-512", 256, 72usize),
+	};
+	// Truncate each canonical form to a single Keccak-f block for the tightest variant rate
+	// (SHA3-512 r = 72 B): fits every level, one permutation, no multi-block absorb.
+	let block = sponge_rate.saturating_sub(8);
 	let canon_of = |r: &DnsRecord| {
 		let mut c = wire_name(r.name);
 		c.extend_from_slice(r.rtype.as_bytes());
 		c.extend_from_slice(r.rdata.as_bytes());
-		c.truncate(120); // single Keccak-f block (SHA3-256 rate = 136 bytes)
+		c.truncate(block.min(64));
 		c
 	};
 	let real_idx = 3.min(zone.len() - 1); // highlight the ML-DSA-65 NS record
@@ -111,12 +140,14 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize) -> Result
 	while canons.len() < padded_n {
 		canons.push(canons[canons.len() % n_real].clone());
 	}
-	// The SHA3 gadget commits over B128 (CanonicalTowerFamily) → ~100-bit FS security; the
-	// aggregation/epoch layer is B256 @ NIST L1 (128). blowup=2 (log_inv_rate=1).
+	// blowup=2 (log_inv_rate=1); r auto-derived by binius to meet `security_bits`.
 	let t0 = std::time::Instant::now();
-	let (real_proof_bytes, digests) = prove_verify_sha3_256(&canons, 1, 100)?;
+	let (real_proof_bytes, digests) = match level {
+		Sha3Level::L5 => prove_verify_sha3_b512(variant, &canons, 1, security_bits)?,
+		_ => prove_verify_sha3_b256(variant, &canons, 1, security_bits)?,
+	};
 	let real_prove_verify_ms = t0.elapsed().as_millis();
-	let real_digest = digests[real_idx];
+	let real_digest = digests[real_idx].clone();
 
 	// (3) epoch commitment: interleave the N records into ONE byte-exact, low-RSS commitment.
 	//     (padded to a power of two with the last record duplicated, as the zone tree does.)
@@ -145,6 +176,11 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize) -> Result
 		real_proof_bytes,
 		real_prove_verify_ms,
 		real_digest,
+		level,
+		field_name,
+		variant_name,
+		security_bits,
+		sponge_rate,
 	})
 }
 
@@ -152,7 +188,7 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize) -> Result
 mod tests {
 	use super::*;
 
-	fn hex8(s: &Sym) -> String {
+	fn hex8(s: &[u8]) -> String {
 		s[..4].iter().map(|b| format!("{b:02x}")).collect()
 	}
 
@@ -170,7 +206,9 @@ mod tests {
 			println!("| {} | {} | {} | {} | {} |", i + 1, r.name, r.rtype, r.rdata, r.sig_alg);
 		}
 
-		let report = run_dns_epoch_demo(&zone, 16).expect("demo must run");
+		// L1 by default; flip to Sha3Level::L3 / L5 for the higher NIST categories.
+		let level = Sha3Level::L1;
+		let report = run_dns_epoch_demo(&zone, 16, level).expect("demo must run");
 
 		println!("\n--- (2) per-record commitments (sliver: each record proved independently, low RSS) ---");
 		for (i, root) in report.per_record_roots.iter().enumerate() {
@@ -178,16 +216,19 @@ mod tests {
 			println!("  record {:>1}: c = {}…{}", i + 1, hex8(root), tag);
 		}
 		let rr = &zone[report.real_record_idx];
-		println!("\n--- (2b) DNSSEC digests proved FULLY in-circuit (real, gated) ---");
-		println!("  all {} records' DNSSEC canonical forms → SHA3-256 (FIPS 202, Keccak-f[1600]) in ONE proof",
-			report.real_n_digests);
+		let nist_cat = match report.level { Sha3Level::L1 => 1, Sha3Level::L3 => 3, Sha3Level::L5 => 5 };
+		println!("\n--- (2b) DNSSEC digests proved FULLY in-circuit (real, gated) @ NIST L{nist_cat} ---");
+		println!("  all {} records' DNSSEC canonical forms → {} (FIPS 202, Keccak-f[1600], sponge r = {} B) in ONE proof",
+			report.real_n_digests, report.variant_name, report.sponge_rate);
 		println!("  e.g. record {} ({} {} / {}, {}-byte canonical form): in-circuit digest = {}…",
 			report.real_record_idx + 1, rr.name, rr.rtype, rr.sig_alg, report.real_msg_len, hex8(&report.real_digest));
-		println!("       (== native SHA3-256, gated inside prove_verify_sha3_256)");
-		println!("  REAL proof: {} KiB, prove+verify {} ms (B128 gadget, ~100-bit; epoch layer is B256@L1) —\n\
-			 a genuine FIPS in-circuit component of every record's DNSSEC verification (the full signature\n\
-			 check per record = the S-layer AIRs).",
-			report.real_proof_bytes / 1024, report.real_prove_verify_ms);
+		println!("       (== native {}, gated inside the in-circuit sponge)", report.variant_name);
+		println!("  REAL proof: {} KiB, prove+verify {} ms — committed over {} @ {}-bit\n\
+			 (query count r auto-derived by binius to meet the target; min(κ_IT,κ_bind,κ_FS) = {}). A genuine\n\
+			 FIPS in-circuit component of every record's DNSSEC verification (the full signature check per\n\
+			 record = the S-layer AIRs).",
+			report.real_proof_bytes / 1024, report.real_prove_verify_ms,
+			report.field_name, report.security_bits, report.security_bits);
 		println!("\n--- (3) epoch commitment (byte-exact interleaved commit; streaming ~KiB RSS) ---");
 		println!("  epoch root R* = {}…  (one artifact binding all {} records)", hex8(&report.epoch_root), report.n_records);
 		println!("\n--- (4) aggregated epoch proof (one recursive STARK, edge-verified) ---");

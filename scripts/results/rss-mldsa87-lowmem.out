@@ -1,0 +1,7 @@
+
+running 1 test
+v2_bench_lowmem level=L5 scheme=ML-DSA-87 blowup=4 threads=4 prove_ms=8739 proof_kib=75474.0
+test ml_dsa_verify_air_v2_orchestration::tests::v2_bench_lowmem ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 720 filtered out; finished in 24.22s
+

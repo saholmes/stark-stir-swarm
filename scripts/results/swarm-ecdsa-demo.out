@@ -1,0 +1,132 @@
+════════════════════════════════════════════════════════════════════════
+ ECDSA SWARM DEMO  —  G=32  blowup=4  K=256  POOL=6
+ work dir: /var/folders/fq/4n32prcj5zs2gc7njtbj52dw0000gn/T//ecdsa-swarm.mAun2w
+════════════════════════════════════════════════════════════════════════
+[build] cargo build --release --example ecdsa_swarm_demo ...
+
+╔══════════════════════════════════════════════════════════════════╗
+║  COORDINATOR — real P256 ECDSA keygen + sign                       ║
+╚══════════════════════════════════════════════════════════════════╝
+  seed key (sk bytes) : 4242424242424242424242424242424242424242424242424242424242424242
+  message             : "STARK-DNS swarm demo: real P256 ECDSA verify"
+  SHA-256 h(m)        : bcc8ea474f3e4ca6adc38d5f5a3e2e24d1df48c27dc77e800afe02f1c40d5e7b
+  ── ECDSA public key Q ──
+     Qx : 3ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90af
+     Qy : d0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d
+  ── signature (r,s) ──
+     r  : 093d63267bc1da9168fccd97df333844f8dc812cf86d4d7947a63eefdc9b2bdc
+     s  : 1c857010ce44047842bcdb89bd301c43bd86e0ba5cc230ed9853c5243c88ef71
+  ── STARK public scalar h(m) mod n (e) ──
+     e  : bcc8ea474f3e4ca6adc38d5f5a3e2e24d1df48c27dc77e800afe02f1c40d5e7b
+  native ECDSA verify : OK ✓
+
+  ── STARK cut (public inputs = h(m) + PK; witness = verify comp) ──
+     full AIR width   : 196193 columns
+     G strands        : 32   (K=256, n_trace=512, blowup=4)
+     per-strand widths: [7141, 5448, 6154, 7128, 6164, 5574, 5758, 6386, 6308, 6308, 5796, 6512, 6864, 5236, 6356, 6298, 7004, 5226, 6154, 6338, 6096, 6018, 7138, 5314, 6823, 5826, 6318, 5806, 6308, 6288, 6522, 5565]
+     width min/max    : 5226 / 7141   (ratio 1.366)
+     seam groups      : 81
+     Σ strand_nc      : 202058   (= monolith constraints, by construction)
+
+  wrote manifest → /var/folders/fq/4n32prcj5zs2gc7njtbj52dw0000gn/T//ecdsa-swarm.mAun2w/job.json  (every worker re-derives this case)
+
+────────────────────────────────────────────────────────────────────────
+ Launching 32 worker processes (one strand each, ≤1 GB target), POOL=6
+────────────────────────────────────────────────────────────────────────
+  ✓ worker 3 done
+  ✓ worker 1 done
+  ✓ worker 4 done
+  ✓ worker 5 done
+  ✓ worker 2 done
+  ✓ worker 0 done
+  ✓ worker 10 done
+  ✓ worker 8 done
+  ✓ worker 7 done
+  ✓ worker 9 done
+  ✓ worker 6 done
+  ✓ worker 11 done
+  ✓ worker 15 done
+  ✓ worker 14 done
+  ✓ worker 13 done
+  ✓ worker 17 done
+  ✓ worker 16 done
+  ✓ worker 12 done
+  ✓ worker 23 done
+  ✓ worker 22 done
+  ✓ worker 20 done
+  ✓ worker 21 done
+  ✓ worker 18 done
+  ✓ worker 19 done
+  ✓ worker 29 done
+  ✓ worker 27 done
+  ✓ worker 25 done
+  ✓ worker 28 done
+  ✓ worker 26 done
+  ✓ worker 24 done
+  ✓ worker 31 done
+  ✓ worker 30 done
+
+────────────────────────────────────────────────────────────────────────
+ Per-worker table  (strand / width / peak RSS / fill / prove / wall)
+────────────────────────────────────────────────────────────────────────
+  strand  width    peakRSS(MiB) fill(ms)  prove(ms)  wall(s) 
+  0       7141     673          305       5097       5.7     
+  1       5448     523          303       3621       4.1     
+  2       6154     628          307       4521       5.1     
+  3       7128     500          302       3407       3.9     
+  4       6164     574          327       4356       5.0     
+  5       5574     599          308       4498       5.1     
+  6       5758     570          279       4737       5.3     
+  7       6386     507          280       4529       5.0     
+  8       6308     545          290       4122       4.7     
+  9       6308     550          282       4589       5.1     
+  10      5796     479          293       4034       4.6     
+  11      6512     603          278       4754       5.4     
+  12      6864     1005         281       7153       7.8     
+  13      5236     501          282       4080       4.6     
+  14      6356     513          291       4048       4.6     
+  15      6298     542          283       4028       4.6     
+  16      7004     541          291       4490       5.0     
+  17      5226     522          278       4074       4.6     
+  18      6154     612          282       4555       5.1     
+  19      6338     623          277       4772       5.3     
+  20      6096     493          287       4162       4.7     
+  21      6018     579          282       4389       4.9     
+  22      7138     503          290       3928       4.5     
+  23      5314     455          280       3918       4.5     
+  24      6823     823          297       6145       6.8     
+  25      5826     548          296       4076       4.6     
+  26      6318     600          296       4328       4.9     
+  27      5806     497          291       3683       4.2     
+  28      6308     547          291       4080       4.6     
+  29      6288     504          295       3391       3.9     
+  30      6522     578          164       2332       2.7     
+  31      5565     439          168       1443       1.8     
+
+  ✓ EVERY worker peaked ≤ 1 GB  (max observed = 1005 MiB)
+
+────────────────────────────────────────────────────────────────────────
+ Wall-clock: swarm (parallel) vs naive sequential sum
+────────────────────────────────────────────────────────────────────────
+  Σ per-strand prove time (naive sequential) : 135.3 s
+  swarm worker-phase wall clock (POOL=6) : 33.7 s   (~6 batches)
+  observed speedup                           : 4.01×
+
+╔══════════════════════════════════════════════════════════════════╗
+║  VERIFY — splice 32 independently-produced strands & check        ║
+╚══════════════════════════════════════════════════════════════════╝
+  verified public statement:
+     h(m)=e : bcc8ea474f3e4ca6adc38d5f5a3e2e24d1df48c27dc77e800afe02f1c40d5e7b
+     PK  Qx : 3ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90af
+     PK  Qy : d0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d
+  spliced verify : PASS ✓   (30110.7 ms, FRI total 36723 KiB across 32 strands)
+[FAIL][QUERY POS] q=0 ell=0 expected=679 got=1192
+  tamper strand 0 (flip trace_root)  : REJECT ✓
+  tamper strand 0 (alter trace cell) : REJECT ✓
+  tamper strand 0 (truncate .bin)    : REJECT ✓
+
+=> SWARM PROVED A REAL ECDSA SIGNATURE: honest splice ACCEPTS; tamper REJECTS
+
+════════════════════════════════════════════════════════════════════════
+ DONE — a swarm of ≤1 GB independent processes proved a real ECDSA sig.
+════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,14 @@
+{
+  "id": "session-1783249269021",
+  "startedAt": "2026-07-05T11:01:09.021Z",
+  "cwd": "/Volumes/SAHexternal 1/Documents/stark-binius-swarm/crates/binius-substrate",
+  "context": {},
+  "metrics": {
+    "edits": 266,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "endedAt": "2026-07-11T08:43:56.698Z",
+  "duration": 510167678
+}

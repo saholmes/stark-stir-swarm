@@ -1,0 +1,22 @@
+=== rsa2048_exp_bound_bench: WITNESS-BINDING compact RSA exp AIR, NIST L1, Fp6, r=54, ldt=stir ===
+[honest]   prove 836.0 ms, verify 29.95 ms, fri 413.5 KiB, FULL sound proof 9.66 MiB (1192428 opening cells) -> verify=true
+[tampered] em=s^65537+1 -> verify=false
+[cross]    A's proof under B's public (s,em) -> verify=false
+        2.66 real         2.42 user         0.14 sys
+           285360128  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               35006  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                3947  involuntary context switches
+         42198867062  instructions retired
+         10858941958  cycles elapsed
+           215958104  peak memory footprint

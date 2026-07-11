@@ -1,0 +1,2 @@
+rsa2048_exp_bound level=L1 field=Fp6 n_trace=32 blowup=32 r=54 prove_ms=836.0 verify_ms=29.95 fri_kib=413.5 proof_mib=9.66 honest_verify=true tampered_verify=false
+=> WITNESS-BINDING WORKS: honest accepts, tampered REJECTS (sound in-circuit RSA)

@@ -1,0 +1,28 @@
+This example is a placeholder.  Use the `v2_bench` test instead:
+
+cargo test --release -p deep_ali \
+--features "parallel sha3-N mldsa-N" --no-default-features \
+v2_bench -- --ignored --nocapture
+
+where (sha3-N, mldsa-N) ∈ {(sha3-256, mldsa-44), (sha3-384, mldsa-65), (sha3-512, mldsa-87)}
+for NIST PQ Levels 1, 3, 5 respectively.
+
+Or use the wrapper scripts in scripts/aws-bench/.
+        0.14 real         0.00 user         0.00 sys
+             1359872  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                 282  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                   5  involuntary context switches
+            15347246  instructions retired
+             6193343  cycles elapsed
+             1048840  peak memory footprint

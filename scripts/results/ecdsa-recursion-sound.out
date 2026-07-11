@@ -1,0 +1,75 @@
+═══════════════════════════════════════════════════════════════
+ECDSA SWARM RECURSION — STARK-of-STARK compression
+  G ECDSA strands (SubAirProofWithTrace + F2b seams)
+     → G recursive strand-STARKs → 1 master STARK
+═══════════════════════════════════════════════════════════════
+Config: K=8  G=4  inner blowup=4 r=144  outer/master blowup=4 r=135
+
+[0/4] Build the G-strand stranded ECDSA-verify proof …
+  full AIR width: 196193  per-strand widths: [49323, 49328, 48908, 49036]
+  seam groups: 4
+  strand prove (all G): 2321 ms
+  DIRECT stranded proof size : 906.04 MiB
+  DIRECT verify              : PASS  (3519.2 ms)
+
+[1/4] Recursively wrap each strand (Stage 1 inner-FRI + Stage 2 seams) …
+  strand  0: wrap     380 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  1: wrap     458 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  2: wrap     325 ms · rec_size 1607.7 KiB · n_trace 8192
+  strand  3: wrap     195 ms · rec_size 1607.7 KiB · n_trace 8192
+  Σ recursive-wrap: 1358 ms · Σ rec size 6430.9 KiB
+
+[2/4] Aggregate the G recursive strand-STARKs into ONE master STARK …
+  master prove : 3172 ms
+  master verify: 7.69 ms   → ACCEPT
+  master size  : 2224.0 KiB   n_trace 131072
+  (this master is ALGEBRAIC-ONLY: it attests the FRI DEEP-quotient +
+   seam-OOD relations on prover-supplied opened values.  The verifier does
+   NOT re-bind those opened values to their committed roots — that binding
+   is added below.)
+
+[3/5] SOUND master — in-AIR SHA-3 Merkle-path binding (merkle blowup=4 r=54) …
+  [per-inner] prove 6125 ms · verify 12.60 ms → ACCEPT
+  [per-inner] size: master 2224.0 KiB + 4×merkle 1583.5 KiB = 3807.5 KiB
+  [batched]   prove 3925 ms · verify 9.08 ms → ACCEPT
+  [batched]   size: master 2224.0 KiB + 1×merkle 395.9 KiB + 4×32B = 2620.0 KiB  ← SOUND DELIVERABLE
+
+[4/5] SOUNDNESS GATES
+
+  (a) HONEST: master ACCEPT = true  (attests all 4 strands' inner
+      FRI DEEP-quotient + all F2b seam OOD equalities, bound to h(m),PK)
+      SOUND (batched, verifier-side) ACCEPT = true
+
+  (b) TAMPER-REJECT
+      corrupt strand 0 inner FRI proof → REJECT (wrap fails / master rejects) ✓
+      break seam group 0 col 60 (strand 0) → REJECT (OOD self-check fails) ✓
+      (these are PROVER-SIDE: the wrap/self-check refuses to build.)
+
+  (b') VERIFIER-SIDE TAMPER-REJECT (SOUND Merkle-bound master)
+      algebraic-only verify of the honest master : ACCEPT (same master as [2/5])
+      forge committed merkle_root  → SOUND verify REJECT ✓
+      substitute inner leaf pi_hash → SOUND verify REJECT ✓
+      tamper merkle-path root node → SOUND verify REJECT ✓
+      → verifier rejects the forged artifact even though the algebraic
+        master inside it is honest: the Merkle binding is verifier-side.
+
+  (c) Master soundness = min(inner, outer).
+      inner strand FRI : blowup=4 r=144  (per-query trace-cell +
+                         DEEP-quotient, ≥ L1 by num_queries_for_blowup)
+      outer/master FRI : blowup=4 r=135 (L1-calibrated at bw=4)
+      merkle binding   : blowup=4 r=54 in-AIR SHA3-256 (L1)
+
+[5/5] HEADLINE — succinct verify restored, SOUND (verifier-side binding)
+
+  stranded (direct)      : 906.04 MiB · 3519.2 ms verify
+  master (algebraic-only): 2224.0 KiB · 7.69 ms verify  (prover-side soundness)
+  master (SOUND, batched): 2620.0 KiB · 9.08 ms verify  (VERIFIER-SIDE binding)
+  compression (SOUND)    : 354.1× smaller · 387.6× faster verify vs direct
+  Merkle-binding overhead: 1.18× size · 1.18× verify vs algebraic-only
+
+  Reference (K=256 real swarm, from task context): stranded ~4 GB /
+  ~31 s direct verify → SOUND master ~few MiB / ms-scale verify (same shape).
+
+═══════════════════════════════════════════════════════════════
+  RESULT: ECDSA swarm proof compressed to ONE SOUND succinct master STARK — honest ACCEPT, verifier-side tamper REJECT.
+═══════════════════════════════════════════════════════════════

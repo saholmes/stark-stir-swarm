@@ -1,0 +1,14 @@
+{
+  "id": "session-1783325434434",
+  "startedAt": "2026-07-06T08:10:34.434Z",
+  "cwd": "/Volumes/SAHexternal 1/Documents/stark-binius-swarm",
+  "context": {},
+  "metrics": {
+    "edits": 98,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "endedAt": "2026-07-08T21:51:54.553Z",
+  "duration": 222080120
+}

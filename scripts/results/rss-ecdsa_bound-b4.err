@@ -1,0 +1,33 @@
+=== ecdsa_verify_multirow_bound_bench: END-TO-END + PUBLIC-INPUT-BOUND P256 ECDSA verify, K=256, n_trace=512, NIST L1, Fp6, r=130, blowup=4 ===
+[native] ecdsa_verify(A) = true, ecdsa_verify(B) = true
+    per-row width = 196193 cells, constraints = 202058
+[diag] in-circuit R.x == native R.x (A): true
+[diag] (R.x mod n) == sig.r (A): true
+[honest A]  prove 89742.1 ms, verify 737.73 ms, fri 1129 KiB, FULL sound proof 390.66 MiB -> verify=true
+[FAIL][STIR OOD FOLD] ell=0
+  fold_at_ood=QuadExt(CubeExt(BigInt([4270182314164363919, 0]), BigInt([6328750909387135010, 0]), BigInt([5075521299923860336, 0])), CubeExt(BigInt([9045324651375012176, 0]), BigInt([8342656606955898015, 0]), BigInt([1207971838406509823, 0])))
+  expected=QuadExt(CubeExt(BigInt([1378967472223686770, 0]), BigInt([1270416351440445004, 0]), BigInt([6007082669377434868, 0])), CubeExt(BigInt([8671650030246563299, 0]), BigInt([12791138911951160459, 0]), BigInt([931847916989841209, 0])))
+[cross]     A's proof under B's public inputs -> verify=false
+[FAIL][STIR OOD FOLD] ell=0
+  fold_at_ood=QuadExt(CubeExt(BigInt([2540884380260461638, 0]), BigInt([8266922401010699381, 0]), BigInt([4905115436846357516, 0])), CubeExt(BigInt([9609452322403127811, 0]), BigInt([15613329703706886989, 0]), BigInt([15400368147787138904, 0])))
+  expected=QuadExt(CubeExt(BigInt([7090772377651067126, 0]), BigInt([5880137342436569930, 0]), BigInt([2023372650316697244, 0])), CubeExt(BigInt([7639626592149060809, 0]), BigInt([9082869206330164820, 0]), BigInt([8510971062812787512, 0])))
+[cross]     honest_B=true, B's proof under A -> verify=false
+[tampered]  perturb r[0] -> verify=false
+      260.82 real       103.48 user       100.14 sys
+          6143983616  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+            50069700  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+              883966  involuntary context switches
+       1898321023623  instructions retired
+        864034630100  cycles elapsed
+         13858826320  peak memory footprint

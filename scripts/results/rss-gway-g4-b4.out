@@ -1,0 +1,2 @@
+ecdsa_verify_stranded_gway G=4 K=256 n_trace=512 full_width=196193 width_min=48908 width_max=49328 seam_groups=4 seam_cols=402 sum_nc=202058 mono=202058 r=144 blowup=4 prove_ms=42805 verify_ms=6688.6 fri_total_kib=4590 honest=true strand_tampers_reject=true seam_tampers_reject=true honest_peak_mib=3991 fill=rebuild
+=> G-WAY STRANDED PROVER WORKS: honest accepts; all tampers REJECT
