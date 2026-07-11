@@ -103,6 +103,76 @@ pub fn fold_verify(c0: &EvalClaim, c1: &EvalClaim, g: &FoldProof, challenge: F) 
 	Some(EvalClaim { point: line(&c0.point, &c1.point, challenge), value: interp_eval(g, challenge) })
 }
 
+// --- experiment 2: CROSS-RECORD folding (different polynomials) --------------------------
+//
+// Records have DIFFERENT polynomials P_i (separate witnesses/commitments). Fold their claims
+// without homomorphic commitments via INTERLEAVING: stack the N records (a power of two) into
+// ONE polynomial P over n+log N vars, with P(x, bin(i)) = P_i(x). Each record claim
+// "P_i(r_i)=v_i" LIFTS to "P((r_i, bin(i))) = v_i" — now all about the SAME P — so the atomic
+// same-poly point-reduction fold (experiment 1) applies. Chain N−1 folds → ONE accumulated
+// claim about P. Each fold is width-independent (µs); a false record value is caught at its
+// fold (g(1) = the true interleaved value ≠ the claimed value → rejected).
+
+/// One record: its multilinear witness `evals` (2^n) + the evaluation claim about it.
+#[derive(Clone)]
+pub struct Record {
+	pub evals: Vec<F>,
+	pub claim: EvalClaim, // claim.point is the inner n-dim point
+}
+
+/// Interleave N records (N a power of two) each of size 2^n into one 2^(n+log N) polynomial:
+/// block i (indices i·2^n .. (i+1)·2^n) holds record i's evaluations, so the high log N index
+/// bits select the record. The COMMITMENT to this is the Merkle parent over the N record
+/// commitments (the zone tree) — one hash per level, homomorphism-FREE (no additive homomorphism
+/// needed). Whether that parent is FRI-openable as P's codeword is the decider crux (see note).
+pub fn interleave(records: &[Record]) -> Vec<F> {
+	let nrec = records.len();
+	assert!(nrec.is_power_of_two(), "record count must be a power of two");
+	let mut out = Vec::with_capacity(records[0].evals.len() * nrec);
+	for r in records {
+		out.extend_from_slice(&r.evals);
+	}
+	out
+}
+
+/// Lift record `i`'s inner claim to a claim about the interleaved polynomial: append the
+/// {0,1} embedding of `i` (log N bits) to the inner point.
+pub fn lifted_claim(rec: &Record, i: usize, m: usize) -> EvalClaim {
+	let mut point = rec.claim.point.clone();
+	for b in 0..m {
+		point.push(if (i >> b) & 1 == 1 { F::ONE } else { F::ZERO });
+	}
+	EvalClaim { point, value: rec.claim.value }
+}
+
+/// PROVER: accumulate N records into ONE claim about the interleaved polynomial, via a chain
+/// of N−1 same-poly point-reduction folds. Returns (interleaved poly, accumulated claim,
+/// fold proofs). `challenges` supplies one t* per fold.
+pub fn accumulate(records: &[Record], challenges: &[F]) -> (Vec<F>, EvalClaim, Vec<FoldProof>) {
+	let interleaved = interleave(records);
+	let m = records.len().trailing_zeros() as usize;
+	let claims: Vec<EvalClaim> = records.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+	let mut acc = claims[0].clone();
+	let mut proofs = Vec::with_capacity(claims.len() - 1);
+	for (k, ck) in claims.iter().enumerate().skip(1) {
+		let (g, folded) = fold_prove(&interleaved, &acc, ck, challenges[k - 1]);
+		proofs.push(g);
+		acc = folded;
+	}
+	(interleaved, acc, proofs)
+}
+
+/// VERIFIER: replay the fold chain over the N record claims WITHOUT the interleaved witness,
+/// producing the accumulated claim. O(N) cheap folds (each width-independent). Returns
+/// Some(accumulated claim) iff every fold is consistent (each record's value is bound).
+pub fn accumulate_verify(records_claims: &[EvalClaim], proofs: &[FoldProof], challenges: &[F]) -> Option<EvalClaim> {
+	let mut acc = records_claims[0].clone();
+	for (k, ck) in records_claims.iter().enumerate().skip(1) {
+		acc = fold_verify(&acc, ck, &proofs[k - 1], challenges[k - 1])?;
+	}
+	Some(acc)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -139,6 +209,78 @@ mod tests {
 			assert!(fold_verify(&bad, &c1, &g, t).is_none(), "tampered v0 accepted (n={n})");
 		}
 		println!("GATE acc-fold: point-reduction fold of two eval claims is SOUND (folded claim holds on M; tamper rejected)");
+	}
+
+	/// GATE acc-crossrecord — N DIFFERENT-polynomial record claims fold into ONE via
+	/// interleaving + point-reduction (homomorphism-free): the accumulated claim holds on the
+	/// interleaved polynomial, and a tampered record value is caught at its fold.
+	#[test]
+	fn cross_record_fold_sound() {
+		let mut rng = StdRng::from_seed([11u8; 32]);
+		let n = 8; // inner vars per record
+		for &nrec in &[2usize, 4, 8] {
+			let m = nrec.trailing_zeros() as usize;
+			let records: Vec<Record> = (0..nrec)
+				.map(|_| {
+					let evals = rand_evals(n, &mut rng);
+					let r = rand_point(n, &mut rng);
+					let v = mle_eval(&evals, &r);
+					Record { evals, claim: EvalClaim { point: r, value: v } }
+				})
+				.collect();
+			let challenges: Vec<F> = (0..nrec - 1).map(|_| rand_f(&mut rng)).collect();
+
+			let (interleaved, acc, proofs) = accumulate(&records, &challenges);
+			// the accumulated claim is TRUE on the interleaved polynomial.
+			assert_eq!(mle_eval(&interleaved, &acc.point), acc.value, "accumulated claim false (nrec={nrec})");
+			// the verifier replays the folds from the lifted claims WITHOUT the witness.
+			let lifted: Vec<EvalClaim> = records.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+			let vacc = accumulate_verify(&lifted, &proofs, &challenges).expect("honest accumulate must verify");
+			assert_eq!(vacc.value, acc.value);
+			// tamper record 1's claimed value → its fold catches it (g(1) = true value ≠ claimed).
+			let mut bad = lifted.clone();
+			bad[1].value += F::ONE;
+			let tampered = accumulate_verify(&bad, &proofs, &challenges);
+			assert!(tampered.is_none() || tampered.unwrap().value != acc.value, "tampered record accepted (nrec={nrec})");
+		}
+		println!("GATE acc-crossrecord: N different-polynomial record claims fold into ONE (interleave + \
+			 point-reduction, homomorphism-free); accumulated claim holds on interleaved P; tamper caught");
+	}
+
+	/// GATE acc-scaling — the accumulate VERIFIER cost vs N records: O(N) cheap folds (each
+	/// width-independent µs). O(N)·µs = ms even for large N — vs Tier-B O(N)·seconds
+	/// (in-circuit FRI-verify per record). The measured accumulation win, and its honest limit.
+	#[test]
+	fn accumulate_verify_cost_vs_n() {
+		let mut rng = StdRng::from_seed([13u8; 32]);
+		let n = 8;
+		println!("| N records | accumulate-verify µs | µs/record |");
+		println!("|---:|---:|---:|");
+		for &nrec in &[2usize, 8, 32, 128] {
+			let m = nrec.trailing_zeros() as usize;
+			let records: Vec<Record> = (0..nrec)
+				.map(|_| {
+					let evals = rand_evals(n, &mut rng);
+					let r = rand_point(n, &mut rng);
+					let v = mle_eval(&evals, &r);
+					Record { evals, claim: EvalClaim { point: r, value: v } }
+				})
+				.collect();
+			let challenges: Vec<F> = (0..nrec - 1).map(|_| rand_f(&mut rng)).collect();
+			let (_, _, proofs) = accumulate(&records, &challenges);
+			let lifted: Vec<EvalClaim> = records.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+			let t0 = Instant::now();
+			for _ in 0..100 {
+				let _ = accumulate_verify(&lifted, &proofs, &challenges).unwrap();
+			}
+			let us = t0.elapsed().as_micros() as f64 / 100.0;
+			println!("| {} | {:.1} | {:.2} |", nrec, us, us / nrec as f64);
+		}
+		println!("# accumulate-verify is O(N) cheap folds (~µs/record), NOT touching any 2^n witness. \
+			 O(N)·µs = ms at N=1000s vs Tier-B O(N)·seconds in-circuit-FRI-verify. ★HONEST LIMIT: this is \
+			 O(N), not O(1) — and the DECIDER must still open the interleaved poly. O(1) decider needs the \
+			 interleaved commitment (Merkle-parent of record commitments) to be FRI-openable via binius's \
+			 interleaved codes; else it's N deferred openings. That commitment crux is the next question.");
 	}
 
 	/// GATE acc-cost — the VERIFIER's fold cost is width-INDEPENDENT: folding claims on
