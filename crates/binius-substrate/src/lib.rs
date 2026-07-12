@@ -158,6 +158,8 @@ pub mod keccak800_air; // Tier-B: Keccak-f[800] narrow recursion hash (~half the
 pub mod accumulation; // Option-3 exploration: accumulation/folding for ms-verify recursion (see docs/accumulation-recursion.md)
 pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narrow? (the ms-recursion measurement)
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
+#[cfg(test)]
+pub mod committed_decider; // REAL measured FRI-Binius committed-multilinear evaluation opening over B256 (decider); uses dev-dep binius_ntt/binius_math
 pub mod dns_epoch_demo; // end-to-end demonstration: a DNS zone → recursive-STARK epoch proof
 pub mod dns_stark; // D DNS-STARK zone assembly
 pub mod se_tld_epoch_demo; // complete .se TLD epoch: real ECDSA-P256 RRSIGs + Merkle tree + proofs
