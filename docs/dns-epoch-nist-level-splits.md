@@ -486,16 +486,37 @@ So the tree is **free** — no PCD machinery — and the ~785 ms/node in-circuit
 sub-root), so a permuted/substituted batch set produces a valid accumulated object over a
 *different* `R*` — caught, not silently accepted. Order is explicit in each node's statement.
 
-**The one remaining crux (honestly unmeasured):** the two decider numbers above are the native
-value check + the O(leaves) fold-verify path — **not** the committed decider. The true decider is
-the **FRI-opening of the `R*`-committed interleaved P** at `root.point` (whether `R*` is
-FRI-openable as P's codeword — `accumulation.rs:127`); that opening is a batch-width binius verify
-(~9–13 s measured upper bound), and it is **not wired here** — the monolithic figure is *not*
-quoted as the hybrid's. Wiring the FRI-opening decider is the single remaining measurement.
+**The committed decider — and whether it re-introduces the monolithic bottleneck.** The two
+decider numbers above are the native value check + the O(leaves) fold-verify path — *not* the
+committed decider, which is the **FRI-opening of the `R*`-committed interleaved P** at `root.point`.
+The risk (reviewer): if all N batch instances are claims on one P, the opening is over the *full
+N-sized* object — the same shape that gave 210 GiB / 1.7 h monolithic. **Does it decompose?**
+Measured — yes (`decider_opening_decomposes`): by multilinearity in the position variables,
+`P(a, b) = Σ_i eq(b, bin(i))·P_i(a)`, and `root.point` splits as `(a = inner-part, b = position-part)`,
+so the accumulated evaluation is an `eq`-weighted sum of **batch-local** evaluations `P_i(a)` — all
+at the *same* shared inner point `a`. **Verified as an identity** over 16 batches, and a wrong
+batch-local opening breaks the combine. So the opening **assembles from N batch-local openings
+(each `P_i` at `a`, against its own sub-root `R*_i`) + an `eq`-weighted combine — no P materialized
+on one machine**: the decider-prove decomposes exactly like the batch proves (bounded per-batch
+RSS, fleet-parallel). **The hybrid removes the monolithic bottleneck, not moves it downstream —
+the architecture closes.** (Honest scope: this is the *value-layer* identity; the FRI-proximity
+layer is the standard batched/interleaved-FRI decomposition over the per-batch codewords the
+streaming commit already builds. The committed decider's *verify* cost is still the ~9–13 s
+batch-width upper bound; the point measured here is that its *prove* is decomposable.)
+
+**The edge's fold object (correcting the "18 ms").** The 18 ms was a chain-final-proof number;
+the capstone's edge fold check is the **native fold-verify path — O(leaves), width-independent:
+1.76 ms at 16 leaves → ~20 ms at 184 → ~340 ms at 2930** (linear, still sub-second at `.se`).
+Quote *this* (or the root recursive-STARK verify, ~785 ms prove / verify TBD), not the 18 ms.
+
+**Level.** The capstone ran at L1; the pipeline's fold/decomposition are native and
+level-independent, and the L5 story is the decider *verify* at ~41 s (the measured N=512 L5 split)
+— a single L5 pipeline run would settle it end-to-end.
 
 **Composite publisher number (the sentence the paper ends on):** ~33 s of batch proves in
 parallel + ~6 s of balanced-tree critical path ⇒ **the `.se` epoch publishes in under a minute of
-wall-clock on ~184 machines at ~1.15 GiB each**, and a resolver verifies it once (decider + fold)
+wall-clock on ~184 machines at ~1.15 GiB each** — and, now that the decider-prove decomposes, the
+final opening is fleet-assembled at bounded RSS too. A resolver verifies once (decider + fold),
 then serves every request at ~µs.
 
 ## Remaining surface (the whole ledger)
