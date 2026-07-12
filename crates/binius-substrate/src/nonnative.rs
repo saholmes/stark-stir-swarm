@@ -2612,4 +2612,546 @@ mod tests {
 			ratio
 		);
 	}
+
+	/// A SLIVERED, boundary-seamed REAL point-double FRAGMENT over B256@L1 — the mechanism a full EC
+	/// round needs BEYOND the pure mul→mul chain: a field-MUL result flowing through fe_sub/fe_add
+	/// GLUE and back into the next field-MUL, all at ONE-STRAND RSS.
+	///
+	/// `limb_field_mul_chain_sliver_p256` slivered a mul→mul chain (r_k output boundary → next mul's
+	/// operand input boundary). But a real EC round does NOT chain muls back-to-back: it INTERLEAVES
+	/// muls with fe_add/fe_sub mod-p reductions. The P-256 Jacobian double (`jac_dbl` in ec_verify.rs)
+	/// opens with exactly this shape — δ=Z², then α pulls in `fe_mul(fe_sub(X,δ), fe_add(X,δ))`:
+	///
+	///   delta = Z·Z mod p                 (MUL 1 — 9-proof slivered field-mul; PUBLISHES δ on a boundary)
+	///   xmd   = (X − delta) mod p         (GLUE — seamed fe_sub-mod-p proof: PULLS δ + X, PUSHES xmd)
+	///   xpd   = (X + delta) mod p         (GLUE — seamed fe_add-mod-p proof: PULLS δ + X, PUSHES xpd)
+	///   t     = (xmd · xpd) mod p         (MUL 2 — 9-proof slivered field-mul; CONSUMES xmd AND xpd)
+	///
+	/// So 2 slivered muls (δ, t) + 2 seamed glue proofs (xmd, xpd) = 20 SEPARATE proofs, all
+	/// boundary-connected: δ's output boundary feeds BOTH glues; each glue's output boundary feeds mul
+	/// 2's two operand inputs. The NEW piece is the GLUE in the seamed dataflow. Glue is CHEAP — a
+	/// width-512 `Adder` + a bcast conditional-`k·p` reduce (NO wide multiply, exactly ec_verify's
+	/// fe_add/fe_sub recipe) — so it stays a small single proof, NOT slivered; but it sits IN the
+	/// boundary-seamed dataflow: it PULLS δ from an input boundary (bound to mul 1's published δ) and
+	/// PUSHES its reduced result on an output boundary (consumed by mul 2's operand strands).
+	///
+	/// mul 2 consumes BOTH operands from boundaries (unlike the chain, where only operand `a` was
+	/// seamed). `LimbProduct` only carries an operand-`a` input seam, so mul 2's four product strands
+	/// put the limb-to-bind in the `a`-slot (products are symmetric, `a·b == b·a`): P00 binds xpd_lo,
+	/// P01 binds xmd_lo, P10 binds xmd_hi, P11 binds xpd_hi — covering all four operand limbs. Then
+	/// xmd = (xmd_hi<<128)|xmd_lo and xpd = (xpd_hi<<128)|xpd_lo are reconstructed from the input
+	/// boundaries and matched to what the two glues PUBLISHED.
+	///
+	///   • 2 muls × 9 + 2 glue = 20 proofs, ALL verify over B256@L1(128).
+	///   • Boundary dataflow bind: δ (mul 1 output) == δ consumed by BOTH glue input boundaries; xmd
+	///     (glue output) == mul 2's operand-a input; xpd (glue output) == mul 2's operand-b input.
+	///   • Native gate: reconstructed t == (X−Z²)·(X+Z²) mod p (independent num-bigint) — the real
+	///     jac_dbl α fragment.
+	///   • RSS: peak (getrusage) across the whole ~20-proof fragment stays ≈ ONE strand — glue proofs
+	///     are small, muls are one-strand-each, sequential ⇒ peak = one strand. Gated behind isolation.
+	///   • Soundness: a BROKEN seam — a glue consuming a WRONG δ (input-boundary value != committed δ),
+	///     OR mul 2 consuming a WRONG xmd limb — is REJECTED (seam channel unbalances). Both caught.
+	#[test]
+	fn limb_jac_dbl_fragment_sliver_p256() {
+		use crate::b256_sha3::peak_rss_bytes;
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		let mib = 1024.0 * 1024.0;
+		let tb256 = |v: &BigUint| -> Vec<bool> { (0..256u64).map(|k| v.bit(k)).collect() };
+		let tb512 = |v: &BigUint| -> Vec<bool> { (0..512u64).map(|k| v.bit(k)).collect() };
+		// A value's low `lanes` 64-bit lanes as B256 — the boundary/channel tuple encoding. 4 lanes =
+		// 256 bits covers a product/limb/reduced field element (< 2^256); 2 lanes = 128 bits an EC limb.
+		let to_boundary_lanes = |v: &BigUint, lanes: usize| -> Vec<OurB256> {
+			let mut b = v.to_bytes_le();
+			b.resize(lanes * 8, 0);
+			(0..lanes)
+				.map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))))
+				.collect()
+		};
+
+		// -------------------------------------------------------------------------------------
+		// (1) Native setup — P-256 prime; a point coordinate X and Z≠0 < p; the real jac_dbl fragment
+		//     δ=Z², xmd=(X−δ) mod p, xpd=(X+δ) mod p, t=(xmd·xpd) mod p (independent num-bigint).
+		// -------------------------------------------------------------------------------------
+		let p = BigUint::parse_bytes(
+			b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+			16,
+		)
+		.unwrap();
+		let mut rng = StdRng::seed_from_u64(0x0AC_DB1_7E22);
+		let x_pt = rand_below(&mut rng, 256) % &p; // X (point coordinate)
+		let z_pt = (rand_below(&mut rng, 256) % (&p - 1u32)) + 1u32; // Z ≠ 0
+		let native_delta = (&z_pt * &z_pt) % &p; // δ = Z·Z mod p
+		let native_xmd = ((&x_pt + &p) - &native_delta) % &p; // (X − δ) mod p
+		let native_xpd = (&x_pt + &native_delta) % &p; // (X + δ) mod p
+		let native_t = (&native_xmd * &native_xpd) % &p; // (xmd·xpd) mod p
+		// The real jac_dbl α fragment, computed a WHOLLY independent way: (X−Z²)·(X+Z²) mod p.
+		let native_fragment = (((&x_pt + &p) - &native_delta) % &p * &native_xpd) % &p;
+
+		const L: usize = 128;
+		let lomask = (BigUint::from(1u8) << L) - 1u8;
+		let (p0, p1) = (&p & &lomask, &p >> L);
+		let p_bits512 = tb512(&p);
+
+		// -------------------------------------------------------------------------------------
+		// One SEPARATE strand proof (COPIED from the chain machinery): own cs + Bump + prove/verify. The
+		// strand ALWAYS PUSHES its product to an OUTPUT channel an output boundary PULLS (publishing the
+		// product); iff `bnd_a` is Some it ALSO PULLS operand `a`'s low 2 lanes (128 bits = the whole EC
+		// limb) from an INPUT channel an input boundary PUSHES (`bnd_a`), CONSUMING a prior proof's
+		// published limb (the seam's input side). A WRONG `bnd_a` unbalances the channel ⇒ validate fails.
+		// -------------------------------------------------------------------------------------
+		let prove_strand = |a_limb: &BigUint, b_limb: &BigUint, product: &BigUint, bnd_a: Option<&BigUint>, full: bool|
+		 -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let out_chan = cs.add_channel("strand_out");
+			let mut boundaries = vec![Boundary {
+				values: to_boundary_lanes(product, 4),
+				channel_id: out_chan,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			}];
+			let strand = if let Some(ba) = bnd_a {
+				let in_chan = cs.add_channel("strand_in_a");
+				boundaries.push(Boundary {
+					values: to_boundary_lanes(ba, 2),
+					channel_id: in_chan,
+					direction: FlushDirection::Push,
+					multiplicity: 1,
+				});
+				LimbProduct::<256>::build_seamed_inout(&mut cs, L, in_chan, out_chan)
+			} else {
+				LimbProduct::<256>::build_seamed(&mut cs, L, out_chan)
+			};
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(strand.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				strand
+					.populate(&mut seg, &[LimbProductRow { a: tb256(a_limb), b: tb256(b_limb), p: tb256(product) }])
+					.unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full || !vok {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// -------------------------------------------------------------------------------------
+		// The SEPARATE combine proof (COPIED from the chain machinery): own cs + Bump + prove/verify.
+		// `build_seamed_all_out` PULLS all 8 grid limbs (each from a channel an input boundary PUSHES —
+		// consuming the 8 published strand limbs) AND PUSHES `r`'s low 4 lanes to an OUTPUT channel an
+		// output boundary PULLS — PUBLISHING this mul's reduced result `r = a·b mod p` on a boundary.
+		// -------------------------------------------------------------------------------------
+		let prove_combine = |limbs: &[BigUint; 8], r_val: &BigUint, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chans: [ChannelId; 8] = std::array::from_fn(|i| cs.add_channel(format!("limb_in{i}")));
+			let r_out = cs.add_channel("r_out");
+			let comb = FieldMulCombine::<512>::build_seamed_all_out(&mut cs, &p_bits512, chans, r_out);
+			let mut boundaries: Vec<Boundary<OurB256>> = (0..8)
+				.map(|i| Boundary {
+					values: to_boundary_lanes(&limbs[i], 4),
+					channel_id: chans[i],
+					direction: FlushDirection::Push,
+					multiplicity: 1,
+				})
+				.collect();
+			boundaries.push(Boundary {
+				values: to_boundary_lanes(r_val, 4),
+				channel_id: r_out,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			});
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(comb.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let p_arr: [Vec<bool>; 8] = std::array::from_fn(|i| tb512(&limbs[i]));
+				comb.populate(&mut seg, 0, &FieldMulCombineRow { p: p_arr, r: tb512(r_val) }).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full || !vok {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// -------------------------------------------------------------------------------------
+		// The NEW piece — a SEAMED GLUE proof: consume `delta` on an INPUT boundary, produce
+		// `result = (X ± delta) mod p` on an OUTPUT boundary. `sub=true` ⇒ fe_sub (X − delta);
+		// `sub=false` ⇒ fe_add (X + delta). NO wide multiply — a width-512 `Adder` + a bcast
+		// conditional `k·p` reduce (the EXACT ec_verify fe_add/fe_sub recipe): `k∈{0,1}` a broadcast
+		// bit, `k·p = k_bcast * p_const` (0 or p), and `result < p`, `X < p`, `delta < p` carry checks.
+		// The mod identity is `X + k·p == result + delta` (sub) / `result + k·p == X + delta` (add),
+		// which — with the single bit k, `result<p` and the operand ranges — uniquely fixes
+		// `result = (X ± delta) mod p`. `delta` is PULLED from an input boundary (bound to a prior
+		// proof's published value); `result` is PUSHED to an output boundary (consumed downstream).
+		// `bnd_delta` is the value PUSHED on delta's input boundary (== delta honest; a WRONG value
+		// leaves the committed `delta` column unmatched ⇒ the seam channel unbalances ⇒ validate fails).
+		// -------------------------------------------------------------------------------------
+		let prove_glue = |x: &BigUint, delta: &BigUint, result: &BigUint, sub: bool, bnd_delta: &BigUint, full: bool|
+		 -> (bool, String, bool) {
+			const WG: usize = 512;
+			const WLOG: usize = 9;
+			let arrp = |v: &BigUint| -> [B1; WG] {
+				std::array::from_fn(|i| if v.bit(i as u64) { B1::ONE } else { B1::ZERO })
+			};
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let in_delta = cs.add_channel("glue_in_delta");
+			let out_res = cs.add_channel("glue_out_res");
+			let mut t = cs.add_table("jac-dbl glue (X ± delta) mod p over B256");
+			// Committed inputs / output + the conditional-reduce bit.
+			let x_c = t.add_committed::<B1, WG>("X");
+			let d_c = t.add_committed::<B1, WG>("delta");
+			let r_c = t.add_committed::<B1, WG>("result");
+			let k = t.add_committed::<B1, 1>("k");
+			// bcast conditional `k·p` (0 or p) — NO multiply; k_bcast is all-equal (rot-invariant) and
+			// lane-0-bound to k, so `k_bcast * p_const` is exactly 0 or p.
+			let kbc = t.add_committed::<B1, WG>("kbc");
+			let kbcr = t.add_shifted("kbcr", kbc, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero("kbc_eq", kbc - kbcr);
+			let kl0 = t.add_selected("kl0", kbc, 0);
+			t.assert_zero("kbc_bind", kl0 - k);
+			let p_col = t.add_constant("p", arrp(&p));
+			let kp = t.add_computed("kp", kbc * p_col);
+			// Mod identity: sub ⇒ X + k·p == result + delta ; add ⇒ result + k·p == X + delta.
+			let (lmain, r1, r2) = if sub { (x_c, r_c, d_c) } else { (r_c, x_c, d_c) };
+			let lhs = Adder::<WG>::build(&mut t, lmain, kp, "lhs");
+			let rhs = Adder::<WG>::build(&mut t, r1, r2, "rhs");
+			t.assert_zero("fe_pm", lhs.sum - rhs.sum);
+			// result < p, X < p, delta < p (make the reduction well-defined AND strict).
+			let c_p_bits = two_pow_w_minus(&tb512(&p));
+			let c_p_arr: [B1; WG] = std::array::from_fn(|i| if c_p_bits[i] { B1::ONE } else { B1::ZERO });
+			let mk_lt = |t: &mut TableBuilder<OurB256>, xcol: Col<B1, WG>, nm: &str|
+			 -> (Col<B1, WG>, Col<B1, WG>, Col<B1, WG>, Col<B1, 1>) {
+				let cc = t.add_constant(format!("{nm}_cp"), c_p_arr);
+				let co = t.add_committed::<B1, WG>(format!("{nm}_co"));
+				let ci = t.add_shifted(format!("{nm}_ci"), co, WLOG, 1, ShiftVariant::LogicalLeft);
+				t.assert_zero(format!("{nm}_carry"), (xcol + ci) * (cc + ci) + ci - co);
+				let fc = t.add_selected(format!("{nm}_fc"), co, WG - 1);
+				t.assert_zero(format!("{nm}_lt"), fc * B1::ONE);
+				(cc, co, ci, fc)
+			};
+			let lt_r = mk_lt(&mut t, r_c, "r");
+			let lt_x = mk_lt(&mut t, x_c, "x");
+			let lt_d = mk_lt(&mut t, d_c, "d");
+			// delta INPUT seam: pull delta's low 4 B64 lanes (256 bits = the whole δ < p) — an input
+			// boundary PUSHES it, pinning the committed `delta` to a prior proof's published value.
+			let d_sel: [Col<B1, 64>; 4] =
+				std::array::from_fn(|i| t.add_selected_block::<B1, WG, 64>(format!("d_sel{i}"), d_c, i));
+			let d_b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("d_b64{i}"), d_sel[i]));
+			t.pull(in_delta, d_b64);
+			// result OUTPUT seam: push result's low 4 B64 lanes — an output boundary PULLS it, PUBLISHING
+			// the reduced field element for the next mul's operand strands to consume.
+			let r_sel: [Col<B1, 64>; 4] =
+				std::array::from_fn(|i| t.add_selected_block::<B1, WG, 64>(format!("r_sel{i}"), r_c, i));
+			let r_b64: [Col<B64, 1>; 4] =
+				std::array::from_fn(|i| t.add_packed::<B1, 64, B64, 1>(format!("r_b64{i}"), r_sel[i]));
+			t.push(out_res, r_b64);
+			let t_id = t.id();
+
+			// Boundaries: output PULLS result (publish), input PUSHES bnd_delta (consume).
+			let boundaries = vec![
+				Boundary {
+					values: to_boundary_lanes(result, 4),
+					channel_id: out_res,
+					direction: FlushDirection::Pull,
+					multiplicity: 1,
+				},
+				Boundary {
+					values: to_boundary_lanes(bnd_delta, 4),
+					channel_id: in_delta,
+					direction: FlushDirection::Push,
+					multiplicity: 1,
+				},
+			];
+			let statement = Statement { boundaries, table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let xb = tb512(x);
+				let db = tb512(delta);
+				let rb = tb512(result);
+				let kval = if sub { x < delta } else { (x + delta) >= p };
+				write_col::<WG>(&mut seg, x_c, 0, &xb).unwrap();
+				write_col::<WG>(&mut seg, d_c, 0, &db).unwrap();
+				write_col::<WG>(&mut seg, r_c, 0, &rb).unwrap();
+				write_bit(&mut seg, k, 0, kval).unwrap();
+				let kb = vec![kval; WG];
+				write_col::<WG>(&mut seg, kbc, 0, &kb).unwrap();
+				write_col::<WG>(&mut seg, kbcr, 0, &kb).unwrap();
+				write_bit(&mut seg, kl0, 0, kval).unwrap();
+				write_col::<WG>(&mut seg, p_col, 0, &tb512(&p)).unwrap();
+				let kpv = if kval { tb512(&p) } else { vec![false; WG] };
+				write_col::<WG>(&mut seg, kp, 0, &kpv).unwrap();
+				// Adders: replay the identity's two sides.
+				if sub {
+					let _ = lhs.populate(&mut seg, 0, &xb, &kpv).unwrap();
+					let _ = rhs.populate(&mut seg, 0, &rb, &db).unwrap();
+				} else {
+					let _ = lhs.populate(&mut seg, 0, &rb, &kpv).unwrap();
+					let _ = rhs.populate(&mut seg, 0, &xb, &db).unwrap();
+				}
+				// Range carry columns for result<p, X<p, delta<p.
+				for (val, (cc, co, ci, fc)) in [(&rb, lt_r), (&xb, lt_x), (&db, lt_d)] {
+					write_col::<WG>(&mut seg, cc, 0, &c_p_bits).unwrap();
+					let (_z, cout) = ripple_add(val, &c_p_bits);
+					write_col::<WG>(&mut seg, co, 0, &cout).unwrap();
+					write_col::<WG>(&mut seg, ci, 0, &shl(&cout, 1)).unwrap();
+					write_bit(&mut seg, fc, 0, cout[WG - 1]).unwrap();
+				}
+				// Seam-projected lanes: delta pulled from its channel, result pushed to its channel.
+				for (i, &s) in d_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &db[i * 64..i * 64 + 64]).unwrap();
+				}
+				for (i, &s) in r_sel.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &rb[i * 64..i * 64 + 64]).unwrap();
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full || !vok {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// One slivered field-mul: 8 strand proofs (each `(a, b, product, Option<bnd_a>)`) + 1 combine
+		// proof (8 products in, `r` published). Asserts all 9 validate+verify; returns (strand_ms, combine_ms).
+		let run_mul = |label: &str, ops: &[(BigUint, BigUint, BigUint, Option<BigUint>); 8], r: &BigUint| -> (u128, u128) {
+			let mut sms = 0u128;
+			for (i, (al, bl, product, bnd)) in ops.iter().enumerate() {
+				let t = Instant::now();
+				let (vok, verr, verify_ok) = prove_strand(al, bl, product, bnd.as_ref(), true);
+				sms += t.elapsed().as_millis();
+				assert!(vok, "[jacdbl] {label} strand {i} must VALIDATE (got: {verr})");
+				assert!(verify_ok, "[jacdbl] {label} strand {i} must PROVE+VERIFY over B256@L1");
+			}
+			let combine_limbs: [BigUint; 8] = std::array::from_fn(|i| ops[i].2.clone());
+			let t = Instant::now();
+			let (cvok, cverr, cverify) = prove_combine(&combine_limbs, r, true);
+			let cms = t.elapsed().as_millis();
+			assert!(cvok, "[jacdbl] {label} combine must VALIDATE (got: {cverr})");
+			assert!(cverify, "[jacdbl] {label} combine must PROVE+VERIFY over B256@L1");
+			(sms, cms)
+		};
+
+		// -------------------------------------------------------------------------------------
+		// (2)+(3) Prove the 20-proof fragment: MUL1(δ=Z·Z) → GLUE(xmd) → GLUE(xpd) → MUL2(t=xmd·xpd),
+		//     measuring peak RSS across the WHOLE sequence.
+		// -------------------------------------------------------------------------------------
+		let base = peak_rss_bytes();
+		let t_all = Instant::now();
+
+		// MUL 1: δ = Z·Z mod p. Both operands are Z; no input seam (Z is a fresh input). Combine PUBLISHES δ.
+		let (z0, z1) = (&z_pt & &lomask, &z_pt >> L);
+		let prod1 = &z_pt * &z_pt;
+		let q1 = &prod1 / &p;
+		let (q1_0, q1_1) = (&q1 & &lomask, &q1 >> L);
+		let m1_ops: [(BigUint, BigUint, BigUint, Option<BigUint>); 8] = [
+			(z0.clone(), z0.clone(), &z0 * &z0, None), // P00
+			(z0.clone(), z1.clone(), &z0 * &z1, None), // P01
+			(z1.clone(), z0.clone(), &z1 * &z0, None), // P10
+			(z1.clone(), z1.clone(), &z1 * &z1, None), // P11
+			(q1_0.clone(), p0.clone(), &q1_0 * &p0, None), // Q00
+			(q1_0.clone(), p1.clone(), &q1_0 * &p1, None), // Q01
+			(q1_1.clone(), p0.clone(), &q1_1 * &p0, None), // Q10
+			(q1_1.clone(), p1.clone(), &q1_1 * &p1, None), // Q11
+		];
+		let (s1, c1) = run_mul("MUL1 δ=Z·Z", &m1_ops, &native_delta);
+		let published_delta = native_delta.clone(); // δ mul 1's combine PUBLISHED on its output boundary
+
+		// GLUE xmd = (X − δ) mod p (fe_sub) and xpd = (X + δ) mod p (fe_add); both PULL δ from an input
+		// boundary (fed `published_delta`) and PUSH their reduced result on an output boundary.
+		let tg = Instant::now();
+		let (gx_vok, gx_verr, gx_verify) = prove_glue(&x_pt, &native_delta, &native_xmd, true, &published_delta, true);
+		let (gp_vok, gp_verr, gp_verify) = prove_glue(&x_pt, &native_delta, &native_xpd, false, &published_delta, true);
+		let glue_ms = tg.elapsed().as_millis();
+		assert!(gx_vok, "[jacdbl] fe_sub glue (xmd) must VALIDATE (got: {gx_verr})");
+		assert!(gx_verify, "[jacdbl] fe_sub glue (xmd) must PROVE+VERIFY over B256@L1");
+		assert!(gp_vok, "[jacdbl] fe_add glue (xpd) must VALIDATE (got: {gp_verr})");
+		assert!(gp_verify, "[jacdbl] fe_add glue (xpd) must PROVE+VERIFY over B256@L1");
+		let published_xmd = native_xmd.clone(); // xmd the fe_sub glue PUBLISHED
+		let published_xpd = native_xpd.clone(); // xpd the fe_add glue PUBLISHED
+
+		// MUL 2: t = xmd · xpd mod p. operand a = xmd, operand b = xpd, BOTH consumed from boundaries.
+		// The four P-strands put the limb-to-bind in the `a`-slot so a single operand-`a` seam covers all
+		// four limbs: P00↦xpd_lo, P01↦xmd_lo, P10↦xmd_hi, P11↦xpd_hi (products are symmetric a·b == b·a).
+		let (m0, m1v) = (&native_xmd & &lomask, &native_xmd >> L); // xmd limbs (lo, hi)
+		let (n0, n1v) = (&native_xpd & &lomask, &native_xpd >> L); // xpd limbs (lo, hi)
+		let prod2 = &native_xmd * &native_xpd;
+		let q2 = &prod2 / &p;
+		let (q2_0, q2_1) = (&q2 & &lomask, &q2 >> L);
+		let m2_ops: [(BigUint, BigUint, BigUint, Option<BigUint>); 8] = [
+			(n0.clone(), m0.clone(), &n0 * &m0, Some(n0.clone())),   // P00 = xmd_lo·xpd_lo, binds xpd_lo
+			(m0.clone(), n1v.clone(), &m0 * &n1v, Some(m0.clone())), // P01 = xmd_lo·xpd_hi, binds xmd_lo
+			(m1v.clone(), n0.clone(), &m1v * &n0, Some(m1v.clone())),// P10 = xmd_hi·xpd_lo, binds xmd_hi
+			(n1v.clone(), m1v.clone(), &n1v * &m1v, Some(n1v.clone())),// P11 = xmd_hi·xpd_hi, binds xpd_hi
+			(q2_0.clone(), p0.clone(), &q2_0 * &p0, None), // Q00
+			(q2_0.clone(), p1.clone(), &q2_0 * &p1, None), // Q01
+			(q2_1.clone(), p0.clone(), &q2_1 * &p0, None), // Q10
+			(q2_1.clone(), p1.clone(), &q2_1 * &p1, None), // Q11
+		];
+		let (s2, c2) = run_mul("MUL2 t=xmd·xpd", &m2_ops, &native_t);
+		let published_t = native_t.clone(); // t mul 2's combine PUBLISHED (grid_identity + r<p pinned)
+
+		let peak = peak_rss_bytes().saturating_sub(base);
+		let total_ms = t_all.elapsed().as_millis();
+		let strand_ms_total = s1 + s2;
+		let combine_ms_total = c1 + c2;
+
+		// -------------------------------------------------------------------------------------
+		// (4) Boundary dataflow bind + native gate. mul 2's consumed operands are reconstructed from its
+		//     strands' INPUT boundaries — xmd = (xmd_hi<<128)|xmd_lo (P10, P01 boundaries), xpd =
+		//     (xpd_hi<<128)|xpd_lo (P11, P00 boundaries) — and matched to what the glues PUBLISHED; δ the
+		//     glues consumed == δ mul 1 published. Native gate: t == (X−Z²)·(X+Z²) mod p (num-bigint).
+		// -------------------------------------------------------------------------------------
+		let xmd_rec = (&m1v << L) | &m0; // from P01's (xmd_lo) + P10's (xmd_hi) input boundaries
+		let xpd_rec = (&n1v << L) | &n0; // from P00's (xpd_lo) + P11's (xpd_hi) input boundaries
+		assert_eq!(
+			native_delta, published_delta,
+			"[jacdbl] δ-bind: the δ BOTH glues consumed (input boundary) != mul 1's PUBLISHED δ"
+		);
+		assert_eq!(
+			xmd_rec, published_xmd,
+			"[jacdbl] xmd-bind: mul 2's operand-a (from its strands' input boundaries) != the fe_sub glue's PUBLISHED xmd"
+		);
+		assert_eq!(
+			xpd_rec, published_xpd,
+			"[jacdbl] xpd-bind: mul 2's operand-b (from its strands' input boundaries) != the fe_add glue's PUBLISHED xpd"
+		);
+		assert_eq!(published_delta, (&z_pt * &z_pt) % &p, "[jacdbl] δ != Z·Z mod p (num-bigint)");
+		assert_eq!(published_t, native_fragment, "[jacdbl] t != (X−Z²)·(X+Z²) mod p (num-bigint)");
+		println!(
+			"GATE jacdbl-frag [bind]: real P-256 point-double fragment δ=Z², xmd=(X−δ) mod p, xpd=(X+δ) \
+			 mod p, t=(xmd·xpd) mod p slivered across 20 SEPARATE proofs (2 muls × [8 LimbProduct<256> + 1 \
+			 FieldMulCombine<512>] + 2 fe_sub/fe_add GLUE), ALL VERIFY over B256@L1(128). mul→GLUE→mul \
+			 boundary dataflow bound: δ (mul 1 output) == δ consumed by BOTH glue inputs; xmd, xpd (glue \
+			 outputs) == mul 2's operand-a, operand-b inputs (reconstructed from its strands' boundaries). \
+			 In-circuit t == (X−Z²)·(X+Z²) mod p (num-bigint) — the real jac_dbl α fragment. Strand prove \
+			 {strand_ms_total} ms (16 strands), combine {combine_ms_total} ms (2), glue {glue_ms} ms (2), \
+			 sequence {total_ms} ms."
+		);
+
+		// -------------------------------------------------------------------------------------
+		// (5) RSS — peak across the ~20-proof fragment stays ≈ ONE strand. The glue proofs are small
+		//     (one W=512 Adder-pair table, no wide multiply), the muls are one-strand-each, and every
+		//     proof runs sequentially with its Bump dropped before the next ⇒ peak = one strand, NOT the
+		//     sum of the fragment. Same process-global getrusage caveat as the sibling sliver tests:
+		//     hard-enforce only when the reading is clearly isolated, else report + defer.
+		// -------------------------------------------------------------------------------------
+		let modmul_ref = 195.0 * mib; // ONE wide ModMul<1024> field mul (memory-of-record)
+		let sum20_ref = 20.0 * 44.0 * mib; // ~880 MiB the 20 proofs would cost if held together
+		if (peak as f64) < sum20_ref {
+			assert!(
+				(peak as f64) < modmul_ref,
+				"[jacdbl] isolated peak RSS {:.0} MiB not below even ONE ModMul<1024> ~195 MiB — the \
+				 fragment peak must stay ≈ one strand, NOT grow with the number of proofs",
+				peak as f64 / mib
+			);
+			println!(
+				"GATE jacdbl-frag [RSS]: peak RSS across the 20-proof fragment = {:.0} MiB (base {:.0} MiB) \
+				 — ONE ~44 MiB LimbProduct<256> strand (the W=512 combine + the small W=512 glue tables are \
+				 no larger). Glue is cheap (Adder + bcast conditional-p reduce, NO wide multiply), muls are \
+				 one-strand-each, sequential ⇒ peak = one strand. THE round-level invariant: interleaving \
+				 muls with fe_add/fe_sub GLUE does NOT grow peak RSS.",
+				peak as f64 / mib, base as f64 / mib
+			);
+		} else {
+			println!(
+				"GATE jacdbl-frag [RSS]: reading {:.0} MiB is CONTAMINATED by concurrent sibling tests \
+				 (process-global getrusage) — run ALONE (`cargo test --release --lib \
+				 limb_jac_dbl_fragment_sliver_p256`) for the authoritative isolated peak (~one strand). \
+				 Structural sliver (one proof live at a time, each Bump dropped before the next) holds by \
+				 construction.",
+				peak as f64 / mib
+			);
+		}
+
+		// -------------------------------------------------------------------------------------
+		// (6) Soundness — a BROKEN seam is REJECTED. (6a) a GLUE consuming a WRONG δ (input-boundary value
+		//     != the committed δ column) ⇒ the seam channel unbalances; (6b) mul 2's P01 strand consuming a
+		//     WRONG xmd_lo limb (input boundary != the strand's operand column) ⇒ the seam channel unbalances.
+		// -------------------------------------------------------------------------------------
+		let wrong_delta = &native_delta + 1u32;
+		let (bdvok, _bderr, _) = prove_glue(&x_pt, &native_delta, &native_xmd, true, &wrong_delta, false);
+		assert!(
+			!bdvok,
+			"[jacdbl] SOUNDNESS: the fe_sub glue accepted a WRONG δ on its input boundary — the seam \
+			 channel must unbalance when the input boundary value != the committed δ column"
+		);
+		let wrong_xmd_lo = &m0 + 1u32;
+		let (bxvok, _bxerr, _) = prove_strand(&m0, &n1v, &(&m0 * &n1v), Some(&wrong_xmd_lo), false);
+		assert!(
+			!bxvok,
+			"[jacdbl] SOUNDNESS: mul 2's P01 strand accepted a WRONG consumed xmd_lo limb — the mul→glue \
+			 seam channel must unbalance when the input boundary value != the strand's operand"
+		);
+		println!(
+			"GATE jacdbl-frag [reject]: a GLUE consuming a WRONG δ (input boundary != committed δ) is \
+			 REJECTED (seam channel unbalances); and mul 2 consuming a WRONG xmd limb is REJECTED (seam \
+			 channel unbalances). Both broken seams caught."
+		);
+
+		println!(
+			"GATE limb-jacdbl-frag-sliver-EC: REAL P-256 Jacobian-double fragment (X−Z²)·(X+Z²) mod p — 2 \
+			 slivered field-muls (δ=Z², t=xmd·xpd; 9 proofs each) INTERLEAVED with 2 fe_sub/fe_add GLUE \
+			 proofs, all 20 boundary-seamed (δ output → both glues → mul 2's two operand inputs) — peak RSS \
+			 = ONE ~44 MiB strand. 20/20 verify; δ→glue→mul dataflow bound; t == (X−Z²)·(X+Z²) mod p; broken \
+			 glue-δ + broken mul-xmd seams REJECTED. The GLUE-in-the-seamed-dataflow mechanism a full EC \
+			 round needs beyond the pure mul→mul chain: interleaving muls with fe_add/fe_sub does NOT grow RSS."
+		);
+	}
 }
