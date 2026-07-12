@@ -524,9 +524,38 @@ batch-sized domain, which is where "removes rather than moves" earns its teeth a
 layer.) *This term is modeled (measured per-path × modeled query/fold counts); wiring the committed
 FRI decider end-to-end to measure it directly is the remaining engineering — not discovery.*
 
-**Batch size is a two-sided trade (a curve, not a column).** Bigger batches ⇒ fewer leaves +
-cheaper naive term, at the cost of higher per-machine RSS (**8192 @ 1.15 GiB vs 512 @ 0.12 GiB** —
-8192 near the sweet spot). The paper is stronger for plotting the curve than quoting one column.
+**Batch size — the verify axis went flat.** With the interleaved layout the verify-side pressure
+toward big batches *vanishes* (the query-path term is `O(queries·depth)`, flat in leaves). So the
+trade's two sides are now purely **per-machine RSS vs fleet width + fold-tree work** — 8192 @
+1.15 GiB still sits fine, but the honest statement is *the verify axis is flat*, not "near the
+sweet spot."
+
+**Canonical-root binding (a soundness obligation the layout introduces).** Symbol-interleaving
+means the per-batch trees under `R*_i` are **not subtrees** of the interleaved `R*` — two
+incompatible Merkle trees over the same codewords. The fold binds leaf instances; the decider
+opens `R*`. Unless tied, a publisher could fold claims about one polynomial set and answer FRI
+queries from another. **Resolution** (`canonical_root_binding`, demonstrated): make `R*`
+**canonical** — each leaf binds `(R*, position i)`. Because `R*` is a CR commitment to *exactly*
+the batch codewords, folding a leaf bound to `R*` forces those codewords; a different set has
+`R*' ≠ R*` and cannot answer it. (The demonstration is sharp: batch 3's *sub-root* is identical
+across a codeword set and a one-batch perturbation of it — so a sub-root binding leaves batch 3's
+leaf answerable from either — yet its *canonical-`R*`* leaf identity differs. Sub-root binding is
+unsound; canonical-`R*` binding closes it.) The steady-state µs Merkle path walks **this** canonical
+tree — one root, one object.
+
+**The interleave-pass barrier (a real publisher-side step, in the wall-clock budget).** The
+canonical `R*` doesn't exist until every batch codeword is done, so leaf-claim finalization sits
+behind a barrier: a second streaming pass builds `R*`, bounded-RSS (one cross-batch coset buffered
+at a time). Measured (`interleave_barrier_wallclock`): **~4.63 Msym/s single-thread ⇒ `.se`
+(384 M symbols) ≈ 83 s single-machine, but it shards** (cosets hash independently, Merkle build is
+log-depth) **⇒ fleet-parallel to ~seconds** (no rayon needed — plain hashing). Publisher timeline:
+**batch proves (fleet) → barrier (this pass) → fold tree**; the fold tree cannot start until `R*`
+exists. The under-a-minute publish claim carries this barrier term.
+
+**The edge's fold object (settled).** Pick the **native fold-verify replay** — O(leaves),
+width-independent, **1.76 ms @ 16 → ~340 ms @ 2930, sub-second at `.se`** — over the root
+recursive-STARK verify (whose ~785 ms is a *prove* number). The resolver's per-epoch check is:
+decider (~11 s, leaves-independent) + native fold replay (sub-second) + the barrier is publisher-side.
 
 **The edge's fold object (correcting the "18 ms").** The 18 ms was a chain-final-proof number;
 the capstone's edge fold check is the **native fold-verify path — O(leaves), width-independent:
