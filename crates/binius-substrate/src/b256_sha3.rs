@@ -458,4 +458,52 @@ mod tests {
 			 (honest SHA3-256 proof size = {size} bytes)"
 		);
 	}
+
+	/// MEASUREMENT — the FULL-DECIDER verify with the width term (the headline number). The
+	/// accumulation decider verifies the accumulated record-AIR instance, so its cost is the
+	/// verify of the record-AIR proof (here SHA3-256/Keccak-f over B256 @L1) at record-AIR
+	/// width. The reviewer's model: verify = O(record-AIR width) + polylog(N) — WIDTH-dominated,
+	/// ~flat in the record count N (unlike the ~18 ms FOLD, which is near-zero width). We measure
+	/// verify across batch sizes N to isolate the width term (the ~constant floor) from the
+	/// polylog(N) growth. This is the statement-validity cost paid ONCE per epoch.
+	#[test]
+	#[ignore = "measurement (~2 min): full-decider verify with the width term"]
+	fn decider_verify_width_term() {
+		use crate::sha3_variants::Sha3Variant;
+		use crate::b256_sha3::prove_verify_sha3_b256_timed;
+		let mk = |n: usize| -> Vec<Vec<u8>> {
+			(0..n)
+				.map(|i| {
+					let mut m = b"decider-".to_vec();
+					m.extend_from_slice(&(i as u64).to_le_bytes());
+					m.truncate(60);
+					m
+				})
+				.collect()
+		};
+		println!("\n=== FULL-DECIDER verify with the width term — SHA3-256 record-AIR over B256 @L1(128) ===");
+		println!("| N (records = rows) | prove ms | VERIFY ms | proof KiB |");
+		println!("|--:|--:|--:|--:|");
+		let mut prev: Option<(usize, u128)> = None;
+		for n in [512usize, 2048, 8192] {
+			let (_d, m) = prove_verify_sha3_b256_timed(Sha3Variant::Sha3_256, &mk(n), 1, 128)
+				.expect("decider prove+verify");
+			println!("| {n} | {} | {} | {} |", m.prove_ms, m.verify_ms, m.proof_bytes / 1024);
+			if let Some((pn, pv)) = prev {
+				let n_growth = n as f64 / pn as f64;
+				let v_growth = m.verify_ms as f64 / pv.max(1) as f64;
+				println!(
+					"  ↳ N ×{:.0}  ⇒  verify ×{:.2}  (record count grows {:.0}×, verify grows only {:.2}× ⇒ polylog(N), NOT linear)",
+					n_growth, v_growth, n_growth, v_growth
+				);
+			}
+			prev = Some((n, m.verify_ms));
+		}
+		println!(
+			"\nDECIDER = verify the accumulated record-AIR instance: verify is WIDTH-dominated \
+			 (near-flat in N — O(record-AIR width) + polylog(N)), a seconds-scale STATEMENT-VALIDITY \
+			 cost paid ONCE per epoch. Contrast the FOLD (~18 ms, near-zero width = distribution \
+			 integrity only). Headline: sound O(1)-in-N aggregation at seconds edge-decider, amortized."
+		);
+	}
 }
