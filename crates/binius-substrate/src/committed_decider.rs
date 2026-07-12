@@ -1,6 +1,7 @@
 // committed_decider.rs — a REAL, MEASURED FRI-Binius committed-multilinear evaluation
-// opening over B256 (the DNS-STARK challenge/extension field). This turns the previously
-// MODELED committed-decider numbers into MEASURED ones:
+// opening across all three NIST levels — L1: B256 @ security_bits 128, L3: B256 @ 192,
+// L5: B512 @ 256 (the DNS-STARK challenge/extension fields). This turns the previously
+// MODELED committed-decider numbers into MEASURED ones (and retires the L5 extrapolation):
 //
 //   * commit a random multilinear P over F = B256 with the standalone FRI-Binius PCS
 //     (`binius_core::piop`, NOT `constraint_system`),
@@ -47,17 +48,27 @@ use binius_core::{
 	transparent::eq_ind::EqIndPartialEval,
 };
 
-use crate::b256_field::{B256 as F, U256};
+use crate::b256_field::{B256, U256};
+use crate::b512_field::{B512, U512};
 use crate::b256_sha3::peak_rss_bytes;
 
-// The crate's proven B256 FRI types.
-type P = PackedType<U256, F>; // width-1: B256 is its own packed field
-type FEncode = BinaryField32b; // 32-bit Reed–Solomon alphabet
-type FDomain = BinaryField8b; // sumcheck evaluation domain (B256: ExtensionField<B8>)
+// Shared RS/domain sub-fields — identical across levels; only F (challenge/extension field)
+// and security_bits change. B256/B512 both hold ExtensionField<B8> and ExtensionField<B32>,
+// so FEncode = B32 (the 32-bit Reed–Solomon alphabet) and FDomain = B8 (sumcheck evaluation
+// domain) are valid at both L1/L3 (B256) and L5 (B512).
+type FEncode = BinaryField32b;
+type FDomain = BinaryField8b;
 
-/// One measured row of the committed-decider evaluation-opening sweep.
+// The width-1 packed types (B256/B512 are each their own packed field over U256/U512).
+type F1 = B256; // L1 & L3
+type P1 = PackedType<U256, F1>;
+type F5 = B512; // L5
+type P5 = PackedType<U512, F5>;
+
+/// One measured row of the committed-decider evaluation-opening sweep at a fixed NIST level.
 #[derive(Debug, Clone, Copy)]
 pub struct CDecRow {
+	pub security_bits: usize,
 	pub n_vars: usize,
 	pub domain_size: u64, // 2^n_vars
 	pub commit_ms: f64,
@@ -69,162 +80,182 @@ pub struct CDecRow {
 	pub tamper_rejects: bool,
 }
 
-/// Build a random committed multilinear over F = B256 with `n_vars` variables, commit it with
-/// FRI-Binius, open it at a random point via one PIOP sumcheck claim (transparent = eq(point,·)),
-/// verify the opening, and also confirm a tampered claimed evaluation is REJECTED. Returns the
-/// measured metrics. Panics if the honest open/verify fails (that would be a real bug).
-fn measure_one(n_vars: usize, seed: u64) -> CDecRow {
-	let mut rng = StdRng::seed_from_u64(seed);
+/// A labelled measured row: (NIST level, field name, metrics).
+pub type LabelledRow = (&'static str, &'static str, CDecRow);
 
-	// --- committed multilinear P over B256 (2^n_vars evals; width-1 ⇒ one packed elem/eval) ---
-	let evals: Vec<P> = (0..(1usize << n_vars))
-		.map(|_| <P as PackedField>::random(&mut rng))
-		.collect();
-	let poly = MultilinearExtension::new(n_vars, evals).unwrap();
-	let committed_multilins = vec![MLEDirectAdapter::from(poly.clone())];
+// One committed-multilinear evaluation-opening measurement over concrete field types.
+// A macro (not a generic fn) so each level's body compiles with fully-inferred concrete types
+// — the piop generics are finicky, and this reuses the exact wiring proven at L1 verbatim.
+//
+//   $F   = challenge/extension field (B256 or B512)
+//   $P   = its width-1 packed type
+//   $nvars, $sec, $seed = polynomial size, security_bits, RNG seed
+macro_rules! measure_cdec {
+	($F:ty, $P:ty, $nvars:expr, $sec:expr, $seed:expr) => {{
+		let n_vars: usize = $nvars;
+		let security_bits: usize = $sec;
+		let mut rng = StdRng::seed_from_u64($seed);
 
-	// --- FRI params: single committed poly of n_vars, 128-bit security, blowup 2 ---
-	let commit_meta = CommitMeta::with_vars([n_vars]);
-	let merkle_prover =
-		BinaryMerkleTreeProver::<F, Sha256, _>::new(Sha256Compression::default());
-	let merkle_scheme = merkle_prover.scheme();
-	let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
-		&commit_meta,
-		merkle_scheme,
-		128, // security_bits
-		1,   // log_inv_rate (blowup = 2)
-	)
-	.unwrap();
-	let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
-	let backend = make_portable_backend();
+		// committed multilinear P (2^n_vars evals; width-1 ⇒ one packed elem/eval)
+		let evals: Vec<$P> = (0..(1usize << n_vars))
+			.map(|_| <$P as PackedField>::random(&mut rng))
+			.collect();
+		let poly = MultilinearExtension::<$P>::new(n_vars, evals).unwrap();
+		let committed_multilins = vec![MLEDirectAdapter::from(poly)];
 
-	// --- COMMIT (timed) ---
-	let t = Instant::now();
-	let CommitOutput {
-		commitment,
-		committed,
-		codeword,
-	} = commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
-	let commit_ms = t.elapsed().as_secs_f64() * 1e3;
-
-	// --- opening point ∈ F^n_vars and eq(point, ·) transparent ---
-	let point: Vec<F> = (0..n_vars).map(|_| <F as Field>::random(&mut rng)).collect();
-	let eq = EqIndPartialEval::<F>::new(point.clone());
-	let eq_mle: MultilinearExtension<P, _> = eq.multilinear_extension::<P, _>(&backend).unwrap();
-	// Transparent must be the SAME M type as the committed multilinears for `prove`.
-	let eq_mle_owned = MultilinearExtension::new(eq_mle.n_vars(), eq_mle.evals().to_vec()).unwrap();
-	let transparent_multilins = vec![MLEDirectAdapter::from(eq_mle_owned.clone())];
-
-	// value = P(point) = Σ_v P(v)·eq(point,v)  — the honest inner product over the hypercube.
-	let value: F = (0..(1usize << n_vars))
-		.map(|v| {
-			committed_multilins[0].evaluate_on_hypercube(v).unwrap()
-				* transparent_multilins[0].evaluate_on_hypercube(v).unwrap()
-		})
-		.sum();
-
-	let claim = PIOPSumcheckClaim::<F> {
-		n_vars,
-		committed: 0,
-		transparent: 0,
-		sum: value,
-	};
-	let claims = vec![claim];
-
-	// --- OPEN / PROVE (timed) ---
-	let domain_factory = DefaultEvaluationDomainFactory::<FDomain>::default();
-	let mut proof = ProverTranscript::<HasherChallenger<Sha256>>::new();
-	proof.message().write(&commitment);
-
-	let t = Instant::now();
-	prove(
-		&fri_params,
-		&ntt,
-		&merkle_prover,
-		domain_factory,
-		&commit_meta,
-		committed,
-		&codeword,
-		&committed_multilins,
-		&transparent_multilins,
-		&claims,
-		&mut proof,
-		&backend,
-	)
-	.unwrap();
-	let open_prove_ms = t.elapsed().as_secs_f64() * 1e3;
-
-	// Peak RSS is a process high-water mark; sample right after the prover (the memory-dominant
-	// phase — codeword LDE + Merkle trees).
-	let peak_rss_bytes = peak_rss_bytes();
-
-	// The transparent for VERIFY is the eq-indicator as a `&dyn MultivariatePoly<F>`.
-	let eq_dyn: &dyn MultivariatePoly<F> = &eq;
-	let transparents: Vec<&dyn MultivariatePoly<F>> = vec![eq_dyn];
-
-	// Serialize the proof to bytes (measures proof size) and rebuild verifier transcripts from it.
-	let proof_bytes_vec = proof.finalize();
-	let proof_bytes = proof_bytes_vec.len();
-
-	// --- VERIFY (timed): honest opening must ACCEPT ---
-	let t = Instant::now();
-	{
-		let mut vproof = VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec.clone());
-		let commitment_v = vproof.message().read().unwrap();
-		verify(
+		// FRI params: single committed poly of n_vars, `security_bits` security, blowup 2
+		let commit_meta = CommitMeta::with_vars([n_vars]);
+		let merkle_prover =
+			BinaryMerkleTreeProver::<$F, Sha256, _>::new(Sha256Compression::default());
+		let merkle_scheme = merkle_prover.scheme();
+		let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
 			&commit_meta,
 			merkle_scheme,
+			security_bits,
+			1, // log_inv_rate (blowup = 2)
+		)
+		.unwrap();
+		let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
+		let backend = make_portable_backend();
+
+		// COMMIT (timed)
+		let t = Instant::now();
+		let CommitOutput { commitment, committed, codeword } =
+			commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
+		let commit_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// opening point ∈ F^n_vars and eq(point, ·) transparent
+		let point: Vec<$F> = (0..n_vars).map(|_| <$F as Field>::random(&mut rng)).collect();
+		let eq = EqIndPartialEval::<$F>::new(point);
+		let eq_mle: MultilinearExtension<$P, _> =
+			eq.multilinear_extension::<$P, _>(&backend).unwrap();
+		// Transparent must be the SAME M type as the committed multilinears for `prove`.
+		let eq_mle_owned =
+			MultilinearExtension::<$P>::new(eq_mle.n_vars(), eq_mle.evals().to_vec()).unwrap();
+		let transparent_multilins = vec![MLEDirectAdapter::from(eq_mle_owned)];
+
+		// value = P(point) = Σ_v P(v)·eq(point,v)  — the honest hypercube inner product.
+		let value: $F = (0..(1usize << n_vars))
+			.map(|v| {
+				committed_multilins[0].evaluate_on_hypercube(v).unwrap()
+					* transparent_multilins[0].evaluate_on_hypercube(v).unwrap()
+			})
+			.sum();
+		let claims = vec![PIOPSumcheckClaim::<$F> {
+			n_vars,
+			committed: 0,
+			transparent: 0,
+			sum: value,
+		}];
+
+		// OPEN / PROVE (timed)
+		let domain_factory = DefaultEvaluationDomainFactory::<FDomain>::default();
+		let mut proof = ProverTranscript::<HasherChallenger<Sha256>>::new();
+		proof.message().write(&commitment);
+		let t = Instant::now();
+		prove(
 			&fri_params,
-			&commitment_v,
-			&transparents,
+			&ntt,
+			&merkle_prover,
+			domain_factory,
+			&commit_meta,
+			committed,
+			&codeword,
+			&committed_multilins,
+			&transparent_multilins,
 			&claims,
-			&mut vproof,
+			&mut proof,
+			&backend,
 		)
-		.expect("honest committed-decider evaluation opening must verify");
-	}
-	let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+		.unwrap();
+		let open_prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
-	// --- TAMPER: corrupt the claimed evaluation (value + 1); verify MUST reject ---
-	let tampered_claims = vec![PIOPSumcheckClaim::<F> {
-		n_vars,
-		committed: 0,
-		transparent: 0,
-		sum: value + F::ONE,
-	}];
-	let tamper_rejects = {
-		let mut vproof = VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec);
-		let commitment_v = vproof.message().read().unwrap();
-		verify(
-			&commit_meta,
-			merkle_scheme,
-			&fri_params,
-			&commitment_v,
-			&transparents,
-			&tampered_claims,
-			&mut vproof,
-		)
-		.is_err()
-	};
+		// Peak RSS is a process high-water mark; sample right after the prover.
+		let peak_rss_bytes = peak_rss_bytes();
 
-	CDecRow {
-		n_vars,
-		domain_size: 1u64 << n_vars,
-		commit_ms,
-		open_prove_ms,
-		verify_ms,
-		proof_bytes,
-		peak_rss_bytes,
-		tamper_rejects,
-	}
+		let eq_dyn: &dyn MultivariatePoly<$F> = &eq;
+		let transparents: Vec<&dyn MultivariatePoly<$F>> = vec![eq_dyn];
+
+		let proof_bytes_vec = proof.finalize();
+		let proof_bytes = proof_bytes_vec.len();
+
+		// VERIFY (timed): honest opening must ACCEPT
+		let t = Instant::now();
+		{
+			let mut vproof =
+				VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec.clone());
+			let commitment_v = vproof.message().read().unwrap();
+			verify(
+				&commit_meta,
+				merkle_scheme,
+				&fri_params,
+				&commitment_v,
+				&transparents,
+				&claims,
+				&mut vproof,
+			)
+			.expect("honest committed-decider evaluation opening must verify");
+		}
+		let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// TAMPER: corrupt the claimed evaluation (value + 1); verify MUST reject.
+		let tampered_claims = vec![PIOPSumcheckClaim::<$F> {
+			n_vars,
+			committed: 0,
+			transparent: 0,
+			sum: value + <$F as Field>::ONE,
+		}];
+		let tamper_rejects = {
+			let mut vproof =
+				VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec);
+			let commitment_v = vproof.message().read().unwrap();
+			verify(
+				&commit_meta,
+				merkle_scheme,
+				&fri_params,
+				&commitment_v,
+				&transparents,
+				&tampered_claims,
+				&mut vproof,
+			)
+			.is_err()
+		};
+
+		CDecRow {
+			security_bits,
+			n_vars,
+			domain_size: 1u64 << n_vars,
+			commit_ms,
+			open_prove_ms,
+			verify_ms,
+			proof_bytes,
+			peak_rss_bytes,
+			tamper_rejects,
+		}
+	}};
 }
 
-/// Run the committed-decider evaluation-opening sweep and return one measured row per n_vars.
-pub fn committed_decider_measure(n_vars_sweep: &[usize]) -> Vec<CDecRow> {
-	n_vars_sweep
-		.iter()
-		.enumerate()
-		.map(|(i, &n)| measure_one(n, 0xC0FFEE + i as u64))
-		.collect()
+/// Measure the committed-decider evaluation opening across NIST levels L1/L3/L5 for the same
+/// n_vars sweep, returning one labelled row per (level, n_vars):
+///   L1 = B256 @ security_bits 128,  L3 = B256 @ 192,  L5 = B512 @ 256.
+/// The Merkle/Fiat–Shamir hash is Sha256 uniformly across levels so the table isolates the
+/// field/security_bits effect on the eval-opening cost curve (the κ_bind SHA3-ladder is an
+/// orthogonal concern handled elsewhere in the crate).
+pub fn committed_decider_measure_all(n_vars_sweep: &[usize]) -> Vec<LabelledRow> {
+	let mut out: Vec<LabelledRow> = Vec::new();
+	for (i, &n) in n_vars_sweep.iter().enumerate() {
+		let s = 0xC0FFEE + i as u64;
+		out.push(("L1", "B256", measure_cdec!(F1, P1, n, 128, s)));
+	}
+	for (i, &n) in n_vars_sweep.iter().enumerate() {
+		let s = 0xB33F + i as u64;
+		out.push(("L3", "B256", measure_cdec!(F1, P1, n, 192, s)));
+	}
+	for (i, &n) in n_vars_sweep.iter().enumerate() {
+		let s = 0x5A1AD + i as u64;
+		out.push(("L5", "B512", measure_cdec!(F5, P5, n, 256, s)));
+	}
+	out
 }
 
 #[cfg(test)]
@@ -234,13 +265,16 @@ mod tests {
 	#[test]
 	fn committed_decider_opening() {
 		let sweep = [10usize, 14, 18];
-		let rows = committed_decider_measure(&sweep);
+		let rows = committed_decider_measure_all(&sweep);
 		println!(
-			"| n_vars | 2^n_vars | commit ms | open-prove ms | VERIFY ms | proof KiB | peak RSS MiB | tamper? |"
+			"| level | field | sec | n_vars | 2^n_vars | commit ms | open-prove ms | VERIFY ms | proof KiB | peak RSS MiB | tamper? |"
 		);
-		for r in &rows {
+		for (level, field, r) in &rows {
 			println!(
-				"| {} | {} | {:.2} | {:.2} | {:.2} | {} | {:.1} | {} |",
+				"| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {} | {:.1} | {} |",
+				level,
+				field,
+				r.security_bits,
 				r.n_vars,
 				r.domain_size,
 				r.commit_ms,
@@ -250,7 +284,10 @@ mod tests {
 				r.peak_rss_bytes as f64 / (1024.0 * 1024.0),
 				if r.tamper_rejects { "REJECT" } else { "ACCEPT(BUG)" },
 			);
-			assert!(r.tamper_rejects, "tampered evaluation must be rejected");
+			assert!(
+				r.tamper_rejects,
+				"tampered evaluation must be rejected at {level} ({field})"
+			);
 		}
 	}
 }
