@@ -498,6 +498,25 @@ record-AIR (SHA3/Keccak) constraints on the accumulated instance — that is the
 verify (**~9–13 s, ~1.15 GiB**, unchanged), which the opening dominates *within*. The opening being
 ~10 ms confirms the FRI layer is cheap and P opens; the AIR-constraint check remains the ~9–13 s.
 
+**Committed-decider opening across L1/L3/L5 (the level-dependent hop, measured — retires the 4.4×
+extrapolation).** The opening is the one genuinely level-dependent pipeline hop (fold is native,
+barrier + µs path are hashing). Measured (`committed_decider`, verify flat-in-domain within each
+level):
+
+| level | field | sec | verify (n_vars 10→18) | open-prove | proof |
+|:--|:--|:--:|:--|:--|:--|
+| **L1** | B256 | 128 | **7.7–10.9 ms** | 5–339 ms | 241–556 KiB |
+| **L3** | B256 | 192 | **8.8–16.0 ms** | 3–341 ms | 357–806 KiB |
+| **L5** | B512 | 256 | **40.2–68.7 ms** | 7–1301 ms | 936–1820 KiB |
+
+The level-to-level verify step (L1→L3 ~1.4×, **L3→L5 ~4–5×**) is driven by FRI query count
+(`security_bits`) + the 2× wider B512 field — *not* domain size — so the **~4.4× field-tax
+multiplier for the opening hop is now measured, not extrapolated**. Tamper rejected at all 9
+(level × n_vars) points. *Caveat:* the challenger hash is `Sha256` uniform across levels here to
+**isolate the field/security effect** on the opening cost — so these L3/L5 opening numbers carry a
+128-bit `κ_FS`; the SHA3 challenger ladder (mechanism proven, rollout pending) is the orthogonal
+`κ_FS` fix, tracked in the remaining surface.
+
 **The decider-prove decomposition (why the hybrid removes the bottleneck).** The two native
 numbers below (value check + fold-verify path) are *not* the committed decider — the committed
 decider is the FRI-opening of the `R*`-committed interleaved P at `root.point`.
