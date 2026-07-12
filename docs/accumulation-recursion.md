@@ -122,15 +122,21 @@ batching is simpler. Both live in this branch.
 records under ONE interleaved commitment; whether that commit streams at low RSS (interleave-on-the-
 fly) is the "commit the batch cheaply" problem the sliver work attacks (measured flat, `stream_commit
 _rss_vs_n`; the publisher answer is C-per-batch + a balanced fold tree, fleet-parallel). (b) The
-statement-validity decider is width-dominated seconds — amortized once per epoch (O(1) in N,
-polylog-in-N-rows), µs steady-state after — but *not* the O(1)-ms first-contact verify the earlier
-framing implied.
+statement-validity decider is width-dominated seconds — amortized once per epoch (the *fold* is
+O(1) in the instance count; the *decider* is **polylog in N**), µs steady-state after — but *not*
+the O(1)-ms first-contact verify the earlier framing implied.
 
 ## Honesty / risks
 - Binius has **no accumulation today**; this is a from-scratch construction over binary
   fields + hash commitments. The non-homomorphism wall is real — A/B give `O(N)`-cheap,
   not `O(1)`, unless a homomorphic-ish commitment is introduced (out of scope: would
   break the hash-based/FIPS posture).
-- ROI vs Option 1: accumulation buys a *faster first-contact verify*; Option 1 already
-  wins steady-state. Worth it only if sub-second first-contact matters, or as a
-  standalone "accumulation over binius" result.
+- ROI vs Option 1: accumulation buys a *first-contact verify that is faster than N×
+  per-record re-verification* (one polylog-in-N decider + O(leaves) fold instead of N
+  Layer-1 proofs). **This is not "fast" in absolute terms** — as
+  [`dns-epoch-nist-level-splits.md`](./dns-epoch-nist-level-splits.md) states plainly, the
+  win is **never first-contact** against a warm DNS cache (that regime is wash-to-loss); the
+  real win is steady-state amortization + polylog-in-N aggregation. "Faster first-contact"
+  here means *relative to re-verifying every record*, not *relative to a cache*. Worth it as a
+  standalone "sound polylog-in-N aggregation over binius" result, or if sub-N×-cost
+  first-contact matters.

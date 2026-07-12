@@ -157,7 +157,8 @@ layer it describes checks.
 
 Layer 1 and Layer 2 below are exactly the two stages of this flow: Layer 1 is
 the per-record S-layer proof (seconds, paid once at publish — the table above);
-Layer 2 is the accumulator + epoch verify (O(1) in N).
+Layer 2 is the accumulator + epoch verify (**fold: O(1) in instance count / O(leaves)
+in the tree; decider: polylog in N**).
 
 ### Why it is secure — three independent guarantees
 
@@ -179,9 +180,9 @@ assumption on the soundness path.
 > **Which check earns which claim (the fold/decider distinction).** *Statement
 > validity* — "no adversary can make `Π` attest to a record whose AIR constraints
 > don't hold" — is earned only by the **full decider** (verify (b): pays record-AIR
-> width, O(1) in N, sub-second–seconds). The **sub-second fold check (O(leaves))** (verify (a))
+> width, **polylog in N**, seconds). The **sub-second fold check (O(leaves))** (verify (a))
 > earns only *distribution integrity* (fold-correctness + anti-substitution vs a
-> publisher-constructed `R*`). Do not attribute validity to the 18 ms layer, and do
+> publisher-constructed `R*`). Do not attribute validity to the fold layer, and do
 > not treat "Layer-1 verified prover-side" as repair — a prover checking its own
 > proof is not a soundness event for the edge. An edge that runs (a) only gets a
 > *correctly-folded commitment to a publisher-chosen record set*; an edge that also
@@ -204,7 +205,8 @@ substituted, added, or dropped**, *and* the surviving records' constraints hold;
 running the fold check **alone** gives the first (anti-substitution) but **not**
 the second — that is the decider's job. Every µs lookup is a SHA-3 Merkle path back
 to the *proven* root; adding records changes `R*` and needs a new `Π`. This is the
-O(1)-in-N win; it is PQ for the same reason as (1).
+**polylog-in-N aggregation win** (fold O(1) in instance count, decider polylog in N —
+never re-verified per record at steady state); it is PQ for the same reason as (1).
 
 **Component × level × hash (the single source of truth for κ_sys).**
 
@@ -225,7 +227,7 @@ the *shipped* epoch prover, the combined artifact's L3/L5 label is still 128-epo
 the current binaries*, but the soundness path to real L3/L5 is demonstrated, not conjectural.
 
 **Edge protocol (three tiers — the amortization shape).** On fetching the epoch package the
-resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, O(1) in N)
+resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, polylog in N)
 and (2) the **fold** (distribution integrity, O(leaves), sub-second). Thereafter, **per DNS request**,
 (3) a **µs SHA-3 Merkle-path** check of the record against the already-verified `R*` — not a
 proof re-verification. So the expensive validity proof is paid once; every lookup in the epoch is
@@ -283,40 +285,55 @@ then amortized away. It is not on the steady-state path.
 
 ### Layer 2 — the epoch verify over N records (accumulation)
 
-What the accumulator buys is that the **edge verifier's work is O(1) in the
-number of records N**, not O(N):
+What the accumulator buys, stated with the fold/decider distinction kept sharp
+(the whole edge cost is verify-once-per-epoch, then µs per record):
+
+* **Fold** (distribution integrity): **O(1) in the instance count N** / O(leaves)
+  in the tree — adding records does not add fold-verify work beyond the leaf-row
+  hashing. This is the sub-second check (1.76 ms @16 → ~340 ms @2930).
+* **Decider** (statement validity): **polylog in N**, seconds — it pays the
+  record-AIR width once (`+0.85 s/doubling`, ~19–20 s at `.se` scale). Polylog,
+  **not O(1)** and **not ms**.
 
 * **Without accumulation**, verifying an epoch of N records recursively means
   re-verifying N per-record proofs — N × (Layer-1 seconds) ⇒ minutes-to-hours
   for a real zone.
 * **With accumulation**, the N per-record proofs are *folded into one
-  accumulator instance during proving*. The edge verifier checks **one**
-  aggregated proof against the interleaved-commit Merkle root `R*` — constant
-  in N (~18 ms in this demo, tied to the Merkle lookup tree). Any individual
-  record then resolves via a ~1.3 µs Merkle path against the verified root.
+  accumulator instance during proving*. The edge verifier runs the decider
+  (polylog-in-N seconds) + fold (O(leaves) sub-second) against the
+  interleaved-commit Merkle root `R*` **once per epoch**. Any individual record
+  then resolves via a ~1.3 µs Merkle path against the verified root.
 
 This works precisely because accumulation arithmetizes the **narrow fold-verify
-(~48 ms)**, *not* the wide FRI/hash-verify.
+(~48 ms native)** for the distribution-integrity check, *not* the wide
+FRI/hash-verify — but statement validity still pays the wide record-AIR in the
+decider.
 
-> **Caveat — don't over-read the ~18 ms.** That figure is the aggregation /
-> fold layer, *not* a from-scratch in-circuit re-verification of the FIPS-hash
-> op-table. A fully assembled recursive verify that re-checks the wide FIPS hash
-> in-circuit is still seconds (~12 s Keccak / ~minute SHA-256 at recursion
-> scale). "ms verify" holds for the fold layer and the steady-state Merkle
-> lookups — not for re-proving the FIPS hashes from scratch.
+> **Caveat — don't over-read the fold's sub-second number.** The fold figure is
+> the aggregation / distribution-integrity layer, *not* statement validity and
+> *not* a from-scratch in-circuit re-verification of the FIPS-hash op-table. The
+> decider that earns validity re-checks the wide record-AIR and is seconds
+> (~9–13 s L1 / ~41 s L5, polylog in N; a fully assembled in-circuit
+> re-verification of the FIPS hash is ~12 s Keccak / ~minute SHA-256 at recursion
+> scale). "Sub-second verify" holds for the fold layer and the steady-state
+> Merkle lookups — **not** for the decider and **not** for re-proving the FIPS
+> hashes from scratch.
 
 ### Net effect
 
 * The win is **never first-contact** (fetch + verify) — that regime is a
   wash-to-loss vs a warm DNS cache.
-* The win is **(a) O(1) scaling in N** — adding more DNS records to the epoch
-  costs the edge verifier nothing extra — **and (b) steady-state amortization**
-  — verify the epoch once, then serve every record with a ~1.3 µs local
-  Merkle-path check.
+* The win is **(a) polylog-in-N aggregation** — the fold is O(1) in the instance
+  count and the decider is polylog in N (the epoch is verified *once*, never
+  re-verified per record), so adding DNS records costs the edge only the
+  decider's polylog term, not N× per-record re-verification — **and (b)
+  steady-state amortization** — verify the epoch once, then serve every record
+  with a ~1.3 µs local Merkle-path check.
 
-In one line: the accumulator means *"more records cost the verifier nothing
-extra, and after the first verify every lookup is µs"* — **not** *"the FIPS-hash
-proof now verifies in milliseconds."* See
+In one line: the accumulator means *"the epoch is verified once (decider polylog
+in N, fold O(leaves) sub-second) and thereafter every lookup is µs"* — **not**
+*"the FIPS-hash proof now verifies in milliseconds"* and **not** *"O(1) in N."*
+See
 [`docs/accumulation-recursion.md`](./accumulation-recursion.md).
 
 ## Runnable `.se` epoch demo (real ECDSA-P256 RRSIGs + Merkle + proofs)
@@ -341,8 +358,10 @@ signing input rejected; every in-circuit digest == the native Merkle leaf;
 sampled membership auth-paths verify + a record-not-in-epoch rejected;
 per-record in-circuit proof 608 KiB / prove 2456 ms / verify 9317 ms / RSS
 0.13 GiB; Merkle tree depth 8; epoch proof 588 KiB / prove 921 ms / **edge
-verify 81 ms, O(1) in N**; steady-state lookup ~1.8 µs. Flip `Sha3Level` for
-L3 / L5.
+fold-layer verify 81 ms at N=256** (this is the aggregation / fold-layer number,
+O(leaves), *not* statement validity and *not* O(1) in N — the full decider that
+earns validity pays the record-AIR width, ~9–13 s at L1, polylog in N);
+steady-state lookup ~1.8 µs. Flip `Sha3Level` for L3 / L5.
 
 > The signature check is **native-pending-in-circuit**; everything downstream of
 > the signed message (commitment, aggregation, lookup) is in-circuit /
@@ -435,7 +454,13 @@ and a batch instance *is* an eval claim — so the existing fold admits batch le
 | Batch proves (fleet, ∥ across proofs) | ~1.15 GiB each, bounded | bounded |
 | Fold **chain** (sequential) | ~144 s | ~38 min |
 | Fold **balanced tree** (∥, log-depth critical path) | **~6 s** (depth 8) | **~9 s** (depth 12) |
-| Edge decider (batch-width) | ~9–13 s, O(1) in leaves | ~9–13 s |
+| Edge decider (batch-width) | ~9–13 s, O(1) in **leaves** | ~9–13 s |
+
+**"O(1) in leaves" ≠ "O(1) in N."** The decider cost is set by the batch *width* it opens,
+so adding *batches* (leaves of the fold tree) does not move it — it is flat in the number of
+leaves. It is **not** flat in the record count N: N grows the decider's polylog term (each
+doubling of N adds ~0.85 s) even at fixed batch count. Keep these separate — "O(1) in leaves"
+is the defensible fold-tree claim; the decider is **polylog in N**.
 
 The fold **chain** is O(leaves) sequential; a balanced fold **tree** is O(leaves) total
 work but **log-depth critical path**, with the *same* cross-proof fleet-parallelism as the

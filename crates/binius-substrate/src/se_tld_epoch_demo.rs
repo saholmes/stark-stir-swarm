@@ -1,6 +1,6 @@
 // se_tld_epoch_demo — a COMPLETE, demonstrable `.se` TLD epoch: real delegations, real
 // ECDSA-P256 RRSIGs, the SHA-3 Merkle lookup tree, in-circuit proofs, and the aggregated
-// recursive-STARK epoch proof with O(1)-in-N edge verify + µs membership lookups.
+// recursive-STARK epoch proof with polylog-in-N edge decider + O(leaves) fold + µs membership lookups.
 //
 // This is the `.se`-scale sibling of `dns_epoch_demo`. It uses REAL `.se` domain names
 // (Tranco) and drives the full DNSSEC delegation unit end to end:
@@ -19,7 +19,7 @@
 //     • the FIPS commitment leaf_i = SHA3-N(m32_i) is proved FULLY IN-CIRCUIT (b256/b512
 //       SHA3 gadget, gated == native), then
 //     • all N leaves are committed into the SHA-3 Merkle tree R* and the aggregated epoch
-//       proof, giving O(1)-in-N edge verify + µs membership lookups.
+//       proof, giving polylog-in-N edge decider + O(leaves) fold + µs membership lookups.
 //   So the signature check is native-pending-in-circuit; everything downstream of the
 //   signed message (commitment, aggregation, lookup) is in-circuit / cryptographic. Swapping
 //   the native ECDSA verify for the assembled S2 gadget is the only remaining upgrade.
@@ -146,7 +146,7 @@ pub struct SeEpochReport {
 	pub tree_depth: usize,
 	pub sample_lookups: Vec<(String, bool)>, // (name, membership-path verified)
 	pub tampered_leaf_rejected: bool,
-	// the aggregated recursive-STARK epoch proof (O(1)-in-N edge verify).
+	// the aggregated recursive-STARK epoch proof (polylog-in-N decider + O(leaves) fold, verified once per epoch).
 	pub epoch_prove_ms: u128,
 	pub epoch_verify_ms: u128,
 	pub epoch_proof_bytes: usize,
@@ -288,7 +288,7 @@ mod tests {
 
 	/// DEMO — a complete `.se` TLD epoch: real Tranco delegations, real ECDSA-P256 RRSIGs
 	/// (native verify), the SHA-3 Merkle lookup tree, the FIPS commitment proved in-circuit,
-	/// and the aggregated recursive STARK with O(1)-in-N edge verify + µs membership lookups.
+	/// and the aggregated recursive STARK with polylog-in-N edge decider + O(leaves) fold + µs membership lookups.
 	#[test]
 	#[ignore = "demonstration (~15s L1): complete .se TLD epoch, real ECDSA RRSIGs + Merkle + proofs"]
 	fn se_tld_epoch_end_to_end() {
