@@ -211,6 +211,43 @@ mod tests {
 		);
 	}
 
+	/// MEASUREMENT — the INTERLEAVE-PASS BARRIER (reviewer): making the interleaved root canonical
+	/// means it doesn't exist until every batch codeword is done, so leaf-claim finalization sits
+	/// behind a barrier — a second streaming pass over all codewords to build the interleaved tree,
+	/// bounded-RSS (one cross-batch coset buffered at a time). Measure its wall-clock throughput and
+	/// extrapolate to `.se`; this number belongs in the under-a-minute publish claim, and the fold
+	/// tree cannot start until it completes.
+	#[test]
+	#[ignore = "measurement (~40 s): interleave-pass barrier wall-clock (canonical-root build)"]
+	fn interleave_barrier_wallclock() {
+		use std::time::Instant;
+		let codeword_len = 256usize;
+		let coset_log = 3usize;
+		println!("\n=== interleave-pass barrier: canonical R* build, bounded-RSS single stream ===");
+		println!("| N records | total symbols | wall ms | Msym/s |");
+		let mut rate = 0f64;
+		for n in [65536usize, 262144] {
+			let t = Instant::now();
+			let _ = streaming_interleaved_root(n, codeword_len, coset_log, sym);
+			let ms = t.elapsed().as_secs_f64() * 1000.0;
+			let syms = (codeword_len * n) as f64;
+			rate = syms / 1e6 / (ms / 1000.0);
+			println!("| {} | {:.1}M | {:.0} | {:.2} |", n, syms / 1e6, ms, rate);
+		}
+		let se_syms = 1_500_000f64 * codeword_len as f64;
+		let se_s = se_syms / 1e6 / rate;
+		println!(
+			"# BARRIER: build the canonical interleaved root R* over ALL batch codewords, ONE cross-batch \
+			 coset buffered at a time (bounded RSS ~KB). Single-thread throughput ~{:.2} Msym/s ⇒ .se \
+			 (1.5 M records × {} codeword = {:.0} M symbols) ≈ {:.0} s single-machine. It SHARDS: cosets \
+			 hash independently + the Merkle build is log-depth ⇒ fleet-parallel to ~seconds (same \
+			 cross-proof parallelism as the batch proves; NO intra-proof rayon needed — it's plain \
+			 hashing). Publisher timeline: batch proves (fleet) → BARRIER (this pass) → fold tree. The \
+			 fold tree CANNOT start until R* exists, because leaf claims bind the canonical R* (below).",
+			rate, codeword_len, se_syms / 1e6, se_s
+		);
+	}
+
 	/// GATE stream-commit-sound — the streaming commit produces the SAME root as the
 	/// full-buffer reference, bit-for-bit, in binius's tree STRUCTURE (symbol-interleave,
 	/// coset leaves of size 1<<coset_log, index-parity tree) — without materializing the
