@@ -645,4 +645,68 @@ mod tests {
 			 standard batched/interleaved-FRI decomposition over the same per-batch codewords.)"
 		);
 	}
+
+	/// MEASUREMENT (reviewer's remaining term): the committed decider's VERIFY has a query-path
+	/// opening term the value-identity doesn't show — FRI queries the combined codeword at a domain
+	/// point, and the verifier needs every per-batch codeword's value there, each opened against its
+	/// sub-root. NAIVE per-batch layout ⇒ O(leaves) fold-paths per query ⇒ term GROWS with leaves
+	/// (plausibly dominates the ~9–13 s batch-scale proximity at 2930 leaves). But the shipped
+	/// `streaming_interleaved_root` SYMBOL-INTERLEAVES the batches, so one coset/path opens a
+	/// CROSS-BATCH row ⇒ O(1) opening per query ⇒ term FLAT in leaves. Measure the per-path SHA3
+	/// Merkle cost; plot verify-vs-leaves under both layouts. (FRI proximity itself is batch-scale:
+	/// all P_i share the inner variables ⇒ the combined poly lives on the batch-sized domain.)
+	#[test]
+	#[ignore = "measurement (~5 s): decider verify query-path term vs leaves (naive vs interleaved)"]
+	fn decider_verify_query_path_vs_leaves() {
+		use crate::recursion::{merkle_auth_path, merkle_path_verify, merkle_tree_sha3};
+		use sha3::{Digest, Sha3_256};
+		use std::time::Instant;
+
+		let bench_path = |tree_leaves: usize| -> f64 {
+			let leaves: Vec<[u8; 32]> = (0..tree_leaves)
+				.map(|i| { let mut h = Sha3_256::new(); h.update((i as u64).to_le_bytes()); h.finalize().into() })
+				.collect();
+			let tree = merkle_tree_sha3(&leaves);
+			let root = tree.last().unwrap()[0];
+			let iters = 2000usize;
+			let t = Instant::now();
+			for k in 0..iters {
+				let idx = k % tree_leaves;
+				let path = merkle_auth_path(&tree, idx);
+				assert!(merkle_path_verify(leaves[idx], idx, &path, root));
+			}
+			t.elapsed().as_secs_f64() * 1e6 / iters as f64 // µs / path
+		};
+
+		let batch_codeword = 8192usize;
+		let fold_depth = (batch_codeword as f64).log2() as usize; // FRI openings per query
+		let n_queries = 100usize;
+		let path_us = bench_path(batch_codeword);
+		let batch_fri_ms = 11_000.0; // measured batch-scale proximity (~9–13 s @L1)
+
+		println!("\n=== decider VERIFY: query-path opening term vs leaves (per-path {:.3} µs, {} queries, fold depth {}) ===", path_us, n_queries, fold_depth);
+		println!("| batch size | leaves | NAIVE paths/q | NAIVE term | INTERLEAVED paths/q | INTERLEAVED term | decider (proximity+interleaved) |");
+		println!("|--:|--:|--:|--:|--:|--:|--:|");
+		for (bs, leaves) in [(8192usize, 184usize), (512usize, 2930usize)] {
+			let per_path_query = fold_depth as f64 * path_us; // one codeword's fold path
+			let naive_ms = n_queries as f64 * leaves as f64 * per_path_query / 1000.0;
+			let inter_ms = n_queries as f64 * per_path_query / 1000.0;
+			println!(
+				"| {} | {} | {} | {:.0} ms | 1 | {:.2} ms | {:.1} s |",
+				bs, leaves, leaves, naive_ms, inter_ms, (batch_fri_ms + inter_ms) / 1000.0
+			);
+		}
+		println!(
+			"# LABEL SETTLED: decider verify = BATCH-SCALE FRI proximity (~9–13 s @L1, batch-domain since all P_i share \
+			 inner vars) + query-path opening term. NAIVE per-batch layout: O(leaves) fold-paths/query ⇒ term grows \
+			 with leaves (SECONDS at 2930 leaves, comparable to the proximity — the reviewer's concern is real). \
+			 INTERLEAVED layout (the shipped streaming_interleaved_root: symbol-interleave ⇒ one coset opens a \
+			 cross-batch row): 1 fold-path/query ⇒ term ~ms, FLAT in leaves ⇒ decider verify leaves-INDEPENDENT \
+			 (~9–13 s). Honest label: polylog(batch) + O(queries), NOT O(leaves·queries). TWO-SIDED BATCH TRADE (a \
+			 curve, not a column): bigger batch ⇒ fewer leaves + cheaper naive term BUT higher per-machine RSS \
+			 (8192 @ 1.15 GiB vs 512 @ 0.12 GiB) — 8192 near the sweet spot. MODELED (measured per-path × modeled \
+			 query/fold counts); wiring the committed FRI decider end-to-end to measure it directly is the remaining \
+			 ENGINEERING (not discovery)."
+		);
+	}
 }
