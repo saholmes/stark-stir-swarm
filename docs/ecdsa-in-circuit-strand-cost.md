@@ -6,8 +6,13 @@ and the **measured** prover-cost wall that decides how it can be deployed.
 
 All gadgets live in
 [`crates/binius-substrate/src/ec_verify.rs`](../crates/binius-substrate/src/ec_verify.rs)
-and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
-(`<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>`).
+and prove+verify at NIST L1 (128-bit) with the FIPS-202 instantiation
+(`<U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>>`) —
+the commitment + Fiat–Shamir hash is SHA-3, uniform with the epoch/record/challenger layers (no
+SHA-2 in the commitment path). The only SHA-256 in the pipeline is the in-circuit *message-hash*
+gadget `e = SHA-256(signing_input)` — that is DNSSEC algorithm 13 and is *meant* to be SHA-256.
+Reaching L3/L5 for the individual gadgets is the same `Sha3_256 → Sha3_384/512` swap (proven
+representatively; not re-run across all sites for cost).
 
 ## TL;DR
 

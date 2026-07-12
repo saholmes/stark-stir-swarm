@@ -229,18 +229,23 @@ never re-verified per record at steady state); it is PQ for the same reason as (
   `κ_FS = κ_bind = κ_IT = 256` (prove ~1.1 s, verify ~172 ms). The L5 `κ_IT` cap is **gone**: the
   epoch AIR now runs over B512 via an in-circuit **GF(2⁵¹²) multiply** (`gf512_air::build_b512_mul`,
   nested Karatsuba `B512 = B256[w]`, gated == native `B512 *`).
-* **Epoch/EC-ECDSA challenger — proven at ALL THREE levels.**
+* **Epoch/EC-ECDSA challenger — proven at ALL THREE levels + EC gadgets SHA-3-uniform.**
   `ec_field_op_challenger_ladders_over_b256` proves the field-op challenger + commitment hash
   laddered at **L1 SHA3-256@128 (B256)**, **L3 SHA3-384@192 (B256)**, and **L5 SHA3-512@256
-  (B512, `κ_IT = 256`)**. *Sole residual:* the ~76 individual EC/ECDSA **gadget test bodies** in
-  `ec_verify.rs` still hard-code `Sha256`@128 — a purely mechanical type-param swap, **deliberately
-  not re-proven at 3 levels** (each EC round is ~695 s ⇒ ~300 core-hours for zero new information;
-  the ladder is proven on the representative field-op and the shipped epoch Π).
+  (B512, `κ_IT = 256`)**. And the ~76 individual EC/ECDSA gadget prove/verify sites in
+  `ec_verify.rs` are **now on FIPS-202 SHA-3-256** (was SHA-2 `Sha256`): the commitment +
+  Fiat–Shamir hash is `Sha3Compression<Sha3_256>` / `HasherChallenger<Sha3_256>` everywhere, so
+  **no SHA-2 remains in the EC commitment layer** — the only `Sha256` left is the in-circuit
+  *message-hash* gadget (`e = SHA-256(signing_input)`, DNSSEC alg 13, which is *supposed* to be
+  SHA-256). Verified green across gadget shapes (field add/sub, inverse, seamed mul-add, Edwards
+  point-double). Reaching L3/L5 category for each individual gadget is the identical
+  `Sha3_256 → Sha3_384/512` swap (proven representatively by the ladder gate), **deliberately not
+  re-run across all 76 sites** (~300 core-hours for zero new information).
 
-So the combined artifact's **L1, L3, AND L5 labels are now real in the shipped binaries** — record,
+So the combined artifact's **L1, L3, AND L5 labels are real in the shipped binaries** — record,
 epoch Π (B512 at L5), lookup Merkle, and challenger all laddered, `κ_sys = min(...)` reaching the
-category at every level. The only untouched surface is the individual EC gadget *test* bodies
-(mechanical, no new information).
+category at every level — and the EC gadget layer is now SHA-3 (FIPS-202) uniform with no SHA-2 in
+the commitment path. Nothing load-bearing remains.
 
 **Edge protocol (three tiers — the amortization shape).** On fetching the epoch package the
 resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, polylog in N)
@@ -697,10 +702,11 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
   the right one by level (green end-to-end), and `epoch_pi_challenger_ladders` proves the epoch Π
   at SHA3-256@128 (B256), SHA3-384@192 (B256), **and SHA3-512@256 (B512, κ_IT=256)**. So `κ_sys`
   of the merged artifact **reaches the category at every level in the shipped binaries** — the L5
-  decider is no longer wasted on a capped transcript. **Sole residual:** the ~76 individual EC
-  gadget *test bodies* still hard-code `Sha256`@128, a mechanical swap deliberately not re-proven
-  at 3 levels (~300 core-hours for no new information — the ladder is proven representatively and
-  on the shipped epoch Π).
+  decider is no longer wasted on a capped transcript. The ~76 individual EC/ECDSA gadget
+  prove/verify sites in `ec_verify.rs` are **now on FIPS-202 SHA-3-256** (was SHA-2) — no SHA-2
+  left in the EC commitment layer, verified green across gadget shapes. Reaching L3/L5 category for
+  each *individual* gadget is the identical `Sha3_256 → Sha3_384/512` swap, proven representatively
+  and deliberately not re-run across all 76 sites (~300 core-hours, no new information).
 * **✓ Width sentence + fold sweep — done.** `committed width ≈ 7000 ≠ gate width ~575`; and
   the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms was a stale
   fold-model number; the fold-verify path is O(leaves), sub-second; the decider is the ~9–13 s

@@ -1979,11 +1979,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -2080,9 +2080,9 @@ mod tests {
 			let proof = binius_core::constraint_system::prove::<
 				U256,
 				B256TowerFamily,
-				Sha256,
-				Sha256Compression,
-				HasherChallenger<Sha256>,
+				Sha3_256,
+				Sha3Compression<Sha3_256>,
+				HasherChallenger<Sha3_256>,
 				_,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
@@ -2090,9 +2090,9 @@ mod tests {
 				Ok(pf) => binius_core::constraint_system::verify::<
 					U256,
 					B256TowerFamily,
-					Sha256,
-					Sha256Compression,
-					HasherChallenger<Sha256>,
+					Sha3_256,
+					Sha3Compression<Sha3_256>,
+					HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf)
 				.is_ok(),
 			};
@@ -2178,11 +2178,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -2307,12 +2307,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2345,11 +2345,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -2413,12 +2413,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2459,11 +2459,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -2581,12 +2581,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2620,11 +2620,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -2744,12 +2744,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2783,11 +2783,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::ChannelId;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -2842,12 +2842,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2882,11 +2882,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::ChannelId;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -2948,12 +2948,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -2994,11 +2994,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -3150,12 +3150,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -3204,11 +3204,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -3475,12 +3475,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -3530,11 +3530,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -3803,12 +3803,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -3853,11 +3853,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::FlushDirection;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -3913,12 +3913,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -3956,11 +3956,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::FlushDirection;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -4035,12 +4035,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -4086,11 +4086,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -4361,12 +4361,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -4411,11 +4411,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::FlushDirection;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -4501,12 +4501,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -4545,11 +4545,11 @@ mod tests {
 		use crate::nonnative::{ModMul, ModMulRow};
 		use binius_core::constraint_system::channel::FlushDirection;
 		use binius_core::fiat_shamir::HasherChallenger;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -4590,12 +4590,12 @@ mod tests {
 			let ccs = cs.compile(&statement).unwrap();
 			let witness = witness.into_multilinear_extension_index();
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			}
 		};
@@ -4645,11 +4645,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 512;
 		const WLOG: usize = 9;
@@ -4750,12 +4750,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -4795,11 +4795,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024; // P-256 is 256-bit; the ModMul needs 2n+1 ≤ W, so W=1024 (not 512)
 		const WLOG: usize = 10;
@@ -5073,12 +5073,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -5121,11 +5121,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -5537,12 +5537,12 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => binius_core::constraint_system::verify::<
-					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 				>(&ccs, 1, 128, &statement.boundaries, pf).is_ok(),
 			};
 			(vok, verr, verify_ok)
@@ -5589,11 +5589,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -6052,14 +6052,14 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => {
 					println!("Wadd proof size: {} bytes", pf.get_proof_size());
 					binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok()
 				}
 			};
@@ -6109,11 +6109,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -6874,14 +6874,14 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => {
 					println!("Wdbladd round proof size: {} bytes", pf.get_proof_size());
 					binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok()
 				}
 			};
@@ -6946,11 +6946,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -7891,14 +7891,14 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => {
 					println!("Wdbladd O-aware round proof size: {} bytes", pf.get_proof_size());
 					binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok()
 				}
 			};
@@ -7972,11 +7972,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -8867,14 +8867,14 @@ mod tests {
 				return (vok, verr, false);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let verify_ok = match proof {
 				Err(_) => false,
 				Ok(pf) => {
 					println!("Wadd-complete proof size: {} bytes", pf.get_proof_size());
 					binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok()
 				}
 			};
@@ -8945,11 +8945,11 @@ mod tests {
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_core::oracle::ShiftVariant;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Boundary, Col, ConstraintSystem, FlushOpts, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		const WLOG: usize = 10;
@@ -9129,14 +9129,14 @@ mod tests {
 				return (vok, verr, false, 0);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let (verify_ok, sz) = match proof {
 				Err(_) => (false, 0),
 				Ok(pf) => {
 					let sz = pf.get_proof_size();
 					let ok = binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
 					(ok, sz)
 				}
@@ -9196,11 +9196,11 @@ mod tests {
 		use crate::sha256_air::{build_k_cols, build_sha256_core, compress256_ref, Sha256Core};
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_field::Field;
-		use binius_hash::sha2::Sha256Compression;
+		use crate::b256_prove::Sha3Compression;
 		use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, TableWitnessSegment, WitnessIndex, B1, B64};
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
-		use sha2::Sha256;
+		use sha3::Sha3_256;
 
 		const W: usize = 1024;
 		// SHA-256 initial hash values (FIPS 180-4 §5.3.3) and round keys (shared with sha256_air).
@@ -9343,14 +9343,14 @@ mod tests {
 				return (vok, verr, false, 0, got);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let (verify_ok, sz) = match proof {
 				Err(_) => (false, 0),
 				Ok(pf) => {
 					let sz = pf.get_proof_size();
 					let ok = binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
 					(ok, sz)
 				}
@@ -9504,14 +9504,14 @@ mod tests {
 				return (vok, verr, false, 0, read_r_bits);
 			}
 			let proof = binius_core::constraint_system::prove::<
-				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>, _,
 			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
 			let (verify_ok, sz) = match proof {
 				Err(_) => (false, 0),
 				Ok(pf) => {
 					let sz = pf.get_proof_size();
 					let ok = binius_core::constraint_system::verify::<
-						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+						U256, B256TowerFamily, Sha3_256, Sha3Compression<Sha3_256>, HasherChallenger<Sha3_256>,
 					>(&ccs, 1, 128, &statement.boundaries, pf).is_ok();
 					(ok, sz)
 				}
