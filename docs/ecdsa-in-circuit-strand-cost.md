@@ -205,10 +205,22 @@ boundaries; boundary-matched, k=1,2). **Measured peak RSS = 70 MiB across the wh
 chain — independent of chain length** (8.3× below the ~585 MiB a 3-mul all-in-one proof would
 cost), because each proof's `Bump` drops before the next. A lying strand and a broken cross-mul
 seam are both rejected. This is the **round-level invariant**: chaining field-muls does *not*
-grow peak RSS, so a full EC round (a dataflow of ~26 field-muls) proves at **one-strand RSS**
-— the round-level pattern is this chained seam replicated across the round's DAG. The `695 s`
-single-thread round is the conservative anchor for *work*; enabling rayon does **not** improve
-it here.
+grow peak RSS, so a full EC round proves at **one-strand RSS** — the round-level pattern is
+this seam replicated across the round's DAG.
+
+**And it's proven on a *real* point-op fragment with glue** (`limb_jac_dbl_fragment_sliver_p256`):
+the actual `jac_dbl` α-fragment `δ=Z²`, `xmd=(X−δ)`, `xpd=(X+δ)`, `t=(X−δ)(X+δ) mod p` as **20
+separate boundary-seamed proofs** — 2 slivered field-muls (`δ`, `t`) **interleaved** with 2
+seamed `fe_sub`/`fe_add mod p` **glue** proofs (glue is cheap: an `Adder` + conditional-`k·p`
+reduce, no wide multiply, so it stays a small proof in the seamed dataflow). The mul→glue→mul
+dataflow is bound (`δ` output → both glue inputs → mul 2's two operands), `t == (X−Z²)(X+Z²) mod p`
+vs num-bigint, and **measured peak RSS = 70 MiB (one strand)** — interleaving muls with glue
+does *not* grow RSS. Broken seams (glue consuming a wrong `δ`, mul consuming a wrong `xmd`) are
+rejected. So **both seam types a real round needs are proven**: mul→mul (the chain) and
+mul→glue→mul (here). A full double+add round is these replicated across its DAG at one-strand
+RSS — remaining work is engineering (the ~26-mul orchestration), not new cryptography. The
+`695 s` single-thread round is the conservative anchor for *work*; enabling rayon does **not**
+improve it here.
 
 ## What the strand model *does* buy
 
