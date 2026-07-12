@@ -21,9 +21,19 @@ for the O(1)-verify accumulation route.
   costs ~0 here because B256 already carries the 192-bit Fiat–Shamir floor.
 * **L5 is the real jump**: the 256-bit floor forces the field B256 → B512,
   which ~2× prove, ~4.4× verify, ~1.6× RSS.
-* The **aggregation / epoch layer is unaffected** — it edge-verifies in **18 ms,
-  O(1) in the record count**, at every level. The per-record hash cost is a
-  first-contact cost, amortized away in steady state.
+* The **aggregation / epoch layer edge-verifies in two checks, both O(1) in N,
+  once per epoch**: a **~18 ms fold check** (distribution integrity — anti-substitution
+  vs `R*`) and a **full decider** (statement validity — pays record-AIR width:
+  ~0.8 s Keccak floor / ~6.6–10 s measured assembled). The 18 ms alone does **not**
+  enforce the per-record constraints (width law: 18 ms ⇒ near-zero width = fold table
+  only); the security section claims validity only for the decider layer. Both amortize
+  into background per-epoch cost.
+* **Open (headline-deciding):** the full-decider verify with the width term is the one
+  measurement that settles "sound O(1)-in-N aggregation at sub-second edge" vs "efficient
+  proof distribution"; and the epoch proof's FS/Merkle + EC/ECDSA challenger are `Sha256`
+  (128-bit), so **L3/L5 pin at 128 for the combined artifact** until they ladder (see the
+  component×level×hash table). The streaming interleaved-commit RSS is the residual that
+  couples low-RSS proving to sound O(1) aggregation.
 
 ## Level instantiation
 
@@ -94,25 +104,43 @@ PUBLISH  (prover, once per epoch)
   each DNS record  r_i
     │  canonical wire form   (name ‖ type ‖ rdata)
     ▼
-  S-layer AIR: proves in-circuit  "RRSIG(r_i) verifies under alg A_i, key K_i"
-               + FIPS SHA-3 digest over the canonical form           ← Layer 1
+  RRSIG(r_i) VERIFIED  [demo: NATIVELY, p256 crate]  +  FIPS SHA-3 digest of the
+               canonical form proved IN-CIRCUIT                      ← Layer 1
+    │  (in-circuit RRSIG verify = the offline two-tier "owner proves once"
+    │   path; ~99 core-hours/sig — see ecdsa-in-circuit-strand-cost.md)
     │  per-record proof π_i  +  commitment c_i
     ▼
   interleave {r_i} → one polynomial P → streaming interleaved commit
     │  Merkle root  R*   (byte-exact == binius commit_interleaved)   ← the lookup tree
     ▼
-  ACCUMULATOR: fold {π_i} into ONE accumulator instance; arithmetize the
-               narrow fold-verify (~48 ms), NOT the wide FRI/hash-verify
+  ACCUMULATOR: fold {π_i} into ONE accumulator instance
     │  one epoch proof  Π  binding all N records to R*               ← Layer 2
     ▼
   artifact = (R*, Π)      [+ the record set / Merkle leaves]
 
-VERIFY   (edge resolver, once)
-  check Π against R*         → O(1) in N,  ~18 ms (fold layer)
+VERIFY   (edge resolver, once per epoch — TWO distinct checks)
+  (a) FOLD layer:    check Π's fold-correctness   → ~18 ms, O(1) in N
+                     ⇒ distribution integrity (anti-substitution vs R*)
+  (b) FULL DECIDER:  check the accumulated record-AIR instance  → O(record-AIR
+                     width) + polylog(N), O(1) in N, SUB-SECOND–SECONDS (see below)
+                     ⇒ statement validity ("the records' constraints hold")
 
 SERVE    (client, every lookup after the first)
   record r_i  +  Merkle path to R*   → ~1.3 µs SHA-3 path check
 ```
+
+**The two verify checks are not interchangeable** (this is the accumulation-soundness
+structure — fold-correctness + a decider): the **~18 ms fold check** establishes that the
+accumulator was folded correctly and binds the lookups to `R*` — *distribution integrity*,
+i.e. anti-substitution relative to a publisher-constructed `R*`. It does **not** by itself
+enforce the per-record digest/AIR constraints, because by the width law
+(`verify ≈ 20 + 1.3·width ms`) an 18 ms verify is only reachable at near-zero width — the
+fold table alone. **Statement validity** ("no adversary can make `Π` attest to a record whose
+constraints don't hold") requires the **full decider**, which checks the accumulated instance
+at record-AIR width — Keccak ~575 cols ⇒ ~0.8 s floor / measured assembled ~6.6–10 s
+(trace-opening-dominated), SHA-256 ~2000 cols ⇒ ~2.6 s. Crucially the decider is **O(1) in N**
+and runs **once per epoch**, so it amortizes into the background exactly like the 18 ms — but
+the security section must claim only what the layer it describes checks.
 
 Layer 1 and Layer 2 below are exactly the two stages of this flow: Layer 1 is
 the per-record S-layer proof (seconds, paid once at publish — the table above);
@@ -133,20 +161,51 @@ to the target (L1/L3/L5 = 128/192/256):
 
 Resting only on **STARK IT-soundness + SHA-3 collision resistance**, this layer
 is post-quantum *unconditionally* — no algebraic hash, no number-theoretic
-assumption on the soundness path. No adversary (classical or quantum) can forge
-a valid epoch proof `Π`, make `Π` attest to a record not in the epoch, or tamper
-a witness (the corrupted-lane / flipped-transcript soundness tests gate exactly
-this).
+assumption on the soundness path.
 
-**2. Aggregation & lookup integrity — unconditional / PQ.**
+> **Which check earns which claim (the fold/decider distinction).** *Statement
+> validity* — "no adversary can make `Π` attest to a record whose AIR constraints
+> don't hold" — is earned only by the **full decider** (verify (b): pays record-AIR
+> width, O(1) in N, sub-second–seconds). The **~18 ms fold check** (verify (a))
+> earns only *distribution integrity* (fold-correctness + anti-substitution vs a
+> publisher-constructed `R*`). Do not attribute validity to the 18 ms layer, and do
+> not treat "Layer-1 verified prover-side" as repair — a prover checking its own
+> proof is not a soundness event for the edge. An edge that runs (a) only gets a
+> *correctly-folded commitment to a publisher-chosen record set*; an edge that also
+> runs (b) gets *the records' constraints actually hold*.
+
+> **Epoch-layer hash must ladder for L3/L5 to be real.** `κ_sys = min(record-layer,
+> epoch-layer, decider)`. The record layer ladders its FS/commitment SHA-3 to the
+> variant (§Level instantiation), **but the epoch proof `Π` and the EC/ECDSA gadgets
+> use a `Sha256` challenger (128-bit FS)**. Unless the epoch proof's own FS + Merkle
+> hash also ladder, `κ_sys` pins at **128 at L3/L5** regardless of Layer-1 laddering —
+> so "18 ms at every level" is level-independence of *cost*, not of *security*. See
+> the component×level×hash table below; every row must reach the category for the
+> label to hold.
+
+**2. Aggregation & lookup integrity — unconditional / PQ (distribution integrity).**
 `R*` is a collision-resistant SHA-3 commitment to the *entire* interleaved
-record set, and `Π` proves the accumulator was folded correctly (the fold-verify
-is itself in-circuit, so a dishonest fold is caught). Once a resolver has
-verified `Π` against `R*`, **no record can be substituted, added, or dropped**
-in steady state — every µs lookup is a SHA-3 Merkle path back to the *proven*
-root. Adding records changes `R*` and needs a new `Π`; it cannot be forged onto
-an existing verified root. This is the O(1)-in-N win *and* the anti-substitution
-guarantee, PQ for the same reason as (1).
+record set, and the fold check proves the accumulator was folded correctly.
+Once a resolver has run **both** verify checks against `R*`, **no record can be
+substituted, added, or dropped**, *and* the surviving records' constraints hold;
+running the fold check **alone** gives the first (anti-substitution) but **not**
+the second — that is the decider's job. Every µs lookup is a SHA-3 Merkle path back
+to the *proven* root; adding records changes `R*` and needs a new `Π`. This is the
+O(1)-in-N win; it is PQ for the same reason as (1).
+
+**Component × level × hash (the single source of truth for κ_sys).**
+
+| Component | Hash today | L1 (128) | L3 (192) | L5 (256) |
+|-----------|-----------|:--------:|:--------:|:--------:|
+| Record proof FS/commitment | SHA3-256/384/512 (laddered) | ✓ | ✓ | ✓ |
+| Record digest AIR (in-circuit) | SHA3-N | ✓ | ✓ | ✓ |
+| **Epoch proof `Π` FS** | **SHA-256 (128)** | ✓ | ✗ pins 128 | ✗ pins 128 |
+| **Epoch/EC-ECDSA challenger** | **SHA-256 (128)** | ✓ | ✗ pins 128 | ✗ pins 128 |
+| Lookup-tree Merkle | SHA3-N (leveled) | ✓ | ✓ | ✓ |
+
+The two ✗ rows are the open work: to make L3/L5 real for the *combined* artifact, the
+epoch proof's FS/Merkle and the EC/ECDSA challenger must ladder to SHA3-384/512. Until
+then the honest label for the combined artifact at L3/L5 is **128-bit (epoch-pinned)**.
 
 **3. Signature trust — algorithm-dependent (the honest caveat).**
 The STARK proves *"this RRSIG verified under algorithm A"*; it does **not**
@@ -292,15 +351,17 @@ epoch proof `Π` out the end.
 
 ### Verify — O(1) in N, edge-side (does not scale with 1.5 M)
 
-| Quantity | Value | Note |
+| Quantity | Value | What it earns |
 |:---------|:------|:-----|
-| Epoch verify (fold layer)         | **~18 ms** | O(1) in N; consistent with the 1.36 ms HNPL edge package |
-| Epoch verify (assembled, in-circuit hash re-check) | **seconds** (~12 s Keccak) | the honest caveat — see the two-layer framing |
+| Epoch verify — **fold check** | **~18 ms**, O(1) in N | distribution integrity (anti-substitution vs `R*`); consistent with the 1.36 ms HNPL edge package |
+| Epoch verify — **full decider** (record-AIR width) | **~0.8 s Keccak floor / ~6.6–10 s measured**, O(1) in N | **statement validity** (the records' constraints hold) — REQUIRED for security-claim 1 |
 | Per-record lookup                 | **~3 µs**  | Merkle path, depth ≈ log₂(2¹⁰·1.5 M) ≈ 30 SHA-3 hashes |
 
-A resolver verifies the **entire `.se` epoch once** in ms (fold layer) —
-*independent of whether it is 857 records or 1.5 M* — then answers any of the
-1.5 M delegations in ~3 µs.
+A resolver runs **both** checks on the **entire `.se` epoch once** — both O(1) in N
+(*independent of whether it is 857 records or 1.5 M*), amortized per-epoch background
+cost — then answers any of the 1.5 M delegations in ~3 µs. The decider is the number
+that decides the headline: with it, the claim is "sound O(1)-in-N aggregation at
+sub-second–seconds edge cost, once per epoch"; without it, only "efficient distribution."
 
 ### L5 multiplier
 
