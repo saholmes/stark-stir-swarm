@@ -698,6 +698,70 @@ pub fn prove_verify<const W: usize>(
 	Ok((proof_size, read_rs))
 }
 
+/// Prove+verify a `ModMul` batch over B256 with an ARBITRARY Fiat–Shamir challenger + Merkle
+/// commitment hash `H`/`C` (so `κ_FS = κ_bind = H`) at `security_bits`. This is `prove_verify`
+/// with the hard-coded SHA-256 challenger swapped for the level's SHA3-N — the fix for the
+/// epoch/EC challenger pinning `κ_FS/κ_bind` at 128. Use `H=Sha3_256`@128 (L1), `Sha3_384`@192
+/// (L3) over B256; L5 (`Sha3_512`@256) needs the B512 field for `κ_IT`. Returns
+/// `(proof_size, prove_ms, verify_ms)`.
+pub fn prove_verify_hash<const W: usize, H, C>(
+	m_bits: &[bool],
+	n: usize,
+	security_bits: usize,
+	rows: &[ModMulRow],
+) -> Result<(usize, u128, u128)>
+where
+	H: sha3::digest::Digest
+		+ sha3::digest::core_api::BlockSizeUser
+		+ sha3::digest::FixedOutputReset
+		+ Default
+		+ Clone
+		+ Send
+		+ Sync,
+	C: binius_hash::PseudoCompressionFunction<sha3::digest::Output<H>, 2> + Default + Sync,
+{
+	use std::time::Instant;
+	let n_rows = rows.len();
+	assert!(n_rows.is_power_of_two(), "batch size must be a power of two");
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let modmul = ModMul::<W>::build(&mut cs, m_bits, n);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![n_rows] };
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(modmul.table_id, n_rows)?;
+		let mut seg = tw.full_segment();
+		modmul.populate(&mut seg, rows)?;
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+
+	let t0 = Instant::now();
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, H, C, HasherChallenger<H>, _>(
+		&ccs,
+		1,
+		security_bits,
+		&statement.boundaries,
+		witness,
+		&binius_hal::make_portable_backend(),
+	)?;
+	let prove_ms = t0.elapsed().as_millis();
+	let sz = proof.get_proof_size();
+
+	let t1 = Instant::now();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, H, C, HasherChallenger<H>>(
+		&ccs,
+		1,
+		security_bits,
+		&statement.boundaries,
+		proof,
+	)?;
+	Ok((sz, prove_ms, t1.elapsed().as_millis()))
+}
+
 /// Like [`prove_verify`] but times the PROVE and VERIFY calls SEPARATELY (the two
 /// legs the sliver-prover cost model needs distinguished — prove dominates wall and
 /// RSS; verify is the cheap polylog leg). Returns `(proof_size, prove_ms, verify_ms)`.
@@ -1604,6 +1668,56 @@ mod tests {
 			 and REJECTS a wrong product; full 2048-bit a*b mod N decomposes EXACTLY into {}+{} = {} \
 			 LimbProduct<512> strands (a*b grid + q*N reduction grid) + carries, r==a*b mod N vs num-bigint",
 			K * K, K * K, 2 * K * K
+		);
+	}
+
+	/// GATE ec-challenger-ladder — the EC field-op `a·b mod p` (P-256) proven over B256 with the
+	/// Fiat–Shamir challenger + Merkle commitment hash LADDERED to SHA3-N (not the hard-coded
+	/// SHA-256), so `κ_FS = κ_bind` reaches the NIST category instead of pinning at 128. This
+	/// closes the reviewer's gap: the EC/ECDSA + epoch proofs used `HasherChallenger<Sha256>`
+	/// everywhere (33 call sites), so `κ_sys = min(record, epoch, decider)` pinned at 128 at
+	/// L3/L5. Here the SAME EC field-op proves with SHA3-256@128 (L1) AND SHA3-384@192 (L3) over
+	/// B256 — `HasherChallenger<Sha3_N>` + `Sha3Compression<Sha3_N>` — so the epoch/EC layer's FS
+	/// and commitment ladder. (L5 = SHA3-512@256 needs the B512 field for `κ_IT`; same swap.)
+	#[test]
+	fn ec_field_op_challenger_ladders_over_b256() {
+		use crate::b256_prove::Sha3Compression;
+		use num_bigint::BigUint;
+		use sha3::{Sha3_256, Sha3_384};
+
+		const W: usize = 1024;
+		let tb = |v: &BigUint| -> Vec<bool> { (0..W as u64).map(|k| v.bit(k)).collect() };
+
+		let p = BigUint::parse_bytes(
+			b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+			16,
+		)
+		.unwrap();
+		let nb = p.bits() as usize; // 256
+		let p_bits = tb(&p);
+		let mut rng = StdRng::seed_from_u64(0x1AD_DE12);
+		let a = rand_below(&mut rng, 256) % &p;
+		let b = rand_below(&mut rng, 256) % &p;
+		let prod = &a * &b;
+		let row = super::ModMulRow { a: tb(&a), b: tb(&b), q: tb(&(&prod / &p)), r: tb(&(&prod % &p)) };
+
+		// L1: SHA3-256 Fiat–Shamir challenger + Sha3Compression<Sha3_256> commitment @ 128.
+		let (sz1, pm1, vm1) =
+			super::prove_verify_hash::<W, Sha3_256, Sha3Compression<Sha3_256>>(&p_bits, nb, 128, &[row.clone()])
+				.expect("EC field-op must PROVE+VERIFY over B256 with SHA3-256 challenger @L1(128)");
+		// L3: SHA3-384 challenger + Sha3Compression<Sha3_384> @ 192 (B256 carries κ_IT=192).
+		let (sz3, pm3, vm3) =
+			super::prove_verify_hash::<W, Sha3_384, Sha3Compression<Sha3_384>>(&p_bits, nb, 192, &[row])
+				.expect("EC field-op must PROVE+VERIFY over B256 with SHA3-384 challenger @L3(192)");
+
+		println!(
+			"GATE ec-challenger-ladder: EC field-op a·b mod p (P-256) PROVEN+VERIFIED over B256 with the \
+			 Fiat–Shamir challenger + commitment hash LADDERED to SHA3-N (NOT SHA-256): \
+			 L1 SHA3-256@128 ({sz1} B, prove {pm1} ms, verify {vm1} ms; κ_FS=κ_bind=128), \
+			 L3 SHA3-384@192 ({sz3} B, prove {pm3} ms, verify {vm3} ms; κ_FS=κ_bind=192). \
+			 The epoch/EC challenger now ladders — κ_sys no longer pins at 128 at L3. \
+			 L5 SHA3-512@256 needs B512 for κ_IT (same swap). Mechanical follow-up: apply to the 33 \
+			 EC/ECDSA/epoch prove/verify call sites."
 		);
 	}
 
