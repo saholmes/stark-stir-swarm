@@ -22,7 +22,9 @@ use binius_m3::builder::{Col, ConstraintSystem, Statement, TableWitnessSegment, 
 use sha2::Sha256;
 
 use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+use crate::b512_field::{B512TowerFamily, B512 as OurB512, U512};
 use crate::gf256_air::{beta, build_b256_mul, col4, pop_b256_mul, split256, wc64};
+use crate::gf512_air::{build_b512_mul, split512};
 
 type C4 = [Col<B64, 1>; 4];
 
@@ -407,6 +409,82 @@ where
 	Ok(out)
 }
 
+/// The epoch-Π prover over the **B512 tower** — the full-L5 variant that lifts `κ_IT` from 192
+/// (B256) to **256**. Same shape as `measure_epoch_verify_hash` but each per-record constraint is
+/// an in-circuit GF(2^512) multiply (`gf512_air::build_b512_mul`) over `ConstraintSystem<OurB512>`,
+/// proved with `H = Sha3_512`/`Sha3Compression<Sha3_512>` at `security_bits = 256`. This closes the
+/// last L5 residual: with the record layer (B512/SHA3-512), the lookup Merkle (SHA3-512) AND the
+/// epoch Π all at 256, `κ_sys = min(...)` reaches category 5 with no B256 cap.
+pub fn measure_epoch_verify_b512_hash<H, C>(
+	per_record_muls: usize,
+	n_records: &[usize],
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>>
+where
+	H: sha3::digest::Digest
+		+ sha3::digest::core_api::BlockSizeUser
+		+ sha3::digest::FixedOutputReset
+		+ Default
+		+ Clone
+		+ Send
+		+ Sync,
+	C: binius_hash::PseudoCompressionFunction<sha3::digest::Output<H>, 2> + Default + Sync,
+{
+	use crate::gf256_air::col8;
+	use rand::SeedableRng;
+	use std::time::Instant;
+	let mut out = Vec::new();
+	for &n in n_records {
+		let n = n.next_power_of_two();
+		let allocator = bumpalo::Bump::new();
+		let mut cs = ConstraintSystem::<OurB512>::new();
+		let mut tb = cs.add_table("epoch(B512): N records batched");
+		let beta_col = tb.add_committed::<B64, 1>("beta");
+		let mut ops = Vec::with_capacity(per_record_muls);
+		let mut muls = Vec::with_capacity(per_record_muls);
+		for i in 0..per_record_muls {
+			let a = col8(&mut tb, &format!("a{i}"));
+			let b = col8(&mut tb, &format!("b{i}"));
+			muls.push(build_b512_mul(&mut tb, beta_col, a, b, &format!("m{i}_")));
+			ops.push((a, b));
+		}
+		let table_id = tb.id();
+		let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+		let mut witness = WitnessIndex::<OurB512>::new(&cs, &allocator);
+		let mut rng = rand::rngs::StdRng::from_seed([0xe5; 32]);
+		{
+			let tw = witness.init_table(table_id, n)?;
+			let mut seg = tw.full_segment();
+			for row in 0..n {
+				wc64(&mut seg, beta_col, row, beta())?;
+				for i in 0..per_record_muls {
+					let (av, bv) = (<OurB512 as Field>::random(&mut rng), <OurB512 as Field>::random(&mut rng));
+					let (asp, bsp) = (split512(av), split512(bv));
+					for j in 0..8 {
+						wc64(&mut seg, ops[i].0[j], row, asp[j])?;
+						wc64(&mut seg, ops[i].1[j], row, bsp[j])?;
+					}
+					crate::gf512_air::pop_b512_mul(&muls[i], &mut seg, row, asp, bsp)?;
+				}
+			}
+		}
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let t0 = Instant::now();
+		let proof = binius_core::constraint_system::prove::<
+			U512, B512TowerFamily, H, C, HasherChallenger<H>, _,
+		>(&ccs, 1, security_bits, &statement.boundaries, witness, &make_portable_backend())?;
+		let prove_ms = t0.elapsed().as_millis();
+		let sz = proof.get_proof_size();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U512, B512TowerFamily, H, C, HasherChallenger<H>,
+		>(&ccs, 1, security_bits, &statement.boundaries, proof)?;
+		out.push((n, prove_ms, t1.elapsed().as_millis(), sz));
+	}
+	Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -434,19 +512,26 @@ mod tests {
 		// L3: SHA3-384 challenger + Sha3Compression<Sha3_384> @192 (B256 carries κ_IT=192).
 		let l3 = measure_epoch_verify_hash::<Sha3_384, Sha3Compression<Sha3_384>>(per_record_muls, &n, 192)
 			.expect("epoch Π must PROVE+VERIFY over B256 with SHA3-384 challenger @L3(192)");
+		// L5: SHA3-512 challenger + Sha3Compression<Sha3_512> @256 over the **B512 tower** — the
+		// full-L5 epoch Π (κ_IT=256), each per-record constraint an in-circuit GF(2^512) multiply.
+		use sha3::Sha3_512;
+		let l5 = measure_epoch_verify_b512_hash::<Sha3_512, Sha3Compression<Sha3_512>>(per_record_muls, &n, 256)
+			.expect("epoch Π must PROVE+VERIFY over B512 with SHA3-512 challenger @L5(256)");
 
 		let (_n1, p1, v1, s1) = l1[0];
 		let (_n3, p3, v3, s3) = l3[0];
+		let (_n5, p5, v5, s5) = l5[0];
 		println!(
-			"GATE epoch-Π-challenger-ladder: the SHIPPED epoch proof Π PROVEN+VERIFIED over B256 with the \
-			 Fiat–Shamir challenger + commitment hash LADDERED to SHA3-N (NOT SHA-256): \
-			 L1 SHA3-256@128 (prove {p1} ms, verify {v1} ms, {} KB; κ_FS=κ_bind=128), \
-			 L3 SHA3-384@192 (prove {p3} ms, verify {v3} ms, {} KB; κ_FS=κ_bind=192). \
-			 κ_sys no longer pins at 128 at L3 — the epoch layer ladders. L5 (κ_IT=256) needs the B512 \
-			 epoch-AIR port; the B512+SHA3-512 stack is proven on the field-op leg.",
-			s1 / 1024, s3 / 1024,
+			"GATE epoch-Π-challenger-ladder: the SHIPPED epoch proof Π PROVEN+VERIFIED with the Fiat–Shamir \
+			 challenger + commitment hash LADDERED to SHA3-N (NOT SHA-256) across ALL THREE NIST levels: \
+			 L1 SHA3-256@128 over B256 (prove {p1} ms, verify {v1} ms, {} KB; κ_FS=κ_bind=128), \
+			 L3 SHA3-384@192 over B256 (prove {p3} ms, verify {v3} ms, {} KB; κ_FS=κ_bind=192), \
+			 L5 SHA3-512@256 over B512 (prove {p5} ms, verify {v5} ms, {} KB; κ_FS=κ_bind=κ_IT=256). \
+			 The epoch layer ladders at EVERY level — L5 uses the B512 tower (GF(2^512) per-record muls), \
+			 so κ_sys reaches category 5 with NO B256 cap. The rollout is complete.",
+			s1 / 1024, s3 / 1024, s5 / 1024,
 		);
-		assert!(p1 > 0 && v1 > 0 && p3 > 0 && v3 > 0, "both levels must produce real prove+verify timings");
+		assert!(p1 > 0 && v1 > 0 && p3 > 0 && v3 > 0 && p5 > 0 && v5 > 0, "all three levels must produce real timings");
 	}
 
 	/// GATE acc-air-sound — the in-circuit fold-verify PROVES+VERIFIES (validate_witness +

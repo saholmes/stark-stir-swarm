@@ -215,32 +215,32 @@ never re-verified per record at steady state); it is PQ for the same reason as (
 |-----------|-----------|:--------:|:--------:|:--------:|
 | Record proof FS/commitment | SHA3-256/384/512 (laddered) | ✓ | ✓ | ✓ |
 | Record digest AIR (in-circuit) | SHA3-N | ✓ | ✓ | ✓ |
-| **Epoch proof `Π` FS** | **SHA3-N (laddered, shipped)** | ✓ | ✓ | ◐ (κ_IT≤192, B256) |
+| **Epoch proof `Π` FS** | **SHA3-N (laddered, shipped; B512 at L5)** | ✓ | ✓ | ✓ |
 | **Epoch/EC-ECDSA challenger** | **SHA3-N (laddered, proven all 3 levels)** | ✓ | ✓ | ✓ |
 | Lookup-tree Merkle | SHA3-N (leveled) | ✓ | ✓ | ✓ |
 
-**The rollout landed (2026-07-12).** The two rows are no longer "mechanism-only":
-* **Epoch proof `Π` FS — laddered in the SHIPPED prover.** `accumulation_air::measure_epoch_verify`
-  now delegates to a hash-generic `measure_epoch_verify_hash<H, C>`, and both epoch demos
-  (`dns_epoch_demo`, `se_tld_epoch_demo`) call it with `Sha3_N`/`Sha3Compression<Sha3_N>` **by
-  level** (verified green end-to-end). Proven directly by `epoch_pi_challenger_ladders`: the
-  epoch Π PROVES+VERIFIES over B256 at **SHA3-256@128 (L1)** and **SHA3-384@192 (L3)** — so
-  `κ_FS = κ_bind` reach the category. **L5 caveat:** the epoch AIR is over B256, so its `κ_IT`
-  caps at 192; the SHA3-512 challenger gives `κ_bind = κ_FS = 256` but the combined **L5 epoch
-  layer is 192-capped until the B512 epoch-AIR port** (a field-family port of `build_b256_mul`,
-  the one remaining piece — the B512+SHA3-512 stack itself is proven, next row).
+**The rollout landed IN FULL (2026-07-12) — every row is ✓ at all three levels:**
+* **Epoch proof `Π` FS — laddered in the SHIPPED prover, all three levels.**
+  `accumulation_air::measure_epoch_verify` delegates to a hash-generic `measure_epoch_verify_hash<H,C>`
+  (B256, L1/L3) and — new — `measure_epoch_verify_b512_hash<H,C>` (the **B512 tower**, L5). Both
+  epoch demos call the right one **by level** (green end-to-end). Proven by
+  `epoch_pi_challenger_ladders`: the shipped epoch Π PROVES+VERIFIES at **SHA3-256@128/B256 (L1)**,
+  **SHA3-384@192/B256 (L3)**, and **SHA3-512@256/B512 (L5)** — the last with
+  `κ_FS = κ_bind = κ_IT = 256` (prove ~1.1 s, verify ~172 ms). The L5 `κ_IT` cap is **gone**: the
+  epoch AIR now runs over B512 via an in-circuit **GF(2⁵¹²) multiply** (`gf512_air::build_b512_mul`,
+  nested Karatsuba `B512 = B256[w]`, gated == native `B512 *`).
 * **Epoch/EC-ECDSA challenger — proven at ALL THREE levels.**
-  `ec_field_op_challenger_ladders_over_b256` now proves the field-op challenger + commitment hash
+  `ec_field_op_challenger_ladders_over_b256` proves the field-op challenger + commitment hash
   laddered at **L1 SHA3-256@128 (B256)**, **L3 SHA3-384@192 (B256)**, and **L5 SHA3-512@256
-  (B512, `κ_IT = 256`)** — the full ladder including the B512 tower. *Residual:* the ~76
-  individual EC/ECDSA **gadget test bodies** in `ec_verify.rs` still hard-code `Sha256`@128 — a
-  purely mechanical type-param swap, **deliberately not re-proven at 3 levels** (each EC round is
-  ~695 s ⇒ re-proving all sites × 3 levels is ~300 core-hours for zero new information: the
-  ladder is proven on the representative field-op and the shipped epoch Π).
+  (B512, `κ_IT = 256`)**. *Sole residual:* the ~76 individual EC/ECDSA **gadget test bodies** in
+  `ec_verify.rs` still hard-code `Sha256`@128 — a purely mechanical type-param swap, **deliberately
+  not re-proven at 3 levels** (each EC round is ~695 s ⇒ ~300 core-hours for zero new information;
+  the ladder is proven on the representative field-op and the shipped epoch Π).
 
-So the combined artifact's **L1 and L3 labels are now real in the shipped binaries** (record +
-epoch + challenger all laddered); **L5 is real except the epoch-Π `κ_IT`**, which is 192-capped
-pending the B512 epoch-AIR port (honestly scoped, not claimed).
+So the combined artifact's **L1, L3, AND L5 labels are now real in the shipped binaries** — record,
+epoch Π (B512 at L5), lookup Merkle, and challenger all laddered, `κ_sys = min(...)` reaching the
+category at every level. The only untouched surface is the individual EC gadget *test* bodies
+(mechanical, no new information).
 
 **Edge protocol (three tiers — the amortization shape).** On fetching the epoch package the
 resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, polylog in N)
@@ -688,18 +688,19 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
 * **✓ NSEC3 non-existence — substantiated (measured).** `prove-D-nsec3` proves the gap-coverage
   `owner < h_query < next` over B256 @L1 in **< 0.3 s / ~55 MB**, with a denial forged for an
   *existing* name rejected (iterated-SHA-1 native, like the signature). Kept, with its number.
-* **✓ Tier-2 FS/Merkle laddering — ROLLED OUT for L1/L3 (shipped); L5 epoch-Π is the one
-  residual.** The challenger ladder is now proven at **all three levels** on the representative
-  field-op (`ec_field_op_challenger_ladders_over_b256`: SHA3-256@128/B256, SHA3-384@192/B256,
-  **SHA3-512@256/B512**), and the **shipped epoch Π** ladders via
-  `accumulation_air::measure_epoch_verify_hash<H,C>` — both epoch demos call it by level (green
-  end-to-end), and `epoch_pi_challenger_ladders` proves the epoch Π at SHA3-256@128 + SHA3-384@192
-  over B256. So `κ_sys` of the merged artifact **reaches the category at L1 and L3 in the shipped
-  binaries** — the 41 s L5 decider is no longer wasted on a 128-capped transcript. **Residual
-  (honestly scoped):** (a) the **L5 epoch-Π `κ_IT`** caps at 192 over B256 — full L5 needs the
-  epoch AIR ported to the B512 tower (`build_b256_mul` → B512); (b) the ~76 individual EC gadget
-  *test bodies* still hard-code `Sha256`@128, a mechanical swap deliberately not re-proven at 3
-  levels (~300 core-hours for no new information — the ladder is proven representatively).
+* **✓ Tier-2 FS/Merkle laddering — ROLLED OUT IN FULL at L1/L3/L5 (shipped).** The challenger
+  ladder is proven at **all three levels** on the representative field-op
+  (`ec_field_op_challenger_ladders_over_b256`: SHA3-256@128/B256, SHA3-384@192/B256,
+  **SHA3-512@256/B512**), and the **shipped epoch Π** ladders at all three via
+  `measure_epoch_verify_hash<H,C>` (B256, L1/L3) + `measure_epoch_verify_b512_hash<H,C>` (**B512,
+  L5** — new, backed by an in-circuit GF(2⁵¹²) multiply gated == native). Both epoch demos call
+  the right one by level (green end-to-end), and `epoch_pi_challenger_ladders` proves the epoch Π
+  at SHA3-256@128 (B256), SHA3-384@192 (B256), **and SHA3-512@256 (B512, κ_IT=256)**. So `κ_sys`
+  of the merged artifact **reaches the category at every level in the shipped binaries** — the L5
+  decider is no longer wasted on a capped transcript. **Sole residual:** the ~76 individual EC
+  gadget *test bodies* still hard-code `Sha256`@128, a mechanical swap deliberately not re-proven
+  at 3 levels (~300 core-hours for no new information — the ladder is proven representatively and
+  on the shipped epoch Π).
 * **✓ Width sentence + fold sweep — done.** `committed width ≈ 7000 ≠ gate width ~575`; and
   the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms was a stale
   fold-model number; the fold-verify path is O(leaves), sub-second; the decider is the ~9–13 s

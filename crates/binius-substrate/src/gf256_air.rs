@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use binius_core::fiat_shamir::HasherChallenger;
 use binius_field::underlier::WithUnderlier;
-use binius_field::{packed::set_packed_slice, BinaryField128b, BinaryField32b, BinaryField64b};
+use binius_field::{packed::set_packed_slice, BinaryField128b, BinaryField32b, BinaryField64b, TowerField};
 use binius_hal::make_portable_backend;
 use binius_hash::sha2::Sha256Compression;
 use binius_m3::builder::{Col, ConstraintSystem, Statement, TableBuilder, WitnessIndex};
@@ -55,8 +55,8 @@ struct B128Mul {
 
 /// Build B128 mul: r_lo = p0·q0 + p1·q1; r_hi = (p0+p1)(q0+q1) - p0·q0 - p1·q1 + (p1·q1)·β.
 /// Operands are given as expressions (so callers can pass `a+b` for the Karatsuba middle).
-fn build_b128_mul(
-	t: &mut TableBuilder<OurB256>,
+fn build_b128_mul<F: TowerField + binius_field::ExtensionField<B64>>(
+	t: &mut TableBuilder<F>,
 	beta_col: Col<B64, 1>,
 	p0: Col<B64, 1>,
 	p1: Col<B64, 1>,
@@ -79,22 +79,30 @@ fn build_b128_mul(
 	B128Mul { w0, w2, w1m, w2b, r0, r1 }
 }
 
-pub(crate) fn wc64(seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>, col: Col<B64, 1>, row: usize, v: B64) -> Result<()> {
+pub(crate) fn wc64<P>(seg: &mut binius_m3::builder::TableWitnessSegment<P>, col: Col<B64, 1>, row: usize, v: B64) -> Result<()>
+where
+	P: binius_field::PackedExtension<B64>,
+	P::Scalar: TowerField,
+{
 	let mut slice = seg.get_mut(col)?;
 	set_packed_slice(&mut slice, row, v);
 	Ok(())
 }
 
 /// Populate a B128Mul from operand B64 values; returns `(r0, r1)`.
-fn pop_b128_mul(
+fn pop_b128_mul<P>(
 	m: &B128Mul,
-	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
+	seg: &mut binius_m3::builder::TableWitnessSegment<P>,
 	row: usize,
 	p0: B64,
 	p1: B64,
 	q0: B64,
 	q1: B64,
-) -> Result<(B64, B64)> {
+) -> Result<(B64, B64)>
+where
+	P: binius_field::PackedExtension<B64>,
+	P::Scalar: TowerField,
+{
 	let w0 = p0 * q0;
 	let w2 = p1 * q1;
 	let w1m = (p0 + p1) * (q0 + q1);
@@ -168,8 +176,8 @@ pub(crate) struct B256MulCols {
 
 /// Build `c = a·b` over B256 (nested Karatsuba) on given input columns; commits the 4
 /// result components `c`. `pfx` namespaces the columns so multiple muls coexist.
-pub(crate) fn build_b256_mul(
-	t: &mut TableBuilder<OurB256>,
+pub(crate) fn build_b256_mul<F: TowerField + binius_field::ExtensionField<B64>>(
+	t: &mut TableBuilder<F>,
 	beta_col: Col<B64, 1>,
 	a: [Col<B64, 1>; 4],
 	b: [Col<B64, 1>; 4],
@@ -177,7 +185,7 @@ pub(crate) fn build_b256_mul(
 ) -> B256MulCols {
 	let z0 = build_b128_mul(t, beta_col, a[0], a[1], b[0], b[1], &format!("{pfx}z0"));
 	let z2 = build_b128_mul(t, beta_col, a[2], a[3], b[2], b[3], &format!("{pfx}z2"));
-	let mk = |t: &mut TableBuilder<OurB256>, nm: String, e: Col<B64, 1>, f: Col<B64, 1>| {
+	let mk = |t: &mut TableBuilder<F>, nm: String, e: Col<B64, 1>, f: Col<B64, 1>| {
 		let c = t.add_committed::<B64, 1>(nm.clone());
 		t.assert_zero(format!("{nm}c"), c - (e + f));
 		c
@@ -198,13 +206,17 @@ pub(crate) fn build_b256_mul(
 }
 
 /// Populate a B256 mul from operand B64 components; writes `c` and returns its value.
-pub(crate) fn pop_b256_mul(
+pub(crate) fn pop_b256_mul<P>(
 	m: &B256MulCols,
-	seg: &mut binius_m3::builder::TableWitnessSegment<OurB256>,
+	seg: &mut binius_m3::builder::TableWitnessSegment<P>,
 	row: usize,
 	av: [B64; 4],
 	bv: [B64; 4],
-) -> Result<[B64; 4]> {
+) -> Result<[B64; 4]>
+where
+	P: binius_field::PackedExtension<B64>,
+	P::Scalar: TowerField,
+{
 	wc64(seg, m.sa[0], row, av[0] + av[2])?;
 	wc64(seg, m.sa[1], row, av[1] + av[3])?;
 	wc64(seg, m.sa[2], row, bv[0] + bv[2])?;
@@ -412,7 +424,12 @@ pub(crate) struct FoldPairCols {
 	pub(crate) folded: [Col<B64, 1>; 4],
 }
 
-pub(crate) fn col4(t: &mut TableBuilder<OurB256>, nm: &str) -> [Col<B64, 1>; 4] {
+pub(crate) fn col4<F: TowerField + binius_field::ExtensionField<B64>>(t: &mut TableBuilder<F>, nm: &str) -> [Col<B64, 1>; 4] {
+	std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{nm}{i}")))
+}
+
+/// Eight committed B64 columns — the B512 (8-component tower) analogue of `col4`.
+pub(crate) fn col8<F: TowerField + binius_field::ExtensionField<B64>>(t: &mut TableBuilder<F>, nm: &str) -> [Col<B64, 1>; 8] {
 	std::array::from_fn(|i| t.add_committed::<B64, 1>(format!("{nm}{i}")))
 }
 

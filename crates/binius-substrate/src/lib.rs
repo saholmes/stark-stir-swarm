@@ -152,6 +152,7 @@ pub mod sha256_air; // Tier-B M1: M3-native SHA-256 compression (FIPS 180-4) rec
 pub mod merkle_air; // Tier-B M2: in-circuit SHA-256 Merkle-path verification (FRI query opening)
 pub mod fri_air; // Tier-B M3: in-circuit FRI folding (field arithmetic)
 pub mod gf256_air; // Tier-B M3b: in-circuit GF(2^256) multiply
+pub mod gf512_air; // in-circuit GF(2^512) multiply — the B512 epoch-Π layer (L5 κ_IT=256)
 pub mod fs_air; // Tier-B M4: in-circuit Fiat-Shamir transcript (multi-block SHA-256)
 pub mod m5_air; // Tier-B M5 kernel: FS challenge drives the FRI fold (recursive-verify composition)
 pub mod keccak800_air; // Tier-B: Keccak-f[800] narrow recursion hash (~half the width of f[1600])
