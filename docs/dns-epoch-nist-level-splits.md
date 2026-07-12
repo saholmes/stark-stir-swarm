@@ -486,9 +486,21 @@ So the tree is **free** — no PCD machinery — and the ~785 ms/node in-circuit
 sub-root), so a permuted/substituted batch set produces a valid accumulated object over a
 *different* `R*` — caught, not silently accepted. Order is explicit in each node's statement.
 
-**The committed decider — and whether it re-introduces the monolithic bottleneck.** The two
-decider numbers above are the native value check + the O(leaves) fold-verify path — *not* the
-committed decider, which is the **FRI-opening of the `R*`-committed interleaved P** at `root.point`.
+**The committed decider — now wired and measured.** The FRI-opening of an `R*`-committed
+multilinear P at a point is now a **real measured gate** (`committed_decider`, via
+`binius_core::piop` — the standalone FRI-Binius PCS, not `constraint_system`): commit P over
+B256, prove `P(point)=value` (an `eq(point,·)` transparent), verify. Measured — **verify flat at
+~6–11 ms across a 256× domain increase** (n_vars 10→18), proof 241→556 KiB, prove RSS 8→84 MiB,
+tamper rejected. So the crux (`accumulation.rs:127` — *is an `R*`-committed P FRI-openable at a
+point?*) is **resolved: yes, cheaply, polylog.** *Honest framing (opening ≠ full decider):* this
+is the PCS-**opening** sub-component. The full statement-validity DNS decider *also* verifies the
+record-AIR (SHA3/Keccak) constraints on the accumulated instance — that is the batch-width STARK
+verify (**~9–13 s, ~1.15 GiB**, unchanged), which the opening dominates *within*. The opening being
+~10 ms confirms the FRI layer is cheap and P opens; the AIR-constraint check remains the ~9–13 s.
+
+**The decider-prove decomposition (why the hybrid removes the bottleneck).** The two native
+numbers below (value check + fold-verify path) are *not* the committed decider — the committed
+decider is the FRI-opening of the `R*`-committed interleaved P at `root.point`.
 The risk (reviewer): if all N batch instances are claims on one P, the opening is over the *full
 N-sized* object — the same shape that gave 210 GiB / 1.7 h monolithic. **Does it decompose?**
 Measured — yes (`decider_opening_decomposes`): by multilinearity in the position variables,
