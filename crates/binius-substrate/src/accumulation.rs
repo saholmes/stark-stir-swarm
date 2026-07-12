@@ -360,4 +360,207 @@ mod tests {
 			 (mle_eval) grows with 2^n. Accumulation defers the single 2^n opening to the end — the fold \
 			 itself is width-independent. This is the ms-recursion lever binius's O(width) in-circuit verify lacks.");
 	}
+
+	/// GATE hybrid-e2e — THE FIGURE-ONE CAPSTONE. The whole hybrid epoch pipeline as ONE gate:
+	/// 16 batch-instance accumulators → a REAL balanced binary fold tree (15 accumulator-merges,
+	/// depth 4) → ONE accumulated root claim → the HYBRID DECIDER verify (native mle + the
+	/// O(leaves) fold-verify path) → POSITION-BINDING (permute a batch ⇒ a different R*; a lying
+	/// leaf ⇒ rejected) → R* + a µs Merkle path. Every hop is MEASURED. The interior fold nodes
+	/// fold ACCUMULATORS (not leaves): fold_prove/fold_verify are symmetric in c0/c1 (both are
+	/// just eval claims on the same interleaved P), so a 2-to-1 accumulator merge is identical to
+	/// a leaf fold — the load-bearing topology confirmation. Everything here is NATIVE (fold /
+	/// mle_eval / SHA3), so it runs in ms; the per-node in-circuit STARK cost is ~785ms (fold_step,
+	/// measured elsewhere) and the committed decider is the FRI-opening of R*-committed P (the
+	/// crux at :127) — both flagged HONESTLY below, never quoted as measured here.
+	#[test]
+	fn hybrid_epoch_pipeline_e2e() {
+		use binius_field::underlier::WithUnderlier;
+		use crate::recursion::{merkle_auth_path, merkle_path_verify, merkle_tree_sha3};
+		use crate::streaming_commit::streaming_interleaved_root;
+		use sha3::{Digest, Sha3_256};
+
+		// F → its 16 canonical little-endian bytes (for hashing sub-roots / R* symbols).
+		fn f_bytes(x: F) -> [u8; 16] {
+			u128::from(x.to_underlier()).to_le_bytes()
+		}
+		// SHA3-256 sub-root binding one batch's (position ‖ all its evals) — the per-batch
+		// commitment the accumulated object carries ALONGSIDE its eval claim. Position i is IN
+		// the hash, so permuting/substituting batches changes the sub-root (⇒ a different R*).
+		fn batch_subroot(i: usize, evals: &[F]) -> [u8; 32] {
+			let mut h = Sha3_256::new();
+			h.update((i as u64).to_le_bytes());
+			for &e in evals {
+				h.update(f_bytes(e));
+			}
+			h.finalize().into()
+		}
+
+		let rss0 = crate::b256_sha3::peak_rss_bytes();
+		let n_batches = 16usize; // the epoch's 16 accumulated batch-instances
+		let m = n_batches.trailing_zeros() as usize; // log2 = 4 position bits
+		let inner_vars = 6usize; // vars per batch poly (small ⇒ fast; L5 = same shape over B512)
+		let mut rng = StdRng::from_seed([42u8; 32]);
+
+		// --- HOP 1: 16 batch-instance leaves (each a stand-in accumulated object) --------------
+		// evals = the batch's multilinear over inner_vars; claim = an inner EvalClaim on it;
+		// sub-root = its 32-byte SHA3 commitment; position i is carried by enumerate.
+		let records: Vec<Record> = (0..n_batches)
+			.map(|_| {
+				let evals = rand_evals(inner_vars, &mut rng);
+				let r = rand_point(inner_vars, &mut rng);
+				let v = mle_eval(&evals, &r);
+				Record { evals, claim: EvalClaim { point: r, value: v } }
+			})
+			.collect();
+		let subroots: Vec<[u8; 32]> = records.iter().enumerate().map(|(i, r)| batch_subroot(i, &r.evals)).collect();
+
+		// Interleave the 16 batch polys into ONE P over inner_vars+4 = 10 vars, and LIFT each
+		// batch's inner claim to P (lifted_claim appends the position bits — position ∈ the point).
+		let p = interleave(&records);
+		let leaves: Vec<EvalClaim> = records.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+		for (i, lc) in leaves.iter().enumerate() {
+			assert_eq!(mle_eval(&p, &lc.point), lc.value, "lifted leaf {i} false on P");
+		}
+
+		// --- HOP 2: REAL balanced binary fold tree (topology confirmation) ---------------------
+		// Level 0 = the 16 lifted leaf claims. Repeatedly fold PAIRS with an FS challenge t,
+		// EDGE-CHECKING each node with the width-independent verifier. 16→8→4→2→1 (depth 4, 15
+		// interior nodes). The interior nodes fold ACCUMULATORS — the load-bearing case.
+		let mut fs = StdRng::from_seed([99u8; 32]); // stands in for Fiat–Shamir t = H(transcript)
+		let mut tree_nodes: Vec<(EvalClaim, EvalClaim, FoldProof, F)> = Vec::new(); // captured for the decider replay
+		let t_build = Instant::now();
+		let mut level = leaves.clone();
+		let (mut nodes, mut depth) = (0usize, 0usize);
+		while level.len() > 1 {
+			let mut next = Vec::with_capacity(level.len() / 2);
+			let mut i = 0;
+			while i < level.len() {
+				let (c0, c1) = (level[i].clone(), level[i + 1].clone());
+				let t = rand_f(&mut fs); // FS challenge for THIS node
+				let (g, folded) = fold_prove(&p, &c0, &c1, t); // PROVER folds two accumulators
+				// EDGE-CHECK: the O(n) verifier reproduces the folded claim WITHOUT touching P.
+				let v = fold_verify(&c0, &c1, &g, t).expect("interior accumulator fold must verify");
+				assert_eq!(v.value, folded.value, "prover/verifier fold value mismatch");
+				assert_eq!(v.point, folded.point, "prover/verifier fold point mismatch");
+				tree_nodes.push((c0, c1, g, t));
+				next.push(folded);
+				nodes += 1;
+				i += 2;
+			}
+			level = next;
+			depth += 1;
+		}
+		let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
+		let root = level.pop().unwrap();
+		// TOPOLOGY CONFIRMED: after 15 accumulator-merges the ROOT claim holds on P.
+		assert_eq!(mle_eval(&p, &root.point), root.value, "root claim false on P — topology broken");
+		assert_eq!(nodes, 15, "expected 15 interior nodes");
+		assert_eq!(depth, 4, "expected depth 4");
+
+		// --- HOP 5 (compute early, needed by HOP 3/4): R* over the 16 batch sub-roots ----------
+		// streaming_interleaved_root treats each batch as ONE symbol (codeword_len=1, coset_log=0):
+		// leaf k = SHA3(sub-root_k), combined by SHA3-node up a balanced tree → R*.
+		let (rstar, spine_peak) = streaming_interleaved_root(n_batches, 1, 0, |b, _j| subroots[b]);
+		// The zone Merkle tree over the SAME leaf definition (leaf = SHA3(sub-root)) → root == R*.
+		let pre_leaves: Vec<[u8; 32]> = subroots
+			.iter()
+			.map(|s| {
+				let mut h = Sha3_256::new();
+				h.update(s);
+				h.finalize().into()
+			})
+			.collect();
+		let mtree = merkle_tree_sha3(&pre_leaves);
+		assert_eq!(mtree.last().unwrap()[0], rstar, "zone Merkle root must equal streaming R*");
+
+		// --- HOP 3: HYBRID DECIDER verify (the key unmeasured number) --------------------------
+		// The decider verifies the accumulated instance = the root claim P(root.point)=root.value.
+		// (a) native mle_eval(&p, root.point): the direct O(|P|) check of the committed value.
+		let t_a = Instant::now();
+		for _ in 0..50 {
+			let _ = mle_eval(&p, &root.point);
+		}
+		let native_ms = t_a.elapsed().as_secs_f64() * 1e3 / 50.0;
+		// (b) the fold-tree verify path: 15 × fold_verify, each O(n) — the O(leaves) tiny-verify.
+		let t_b = Instant::now();
+		for _ in 0..1000 {
+			for (c0, c1, g, t) in &tree_nodes {
+				let _ = fold_verify(c0, c1, g, *t).unwrap();
+			}
+		}
+		let foldverify_ms = t_b.elapsed().as_secs_f64() * 1e3 / 1000.0;
+
+		// --- HOP 4: POSITION-BINDING (the added obligation) ------------------------------------
+		// Rebuild the fold-tree root for an arbitrary record set (same FS seed → deterministic;
+		// on the honest set it reproduces `root`, asserted below).
+		let build_root = |recs: &[Record]| -> EvalClaim {
+			let pp = interleave(recs);
+			let mut lvl: Vec<EvalClaim> = recs.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+			let mut fs2 = StdRng::from_seed([99u8; 32]);
+			while lvl.len() > 1 {
+				let mut nx = Vec::with_capacity(lvl.len() / 2);
+				let mut i = 0;
+				while i < lvl.len() {
+					let t = rand_f(&mut fs2);
+					let (_, folded) = fold_prove(&pp, &lvl[i], &lvl[i + 1], t);
+					nx.push(folded);
+					i += 2;
+				}
+				lvl = nx;
+			}
+			lvl.pop().unwrap()
+		};
+		assert_eq!(build_root(&records).value, root.value, "deterministic rebuild must match honest root");
+		// (i) PERMUTE: swap batch 3 and batch 5. lifted points carry position AND the sub-roots
+		// hash position ⇒ a DIFFERENT accumulated root over a DIFFERENT R* (permutation caught).
+		let mut permuted = records.clone();
+		permuted.swap(3, 5);
+		let permuted_root = build_root(&permuted);
+		assert_ne!(permuted_root.value, root.value, "permuted root must differ (position-bound)");
+		let permuted_subroots: Vec<[u8; 32]> = permuted.iter().enumerate().map(|(i, r)| batch_subroot(i, &r.evals)).collect();
+		let (rstar_permuted, _) = streaming_interleaved_root(n_batches, 1, 0, |b, _j| permuted_subroots[b]);
+		assert_ne!(rstar_permuted, rstar, "permuted batch set must yield a DIFFERENT R*");
+		// (ii) LYING LEAF: flip one leaf value → its fold's g(1) no longer matches → REJECTED.
+		let (lc0, lc1, g0, t0) = &tree_nodes[0];
+		let mut liar = lc1.clone();
+		liar.value += F::ONE;
+		assert!(fold_verify(lc0, &liar, g0, *t0).is_none(), "lying leaf must be rejected at its fold");
+
+		// --- HOP 5 (path): one batch's µs Merkle auth path against R* — the steady-state lookup -
+		let qi = 5usize;
+		let path = merkle_auth_path(&mtree, qi);
+		let mut ok = false;
+		let t_path = Instant::now();
+		for _ in 0..10_000 {
+			ok = merkle_path_verify(pre_leaves[qi], qi, &path, rstar);
+		}
+		let path_us = t_path.elapsed().as_micros() as f64 / 10_000.0;
+		assert!(ok, "honest Merkle path must verify against R*");
+		let rss1 = crate::b256_sha3::peak_rss_bytes();
+
+		// --- HOP 6: figure-one — every hop with measured numbers -------------------------------
+		println!("\n=== HYBRID EPOCH PIPELINE (figure-one, all-native, ms) ===============");
+		println!("| hop | quantity | measured |");
+		println!("|:--|:--|--:|");
+		println!("| 1 leaves          | batch-instance accumulators | {} (inner 2^{} → P over {} vars, |P|={}) |", n_batches, inner_vars, inner_vars + m, p.len());
+		println!("| 2 fold tree       | interior nodes / depth / build | {} nodes / depth {} / {:.3} ms |", nodes, depth, build_ms);
+		println!("| 2 topology        | root claim holds on P after {} accumulator-merges | ✓ |", nodes);
+		println!("| 3 decider native  | mle_eval(P, root.point)  [direct O(|P|) value check] | {:.4} ms |", native_ms);
+		println!("| 3 decider fold    | 15× fold_verify  [O(leaves) width-indep. path] | {:.4} ms |", foldverify_ms);
+		println!("| 4 permute         | swap b3↔b5 → different root & different R* | ✓ |");
+		println!("| 4 lying leaf      | flip one leaf value → fold rejected | ✓ |");
+		println!("| 5 R* + path       | Merkle auth path (leaf {}) verify vs R* | {:.3} µs (spine peak {}) |", qi, path_us, spine_peak);
+		println!("| -- RSS            | peak resident (native pipeline) | {:.1} → {:.1} MiB |", mib(rss0), mib(rss1));
+		println!("# HONEST DECIDER NOTE: the two decider numbers above are the NATIVE value check and the \
+			 O(leaves) fold-verify path — NOT the committed decider. The true decider is the FRI-OPENING of \
+			 the R*-committed interleaved P at root.point (the crux at accumulation.rs:127 — whether R* is \
+			 FRI-openable as P's codeword). That opening is a batch-width binius verify ~9–13 s (measured \
+			 upper bound, hash-op-table dominated) and is the REMAINING CRUX; it is NOT wired here and the \
+			 monolithic number is NOT quoted as measured for the hybrid. Per-node in-circuit STARK cost is \
+			 ~785 ms (fold_step, measured elsewhere) — the fold-tree build above is the NATIVE fold cost.");
+		println!("GATE hybrid-e2e: 16 batch accumulators → real balanced fold tree ({} nodes, depth {}) → \
+			 root claim holds on P ✓ → hybrid decider MEASURED (native {:.4} ms + fold-verify {:.4} ms; \
+			 FRI-opening decider = remaining crux ~9–13 s) → position-binding ✓ (permute→different R*, \
+			 lying leaf rejected) → R* Merkle path {:.3} µs. Figure-one.", nodes, depth, native_ms, foldverify_ms, path_us);
+	}
 }
