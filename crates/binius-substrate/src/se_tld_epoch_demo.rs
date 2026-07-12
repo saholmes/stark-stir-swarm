@@ -243,7 +243,8 @@ pub fn run_se_tld_epoch_demo(n_real: usize, level: Sha3Level) -> Result<SeEpochR
 	let codeword_len = 1usize << 10;
 	let (epoch_root, _spine) = streaming_interleaved_root(n_pow2, codeword_len, 3, get);
 
-	// (7) the aggregated recursive-STARK epoch proof — edge verify O(1) in N.
+	// (7) the aggregated recursive-STARK epoch proof — fold-layer verify model (distribution
+	//     integrity); the statement-validity decider is the record-AIR verify (~9-13s @L1, polylog in N).
 	let em = measure_epoch_verify(16, &[n_pow2])?;
 	let (_, epoch_prove_ms, epoch_verify_ms, epoch_proof_bytes) = em[0];
 
@@ -326,13 +327,17 @@ mod tests {
 		println!("\n--- (4) aggregated recursive-STARK epoch proof (edge-verified) ---");
 		println!("  proof size   : {} KiB", r.epoch_proof_bytes / 1024);
 		println!("  prove time   : {} ms (aggregator, O(N))", r.epoch_prove_ms);
-		println!("  EDGE VERIFY  : {} ms  ← O(1) in the {} records", r.epoch_verify_ms, r.n_real);
+		println!("  EDGE VERIFY  : {} ms  ← FOLD-layer model (distribution integrity), NOT the full decider.", r.epoch_verify_ms);
+		println!("                 Statement validity = the record-AIR decider ~9-13s @L1 (polylog in N,");
+		println!("                 width-dominated); the fold-verify path is O(leaves), sub-second. Both once/epoch.");
 
 		println!("\n--- (5) steady state ---");
 		println!("  local SHA3 Merkle-path check per lookup : {:.1} µs", r.steady_state_us);
 
-		println!("\n=== A resolver fetches (R*, Π) once ({} ms verify), then answers any of the {} `.se`\n\
-			 delegations with a {:.1} µs membership check. Signatures: ECDSA-P256 native (in-circuit\n\
+		println!("\n=== A resolver fetches (R*, Π) once and runs, ONCE per epoch: the statement-validity\n\
+			 DECIDER (record-AIR verify ~9-13s @L1, polylog in N, width-dominated) + the fold-verify\n\
+			 path ({} ms fold model here; O(leaves), sub-second at .se) — then answers any of the {}\n\
+			 `.se` delegations with a {:.1} µs membership check. Signatures: ECDSA-P256 native (in-circuit\n\
 			 verify = the S2-gadget upgrade); everything downstream (commitment, aggregation, lookup)\n\
 			 is in-circuit / cryptographic. ===\n",
 			r.epoch_verify_ms, r.n_real, r.steady_state_us);

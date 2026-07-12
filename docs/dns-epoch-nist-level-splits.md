@@ -22,9 +22,11 @@ for the O(1)-verify accumulation route.
 * **L5 is the real jump**: the 256-bit floor forces the field B256 → B512,
   which ~2× prove, ~4.4× verify, ~1.6× RSS.
 * The **aggregation / epoch layer edge-verifies in two checks, once per epoch**: a
-  **~18 ms fold check** (distribution integrity — anti-substitution vs `R*`, near-flat in N)
-  and a **full decider** (statement validity — pays record-AIR width: **measured ~9–13 s,
-  POLYLOG in N** — 16× records → 1.38× verify, ~0.85 s/doubling; **not O(1)**). The 18 ms alone does **not**
+  **fold check** (distribution integrity — anti-substitution vs `R*`; the native fold-verify
+  path, **O(leaves), sub-second** — 1.76 ms @ 16 leaves → ~340 ms @ 2930, linear, *not* the old
+  "~18 ms / O(1)" chain-final-proof number) and a **full decider** (statement validity — pays
+  record-AIR width: **measured ~9–13 s, POLYLOG in N** — 16× records → 1.38× verify,
+  ~0.85 s/doubling; **not O(1)**). The fold alone does **not**
   enforce the per-record constraints (width law: 18 ms ⇒ near-zero width = fold table
   only); the security section claims validity only for the decider layer. Both amortize
   into background per-epoch cost.
@@ -73,7 +75,7 @@ batched record-AIR proof, so it scales with the record-AIR width/level):
 |:------------------|:-------------------------|
 | Epoch proof size  | 339 KiB (fold) / 608 KiB–830 KiB (decider, N-dependent) |
 | Epoch prove       | ~77 ms fold; decider O(N), ~linear RSS (publisher-half open) |
-| **Edge — fold check**   | **~18 ms**, near-flat in N — *distribution integrity* |
+| **Edge — fold check**   | **O(leaves), sub-second** (1.76 ms @16 → ~340 ms @2930) — *distribution integrity* |
 | **Edge — full decider** | **~9–13 s L1 / ~41 s L5**, polylog in N — *statement validity* |
 | Steady-state lookup | ~1.3 µs (local SHA3 Merkle path) |
 
@@ -99,7 +101,8 @@ batched record-AIR proof, so it scales with the record-AIR width/level):
 ## Flow model & security
 
 **Actors:** the zone *publisher* (prover — does the expensive work once per
-epoch), the *edge resolver* (verifier — O(1) work), the *client* (µs lookups).
+epoch), the *edge resolver* (verifier — once-per-epoch: seconds decider + sub-second fold,
+polylog in N), the *client* (µs lookups).
 
 ```
 PUBLISH  (prover, once per epoch)
@@ -121,8 +124,8 @@ PUBLISH  (prover, once per epoch)
   artifact = (R*, Π)      [+ the record set / Merkle leaves]
 
 VERIFY   (edge resolver, once per epoch — TWO distinct checks)
-  (a) FOLD layer:    check Π's fold-correctness   → ~18 ms, O(1) in N
-                     ⇒ distribution integrity (anti-substitution vs R*)
+  (a) FOLD layer:    replay the fold-verify path   → O(leaves), sub-second
+                     (1.76 ms @16 → ~340 ms @2930) ⇒ distribution integrity (anti-sub vs R*)
   (b) FULL DECIDER:  check the accumulated record-AIR instance  → O(record-AIR
                      width) + polylog(N), MEASURED ~9–13 s (SHA3-256 @L1), ~flat in N
                      ⇒ statement validity ("the records' constraints hold")
@@ -132,7 +135,7 @@ SERVE    (client, every lookup after the first)
 ```
 
 **The two verify checks are not interchangeable** (this is the accumulation-soundness
-structure — fold-correctness + a decider): the **~18 ms fold check** establishes that the
+structure — fold-correctness + a decider): the **sub-second fold check (O(leaves))** establishes that the
 accumulator was folded correctly and binds the lookups to `R*` — *distribution integrity*,
 i.e. anti-substitution relative to a publisher-constructed `R*`. It does **not** by itself
 enforce the per-record digest/AIR constraints, because by the width law
@@ -176,7 +179,7 @@ assumption on the soundness path.
 > **Which check earns which claim (the fold/decider distinction).** *Statement
 > validity* — "no adversary can make `Π` attest to a record whose AIR constraints
 > don't hold" — is earned only by the **full decider** (verify (b): pays record-AIR
-> width, O(1) in N, sub-second–seconds). The **~18 ms fold check** (verify (a))
+> width, O(1) in N, sub-second–seconds). The **sub-second fold check (O(leaves))** (verify (a))
 > earns only *distribution integrity* (fold-correctness + anti-substitution vs a
 > publisher-constructed `R*`). Do not attribute validity to the 18 ms layer, and do
 > not treat "Layer-1 verified prover-side" as repair — a prover checking its own
@@ -223,7 +226,7 @@ the current binaries*, but the soundness path to real L3/L5 is demonstrated, not
 
 **Edge protocol (three tiers — the amortization shape).** On fetching the epoch package the
 resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, O(1) in N)
-and (2) the **fold** (distribution integrity, ~18 ms, O(1) in N). Thereafter, **per DNS request**,
+and (2) the **fold** (distribution integrity, O(leaves), sub-second). Thereafter, **per DNS request**,
 (3) a **µs SHA-3 Merkle-path** check of the record against the already-verified `R*` — not a
 proof re-verification. So the expensive validity proof is paid once; every lookup in the epoch is
 a µs membership check.
@@ -394,7 +397,7 @@ to the Layer-1 table; the batch proof *was* the decider all along). Verify grows
 
 | Quantity | Demo (N=8192) | `.se` (N=1.5 M, extrapolated) | What it earns |
 |:---------|:-------------|:--------|:-----|
-| **Fold check** | ~18 ms | ~18 ms (near-flat) | distribution integrity (anti-substitution vs `R*`) |
+| **Fold check** | ~1.8 ms @16 | **O(leaves), sub-second** (~340 ms @2930, linear) | distribution integrity (anti-substitution vs `R*`) |
 | **Full decider — L1** | **~13 s** (measured) | **~19–20 s** (polylog, +0.85 s/doubling) | **statement validity** (records' constraints hold) |
 | **Full decider — L5** | **~41 s** (measured, the N=512 L5 split) | proportionally higher | statement validity at L5 field |
 | Per-record lookup | ~3 µs | ~3 µs | Merkle path to the proven `R*` |
@@ -449,11 +452,11 @@ becomes a single decider attesting both statement validity and distribution (wor
 * **Prove:** the fleet-parallel "~1000 provers, 7.2 s" figure is an Approach-A/B (per-batch)
   picture; the measured monolithic-C decider is **one proof, O(N) time, ~linear RSS** —
   reconciling the two (streaming commit vs C-per-batch+fold) is the publisher-half open above.
-* **Verify (fetch-path total, L1):** **~9–20 s decider + ~18 ms fold, once per epoch**
+* **Verify (fetch-path total, L1):** **~9–20 s decider + sub-second O(leaves) fold, once per epoch**
   (polylog in N), then **~3 µs/lookup** — the per-request cost is invisible; the per-epoch
   fetch cost is seconds, amortized.
 
-Two reviewer caveats restated: (1) the ~18 ms is the fold layer, not the decider (seconds);
+Two reviewer caveats restated: (1) the fold is the O(leaves) sub-second layer, not the decider (seconds);
 (2) 4.79 ms/record is the SHA3 digest,
 not the full RRSIG signature verify.
 
@@ -643,5 +646,20 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
   type-param swap (`prove_verify_hash<W,H,C>` exists); the numbers change by the L3→L5
   challenger multiplier (~4.4×), not the architecture.
 * **✓ Width sentence + fold sweep — done.** `committed width ≈ 7000 ≠ gate width ~575`; and
-  the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms is the *fold*
-  check; the decider is the ~9–13 s statement-validity verify).
+  the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms was a stale
+  fold-model number; the fold-verify path is O(leaves), sub-second; the decider is the ~9–13 s
+  statement-validity verify).
+* **○ OPEN (own line) — end-to-end committed decider on an *actual interleaved* commit.** The
+  committed-decider table above measures a real FRI opening of a *single* multilinear
+  (leaves-independence of a batch-scale opening). The **leaves-independent decider-verify
+  headline** — that one cross-batch coset opens all batches in a single query-path — currently
+  rests on the *modeled* query-path term (measured per-path × modeled query/fold counts,
+  `decider_verify_query_path_vs_leaves`). Committing an actual N-batch interleaved codeword and
+  measuring its opening verify vs leaves directly is a **second open measurement of similar weight
+  to the headline** — engineering (the layout is proven byte-exact in `streaming_commit`), not
+  discovery.
+* **○ OPEN — full-signature per-record prove cost.** The `.se` publisher-prove projection
+  (~2 core-hours / fleet-parallel) rests on **4.79 ms/record = the SHA3 *digest* proof, not the
+  RRSIG *signature* verify** (the S-layer sig-AIR — `.se` ZSK ECDSA-P256, ~99 core-hours in-circuit
+  = the offline path). Any full-`.se` prove number is a projection on an unmeasured per-record
+  signature cost until one real `.se`-ZSK signature proof is timed (the ECDSA doc is unchanged).

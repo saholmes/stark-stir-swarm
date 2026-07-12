@@ -5,8 +5,10 @@
 //   2. each record proved independently (sliver, low RSS) → a per-record commitment;
 //   3. the records aggregated into ONE epoch commitment — the byte-exact, low-RSS streaming
 //      interleaved commit (streaming_commit, gated == binius commit_interleaved);
-//   4. an aggregated epoch proof, verified by an edge resolver in ~constant time (O(1) in the
-//      record count — accumulation_air::measure_epoch_verify);
+//   4. an aggregated epoch proof; the edge, once per epoch, runs the statement-validity decider
+//      (record-AIR verify, ~9-13s @L1, POLYLOG in N, width-dominated) + the fold-verify path
+//      (O(leaves), sub-second) — NOT O(1). (The `EDGE VERIFY` number below is the fold-layer
+//      model from accumulation_air::measure_epoch_verify, not the full decider.);
 //   5. steady state: every record lookup is a local SHA3 Merkle-path check against the proven
 //      epoch root — microseconds, no network, cryptographic (not TTL) integrity.
 //
@@ -239,12 +241,16 @@ mod tests {
 		println!("\n--- (4) aggregated epoch proof (one recursive STARK, edge-verified) ---");
 		println!("  proof size   : {} KiB", report.epoch_proof_bytes / 1024);
 		println!("  prove time   : {} ms (aggregator, O(N))", report.epoch_prove_ms);
-		println!("  EDGE VERIFY  : {} ms  ← fast, ~constant in record count (O(1) in N)", report.epoch_verify_ms);
+		println!("  EDGE VERIFY  : {} ms  ← this is the FOLD-layer model (distribution integrity), NOT the full", report.epoch_verify_ms);
+		println!("                 decider: statement validity is the record-AIR verify ~9-13s @L1 (polylog in N,");
+		println!("                 width-dominated); the fold-verify path itself is O(leaves), sub-second. See");
+		println!("                 docs/dns-epoch-nist-level-splits.md (fold vs decider).");
 		println!("\n--- (5) steady state: every lookup after the first ---");
 		println!("  local SHA3 Merkle-path check vs R* : {:.1} µs — no network, cryptographic integrity",
 			report.steady_state_us);
-		println!("\n=== A resolver fetches R* + the proof once ({} ms verify), then serves every record\n\
-			 with a {:.1} µs local check — post-quantum, FIPS-clean, decentralised, no network round trip. ===\n",
+		println!("\n=== A resolver fetches R* + the proof once and runs the decider (~9-13s @L1, polylog in N)\n\
+			 + the fold-verify path ({} ms fold model; O(leaves), sub-second) ONCE per epoch, then serves\n\
+			 every record with a {:.1} µs local check — post-quantum, FIPS-clean, decentralised, no network. ===\n",
 			report.epoch_verify_ms, report.steady_state_us);
 
 		assert!(report.epoch_verify_ms > 0 && report.epoch_proof_bytes > 0);
