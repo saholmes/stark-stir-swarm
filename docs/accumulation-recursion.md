@@ -60,8 +60,10 @@ Useful as the **verify-cost lower bound** to measure A/B against.
 ## What "success" looks like
 - **Per-fold cost `O(log)`**, empirically flat as records accumulate (contrast: the
   in-circuit verify is `O(width)` *per record*).
-- **Decider verify** small and ~constant (A/B: `O(N)` cheap openings; C: `O(1)`), vs the
-  Tier-B in-circuit seconds-per-proof.
+- **Decider verify**: the *opening* is small and leaves-independent (measured ~10 ms), and the
+  fold is O(1) in the instance count — but the **statement-validity** decider (record-AIR verify)
+  is **width-dominated seconds** (~9–13 s L1, polylog-in-N). See the CORRECTION below: this is
+  polylog-in-N, not O(1) wall-clock. Still amortized once-per-epoch, µs steady-state.
 - **Low-RSS parallel proving preserved** — folds consume separately-proved instances.
 - The FIPS hash appears only at the base commitment + final wrap, never re-arithmetized
   per query. (This is *why* accumulation dodges the FIPS-width tension.)
@@ -77,38 +79,52 @@ Useful as the **verify-cost lower bound** to measure A/B against.
 4. **Only then**: does binius's PIOP expose the seam to slot A/B in? (cf. the STIR trace
    — the sumcheck↔FRI lockstep may resist a clean insertion here too.)
 
-## ★ O(1) collapse — RESOLVED analytically (binius already has the machinery)
+## ★ Instance-count collapse — RESOLVED; but the decider is WIDTH-dominated (polylog-in-N, seconds — NOT O(1) wall-clock)
 
-Investigating the O(1) decider + instance-folding led to a clean resolution: **binius's PCS
-already contains both halves of Nova-style accumulation** — you don't port Nova, you use what's
-there.
+Investigating the accumulation led to a clean structural resolution: **binius's PCS already
+contains both halves of Nova-style accumulation** — you don't port Nova, you use what's there.
 
 1. **Instance-fold ≡ binius's batched multi-claim sumcheck.** `front_loaded::BatchVerifier`
    samples one random mixing coefficient per claim and combines N evaluation claims (even at
    different points / n_vars) into ONE sumcheck. That random-linear-combination of claims *is*
-   the fold; my custom point-reduction fold was re-deriving it.
-2. **O(1) decider ≡ binius's interleaved codes.** `fold_interleaved_chunk` (`log_batch_size`)
-   commits a BATCH of codewords and opens the batch at a point in O(1) via the interleave-tensor
-   (the tensor product of the first fold challenges). A batch of N record codewords committed
-   this way IS a commitment to the block-interleaved multilinear P over `inner + log N` vars,
-   openable at ANY point (including the batched-claim point) in one FRI query set — polylog in N.
+   the fold; the custom point-reduction fold was re-deriving it. **This part is genuinely O(1) in
+   the instance count** — N records collapse to one accumulated claim.
+2. **The opening ≡ binius's interleaved codes.** `fold_interleaved_chunk` (`log_batch_size`)
+   commits a BATCH of codewords and opens the batch at a point via the interleave-tensor. A batch
+   of N record codewords committed this way IS a commitment to the block-interleaved multilinear P
+   over `inner + log N` vars, openable at ANY point in one FRI query set. **The PCS opening is
+   polylog and leaves-independent — MEASURED at ~7–11 ms (L1), flat across a 256× domain**
+   (`committed_decider`). This confirms the opening half.
 
-So **O(1)-verify aggregation over binius is achievable with native machinery**: commit the N
-records as ONE interleaved-code batch, prove the aggregation as ONE binius proof whose N record
-claims are batched by the sumcheck. Edge verify = one sumcheck + one FRI opening = **O(polylog),
-O(1) in N.** No homomorphic commitment, no custom folding scheme.
+> **CORRECTION (this is the load-bearing hygiene fix — supersedes the earlier "edge verify = O(1)
+> in N" claim).** The instance-fold and the PCS *opening* are cheap and leaves-independent. But
+> **statement validity is NOT the opening alone** — the decider must also verify that the
+> accumulated instance satisfies the **record-AIR (SHA3/Keccak) constraints**, and *that* verify
+> is **width-dominated**: `verify ≈ 20 + 1.3 ms × committed-width`, and the FIPS-hash record-AIR is
+> ~7000 committed columns ⇒ **~9–13 s at L1 (~41 s at L5)**, polylog in N-rows but **linear in
+> width**. The "one sumcheck" above silently absorbs this width-linear AIR verify — which is the
+> whole cost. So the honest label is:
+> - **O(1) in the instance count N** (fold) ✓, and **leaves-independent PCS opening** (~10 ms) ✓;
+> - **but statement-validity decider wall-clock is width-dominated seconds** (~9–13 s L1 / ~41 s L5),
+>   **polylog-in-N, NOT O(1) and NOT ms.**
+>
+> The measured evidence and the full argument live in
+> [`dns-epoch-nist-level-splits.md`](./dns-epoch-nist-level-splits.md) (fold vs decider, the width
+> law, the committed-decider L1/L3/L5 table). "Sound **polylog-in-N** aggregation at a seconds-scale
+> per-epoch decider" is the result — not "O(1)-in-N edge verify."
 
 **Why the detour was still worth it.** The custom narrow fold-verify circuit (accumulation_air,
-~48 ms, FIPS-clean) is the primitive you need for STREAMING / bounded-memory IVC — folding one
-record at a time in a recursion circuit when you can't hold the batch. For a single aggregation
-proof, binius's native batching is simpler and directly O(1). Both live in this branch.
+~48 ms native, FIPS-clean) is the primitive for STREAMING / bounded-memory IVC — folding one
+record at a time when you can't hold the batch. For a single aggregation proof, binius's native
+batching is simpler. Both live in this branch.
 
-**The residual is RSS, not O(1).** Native batched opening requires the records under ONE
-interleaved commitment. Per-record trace/witness generation still shards (low RSS), and each
-record's codeword is RS-encoded independently — but the *interleave + Merkle commit* step wants
-the codewords together. Whether that commit streams at low RSS (interleave-on-the-fly, à la the
-low-mem streaming prover) is the real open question — the same "commit the batch cheaply" problem
-the sliver work already attacks. That, not the O(1) verify, is what's left.
+**The two residuals: RSS *and* the width-dominated decider.** (a) Native batched opening wants the
+records under ONE interleaved commitment; whether that commit streams at low RSS (interleave-on-the-
+fly) is the "commit the batch cheaply" problem the sliver work attacks (measured flat, `stream_commit
+_rss_vs_n`; the publisher answer is C-per-batch + a balanced fold tree, fleet-parallel). (b) The
+statement-validity decider is width-dominated seconds — amortized once per epoch (O(1) in N,
+polylog-in-N-rows), µs steady-state after — but *not* the O(1)-ms first-contact verify the earlier
+framing implied.
 
 ## Honesty / risks
 - Binius has **no accumulation today**; this is a from-scratch construction over binary
