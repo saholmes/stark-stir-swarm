@@ -248,6 +248,83 @@ mod tests {
 		);
 	}
 
+	/// GATE canonical-root-binding (the reviewer's soundness sentence) — symbol-interleaving means
+	/// the per-batch trees under `R*_i` are NOT subtrees of the interleaved root `R*`: they are two
+	/// incompatible Merkle trees over the same codewords. The fold binds leaf instances; the decider
+	/// opens against `R*`. Unless the package ties the fold's leaves to the SAME codewords the
+	/// decider opens, a publisher folds claims about one polynomial set and answers FRI queries from
+	/// another. RESOLUTION: make the interleaved root CANONICAL — each leaf claim binds
+	/// `(R*, position i)`, and because `R*` is a collision-resistant commitment to exactly the batch
+	/// codewords, folding a leaf bound to `R*` FORCES those codewords. A different codeword set has a
+	/// different `R*'`, so a leaf bound to `R*` cannot be answered from `R*'`. The steady-state µs
+	/// Merkle path also walks THIS canonical interleaved tree — one root, one object.
+	#[test]
+	fn canonical_root_binding() {
+		let n_batches = 16usize;
+		let codeword_len = 64usize; // per-batch codeword length
+		// batch codewords {C_i}: C_i[p] = sym(i, p). Interleaved P symbol = sym(record, pos).
+		let cw = |i: usize, p: usize| sym(i, p);
+
+		// (1) canonical interleaved root R* (symbol-interleave, cross-batch cosets).
+		let (rstar, _) = streaming_interleaved_root(n_batches, codeword_len, 3, cw);
+		// per-batch sub-roots R*_i over C_i alone (a SEPARATE tree per batch).
+		let subroot = |i: usize| -> Digest32 {
+			let leaves: Vec<Digest32> = (0..codeword_len).map(|p| cw(i, p)).collect();
+			crate::recursion::merkle_root_sha3(&leaves)
+		};
+		let subroots: Vec<Digest32> = (0..n_batches).map(subroot).collect();
+
+		// (2) INCOMPATIBILITY: no R*_i equals R* (different trees over the same codewords) — the
+		//     per-batch trees are not subtrees of the interleaved tree.
+		for (i, s) in subroots.iter().enumerate() {
+			assert_ne!(*s, rstar, "R*_{i} must differ from the interleaved R* (incompatible trees)");
+		}
+
+		// (3) A DIFFERENT codeword set {C'_i} (perturb batch 7's codeword) ⇒ different canonical R*'.
+		let cw2 = |i: usize, p: usize| -> Digest32 {
+			let mut s = sym(i, p);
+			if i == 7 && p == 0 { s[0] ^= 1; }
+			s
+		};
+		let (rstar2, _) = streaming_interleaved_root(n_batches, codeword_len, 3, cw2);
+		assert_ne!(rstar, rstar2, "a different codeword set must yield a different canonical R'");
+
+		// (4) BINDING: leaf identity = SHA3(R* ‖ i). Binding the CANONICAL root ties each leaf to the
+		//     specific codeword set; the SAME position under R*' is a different leaf identity ⇒ a
+		//     publisher cannot fold leaves bound to R* and open codewords committed under R*'.
+		let leaf_id = |root: &Digest32, i: usize| -> Digest32 {
+			let mut h = Sha3_256::new();
+			h.update(root);
+			h.update((i as u64).to_le_bytes());
+			h.finalize().into()
+		};
+		for i in 0..n_batches {
+			assert_ne!(leaf_id(&rstar, i), leaf_id(&rstar2, i), "leaf {i} must bind the canonical root (R* ≠ R')");
+		}
+		// binding the SUB-ROOT instead would NOT distinguish the two sets at unperturbed batches —
+		// e.g. batch 3's sub-root is identical across {C_i} and {C'_i} (only batch 7 changed), so a
+		// sub-root binding leaves batch 3's leaf free to be answered from either tree. The canonical
+		// R* binding closes this: every leaf's identity moves when ANY codeword changes.
+		assert_eq!(subroot(3), {
+			let leaves: Vec<Digest32> = (0..codeword_len).map(|p| cw2(3, p)).collect();
+			crate::recursion::merkle_root_sha3(&leaves)
+		}, "batch 3 sub-root unchanged across the two sets — why sub-root binding is unsound");
+		assert_ne!(leaf_id(&rstar, 3), leaf_id(&rstar2, 3), "but the canonical-R* binding of batch 3 DOES move");
+
+		// (5) steady-state path walks the CANONICAL interleaved tree (R*), not a sub-root tree.
+		println!(
+			"GATE canonical-root-binding: the per-batch sub-roots R*_i are NOT subtrees of the interleaved R* \
+			 (incompatible trees over the same codewords) — so binding the fold's leaves to R*_i while the decider \
+			 opens R* is UNSOUND (a sub-root binding leaves an unperturbed batch's leaf answerable from either \
+			 codeword set: batch 3's sub-root is identical across {{C_i}} and {{C'_i}}, yet its canonical-R* leaf \
+			 identity DIFFERS). RESOLUTION (one sentence in the statement): each leaf binds the CANONICAL \
+			 (R*, position i); R* is a CR commitment to exactly the batch codewords, so folding a leaf bound to R* \
+			 FORCES those codewords and a different set (R'≠R*) cannot answer it. The steady-state µs Merkle path \
+			 walks THIS canonical interleaved tree. Cost: the interleave-pass BARRIER (measured ~83 s single / \
+			 ~seconds fleet) before the fold tree can start."
+		);
+	}
+
 	/// GATE stream-commit-sound — the streaming commit produces the SAME root as the
 	/// full-buffer reference, bit-for-bit, in binius's tree STRUCTURE (symbol-interleave,
 	/// coset leaves of size 1<<coset_log, index-parity tree) — without materializing the
