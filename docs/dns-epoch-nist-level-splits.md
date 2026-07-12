@@ -677,15 +677,19 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
   the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms was a stale
   fold-model number; the fold-verify path is O(leaves), sub-second; the decider is the ~9–13 s
   statement-validity verify).
-* **○ OPEN (own line) — end-to-end committed decider on an *actual interleaved* commit.** The
-  committed-decider table above measures a real FRI opening of a *single* multilinear
-  (leaves-independence of a batch-scale opening). The **leaves-independent decider-verify
-  headline** — that one cross-batch coset opens all batches in a single query-path — currently
-  rests on the *modeled* query-path term (measured per-path × modeled query/fold counts,
-  `decider_verify_query_path_vs_leaves`). Committing an actual N-batch interleaved codeword and
-  measuring its opening verify vs leaves directly is a **second open measurement of similar weight
-  to the headline** — engineering (the layout is proven byte-exact in `streaming_commit`), not
-  discovery.
+* **✓ CLOSED (was the headline's one modeled term) — committed decider on an *actual interleaved*
+  commit, MEASURED.** The leaves-independent decider-verify headline previously rested on a
+  *modeled* query-path term (`decider_verify_query_path_vs_leaves`: measured per-path × modeled
+  query/fold counts). It is now **directly measured** (`committed_decider::interleaved_decider_verify_vs_leaves`):
+  a genuine block-interleaved N-batch codeword (the `interleave` layout) is committed and opened
+  through the **real FRI-Binius piop** at the decomposition point `(a‖b)`, with the opened value
+  verified equal to `Σ_i eq(b,i)·P_i(a)` (`decomp OK` — the real commit *is* the decomposable one)
+  and tamper rejected, at each N. **Result (L1 B256@128, inner_vars=6): 256× more leaves (N: 2 →
+  512) grows the piop verify only ×1.43 (5.82 → 8.33 ms)** — polylog in the leaf count via the
+  `log N` term in `n_vars`, **not O(leaves)**. So "one cross-batch opening verifies all batches" is
+  now a measured property of the real interleaved commitment, not a model. (Commit/open-prove
+  *do* grow — 1.1 → 26 ms / 2.4 → 45 ms over the sweep — but those are publisher-side and
+  fleet-parallel; the edge *verify* is the leaves-independent quantity, and it is.)
 * **○ OPEN — full-signature per-record prove cost.** The `.se` publisher-prove projection
   (~2 core-hours / fleet-parallel) rests on **4.79 ms/record = the SHA3 *digest* proof, not the
   RRSIG *signature* verify** (the S-layer sig-AIR — `.se` ZSK ECDSA-P256, ~99 core-hours in-circuit

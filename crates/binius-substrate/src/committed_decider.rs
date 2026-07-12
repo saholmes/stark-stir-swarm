@@ -235,6 +235,221 @@ macro_rules! measure_cdec {
 	}};
 }
 
+/// One measured row of the REAL interleaved-commit decider sweep: a P built by block-interleaving
+/// `n_batches` separate batch polys (each `inner_vars` vars) into `inner_vars + log2(n_batches)`
+/// vars — the actual `accumulation::interleave` layout — committed and opened through the SAME
+/// FRI-Binius piop, at the decomposition point (a ‖ b). This is ledger item #3: it replaces the
+/// MODELED query-path term (`accumulation::decider_verify_query_path_vs_leaves`) with a directly
+/// MEASURED piop verify of a genuine interleaved commitment, swept against the leaf count.
+#[derive(Debug, Clone, Copy)]
+pub struct IntlvRow {
+	pub inner_vars: usize,
+	pub n_batches: usize, // = leaves
+	pub n_vars: usize,    // = inner_vars + log2(n_batches)
+	pub commit_ms: f64,
+	pub open_prove_ms: f64,
+	pub verify_ms: f64,
+	pub proof_bytes: usize,
+	pub peak_rss_bytes: u64,
+	/// P(a‖b) opened value == Σ_i eq(b,i)·P_i(a) — the real commit matches the decomposition.
+	pub decomp_ok: bool,
+	pub tamper_rejects: bool,
+}
+
+// Real interleaved-commit decider measurement over concrete field types. Mirrors `measure_cdec`
+// but constructs the committed multilinear as the BLOCK-INTERLEAVE of `2^logn` batch polys (each
+// `inner_vars` vars) — block i at hypercube indices [i·2^inner .. (i+1)·2^inner), so the high
+// `logn` index bits select the batch (exactly `accumulation::interleave` / `lifted_claim`). The
+// opening point is (a = inner, low vars ‖ b = position, high vars); the opened value is checked
+// EQUAL to Σ_i eq(b,i)·P_i(a), so the measured verify is a verify of the genuinely decomposable
+// interleaved commitment — not a random poly.
+macro_rules! measure_intlv_cdec {
+	($F:ty, $P:ty, $inner:expr, $logn:expr, $sec:expr, $seed:expr) => {{
+		let inner_vars: usize = $inner;
+		let logn: usize = $logn;
+		let n_vars: usize = inner_vars + logn;
+		let n_batches: usize = 1usize << logn;
+		let security_bits: usize = $sec;
+		let mut rng = StdRng::seed_from_u64($seed);
+
+		// N batch polys, each 2^inner_vars width-1 packed evals; interleave = concatenate blocks.
+		let batch_evals: Vec<Vec<$P>> = (0..n_batches)
+			.map(|_| {
+				(0..(1usize << inner_vars))
+					.map(|_| <$P as PackedField>::random(&mut rng))
+					.collect::<Vec<$P>>()
+			})
+			.collect();
+		let evals: Vec<$P> = batch_evals.iter().flat_map(|b| b.iter().cloned()).collect();
+		let poly = MultilinearExtension::<$P>::new(n_vars, evals).unwrap();
+		let committed_multilins = vec![MLEDirectAdapter::from(poly)];
+
+		let commit_meta = CommitMeta::with_vars([n_vars]);
+		let merkle_prover =
+			BinaryMerkleTreeProver::<$F, Sha256, _>::new(Sha256Compression::default());
+		let merkle_scheme = merkle_prover.scheme();
+		let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
+			&commit_meta,
+			merkle_scheme,
+			security_bits,
+			1,
+		)
+		.unwrap();
+		let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
+		let backend = make_portable_backend();
+
+		// COMMIT the REAL interleaved codeword (timed).
+		let t = Instant::now();
+		let CommitOutput { commitment, committed, codeword } =
+			commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
+		let commit_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// Decomposition point: a = inner (low vars), b = position (high vars). point = a ‖ b.
+		let a: Vec<$F> = (0..inner_vars).map(|_| <$F as Field>::random(&mut rng)).collect();
+		let b: Vec<$F> = (0..logn).map(|_| <$F as Field>::random(&mut rng)).collect();
+		let point: Vec<$F> = a.iter().cloned().chain(b.iter().cloned()).collect();
+
+		let eq = EqIndPartialEval::<$F>::new(point.clone());
+		let eq_mle: MultilinearExtension<$P, _> =
+			eq.multilinear_extension::<$P, _>(&backend).unwrap();
+		let eq_mle_owned =
+			MultilinearExtension::<$P>::new(eq_mle.n_vars(), eq_mle.evals().to_vec()).unwrap();
+		let transparent_multilins = vec![MLEDirectAdapter::from(eq_mle_owned)];
+
+		// value = P(point) = Σ_V P(V)·eq(point,V) — ground-truth hypercube inner product.
+		let value: $F = (0..(1usize << n_vars))
+			.map(|v| {
+				committed_multilins[0].evaluate_on_hypercube(v).unwrap()
+					* transparent_multilins[0].evaluate_on_hypercube(v).unwrap()
+			})
+			.sum();
+
+		// DECOMPOSITION check: recompute value INDEPENDENTLY as Σ_i eq(b,i)·P_i(a), where
+		// P_i(a) = Σ_v batch_evals_i(v)·eq(a,v). If these agree, the measured verify below is a
+		// verify of a genuinely batch-decomposable interleaved commitment.
+		let eq_pt = |pt: &[$F], v: usize| -> $F {
+			let mut w = <$F as Field>::ONE;
+			for (j, &c) in pt.iter().enumerate() {
+				w *= if (v >> j) & 1 == 1 { c } else { <$F as Field>::ONE + c };
+			}
+			w
+		};
+		let p_i_at_a = |i: usize| -> $F {
+			(0..(1usize << inner_vars))
+				.map(|v| {
+					let s: $F = <$P as PackedField>::get(&batch_evals[i][v], 0);
+					s * eq_pt(&a, v)
+				})
+				.sum()
+		};
+		let rhs: $F = (0..n_batches).map(|i| eq_pt(&b, i) * p_i_at_a(i)).sum();
+		let decomp_ok = rhs == value;
+
+		let claims = vec![PIOPSumcheckClaim::<$F> {
+			n_vars,
+			committed: 0,
+			transparent: 0,
+			sum: value,
+		}];
+
+		let domain_factory = DefaultEvaluationDomainFactory::<FDomain>::default();
+		let mut proof = ProverTranscript::<HasherChallenger<Sha256>>::new();
+		proof.message().write(&commitment);
+		let t = Instant::now();
+		prove(
+			&fri_params,
+			&ntt,
+			&merkle_prover,
+			domain_factory,
+			&commit_meta,
+			committed,
+			&codeword,
+			&committed_multilins,
+			&transparent_multilins,
+			&claims,
+			&mut proof,
+			&backend,
+		)
+		.unwrap();
+		let open_prove_ms = t.elapsed().as_secs_f64() * 1e3;
+		let peak_rss_bytes = peak_rss_bytes();
+
+		let eq_dyn: &dyn MultivariatePoly<$F> = &eq;
+		let transparents: Vec<&dyn MultivariatePoly<$F>> = vec![eq_dyn];
+		let proof_bytes_vec = proof.finalize();
+		let proof_bytes = proof_bytes_vec.len();
+
+		// VERIFY (timed) — the real query-path opening of the interleaved codeword.
+		let t = Instant::now();
+		{
+			let mut vproof =
+				VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec.clone());
+			let commitment_v = vproof.message().read().unwrap();
+			verify(
+				&commit_meta,
+				merkle_scheme,
+				&fri_params,
+				&commitment_v,
+				&transparents,
+				&claims,
+				&mut vproof,
+			)
+			.expect("honest interleaved-commit decider opening must verify");
+		}
+		let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// TAMPER: corrupt the claimed value; verify MUST reject.
+		let tampered_claims = vec![PIOPSumcheckClaim::<$F> {
+			n_vars,
+			committed: 0,
+			transparent: 0,
+			sum: value + <$F as Field>::ONE,
+		}];
+		let tamper_rejects = {
+			let mut vproof =
+				VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes_vec);
+			let commitment_v = vproof.message().read().unwrap();
+			verify(
+				&commit_meta,
+				merkle_scheme,
+				&fri_params,
+				&commitment_v,
+				&transparents,
+				&tampered_claims,
+				&mut vproof,
+			)
+			.is_err()
+		};
+
+		IntlvRow {
+			inner_vars,
+			n_batches,
+			n_vars,
+			commit_ms,
+			open_prove_ms,
+			verify_ms,
+			proof_bytes,
+			peak_rss_bytes,
+			decomp_ok,
+			tamper_rejects,
+		}
+	}};
+}
+
+/// Ledger item #3, MEASURED: verify a REAL interleaved-commit decider opening vs the leaf count.
+/// Fix `inner_vars`, sweep `logn` (⇒ N = 2^logn batches, n_vars = inner_vars + logn), and measure
+/// the piop verify wall-clock of the genuine block-interleaved commitment at each N. If verify
+/// grows only polylog in N (the `logn` term in n_vars) at fixed inner width — and NOT linearly in
+/// the leaf count — the "leaves-independent decider verify" headline is directly measured, not
+/// modeled. L1 = B256 @ 128.
+pub fn interleaved_decider_measure_l1(inner_vars: usize, logn_sweep: &[usize]) -> Vec<IntlvRow> {
+	logn_sweep
+		.iter()
+		.enumerate()
+		.map(|(i, &logn)| measure_intlv_cdec!(F1, P1, inner_vars, logn, 128, 0x1_0000 + i as u64))
+		.collect()
+}
+
 /// Measure the committed-decider evaluation opening across NIST levels L1/L3/L5 for the same
 /// n_vars sweep, returning one labelled row per (level, n_vars):
 ///   L1 = B256 @ security_bits 128,  L3 = B256 @ 192,  L5 = B512 @ 256.
@@ -289,5 +504,60 @@ mod tests {
 				"tampered evaluation must be rejected at {level} ({field})"
 			);
 		}
+	}
+
+	/// LEDGER ITEM #3 (MEASURED): the leaves-independent decider verify, on a REAL interleaved
+	/// commit. Fix inner width, sweep N = 2^logn batches; each row commits the genuine
+	/// block-interleaved codeword through the FRI-Binius piop and MEASURES the verify. The point
+	/// is that at FIXED inner width, growing the leaf count N by 256× (2 → 512) moves the verify
+	/// only by the polylog `logn` term (n_vars = inner + logn), NOT linearly in leaves — so "one
+	/// cross-batch opening verifies all batches" is measured, replacing the modeled query-path term.
+	#[test]
+	fn interleaved_decider_verify_vs_leaves() {
+		let inner_vars = 6usize;
+		let logn_sweep = [1usize, 3, 5, 7, 9]; // N = 2, 8, 32, 128, 512
+		let rows = interleaved_decider_measure_l1(inner_vars, &logn_sweep);
+		println!(
+			"\n=== LEDGER #3 MEASURED: interleaved-commit decider verify vs leaves (L1 B256@128, inner_vars={inner_vars}) ==="
+		);
+		println!(
+			"| N (leaves) | n_vars | commit ms | open-prove ms | VERIFY ms | proof KiB | peak RSS MiB | decomp | tamper |"
+		);
+		println!("|--:|--:|--:|--:|--:|--:|--:|:--:|:--:|");
+		for r in &rows {
+			println!(
+				"| {} | {} | {:.2} | {:.2} | {:.2} | {} | {:.1} | {} | {} |",
+				r.n_batches,
+				r.n_vars,
+				r.commit_ms,
+				r.open_prove_ms,
+				r.verify_ms,
+				r.proof_bytes / 1024,
+				r.peak_rss_bytes as f64 / (1024.0 * 1024.0),
+				if r.decomp_ok { "OK" } else { "MISMATCH(BUG)" },
+				if r.tamper_rejects { "REJECT" } else { "ACCEPT(BUG)" },
+			);
+			assert!(r.decomp_ok, "opened value must equal Σ_i eq(b,i)·P_i(a) at N={}", r.n_batches);
+			assert!(r.tamper_rejects, "tampered value must be rejected at N={}", r.n_batches);
+		}
+
+		// Leaves-independence: 256× more leaves (N: 2 → 512) must NOT scale verify linearly. A
+		// linear-in-leaves query-path term would blow up ~256×; the interleaved commit's single
+		// opening should move only by the polylog n_vars term. Assert the verify ratio is far
+		// below the leaf ratio (generous 20× bound vs the 256× leaf growth — the real ratio is a
+		// small polylog factor; this catches a genuinely O(leaves) regression without being flaky).
+		let first = rows.first().unwrap();
+		let last = rows.last().unwrap();
+		let leaf_ratio = last.n_batches as f64 / first.n_batches as f64; // 256×
+		let verify_ratio = last.verify_ms / first.verify_ms;
+		println!(
+			"leaves ×{:.0} ({} → {}), verify ×{:.2} ({:.2} → {:.2} ms) ⇒ verify grows POLYLOG in leaves, \
+			 NOT O(leaves): the single interleaved opening verifies all batches. Ledger #3 MEASURED, not modeled.",
+			leaf_ratio, first.n_batches, last.n_batches, verify_ratio, first.verify_ms, last.verify_ms
+		);
+		assert!(
+			verify_ratio < 20.0,
+			"verify grew ×{verify_ratio:.2} over ×{leaf_ratio:.0} leaves — that looks O(leaves), not polylog (regression?)"
+		);
 	}
 }

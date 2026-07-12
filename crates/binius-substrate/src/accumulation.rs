@@ -682,6 +682,13 @@ mod tests {
 	/// CROSS-BATCH row ⇒ O(1) opening per query ⇒ term FLAT in leaves. Measure the per-path SHA3
 	/// Merkle cost; plot verify-vs-leaves under both layouts. (FRI proximity itself is batch-scale:
 	/// all P_i share the inner variables ⇒ the combined poly lives on the batch-sized domain.)
+	///
+	/// SUPERSEDED (ledger #3 CLOSED): this MODEL is retained for the naive-vs-interleaved contrast,
+	/// but the leaves-independence it argues is now DIRECTLY MEASURED end-to-end on a real
+	/// interleaved commit through the FRI-Binius piop — see
+	/// `committed_decider::interleaved_decider_verify_vs_leaves` (256× leaves ⇒ verify ×1.43,
+	/// polylog not O(leaves), decomposition-checked and tamper-rejected). Prefer that measurement
+	/// over these modeled counts when quoting the headline.
 	#[test]
 	#[ignore = "measurement (~5 s): decider verify query-path term vs leaves (naive vs interleaved)"]
 	fn decider_verify_query_path_vs_leaves() {
