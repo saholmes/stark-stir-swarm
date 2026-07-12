@@ -27,8 +27,9 @@ for the O(1)-verify accumulation route.
   "~18 ms / O(1)" chain-final-proof number) and a **full decider** (statement validity — pays
   record-AIR width: **measured ~9–13 s, POLYLOG in N** — 16× records → 1.38× verify,
   ~0.85 s/doubling; **not O(1)**). The fold alone does **not**
-  enforce the per-record constraints (width law: 18 ms ⇒ near-zero width = fold table
-  only); the security section claims validity only for the decider layer. Both amortize
+  enforce the per-record constraints (width law: a sub-second fold-path verify ⇒
+  near-zero width = fold table only); the security section claims validity only for the
+  decider layer. Both amortize
   into background per-epoch cost.
 * **Open (headline-deciding):** the full-decider verify with the width term is the one
   measurement that settles "sound polylog-in-N aggregation at seconds edge" vs "efficient
@@ -127,7 +128,7 @@ VERIFY   (edge resolver, once per epoch — TWO distinct checks)
   (a) FOLD layer:    replay the fold-verify path   → O(leaves), sub-second
                      (1.76 ms @16 → ~340 ms @2930) ⇒ distribution integrity (anti-sub vs R*)
   (b) FULL DECIDER:  check the accumulated record-AIR instance  → O(record-AIR
-                     width) + polylog(N), MEASURED ~9–13 s (SHA3-256 @L1), ~flat in N
+                     width) + polylog(N), MEASURED ~9–13 s (SHA3-256 @L1), polylog in N
                      ⇒ statement validity ("the records' constraints hold")
 
 SERVE    (client, every lookup after the first)
@@ -139,21 +140,21 @@ structure — fold-correctness + a decider): the **sub-second fold check (O(leav
 accumulator was folded correctly and binds the lookups to `R*` — *distribution integrity*,
 i.e. anti-substitution relative to a publisher-constructed `R*`. It does **not** by itself
 enforce the per-record digest/AIR constraints, because by the width law
-(`verify ≈ 20 + 1.3·width ms`) an 18 ms verify is only reachable at near-zero width — the
-fold table alone. **Statement validity** ("no adversary can make `Π` attest to a record whose
+(`verify ≈ 20 + 1.3·width ms`) a sub-second fold-path verify is only reachable at
+near-zero width — the fold table alone. **Statement validity** ("no adversary can make `Π` attest to a record whose
 constraints don't hold") requires the **full decider**, which checks the accumulated instance
 at record-AIR width. **Measured** (`decider_verify_width_term`, SHA3-256 record-AIR over B256 @L1):
 N=512 → 9.4 s, N=2048 → 11.2 s, N=8192 → 12.9 s — i.e. **16× the records grows the decider verify
 only 1.38×** (`O(record-AIR width) + polylog(N)`, width-dominated), so the decider is **~9–13 s,
-~flat in N**, paid **once per epoch**. *Width reconciliation:* 9.4 s at the diagnostic's
+polylog in N** (near-flat: 1.38× over 16× records, *not* constant), paid **once per epoch**. *Width reconciliation:* 9.4 s at the diagnostic's
 ~1.3 ms/col slope implies an **effective committed width ≈ 7000 columns** for the SHA3
 record-AIR — the honest figure (full Keccak-f[1600] state + per-query trace-opening
 columns). **The ~575 figure is the algebraic Keccak *gate* count; committed width ≠ gate
 width** — the committed SHA3-block AIR is ~7000 cols, and the ~1.3 ms/col slope × 7000 ≈
 9 s reconciles with the measured decider (and with L5: 41 s/9.4 s ≈ 4.4× = the field-tax
 multiplier at full width). The decider amortizes
-into the background exactly like the 18 ms — but the security section must claim only what the
-layer it describes checks.
+into the background exactly like the sub-second fold check — but the security section must
+claim only what the layer it describes checks.
 
 Layer 1 and Layer 2 below are exactly the two stages of this flow: Layer 1 is
 the per-record S-layer proof (seconds, paid once at publish — the table above);
@@ -389,7 +390,9 @@ TLD epoch?"
   the prove side up proportionally (still fleet-parallel). Nail this down with a
   real ZSK-algorithm measurement before quoting full-signature numbers.
 * Anchor: the real `.se` HNPL sample (857 records → 207 KiB package, **1.36 ms
-  edge verify**) supports the O(1) ms edge-verify at the leaf model.
+  edge verify**) — this 1.36 ms is a **fold/lookup-layer** figure (steady-state Merkle-path
+  + fold check), **not** the artifact's edge cost, which is decider (polylog in N, seconds) +
+  fold (O(leaves), sub-second) once per epoch.
 
 ### Prove — fleet-parallel, publisher-side (once per epoch)
 

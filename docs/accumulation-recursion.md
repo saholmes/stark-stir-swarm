@@ -53,7 +53,8 @@ native openings + one arithmetic check — again no in-circuit FRI-verify.
 
 ### C. Batch commitment + sumcheck (the "not really accumulation" baseline)
 Commit all `N` records under **one** tree, prove once. Verify = `O(record-AIR width)` +
-`polylog(N)` = fast + constant-in-N (verify is row-flat). BUT commits together → loses
+`polylog(N)` — **width-dominated, polylog-in-N** (row-flat but *not* constant: the epoch doc
+measures +0.85 s/doubling; this is the decider all along). BUT commits together → loses
 the per-record RSS independence at commit time (proving can still shard the trace).
 Useful as the **verify-cost lower bound** to measure A/B against.
 
