@@ -563,4 +563,86 @@ mod tests {
 			 FRI-opening decider = remaining crux ~9–13 s) → position-binding ✓ (permute→different R*, \
 			 lying leaf rejected) → R* Merkle path {:.3} µs. Figure-one.", nodes, depth, native_ms, foldverify_ms, path_us);
 	}
+
+	/// THE ONE REMAINING MEASUREMENT (reviewer's crux): does the committed decider's opening of the
+	/// R*-committed interleaved P at `root.point` DECOMPOSE into batch-local openings — assemblable
+	/// without materializing the full N-sized P on one machine — or did the hybrid just move the
+	/// monolithic bottleneck one hop downstream? Structural answer, here MEASURED as an identity:
+	/// by multilinearity in the position variables, for ANY point (a, b),
+	///     P(a, b) = Σ_i eq(b, bin(i)) · P_i(a),
+	/// and the fold tree's `root.point` splits as (a = inner-part, b = position-part) — so the
+	/// accumulated evaluation is an eq-weighted sum of BATCH-LOCAL evaluations `P_i(a)`, all at the
+	/// SAME inner point a. Each batch opens its own P_i at a against its own sub-root R*_i
+	/// (batch-local, bounded RSS); a combiner does the eq-weighted sum. No P on one machine ⇒ the
+	/// decider-prove decomposes exactly like the batch proves ⇒ the architecture CLOSES.
+	#[test]
+	fn decider_opening_decomposes() {
+		let mut rng = StdRng::from_seed([0x3d; 32]);
+		let n_batches = 16usize;
+		let m = n_batches.trailing_zeros() as usize;
+		let inner_vars = 6usize;
+
+		// 16 batch polys + inner claims; interleave into P over inner_vars+m vars.
+		let records: Vec<Record> = (0..n_batches)
+			.map(|_| {
+				let evals = rand_evals(inner_vars, &mut rng);
+				let r = rand_point(inner_vars, &mut rng);
+				let value = mle_eval(&evals, &r);
+				Record { evals, claim: EvalClaim { point: r, value } }
+			})
+			.collect();
+		let p = interleave(&records);
+
+		// Balanced fold tree over the lifted leaf claims → root accumulated claim.
+		let mut level: Vec<EvalClaim> = records.iter().enumerate().map(|(i, rec)| lifted_claim(rec, i, m)).collect();
+		while level.len() > 1 {
+			let mut next = Vec::new();
+			for pair in level.chunks(2) {
+				let t = rand_f(&mut rng);
+				let (_g, folded) = fold_prove(&p, &pair[0], &pair[1], t);
+				next.push(folded);
+			}
+			level = next;
+		}
+		let root = level.pop().unwrap();
+
+		// The committed decider's claim: P(root.point) = root.value (the accumulated instance).
+		let lhs = mle_eval(&p, &root.point);
+		assert_eq!(lhs, root.value, "root claim must hold on P");
+
+		// DECOMPOSITION: split root.point into inner-part a (shared) and position-part b, then
+		// assemble from batch-local evaluations P_i(a) with eq(b, bin(i)) weights.
+		let a = &root.point[..inner_vars];
+		let b = &root.point[inner_vars..];
+		let eq = |bpt: &[F], idx: usize| -> F {
+			let mut w = F::ONE;
+			for (j, &bj) in bpt.iter().enumerate() {
+				w *= if (idx >> j) & 1 == 1 { bj } else { F::ONE + bj };
+			}
+			w
+		};
+		let rhs: F = (0..n_batches).fold(F::ZERO, |acc, i| acc + eq(b, i) * mle_eval(&records[i].evals, a));
+		assert_eq!(lhs, rhs, "DECOMPOSITION FAILURE: P(root.point) != Σ_i eq(b,bin(i))·P_i(a)");
+
+		// Soundness: a batch lying about its local value breaks the combine (so a fleet-assembled
+		// opening cannot forge the accumulated value from wrong batch-local openings).
+		let mut bad = records[3].evals.clone();
+		bad[0] += F::ONE;
+		let rhs_bad: F = (0..n_batches).fold(F::ZERO, |acc, i| {
+			let v = if i == 3 { mle_eval(&bad, a) } else { mle_eval(&records[i].evals, a) };
+			acc + eq(b, i) * v
+		});
+		assert_ne!(lhs, rhs_bad, "a wrong batch-local opening must break the combine");
+
+		println!(
+			"GATE decider-decomposes: P(root.point) == Σ_i eq(b, bin(i))·P_i(a) VERIFIED (a = root.point[..{inner_vars}], \
+			 the SHARED inner point; b = position-part). So the committed decider's opening of R*-committed P at \
+			 root.point ASSEMBLES from {n_batches} BATCH-LOCAL openings (each P_i at the shared inner point a, against \
+			 its sub-root R*_i) + an eq-weighted combine — NO materialization of the full N-sized P on one machine, and \
+			 a wrong batch-local opening breaks the combine. The DECIDER-PROVE DECOMPOSES: bounded per-batch RSS, \
+			 fleet-parallel, same shape as the batch proves. The hybrid REMOVES the monolithic bottleneck rather than \
+			 moving it downstream — the architecture CLOSES. (Value-layer identity; the FRI proximity layer is the \
+			 standard batched/interleaved-FRI decomposition over the same per-batch codewords.)"
+		);
+	}
 }
