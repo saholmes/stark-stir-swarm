@@ -21,19 +21,19 @@ for the O(1)-verify accumulation route.
   costs ~0 here because B256 already carries the 192-bit Fiat–Shamir floor.
 * **L5 is the real jump**: the 256-bit floor forces the field B256 → B512,
   which ~2× prove, ~4.4× verify, ~1.6× RSS.
-* The **aggregation / epoch layer edge-verifies in two checks, both O(1) in N,
-  once per epoch**: a **~18 ms fold check** (distribution integrity — anti-substitution
-  vs `R*`) and a **full decider** (statement validity — pays record-AIR width:
-  **measured ~9–13 s, ~flat in N** — 16× records → 1.38× verify). The 18 ms alone does **not**
+* The **aggregation / epoch layer edge-verifies in two checks, once per epoch**: a
+  **~18 ms fold check** (distribution integrity — anti-substitution vs `R*`, near-flat in N)
+  and a **full decider** (statement validity — pays record-AIR width: **measured ~9–13 s,
+  POLYLOG in N** — 16× records → 1.38× verify, ~0.85 s/doubling; **not O(1)**). The 18 ms alone does **not**
   enforce the per-record constraints (width law: 18 ms ⇒ near-zero width = fold table
   only); the security section claims validity only for the decider layer. Both amortize
   into background per-epoch cost.
 * **Open (headline-deciding):** the full-decider verify with the width term is the one
-  measurement that settles "sound O(1)-in-N aggregation at sub-second edge" vs "efficient
+  measurement that settles "sound polylog-in-N aggregation at seconds edge" vs "efficient
   proof distribution"; and the epoch proof's FS/Merkle + EC/ECDSA challenger are `Sha256`
   (128-bit), so **L3/L5 pin at 128 for the combined artifact** until they ladder (see the
   component×level×hash table). The streaming interleaved-commit RSS is the residual that
-  couples low-RSS proving to sound O(1) aggregation.
+  couples low-RSS proving to sound polylog-in-N aggregation.
 
 ## Level instantiation
 
@@ -65,14 +65,16 @@ blowup = 2). Digest gated bit-for-bit against the native `sha3` crate.
 | **L3** | 844 KiB  | 2448 ms  | 9316 ms   | 3.8×           | 0.12 GiB     |
 | **L5** | 1943 KiB | 5062 ms  | 40952 ms  | 8.1×           | 0.19 GiB     |
 
-For contrast, the **aggregation / epoch layer** (one recursive STARK binding
-all N records, edge-verified) is level-independent in the demo:
+For contrast, the **aggregation / epoch layer** has two edge checks (see §Flow model
+& security). The **fold** is near level-independent; the **decider** is not (it is the
+batched record-AIR proof, so it scales with the record-AIR width/level):
 
 | Stage             | Value                    |
 |:------------------|:-------------------------|
-| Epoch proof size  | 339 KiB                  |
-| Epoch prove       | ~77 ms (aggregator, O(N))|
-| **Edge verify**   | **~18 ms, O(1) in N**    |
+| Epoch proof size  | 339 KiB (fold) / 608 KiB–830 KiB (decider, N-dependent) |
+| Epoch prove       | ~77 ms fold; decider O(N), ~linear RSS (publisher-half open) |
+| **Edge — fold check**   | **~18 ms**, near-flat in N — *distribution integrity* |
+| **Edge — full decider** | **~9–13 s L1 / ~41 s L5**, polylog in N — *statement validity* |
 | Steady-state lookup | ~1.3 µs (local SHA3 Merkle path) |
 
 ## Reading the numbers
@@ -140,8 +142,11 @@ constraints don't hold") requires the **full decider**, which checks the accumul
 at record-AIR width. **Measured** (`decider_verify_width_term`, SHA3-256 record-AIR over B256 @L1):
 N=512 → 9.4 s, N=2048 → 11.2 s, N=8192 → 12.9 s — i.e. **16× the records grows the decider verify
 only 1.38×** (`O(record-AIR width) + polylog(N)`, width-dominated), so the decider is **~9–13 s,
-~flat in N**, paid **once per epoch** (it exceeds the ~0.8 s width-law floor because of
-trace-opening overhead + the full Keccak-f width — the ML-DSA finding). The decider amortizes
+~flat in N**, paid **once per epoch**. *Width reconciliation:* 9.4 s at the diagnostic's
+~1.3 ms/col slope implies an **effective committed width ≈ 7000 columns** for the SHA3
+record-AIR — the honest figure (full Keccak-f[1600] state + per-query trace-opening
+columns), which **supersedes the earlier "~575 cols" estimate** (that was the algebraic
+Keccak gate, not the committed SHA3-block AIR). The decider amortizes
 into the background exactly like the 18 ms — but the security section must claim only what the
 layer it describes checks.
 
@@ -363,36 +368,59 @@ Folding 2930 batch-instances is a ~log₂(2930) ≈ 11.5-deep narrow-fold tree
 (~48 ms arithmetized fold-verify per node) → **adds seconds, not hours**; one
 epoch proof `Π` out the end.
 
-### Verify — O(1) in N, edge-side (does not scale with 1.5 M)
+### Verify — polylog in N, edge-side, extrapolated to `.se` scale
 
-| Quantity | Value | What it earns |
-|:---------|:------|:-----|
-| Epoch verify — **fold check** | **~18 ms**, O(1) in N | distribution integrity (anti-substitution vs `R*`); consistent with the 1.36 ms HNPL edge package |
-| Epoch verify — **full decider** (record-AIR width) | **measured ~9–13 s, ~flat in N** (16× records → 1.38× verify) | **statement validity** (the records' constraints hold) — REQUIRED for security-claim 1 |
-| Per-record lookup                 | **~3 µs**  | Merkle path, depth ≈ log₂(2¹⁰·1.5 M) ≈ 30 SHA-3 hashes |
+The decider is the batched record-AIR proof (Approach C — the N=512 row is bit-identical
+to the Layer-1 table; the batch proof *was* the decider all along). Verify grows
+**polylog in N** (not O(1)): the measured slope is **~0.85 s per doubling** of N. So at
+`.se` scale (1.5 M ≈ 7.5 doublings beyond N=8192) the L1 decider is **~19–20 s**
+(~1.1 MiB proof), *extrapolated but safe* because polylog.
 
-A resolver runs **both** checks on the **entire `.se` epoch once** — both O(1) in N
-(*independent of whether it is 857 records or 1.5 M*), amortized per-epoch background
-cost — then answers any of the 1.5 M delegations in ~3 µs. The decider is the number
-that decides the headline: with it, the claim is "sound O(1)-in-N aggregation at
-sub-second–seconds edge cost, once per epoch"; without it, only "efficient distribution."
+| Quantity | Demo (N=8192) | `.se` (N=1.5 M, extrapolated) | What it earns |
+|:---------|:-------------|:--------|:-----|
+| **Fold check** | ~18 ms | ~18 ms (near-flat) | distribution integrity (anti-substitution vs `R*`) |
+| **Full decider — L1** | **~13 s** (measured) | **~19–20 s** (polylog, +0.85 s/doubling) | **statement validity** (records' constraints hold) |
+| **Full decider — L5** | **~41 s** (measured, the N=512 L5 split) | proportionally higher | statement validity at L5 field |
+| Per-record lookup | ~3 µs | ~3 µs | Merkle path to the proven `R*` |
 
-### L5 multiplier
+A resolver runs **both** checks on the **entire `.se` epoch once** (per-epoch background
+cost) — then answers any of the 1.5 M delegations in ~3 µs. The decider decides the
+headline: **"sound polylog-in-N aggregation at seconds edge cost, once per epoch"** (the
+strong result), not "efficient distribution."
 
-Prove ×2.1, Layer-1 verify ×4.4, RSS ×1.6 (B256 → B512). The edge/epoch verify
-stays **O(1) in N** regardless of level.
+### Level dependence — the decider is NOT level-independent
+
+"18 ms at every level" is level-independence of the *fold*, not the artifact. The
+**decider is measured per level**: **~9–13 s at L1** (SHA3-256/B256) and **~41 s at L5**
+(SHA3-512/B512 — the earlier N=512 L5 split). So the once-per-epoch edge cost is level-
+*dependent* on cost grounds alone, before the κ-laddering question. (Prove ×2.1,
+Layer-1 verify ×4.4, RSS ×1.6 for B256→B512.)
+
+### Publisher-half open — decider prove RSS grows ~linearly in N
+
+The decider is one monolithic Approach-C proof, and its **prove-side peak RSS grows
+~linearly in N** (measured: 0.12 GiB @ 512 → 0.35 @ 2048 → 1.15 @ 8192, ~×3.3 per ×4).
+At `.se` scale (~183× N=8192) that is **~210 GiB if linear — infeasible on one machine**,
+and **intra-proof rayon does not rescue it** (measured ~1× even on these table_size≥512
+batch tables — the "many rows should parallelize" intuition does *not* hold in this
+binius build). So the publisher must **either** stream the interleaved commit to hold RSS
+flat (the sliver question — `streaming_commit` targets this, but its RSS-at-full-decider-
+scale is unmeasured) **or** shard to **C-per-batch + a fold tree** (then statement validity
+for all batches flows through the fold's accumulated instance — the decider semantics
+restate for that hybrid). *"Does the decider prove at bounded RSS at scale, and on how
+many machines?"* is the open that decides the publisher half.
 
 ### Bottom line
 
-* **Prove:** ~2 core-hours at digest granularity for full `.se`, collapsing to
-  **seconds on a ~1000-prover fleet** — the decentralised, censorship-resistant
-  proving path. (Full-signature granularity is heavier; needs the ZSK-algo
-  S-layer number.)
-* **Verify:** **~18 ms once, O(1) in N**, then ~3 µs/lookup — the 1.5 M scale is
-  invisible to the verifier.
+* **Prove:** the fleet-parallel "~1000 provers, 7.2 s" figure is an Approach-A/B (per-batch)
+  picture; the measured monolithic-C decider is **one proof, O(N) time, ~linear RSS** —
+  reconciling the two (streaming commit vs C-per-batch+fold) is the publisher-half open above.
+* **Verify (fetch-path total, L1):** **~9–20 s decider + ~18 ms fold, once per epoch**
+  (polylog in N), then **~3 µs/lookup** — the per-request cost is invisible; the per-epoch
+  fetch cost is seconds, amortized.
 
-Two reviewer caveats restated: (1) the ~18 ms is the fold layer, not assembled
-in-circuit hash re-verification (seconds); (2) 4.79 ms/record is the SHA3 digest,
+Two reviewer caveats restated: (1) the ~18 ms is the fold layer, not the decider (seconds);
+(2) 4.79 ms/record is the SHA3 digest,
 not the full RRSIG signature verify.
 
 ## Reproducing
