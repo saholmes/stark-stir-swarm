@@ -461,6 +461,43 @@ phase.
 Measurement host: Apple M-series (`darwin`), release profile, single machine.
 Timings are wall-clock; treat ±10% as run-to-run noise.
 
+## Figure-one — end-to-end hybrid epoch pipeline (all hops measured)
+
+One gate (`hybrid_epoch_pipeline_e2e`) produces the actual epoch package with a number at
+every hop: 16 batch accumulators → a **real balanced fold tree** → one accumulated object →
+edge decider + root fold → µs Merkle path against the resulting `R*`.
+
+| hop | quantity | measured |
+|:---|:---|--:|
+| fold tree | 15 interior nodes, depth 4 (2-to-1 **accumulator** merges) | native build 318 ms; in-circuit ~785 ms/node |
+| topology | root claim holds on P after 15 accumulator-merges | ✓ |
+| decider (native) | `mle_eval(P, root.point)` value check | 1.99 ms |
+| decider (fold path) | 15× `fold_verify`, O(leaves), width-independent | 1.76 ms |
+| position-binding | swap batch 3↔5 → different root **and** different `R*` | ✓ (caught) |
+| lying leaf | flip one leaf value → fold rejected | ✓ |
+| steady state | Merkle auth path vs `R*` | 0.642 µs |
+
+**Topology confirmed (the load-bearing question):** the balanced tree's interior nodes fold
+*accumulators*, not leaves — and because `fold_prove`/`fold_verify` are symmetric in their two
+claim arguments (both are points on the same P), an accumulator *is* just another eval claim.
+So the tree is **free** — no PCD machinery — and the ~785 ms/node in-circuit cost transfers.
+
+**Position-binding:** `lifted_claim` puts the batch's position in the claim point (and its SHA3
+sub-root), so a permuted/substituted batch set produces a valid accumulated object over a
+*different* `R*` — caught, not silently accepted. Order is explicit in each node's statement.
+
+**The one remaining crux (honestly unmeasured):** the two decider numbers above are the native
+value check + the O(leaves) fold-verify path — **not** the committed decider. The true decider is
+the **FRI-opening of the `R*`-committed interleaved P** at `root.point` (whether `R*` is
+FRI-openable as P's codeword — `accumulation.rs:127`); that opening is a batch-width binius verify
+(~9–13 s measured upper bound), and it is **not wired here** — the monolithic figure is *not*
+quoted as the hybrid's. Wiring the FRI-opening decider is the single remaining measurement.
+
+**Composite publisher number (the sentence the paper ends on):** ~33 s of batch proves in
+parallel + ~6 s of balanced-tree critical path ⇒ **the `.se` epoch publishes in under a minute of
+wall-clock on ~184 machines at ~1.15 GiB each**, and a resolver verifies it once (decider + fold)
+then serves every request at ~µs.
+
 ## Remaining surface (the whole ledger)
 
 Both halves are now measured — verifier: sound polylog-in-N decider ~9–13 s once per
