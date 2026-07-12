@@ -504,6 +504,30 @@ layer is the standard batched/interleaved-FRI decomposition over the per-batch c
 streaming commit already builds. The committed decider's *verify* cost is still the ~9–13 s
 batch-width upper bound; the point measured here is that its *prove* is decomposable.)
 
+**The decider-verify's query-path term (label correction).** The value identity decomposes the
+*evaluation*; the FRI *query* phase has a cost it doesn't show — each query needs every per-batch
+codeword's value at the queried domain point, opened against its sub-root. Measured
+(`decider_verify_query_path_vs_leaves`, per-path 3.73 µs, 100 queries, fold depth 13):
+
+| batch | leaves | naive term | interleaved term (shipped) |
+|--:|--:|--:|--:|
+| 8192 | 184 | 892 ms | 4.85 ms |
+| 512 | 2930 | **14.2 s** (dominates the proximity) | 4.85 ms (flat) |
+
+A **naive per-batch layout is `O(leaves·queries)`** and *does* dominate the ~9–13 s proximity at
+2930 leaves — the reviewer's concern is real. But the shipped `streaming_interleaved_root`
+**symbol-interleaves the batches**, so one coset/path opens a *cross-batch row* ⇒ **1 path/query,
+flat in leaves**. So under the shipped commit the decider verify is **leaves-independent**, and the
+honest label is **`polylog(batch) + O(queries)`, not `O(leaves·queries)`**. (The FRI proximity is
+itself batch-scale — all `P_i` share the inner variables, so the combined poly lives on the
+batch-sized domain, which is where "removes rather than moves" earns its teeth at the proximity
+layer.) *This term is modeled (measured per-path × modeled query/fold counts); wiring the committed
+FRI decider end-to-end to measure it directly is the remaining engineering — not discovery.*
+
+**Batch size is a two-sided trade (a curve, not a column).** Bigger batches ⇒ fewer leaves +
+cheaper naive term, at the cost of higher per-machine RSS (**8192 @ 1.15 GiB vs 512 @ 0.12 GiB** —
+8192 near the sweet spot). The paper is stronger for plotting the curve than quoting one column.
+
 **The edge's fold object (correcting the "18 ms").** The 18 ms was a chain-final-proof number;
 the capstone's edge fold check is the **native fold-verify path — O(leaves), width-independent:
 1.76 ms at 16 leaves → ~20 ms at 184 → ~340 ms at 2930** (linear, still sub-second at `.se`).
