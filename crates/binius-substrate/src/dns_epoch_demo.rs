@@ -19,7 +19,6 @@
 use anyhow::Result;
 use sha3::{Digest, Sha3_256};
 
-use crate::accumulation_air::measure_epoch_verify;
 use crate::b256_sha3::prove_verify_sha3_b256_timed;
 use crate::b512_sha3::prove_verify_sha3_b512_timed;
 use crate::dns_stark::wire_name;
@@ -159,7 +158,18 @@ pub fn run_dns_epoch_demo(zone: &[DnsRecord], per_record_width: usize, level: Sh
 	let (epoch_root, _spine) = streaming_interleaved_root(n, codeword_len, 3, get);
 
 	// (4) aggregated epoch proof: one binius proof over the N records; edge verifies it fast.
-	let m = measure_epoch_verify(per_record_width, &[n])?;
+	//     The epoch Π's challenger + Merkle hash LADDER to the NIST level (SHA3-N) so κ_FS = κ_bind
+	//     reach the category. L1/L3 reach it over B256; L5's epoch Π is B256 ⇒ κ_IT caps at 192
+	//     (192-capped until the B512 epoch-AIR port; the B512+SHA3-512 stack is proven on the
+	//     field-op leg).
+	use crate::accumulation_air::measure_epoch_verify_hash;
+	use crate::b256_prove::Sha3Compression;
+	use sha3::{Sha3_256, Sha3_384, Sha3_512};
+	let m = match level {
+		Sha3Level::L1 => measure_epoch_verify_hash::<Sha3_256, Sha3Compression<Sha3_256>>(per_record_width, &[n], 128)?,
+		Sha3Level::L3 => measure_epoch_verify_hash::<Sha3_384, Sha3Compression<Sha3_384>>(per_record_width, &[n], 192)?,
+		Sha3Level::L5 => measure_epoch_verify_hash::<Sha3_512, Sha3Compression<Sha3_512>>(per_record_width, &[n], 192)?,
+	};
 	let (_, epoch_prove_ms, epoch_verify_ms, epoch_proof_bytes) = m[0];
 
 	// (5) steady state: a local SHA3 Merkle path check per record (~depth SHA3 hashes).

@@ -327,6 +327,32 @@ pub fn run_ivc(n_records: usize, inner_vars: usize) -> Result<IvcSummary> {
 /// records property. `per_record_muls` is the stand-in for one record's committed AIR width.
 /// Returns `(n_records, prove_ms, verify_ms, proof_bytes)`.
 pub fn measure_epoch_verify(per_record_muls: usize, n_records: &[usize]) -> Result<Vec<(usize, u128, u128, usize)>> {
+	// Back-compat wrapper: the shipped demos call this at the L1 default (SHA-256 @ 128). The
+	// laddered variant `measure_epoch_verify_hash::<Sha3_N, Sha3Compression<Sha3_N>>` proves the
+	// SAME epoch Π with the NIST-level challenger + commitment hash (see the ladder test).
+	measure_epoch_verify_hash::<Sha256, Sha256Compression>(per_record_muls, n_records, 128)
+}
+
+/// The epoch-Π prover, generic over the commitment/Fiat–Shamir hash `<H, C>` and `security_bits`.
+/// This is the load-bearing `κ_sys` site: the epoch proof Π's FS + Merkle hash. Instantiate with
+/// `Sha3_256`@128 (L1), `Sha3_384`@192 (L3) over B256 so `κ_FS = κ_bind` ladder to the NIST
+/// category instead of pinning at 128. (L5 `κ_IT`=256 needs the B512 tower — a field-family port
+/// of this AIR, out of scope here; the B512+SHA3-512 stack itself is proven on the field-op leg.)
+pub fn measure_epoch_verify_hash<H, C>(
+	per_record_muls: usize,
+	n_records: &[usize],
+	security_bits: usize,
+) -> Result<Vec<(usize, u128, u128, usize)>>
+where
+	H: sha3::digest::Digest
+		+ sha3::digest::core_api::BlockSizeUser
+		+ sha3::digest::FixedOutputReset
+		+ Default
+		+ Clone
+		+ Send
+		+ Sync,
+	C: binius_hash::PseudoCompressionFunction<sha3::digest::Output<H>, 2> + Default + Sync,
+{
 	use rand::SeedableRng;
 	use std::time::Instant;
 	let mut out = Vec::new();
@@ -368,14 +394,14 @@ pub fn measure_epoch_verify(per_record_muls: usize, n_records: &[usize]) -> Resu
 		let witness = witness.into_multilinear_extension_index();
 		let t0 = Instant::now();
 		let proof = binius_core::constraint_system::prove::<
-			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
-		>(&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend())?;
+			U256, B256TowerFamily, H, C, HasherChallenger<H>, _,
+		>(&ccs, 1, security_bits, &statement.boundaries, witness, &make_portable_backend())?;
 		let prove_ms = t0.elapsed().as_millis();
 		let sz = proof.get_proof_size();
 		let t1 = Instant::now();
 		binius_core::constraint_system::verify::<
-			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
-		>(&ccs, 1, 128, &statement.boundaries, proof)?;
+			U256, B256TowerFamily, H, C, HasherChallenger<H>,
+		>(&ccs, 1, security_bits, &statement.boundaries, proof)?;
 		out.push((n, prove_ms, t1.elapsed().as_millis(), sz));
 	}
 	Ok(out)
@@ -384,6 +410,44 @@ pub fn measure_epoch_verify(per_record_muls: usize, n_records: &[usize]) -> Resu
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// GATE epoch-Π-challenger-ladder — the LOAD-BEARING κ_sys site. The shipped epoch proof Π
+	/// (`measure_epoch_verify`) hard-coded `HasherChallenger<Sha256>` + `Sha256Compression` @128,
+	/// so `κ_sys = min(record, epoch, decider)` PINNED at 128 at L3/L5 no matter how the record
+	/// layer laddered. Here the SAME epoch Π proves+verifies over B256 with the challenger AND
+	/// commitment hash LADDERED: L1 SHA3-256@128 and L3 SHA3-384@192 (B256 carries κ_IT up to
+	/// 192). So the epoch layer's κ_FS = κ_bind now reach the NIST category — the "Epoch proof Π
+	/// FS" ◐ row flips to ✓ for L1/L3 with a REAL proof of the shipped prover. (L5 SHA3-512@256
+	/// needs the B512 tower for κ_IT=256 — a field-family port of this AIR; the B512+SHA3-512
+	/// stack itself is proven on the field-op leg, `measure_square_scaling_b512_hash`.)
+	#[test]
+	fn epoch_pi_challenger_ladders() {
+		use crate::b256_prove::Sha3Compression;
+		use sha3::{Sha3_256, Sha3_384};
+
+		let per_record_muls = 4usize; // small width — this gates the ladder, not the cost curve
+		let n = [64usize];
+
+		// L1: SHA3-256 challenger + Sha3Compression<Sha3_256> @128.
+		let l1 = measure_epoch_verify_hash::<Sha3_256, Sha3Compression<Sha3_256>>(per_record_muls, &n, 128)
+			.expect("epoch Π must PROVE+VERIFY over B256 with SHA3-256 challenger @L1(128)");
+		// L3: SHA3-384 challenger + Sha3Compression<Sha3_384> @192 (B256 carries κ_IT=192).
+		let l3 = measure_epoch_verify_hash::<Sha3_384, Sha3Compression<Sha3_384>>(per_record_muls, &n, 192)
+			.expect("epoch Π must PROVE+VERIFY over B256 with SHA3-384 challenger @L3(192)");
+
+		let (_n1, p1, v1, s1) = l1[0];
+		let (_n3, p3, v3, s3) = l3[0];
+		println!(
+			"GATE epoch-Π-challenger-ladder: the SHIPPED epoch proof Π PROVEN+VERIFIED over B256 with the \
+			 Fiat–Shamir challenger + commitment hash LADDERED to SHA3-N (NOT SHA-256): \
+			 L1 SHA3-256@128 (prove {p1} ms, verify {v1} ms, {} KB; κ_FS=κ_bind=128), \
+			 L3 SHA3-384@192 (prove {p3} ms, verify {v3} ms, {} KB; κ_FS=κ_bind=192). \
+			 κ_sys no longer pins at 128 at L3 — the epoch layer ladders. L5 (κ_IT=256) needs the B512 \
+			 epoch-AIR port; the B512+SHA3-512 stack is proven on the field-op leg.",
+			s1 / 1024, s3 / 1024,
+		);
+		assert!(p1 > 0 && v1 > 0 && p3 > 0 && v3 > 0, "both levels must produce real prove+verify timings");
+	}
 
 	/// GATE acc-air-sound — the in-circuit fold-verify PROVES+VERIFIES (validate_witness +
 	/// prove/verify) for the native-consistent witness, i.e. the Horner/line arithmetization

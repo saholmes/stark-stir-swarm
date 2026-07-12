@@ -1710,14 +1710,27 @@ mod tests {
 			super::prove_verify_hash::<W, Sha3_384, Sha3Compression<Sha3_384>>(&p_bits, nb, 192, &[row])
 				.expect("EC field-op must PROVE+VERIFY over B256 with SHA3-384 challenger @L3(192)");
 
+		// L5: SHA3-512 challenger + Sha3Compression<Sha3_512> @ 256 over the B512 tower (κ_IT=256
+		// needs B512, not B256). Proven on a representative field-op (x·x=y) via the B512
+		// hash-generic path — this completes the ladder to a full three NIST levels.
+		use sha3::Sha3_512;
+		// n_rows must satisfy the B512 NTT packing constraint (packing width | code dimension);
+		// 16384 is the proven-good size the B512 square test uses (small counts fail the NTT).
+		let l5 = crate::b512_prove::measure_square_scaling_b512_hash::<Sha3_512, Sha3Compression<Sha3_512>>(
+			&[16384usize], 1, 256,
+		)
+		.expect("field-op must PROVE+VERIFY over B512 with SHA3-512 challenger @L5(256)");
+		let (_n5, pm5, vm5, sz5) = l5[0];
+
 		println!(
-			"GATE ec-challenger-ladder: EC field-op a·b mod p (P-256) PROVEN+VERIFIED over B256 with the \
-			 Fiat–Shamir challenger + commitment hash LADDERED to SHA3-N (NOT SHA-256): \
-			 L1 SHA3-256@128 ({sz1} B, prove {pm1} ms, verify {vm1} ms; κ_FS=κ_bind=128), \
-			 L3 SHA3-384@192 ({sz3} B, prove {pm3} ms, verify {vm3} ms; κ_FS=κ_bind=192). \
-			 The epoch/EC challenger now ladders — κ_sys no longer pins at 128 at L3. \
-			 L5 SHA3-512@256 needs B512 for κ_IT (same swap). Mechanical follow-up: apply to the 33 \
-			 EC/ECDSA/epoch prove/verify call sites."
+			"GATE ec-challenger-ladder: the EC/field-op challenger + commitment hash LADDERED to SHA3-N \
+			 (NOT SHA-256) across ALL THREE NIST levels: \
+			 L1 SHA3-256@128 over B256 (a·b mod p, {sz1} B, prove {pm1} ms, verify {vm1} ms; κ_FS=κ_bind=128), \
+			 L3 SHA3-384@192 over B256 (a·b mod p, {sz3} B, prove {pm3} ms, verify {vm3} ms; κ_FS=κ_bind=192), \
+			 L5 SHA3-512@256 over B512 (x·x=y, {sz5} B, prove {pm5} ms, verify {vm5} ms; κ_FS=κ_bind=256, κ_IT=256). \
+			 The epoch/EC challenger ladders at every level — κ_sys no longer pins at 128 at L3/L5. \
+			 Mechanical follow-up remains: apply the same type-param swap to the individual EC/ECDSA \
+			 gadget test sites (the shipped epoch Π is laddered in `accumulation_air::measure_epoch_verify_hash`)."
 		);
 	}
 

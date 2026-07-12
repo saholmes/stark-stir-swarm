@@ -30,7 +30,6 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 use sha3::{Sha3_256, Sha3_384, Sha3_512};
 
-use crate::accumulation_air::measure_epoch_verify;
 use crate::b256_sha3::{prove_verify_sha3_b256_timed, ProveVerifyMetrics};
 use crate::b512_sha3::prove_verify_sha3_b512_timed;
 use crate::dns_stark::{rrsig_signing_input, CanonicalRr, RrsigFields};
@@ -245,7 +244,19 @@ pub fn run_se_tld_epoch_demo(n_real: usize, level: Sha3Level) -> Result<SeEpochR
 
 	// (7) the aggregated recursive-STARK epoch proof — fold-layer verify model (distribution
 	//     integrity); the statement-validity decider is the record-AIR verify (~9-13s @L1, polylog in N).
-	let em = measure_epoch_verify(16, &[n_pow2])?;
+	//     The epoch Π's Fiat–Shamir challenger + Merkle hash LADDER to the NIST level (SHA3-N), so
+	//     κ_FS = κ_bind reach the category instead of pinning at 128. L1/L3 reach their category over
+	//     B256; L5's epoch Π is over B256 so κ_IT caps at 192 — the combined L5 epoch layer is
+	//     192-capped until the B512 epoch-AIR port (the B512+SHA3-512 stack is proven on the field-op
+	//     leg, `nonnative::ec_field_op_challenger_ladders_over_b256`).
+	use crate::accumulation_air::measure_epoch_verify_hash;
+	use crate::b256_prove::Sha3Compression;
+	use sha3::{Sha3_256, Sha3_384, Sha3_512};
+	let em = match level {
+		Sha3Level::L1 => measure_epoch_verify_hash::<Sha3_256, Sha3Compression<Sha3_256>>(16, &[n_pow2], 128)?,
+		Sha3Level::L3 => measure_epoch_verify_hash::<Sha3_384, Sha3Compression<Sha3_384>>(16, &[n_pow2], 192)?,
+		Sha3Level::L5 => measure_epoch_verify_hash::<Sha3_512, Sha3Compression<Sha3_512>>(16, &[n_pow2], 192)?,
+	};
 	let (_, epoch_prove_ms, epoch_verify_ms, epoch_proof_bytes) = em[0];
 
 	// (8) steady state: a local SHA3 Merkle-path check per lookup.
