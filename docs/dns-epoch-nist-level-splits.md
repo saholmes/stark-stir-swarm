@@ -242,6 +242,20 @@ upgrade the signature's own security:
   about the *statement* — the trust root is only as quantum-safe as the
   signature algorithm.
 
+**Scope of the statement (stated at the point of claim — what the decider enforces).**
+The epoch decider's *statement validity* is over the **digest relations**: each record's
+committed digest is `SHA3(canonical wire form)` — the message the RRSIG signs — proven
+in-circuit and folded. The full RRSIG **signature** relation is *available* in-circuit
+(RSA/ECDSA/Ed25519/ML-DSA, component-complete — see
+[`ecdsa-in-circuit-strand-cost.md`](./ecdsa-in-circuit-strand-cost.md)) but is verified
+**natively in the demo** (in-circuit ECDSA ≈ 99 core-hours = the offline two-tier
+"owner proves once" path); the digest binds the signed message, so tampering a record
+changes its digest and is caught. **Non-existence** is in-circuit: `prove-D-nsec3` proves
+the NSEC3 gap-coverage `owner < h_query < next` (**< 0.3 s / ~55 MB over B256 @L1**, a
+denial forged for an *existing* name rejected; the iterated-SHA-1 hash is native, like the
+signature). So: *validity = digest relations + NSEC3 gap-coverage in-circuit; the RRSIG
+signature check is native-pending-in-circuit (offline path).*
+
 > **Precise statement.** The **transport, aggregation, and lookup integrity are
 > post-quantum unconditional** (STARK + SHA-3): you cannot forge the epoch
 > proof, substitute records, or tamper the witness, even with a quantum
@@ -613,13 +627,21 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
   table_size=1 EC gadgets and table_size≥512 batch tables — a general property of this
   prover's path. Consequence: publisher time is fleet-only (cross-proof), which is exactly
   why the hybrid is the answer.
-* **Tier-1 statement scope.** The epoch decider today enforces the **digest** relations
-  (record digest = SHA3 of canonical form); the full **RRSIG signature** relation is
-  in-circuit but native in the demo (ECDSA ~99 core-hours = the offline two-tier path).
-  State "validity = digest relations, RRSIG native" at the point of claim.
-* **NSEC3 non-existence.** The gate `prove-D-nsec3` proves it; either add a measurement row
-  (verify cost in the epoch) or drop it from the tier-1 parenthetical.
-* **Tier-2 FS/Merkle laddering at L3/L5.** The challenger-ladder mechanism is proven
-  (SHA3-384@192); until the rollout lands in the shipped epoch/fold prover, `κ_sys` of the
-  *merged* artifact pins at the weakest layer — so the 41 s L5 decider buys nothing if the
-  fold's transcript hash caps the category. Ladder or scope explicitly.
+* **✓ Tier-1 statement scope — done.** Stated at the point of claim (§Signature trust):
+  validity = **digest relations + NSEC3 gap-coverage in-circuit**; the RRSIG **signature**
+  check is native-pending-in-circuit (the offline two-tier path, ECDSA ~99 core-hours).
+* **✓ NSEC3 non-existence — substantiated (measured).** `prove-D-nsec3` proves the gap-coverage
+  `owner < h_query < next` over B256 @L1 in **< 0.3 s / ~55 MB**, with a denial forged for an
+  *existing* name rejected (iterated-SHA-1 native, like the signature). Kept, with its number.
+* **◐ Tier-2 FS/Merkle laddering at L3/L5 — scoped; rollout is the one remaining code task.**
+  The challenger-ladder *mechanism* is proven (`ec_field_op_challenger_ladders`: SHA3-256@128
+  **and SHA3-384@192**), and the L1/L3/L5 committed-decider table above deliberately holds the
+  hash at `Sha256` to isolate the field/security effect. **Honest scope:** until the SHA3-N
+  challenger + Merkle hash are rolled out across the ~33 EC/ECDSA/epoch/fold prove/verify call
+  sites, `κ_sys` of the *merged* artifact **pins at 128 at L3/L5** — the **41 s L5 decider buys
+  nothing if the fold's transcript hash caps the category at 128**. The fix is a mechanical
+  type-param swap (`prove_verify_hash<W,H,C>` exists); the numbers change by the L3→L5
+  challenger multiplier (~4.4×), not the architecture.
+* **✓ Width sentence + fold sweep — done.** `committed width ≈ 7000 ≠ gate width ~575`; and
+  the edge object is the **decider + fold path**, not "~18 ms" alone (the 18 ms is the *fold*
+  check; the decider is the ~9–13 s statement-validity verify).
