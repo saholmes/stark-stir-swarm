@@ -195,7 +195,18 @@ proof would cost — each proof's `Bump` drops before the next, so the high-wate
 strand), **3.3× below the wide `ModMul<1024>` (~195 MiB)** it replaces. `r == a·b mod p` vs
 num-bigint; a lying strand is rejected two ways (cross-proof boundary mismatch **and** the
 combine's `grid_identity`). This is the IoT sliver win realized: the in-circuit EC field
-multiply proves at **one-strand RSS** instead of a monolithic wide multiply. The `695 s`
+multiply proves at **one-strand RSS** instead of a monolithic wide multiply.
+
+**And it composes across a round's dataflow** (`limb_field_mul_chain_sliver_p256`): a 3-mul
+chain `((a·b)·c)·d mod p` where each mul is fully slivered (27 proofs total) and each mul's
+result feeds the next via a **cross-mul boundary seam** (`FieldMulCombine` publishes `r_k` on
+an output boundary; the next mul's `LimbProduct` strands consume it as an operand on input
+boundaries; boundary-matched, k=1,2). **Measured peak RSS = 70 MiB across the whole 27-proof
+chain — independent of chain length** (8.3× below the ~585 MiB a 3-mul all-in-one proof would
+cost), because each proof's `Bump` drops before the next. A lying strand and a broken cross-mul
+seam are both rejected. This is the **round-level invariant**: chaining field-muls does *not*
+grow peak RSS, so a full EC round (a dataflow of ~26 field-muls) proves at **one-strand RSS**
+— the round-level pattern is this chained seam replicated across the round's DAG. The `695 s`
 single-thread round is the conservative anchor for *work*; enabling rayon does **not** improve
 it here.
 
