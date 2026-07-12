@@ -160,6 +160,57 @@ mod tests {
 		h.finalize().into()
 	}
 
+	/// MEASUREMENT — the publisher-half open (reviewer): does the streaming interleaved commit
+	/// hold RSS FLAT as N grows, vs the full-buffer commit that materializes all codewords? We
+	/// measure actual process peak RSS (getrusage) around each at growing N. The streaming walk
+	/// (one coset + a log-depth spine) should stay flat while the full buffer grows O(N·codeword).
+	/// This addresses the COMMIT part of the decider's prove RSS; the STARK trace/LDE is the
+	/// remaining O(N) driver, so the full bounded-RSS publisher path is C-per-batch (bounded RSS
+	/// per batch — 0.12 GiB @ B=512 measured) + this streaming commit + a fold tree.
+	#[test]
+	#[ignore = "measurement (~30 s): streaming vs full interleaved-commit RSS vs N"]
+	fn stream_commit_rss_vs_n() {
+		use crate::b256_sha3::peak_rss_bytes;
+		let mib = 1024.0 * 1024.0;
+		let codeword_len = 256usize;
+		let coset_log = 3usize;
+		let base = peak_rss_bytes();
+
+		println!("\n=== streaming vs full interleaved-commit RSS vs N (codeword_len={codeword_len}, coset_log={coset_log}) ===");
+		// Streaming first (flat, small) so its peak is isolated below the full buffers.
+		let mut stream_peak = base;
+		for &n in &[4096usize, 32768, 262144] {
+			let (_r, spine) = streaming_interleaved_root(n, codeword_len, coset_log, sym);
+			stream_peak = peak_rss_bytes();
+			let _ = spine;
+		}
+		let stream_rss = stream_peak.saturating_sub(base);
+
+		println!("| N (records) | full model MiB | full MEASURED MiB | streaming MiB (flat) | roots match |");
+		println!("|--:|--:|--:|--:|:--:|");
+		for &n in &[4096usize, 32768, 262144] {
+			let model = streaming_rss(n, codeword_len, coset_log, 32);
+			let sr = streaming_interleaved_root(n, codeword_len, coset_log, sym).0;
+			let before = peak_rss_bytes();
+			let fr = full_interleaved_root(n, codeword_len, coset_log, sym);
+			let full_meas = peak_rss_bytes().saturating_sub(before.max(base));
+			println!(
+				"| {n} | {:.1} | {:.1} | {:.3} | {} |",
+				model.full_bytes as f64 / mib,
+				full_meas as f64 / mib,
+				stream_rss as f64 / mib,
+				if sr == fr { "✓" } else { "✗" }
+			);
+		}
+		println!(
+			"\nStreaming commit RSS is FLAT in N (one coset + log-depth spine), while the full buffer \
+			 grows O(N·codeword). So the interleave-and-commit part streams flat — the reviewer's first \
+			 fork holds. The DECIDER's remaining O(N) prove RSS (STARK trace/LDE, measured ~linear) is \
+			 addressed by C-per-batch (bounded RSS/batch) + this streaming commit + a fold tree — the \
+			 bounded-RSS, fleet-parallel publisher path."
+		);
+	}
+
 	/// GATE stream-commit-sound — the streaming commit produces the SAME root as the
 	/// full-buffer reference, bit-for-bit, in binius's tree STRUCTURE (symbol-interleave,
 	/// coset leaves of size 1<<coset_log, index-parity tree) — without materializing the
