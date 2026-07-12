@@ -286,6 +286,78 @@ mod tests {
 		s[..4.min(s.len())].iter().map(|b| format!("{b:02x}")).collect()
 	}
 
+	/// LEDGER ITEM #5 (MEASURED): the per-record RRSIG *signature* cost that the `.se` prove
+	/// projection previously left unmeasured (it quoted 4.79 ms/record = the SHA3 *digest* proof
+	/// only). This measures both halves of the hybrid live-path per-record cost on REAL `.se`-ZSK
+	/// ECDSA-P256 RRSIGs: (a) the NATIVE signature verify (the `p256` crate the demo actually
+	/// runs), and (b) the in-circuit SHA3-256 digest prove. The honest per-record LIVE prove cost
+	/// is (a)+(b); this shows the signature term's true weight against the digest term, so the
+	/// projection no longer rests on a digest-only number. (The full-ZK per-record — proving the
+	/// ECDSA verify itself in-circuit — is the ~99 core-hour offline path in
+	/// `docs/ecdsa-in-circuit-strand-cost.md`, not the live hybrid path measured here.)
+	#[test]
+	fn se_per_record_signature_cost() {
+		use std::time::Instant;
+
+		// Same deterministic `.se` ZSK + real Tranco delegations as the end-to-end demo.
+		let level = Sha3Level::L1;
+		let d_seed: [u8; 32] = Sha256::digest(b"dot-se-ZSK-seed-v1").into();
+		let zsk = SigningKey::from_slice(&d_seed).expect("valid P-256 scalar");
+		let vk: VerifyingKey = *zsk.verifying_key();
+		let names = load_se_names(256).expect("load real .se names");
+		let n = names.len();
+		let delegations: Vec<SeDelegation> =
+			names.iter().map(|nm| build_delegation(&zsk, level, nm)).collect();
+
+		// (a) NATIVE ECDSA-P256 RRSIG verify — time it over enough iterations for a stable µs/sig.
+		//     (This is the live-path signature cost: the publisher native-verifies before committing.)
+		let reps = 20usize;
+		let t = Instant::now();
+		let mut ok = true;
+		for _ in 0..reps {
+			for d in &delegations {
+				ok &= vk.verify(&d.signing_input, &d.sig).is_ok();
+			}
+		}
+		let native_verify_us_per_sig = t.elapsed().as_secs_f64() * 1e6 / (reps * n) as f64;
+		assert!(ok, "all real `.se` RRSIGs must verify natively");
+
+		// (b) in-circuit SHA3-256 digest prove — the FIPS commitment, per record. Same call the
+		//     end-to-end demo makes; per-record = batch prove_ms / batch size.
+		let mut msgs: Vec<Vec<u8>> = delegations.iter().map(|d| d.m32.to_vec()).collect();
+		let padded_n = n.next_power_of_two().max(512);
+		while msgs.len() < padded_n {
+			msgs.push(msgs[msgs.len() % n].clone());
+		}
+		let n_incircuit = msgs.len();
+		let (_digests, m): (Vec<Vec<u8>>, ProveVerifyMetrics) =
+			prove_verify_sha3_b256_timed(Sha3Variant::Sha3_256, &msgs, 1, 128)
+				.expect("in-circuit SHA3-256 digest prove");
+		let digest_prove_ms_per_record = m.prove_ms as f64 / n_incircuit as f64;
+
+		let native_verify_ms_per_sig = native_verify_us_per_sig / 1e3;
+		let hybrid_per_record_ms = digest_prove_ms_per_record + native_verify_ms_per_sig;
+		let sig_fraction = native_verify_ms_per_sig / hybrid_per_record_ms;
+
+		println!("\n=== LEDGER #5 MEASURED: `.se` per-record signature cost (hybrid live path, L1) ===");
+		println!("  real `.se`-ZSK ECDSA-P256 RRSIGs measured : {n}");
+		println!("  (a) NATIVE RRSIG verify (p256 crate)      : {native_verify_us_per_sig:.1} µs/sig  (= {native_verify_ms_per_sig:.4} ms)");
+		println!("  (b) in-circuit SHA3-256 digest prove      : {digest_prove_ms_per_record:.3} ms/record  (batch {n_incircuit}, prove {} ms)", m.prove_ms);
+		println!("  hybrid LIVE per-record prove (a)+(b)      : {hybrid_per_record_ms:.3} ms/record");
+		println!("  signature term as fraction of per-record  : {:.3}%  (native verify is negligible vs the digest prove)", sig_fraction * 100.0);
+		println!("  ⇒ the `.se` prove projection's ~4.79 ms/record digest number is ROBUST: adding the");
+		println!("    measured native RRSIG verify moves it only ~{:.1}%. Full-ZK per-record (in-circuit ECDSA", sig_fraction * 100.0);
+		println!("    sig-AIR ~99 core-hr) is the OFFLINE path (docs/ecdsa-in-circuit-strand-cost.md), not this one.");
+
+		// The claim we are closing: on the hybrid LIVE path the signature cost is negligible next
+		// to the digest prove, so the digest-only projection holds. (A regression that made native
+		// verify dominate — e.g. a pathological curve impl — would trip this.)
+		assert!(
+			sig_fraction < 0.05,
+			"native RRSIG verify ({native_verify_ms_per_sig:.4} ms) should be <5% of the per-record prove ({hybrid_per_record_ms:.3} ms) on the hybrid live path"
+		);
+	}
+
 	/// DEMO — a complete `.se` TLD epoch: real Tranco delegations, real ECDSA-P256 RRSIGs
 	/// (native verify), the SHA-3 Merkle lookup tree, the FIPS commitment proved in-circuit,
 	/// and the aggregated recursive STARK with polylog-in-N edge decider + O(leaves) fold + µs membership lookups.

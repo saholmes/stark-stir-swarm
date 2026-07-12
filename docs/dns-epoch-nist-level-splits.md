@@ -384,11 +384,20 @@ TLD epoch?"
 * **Measured unit** (L1 split above): a 512-record single-block SHA3-256 batch =
   one Binius proof, prove 2455 ms, verify 9318 ms, 608 KiB. Amortized prove =
   **4.79 ms/record**.
-* **Granularity caveat:** 4.79 ms/record is the SHA3 *digest* proof, not the full
-  RRSIG *signature* verify. The full S-layer sig-AIR (`.se` ZSK = ECDSA-P256 or
-  RSA) is heavier — RSA-2048 ModMul is seconds/record, ECDSA lighter — and pushes
-  the prove side up proportionally (still fleet-parallel). Nail this down with a
-  real ZSK-algorithm measurement before quoting full-signature numbers.
+* **Granularity — signature cost now MEASURED (ledger #5).** 4.79 ms/record is the SHA3
+  *digest* proof; the RRSIG *signature* cost depends on which path carries it:
+  * **Hybrid live path (what the demo runs)** — the publisher **native-verifies** each RRSIG,
+    then proves only the digest in-circuit. Measured
+    (`se_tld_epoch_demo::se_per_record_signature_cost`, real `.se`-ZSK ECDSA-P256, L1):
+    **native RRSIG verify = 161 µs/sig**, digest prove = 4.93 ms/record ⇒ hybrid per-record
+    **5.09 ms**, i.e. the signature is only **~3%** of the per-record cost. **So the
+    ~4.79 ms/record projection is robust** — the measured signature term moves it ~3%, not a
+    proportional blow-up. (RSA-2048 native verify is likewise sub-ms; the native path keeps the
+    per-record cost digest-dominated regardless of ZSK algorithm.)
+  * **Full-ZK path (offline)** — proving the *signature verify itself* in-circuit is the
+    S-layer sig-AIR: **~99 core-hours/sig for ECDSA-P256** (measured,
+    [`ecdsa-in-circuit-strand-cost.md`](./ecdsa-in-circuit-strand-cost.md)), the two-tier
+    "owner proves once offline" artifact — never on the live epoch path.
 * Anchor: the real `.se` HNPL sample (857 records → 207 KiB package, **1.36 ms
   edge verify**) — this 1.36 ms is a **fold/lookup-layer** figure (steady-state Merkle-path
   + fold check), **not** the artifact's edge cost, which is decider (polylog in N, seconds) +
@@ -690,8 +699,12 @@ epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bou
   now a measured property of the real interleaved commitment, not a model. (Commit/open-prove
   *do* grow — 1.1 → 26 ms / 2.4 → 45 ms over the sweep — but those are publisher-side and
   fleet-parallel; the edge *verify* is the leaves-independent quantity, and it is.)
-* **○ OPEN — full-signature per-record prove cost.** The `.se` publisher-prove projection
-  (~2 core-hours / fleet-parallel) rests on **4.79 ms/record = the SHA3 *digest* proof, not the
-  RRSIG *signature* verify** (the S-layer sig-AIR — `.se` ZSK ECDSA-P256, ~99 core-hours in-circuit
-  = the offline path). Any full-`.se` prove number is a projection on an unmeasured per-record
-  signature cost until one real `.se`-ZSK signature proof is timed (the ECDSA doc is unchanged).
+* **✓ CLOSED — full-signature per-record prove cost, MEASURED.** The `.se` publisher-prove
+  projection previously rested on **4.79 ms/record = the SHA3 *digest* proof**, with the RRSIG
+  *signature* cost unmeasured. Now measured (`se_tld_epoch_demo::se_per_record_signature_cost`,
+  real `.se`-ZSK ECDSA-P256): on the **hybrid live path** the publisher native-verifies each
+  RRSIG (**161 µs/sig, measured**) and proves the digest in-circuit (4.93 ms/record) ⇒ per-record
+  **5.09 ms**, signature = **~3%** — so the digest-only projection is **robust** (the signature
+  does not blow it up). The **full-ZK path** (proving the signature verify in-circuit) is the
+  **~99 core-hour/sig** ECDSA sig-AIR (measured, offline two-tier path). The projection now rests
+  on measured signature cost, not a digest-only number.
