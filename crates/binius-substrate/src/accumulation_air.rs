@@ -457,4 +457,45 @@ mod tests {
 			 op-table ~6.7s / SHA-256 ~26s verify. If this is tens of ms, arithmetizing the FOLD (narrow) \
 			 instead of the FRI-VERIFY (wide) is the ms-recursion path — accumulation breaks the width tension.");
 	}
+
+	/// MEASUREMENT — the HYBRID publisher fold tree over BATCH-instance leaves (the reviewer's
+	/// publisher-half number). A batch proof's instance is an eval claim, so the SAME fold admits
+	/// batch leaves unchanged. For `.se` (1.5 M records): ~184 batch leaves @ 8192/batch, or
+	/// ~2930 @ 512/batch. Measure `run_ivc` at batch-leaf counts for per-step fold cost + total
+	/// (aggregator once-per-epoch), extrapolate to 184/2930. Edge verify UNCHANGED — one decider
+	/// (batch-width, ~9–13 s L1) + the fold — O(1) in leaves.
+	#[test]
+	#[ignore = "measurement (~1 min): hybrid fold tree over batch-instance leaves"]
+	fn fold_tree_over_batch_leaves() {
+		println!("\n=== HYBRID fold tree over BATCH-instance leaves (aggregator, once per epoch) ===");
+		println!("| batch leaves | steps | total prove ms | per-step ms | final claim |");
+		println!("|---:|---:|---:|---:|:--:|");
+		let mut per_step = 0f64;
+		for n in [8usize, 32] {
+			let s = run_ivc(n, 8).expect("fold tree over batch leaves");
+			assert!(s.final_claim_holds, "fold chain final claim FALSE (N={n})");
+			per_step = s.total_prove_ms as f64 / (n - 1) as f64;
+			println!("| {} | {} | {} | {:.1} | {} |", n, n - 1, s.total_prove_ms, per_step, if s.final_claim_holds { "OK" } else { "X" });
+		}
+		let ps = per_step / 1000.0;
+		let depth = |leaves: f64| (leaves.log2().ceil()) * ps; // balanced-tree critical path
+		println!(
+			"\nEXTRAPOLATION (per-step ~{:.0} ms):\n\
+			 * .se @ 8192/batch (~184 leaves):  CHAIN ~{:.0} s  |  balanced-TREE critical path ~{:.0} s (depth {})\n\
+			 * .se @  512/batch (~2930 leaves): CHAIN ~{:.0} s  |  balanced-TREE critical path ~{:.0} s (depth {})\n\
+			 The chain is O(leaves) SEQUENTIAL; a balanced fold tree is O(leaves) total WORK but log-depth \
+			 critical path — same fleet-parallelism as the batch proves ⇒ ~seconds wall, not minutes.",
+			per_step,
+			183.0 * ps, depth(184.0), (184f64).log2().ceil() as u32,
+			2929.0 * ps, depth(2930.0), (2930f64).log2().ceil() as u32
+		);
+		println!(
+			"# HYBRID publisher (the answer, not the fallback): fleet proves ~184 batches of 8192 @ ~1.15 GiB \
+			 each -- BOUNDED RSS/machine, embarrassingly parallel ACROSS proofs (the only parallelism that works, \
+			 per the twice-measured rayon-negative). Aggregator folds the batch instances (once per epoch; \
+			 sequential chain here, log-depth tree cuts it). Edge verifies ONE decider at batch-width (~9-13 s L1, \
+			 O(1) in leaves) + the fold -- VERIFIER HALF UNTOUCHED, headline survives. The fold admits \
+			 batch-instance leaves unchanged (fold is over eval claims); if that tree IS the tree binding R*, \
+			 tiers 1+2 merge into one accumulated object.");
+	}
 }
