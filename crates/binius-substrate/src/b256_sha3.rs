@@ -481,29 +481,32 @@ mod tests {
 				})
 				.collect()
 		};
-		println!("\n=== FULL-DECIDER verify with the width term — SHA3-256 record-AIR over B256 @L1(128) ===");
-		println!("| N (records = rows) | prove ms | VERIFY ms | proof KiB |");
-		println!("|--:|--:|--:|--:|");
-		let mut prev: Option<(usize, u128)> = None;
+		let gib = 1024.0 * 1024.0 * 1024.0;
+		println!("\n=== FULL-DECIDER (= the batched record-AIR proof, Approach C) — SHA3-256 over B256 @L1(128) ===");
+		println!("| N (records = rows) | PROVE ms | VERIFY ms | prove peak RSS GiB | proof KiB |");
+		println!("|--:|--:|--:|--:|--:|");
+		let mut prev: Option<(usize, u128, u128, u64)> = None;
 		for n in [512usize, 2048, 8192] {
 			let (_d, m) = prove_verify_sha3_b256_timed(Sha3Variant::Sha3_256, &mk(n), 1, 128)
 				.expect("decider prove+verify");
-			println!("| {n} | {} | {} | {} |", m.prove_ms, m.verify_ms, m.proof_bytes / 1024);
-			if let Some((pn, pv)) = prev {
-				let n_growth = n as f64 / pn as f64;
-				let v_growth = m.verify_ms as f64 / pv.max(1) as f64;
+			println!("| {n} | {} | {} | {:.2} | {} |", m.prove_ms, m.verify_ms, m.peak_rss_bytes as f64 / gib, m.proof_bytes / 1024);
+			if let Some((pn, pp, pv, prss)) = prev {
+				let ng = n as f64 / pn as f64;
 				println!(
-					"  ↳ N ×{:.0}  ⇒  verify ×{:.2}  (record count grows {:.0}×, verify grows only {:.2}× ⇒ polylog(N), NOT linear)",
-					n_growth, v_growth, n_growth, v_growth
+					"  ↳ N ×{:.0}  ⇒  prove ×{:.2} (~O(N)),  verify ×{:.2} (polylog(N)),  RSS ×{:.2}",
+					ng, m.prove_ms as f64 / pp.max(1) as f64, m.verify_ms as f64 / pv.max(1) as f64,
+					m.peak_rss_bytes as f64 / prss.max(1) as f64
 				);
 			}
-			prev = Some((n, m.verify_ms));
+			prev = Some((n, m.prove_ms, m.verify_ms, m.peak_rss_bytes));
 		}
 		println!(
-			"\nDECIDER = verify the accumulated record-AIR instance: verify is WIDTH-dominated \
-			 (near-flat in N — O(record-AIR width) + polylog(N)), a seconds-scale STATEMENT-VALIDITY \
-			 cost paid ONCE per epoch. Contrast the FOLD (~18 ms, near-zero width = distribution \
-			 integrity only). Headline: sound O(1)-in-N aggregation at seconds edge-decider, amortized."
+			"\nDECIDER = verify the batched record-AIR proof (the SAME artifact scaled up N; N=512 is \
+			 bit-identical to the Layer-1 table). VERIFY is width-dominated (polylog(N)); PROVE is O(N) \
+			 and its PEAK RSS-vs-N is the publisher-side open (does the streaming interleaved commit hold \
+			 it flat, or does the publisher shard to C-per-batch + fold tree?). Batch tables are \
+			 table_size≥512 (many rows) — the shape binius rayon parallelizes, unlike the table_size=1 \
+			 EC gadgets; run --features parallel to check whether intra-proof rayon pays here."
 		);
 	}
 }
