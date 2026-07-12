@@ -24,7 +24,7 @@ for the O(1)-verify accumulation route.
 * The **aggregation / epoch layer edge-verifies in two checks, both O(1) in N,
   once per epoch**: a **~18 ms fold check** (distribution integrity — anti-substitution
   vs `R*`) and a **full decider** (statement validity — pays record-AIR width:
-  ~0.8 s Keccak floor / ~6.6–10 s measured assembled). The 18 ms alone does **not**
+  **measured ~9–13 s, ~flat in N** — 16× records → 1.38× verify). The 18 ms alone does **not**
   enforce the per-record constraints (width law: 18 ms ⇒ near-zero width = fold table
   only); the security section claims validity only for the decider layer. Both amortize
   into background per-epoch cost.
@@ -122,7 +122,7 @@ VERIFY   (edge resolver, once per epoch — TWO distinct checks)
   (a) FOLD layer:    check Π's fold-correctness   → ~18 ms, O(1) in N
                      ⇒ distribution integrity (anti-substitution vs R*)
   (b) FULL DECIDER:  check the accumulated record-AIR instance  → O(record-AIR
-                     width) + polylog(N), O(1) in N, SUB-SECOND–SECONDS (see below)
+                     width) + polylog(N), MEASURED ~9–13 s (SHA3-256 @L1), ~flat in N
                      ⇒ statement validity ("the records' constraints hold")
 
 SERVE    (client, every lookup after the first)
@@ -137,10 +137,13 @@ enforce the per-record digest/AIR constraints, because by the width law
 (`verify ≈ 20 + 1.3·width ms`) an 18 ms verify is only reachable at near-zero width — the
 fold table alone. **Statement validity** ("no adversary can make `Π` attest to a record whose
 constraints don't hold") requires the **full decider**, which checks the accumulated instance
-at record-AIR width — Keccak ~575 cols ⇒ ~0.8 s floor / measured assembled ~6.6–10 s
-(trace-opening-dominated), SHA-256 ~2000 cols ⇒ ~2.6 s. Crucially the decider is **O(1) in N**
-and runs **once per epoch**, so it amortizes into the background exactly like the 18 ms — but
-the security section must claim only what the layer it describes checks.
+at record-AIR width. **Measured** (`decider_verify_width_term`, SHA3-256 record-AIR over B256 @L1):
+N=512 → 9.4 s, N=2048 → 11.2 s, N=8192 → 12.9 s — i.e. **16× the records grows the decider verify
+only 1.38×** (`O(record-AIR width) + polylog(N)`, width-dominated), so the decider is **~9–13 s,
+~flat in N**, paid **once per epoch** (it exceeds the ~0.8 s width-law floor because of
+trace-opening overhead + the full Keccak-f width — the ML-DSA finding). The decider amortizes
+into the background exactly like the 18 ms — but the security section must claim only what the
+layer it describes checks.
 
 Layer 1 and Layer 2 below are exactly the two stages of this flow: Layer 1 is
 the per-record S-layer proof (seconds, paid once at publish — the table above);
@@ -365,7 +368,7 @@ epoch proof `Π` out the end.
 | Quantity | Value | What it earns |
 |:---------|:------|:-----|
 | Epoch verify — **fold check** | **~18 ms**, O(1) in N | distribution integrity (anti-substitution vs `R*`); consistent with the 1.36 ms HNPL edge package |
-| Epoch verify — **full decider** (record-AIR width) | **~0.8 s Keccak floor / ~6.6–10 s measured**, O(1) in N | **statement validity** (the records' constraints hold) — REQUIRED for security-claim 1 |
+| Epoch verify — **full decider** (record-AIR width) | **measured ~9–13 s, ~flat in N** (16× records → 1.38× verify) | **statement validity** (the records' constraints hold) — REQUIRED for security-claim 1 |
 | Per-record lookup                 | **~3 µs**  | Merkle path, depth ≈ log₂(2¹⁰·1.5 M) ≈ 30 SHA-3 hashes |
 
 A resolver runs **both** checks on the **entire `.se` epoch once** — both O(1) in N
