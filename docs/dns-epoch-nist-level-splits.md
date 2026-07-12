@@ -145,8 +145,10 @@ only 1.38×** (`O(record-AIR width) + polylog(N)`, width-dominated), so the deci
 ~flat in N**, paid **once per epoch**. *Width reconciliation:* 9.4 s at the diagnostic's
 ~1.3 ms/col slope implies an **effective committed width ≈ 7000 columns** for the SHA3
 record-AIR — the honest figure (full Keccak-f[1600] state + per-query trace-opening
-columns), which **supersedes the earlier "~575 cols" estimate** (that was the algebraic
-Keccak gate, not the committed SHA3-block AIR). The decider amortizes
+columns). **The ~575 figure is the algebraic Keccak *gate* count; committed width ≠ gate
+width** — the committed SHA3-block AIR is ~7000 cols, and the ~1.3 ms/col slope × 7000 ≈
+9 s reconciles with the measured decider (and with L5: 41 s/9.4 s ≈ 4.4× = the field-tax
+multiplier at full width). The decider amortizes
 into the background exactly like the 18 ms — but the security section must claim only what the
 layer it describes checks.
 
@@ -396,19 +398,37 @@ strong result), not "efficient distribution."
 *dependent* on cost grounds alone, before the κ-laddering question. (Prove ×2.1,
 Layer-1 verify ×4.4, RSS ×1.6 for B256→B512.)
 
-### Publisher-half open — decider prove RSS grows ~linearly in N
+### Publisher half — resolved: the HYBRID (C-per-batch + fold tree, fleet-parallel)
 
-The decider is one monolithic Approach-C proof, and its **prove-side peak RSS grows
-~linearly in N** (measured: 0.12 GiB @ 512 → 0.35 @ 2048 → 1.15 @ 8192, ~×3.3 per ×4).
-At `.se` scale (~183× N=8192) that is **~210 GiB if linear — infeasible on one machine**,
-and **intra-proof rayon does not rescue it** (measured ~1× even on these table_size≥512
-batch tables — the "many rows should parallelize" intuition does *not* hold in this
-binius build). So the publisher must **either** stream the interleaved commit to hold RSS
-flat (the sliver question — `streaming_commit` targets this, but its RSS-at-full-decider-
-scale is unmeasured) **or** shard to **C-per-batch + a fold tree** (then statement validity
-for all batches flows through the fold's accumulated instance — the decider semantics
-restate for that hybrid). *"Does the decider prove at bounded RSS at scale, and on how
-many machines?"* is the open that decides the publisher half.
+Monolithic Approach-C does **not** scale: prove RSS grows **~linearly in N** (measured
+0.12 → 0.35 → 1.15 GiB over 512 → 2048 → 8192) — ~210 GiB at `.se`, infeasible on one
+machine — and **intra-proof rayon does not rescue it**. That last point is now a
+**general finding, twice-measured**: rayon gives ~1× on *both* the table_size=1 EC
+gadgets *and* the table_size≥512 batch tables — this prover's proof path has **no
+intra-proof parallelism**. So monolithic-C is also **~1.7 h of *serial* wall-clock** at
+`.se` (33 s/8192 × 2⁷·⁵) — streaming the commit rescues *memory but not time*.
+
+**The fleet is the answer, not the fallback**, and the hybrid is already this document's
+flow diagram with **batches as leaves instead of records** (the fold is over eval claims,
+and a batch instance *is* an eval claim — so the existing fold admits batch leaves
+**unchanged**). Measured (`fold_tree_over_batch_leaves`, per fold step ~785 ms):
+
+| Publisher stage | @ 8192/batch (~184 leaves) | @ 512/batch (~2930 leaves) |
+|:---|:---|:---|
+| Batch proves (fleet, ∥ across proofs) | ~1.15 GiB each, bounded | bounded |
+| Fold **chain** (sequential) | ~144 s | ~38 min |
+| Fold **balanced tree** (∥, log-depth critical path) | **~6 s** (depth 8) | **~9 s** (depth 12) |
+| Edge decider (batch-width) | ~9–13 s, O(1) in leaves | ~9–13 s |
+
+The fold **chain** is O(leaves) sequential; a balanced fold **tree** is O(leaves) total
+work but **log-depth critical path**, with the *same* cross-proof fleet-parallelism as the
+batch proves ⇒ **~6–9 s wall, not minutes**. So the publisher is **feasible on a fleet at
+bounded RSS *and* bounded time**. The **verifier half is untouched** — the resolver still
+checks one polylog decider (~9–13 s) + the fold, once per epoch — so the headline survives
+the fork intact. (The "~1000 provers / 7.2 s" figure re-derives for *batch-granularity*
+leaves, relabeled not deleted.) **Potential merge:** if the fold tree over batch instances
+*is* the tree binding `R*`, tiers 1+2 collapse into one accumulated object — the fetch path
+becomes a single decider attesting both statement validity and distribution (worth checking).
 
 ### Bottom line
 
@@ -440,3 +460,24 @@ phase.
 
 Measurement host: Apple M-series (`darwin`), release profile, single machine.
 Timings are wall-clock; treat ±10% as run-to-run noise.
+
+## Remaining surface (the whole ledger)
+
+Both halves are now measured — verifier: sound polylog-in-N decider ~9–13 s once per
+epoch, µs steady state; publisher: feasible on a fleet at bounded RSS *and* bounded time
+(hybrid C-per-batch + balanced fold tree). One finding and three predating items remain:
+
+* **Finding (not bookkeeping): no intra-proof parallelism.** rayon is ~1× on *both*
+  table_size=1 EC gadgets and table_size≥512 batch tables — a general property of this
+  prover's path. Consequence: publisher time is fleet-only (cross-proof), which is exactly
+  why the hybrid is the answer.
+* **Tier-1 statement scope.** The epoch decider today enforces the **digest** relations
+  (record digest = SHA3 of canonical form); the full **RRSIG signature** relation is
+  in-circuit but native in the demo (ECDSA ~99 core-hours = the offline two-tier path).
+  State "validity = digest relations, RRSIG native" at the point of claim.
+* **NSEC3 non-existence.** The gate `prove-D-nsec3` proves it; either add a measurement row
+  (verify cost in the epoch) or drop it from the tier-1 parenthetical.
+* **Tier-2 FS/Merkle laddering at L3/L5.** The challenger-ladder mechanism is proven
+  (SHA3-384@192); until the rollout lands in the shipped epoch/fold prover, `κ_sys` of the
+  *merged* artifact pins at the weakest layer — so the 41 s L5 decider buys nothing if the
+  fold's transcript hash caps the category. Ladder or scope explicitly.
