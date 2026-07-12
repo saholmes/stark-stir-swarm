@@ -199,13 +199,24 @@ O(1)-in-N win; it is PQ for the same reason as (1).
 |-----------|-----------|:--------:|:--------:|:--------:|
 | Record proof FS/commitment | SHA3-256/384/512 (laddered) | ✓ | ✓ | ✓ |
 | Record digest AIR (in-circuit) | SHA3-N | ✓ | ✓ | ✓ |
-| **Epoch proof `Π` FS** | **SHA-256 (128)** | ✓ | ✗ pins 128 | ✗ pins 128 |
-| **Epoch/EC-ECDSA challenger** | **SHA-256 (128)** | ✓ | ✗ pins 128 | ✗ pins 128 |
+| **Epoch proof `Π` FS** | SHA-256 today → **SHA3-N (mechanism proven)** | ✓ | ◐ | ◐ |
+| **Epoch/EC-ECDSA challenger** | SHA-256 today → **SHA3-N (mechanism proven)** | ✓ | ◐ | ◐ |
 | Lookup-tree Merkle | SHA3-N (leveled) | ✓ | ✓ | ✓ |
 
-The two ✗ rows are the open work: to make L3/L5 real for the *combined* artifact, the
-epoch proof's FS/Merkle and the EC/ECDSA challenger must ladder to SHA3-384/512. Until
-then the honest label for the combined artifact at L3/L5 is **128-bit (epoch-pinned)**.
+The two ◐ rows: the **laddering mechanism is now proven** — `ec_field_op_challenger_ladders_over_b256`
+proves the EC field-op over B256 with `HasherChallenger<Sha3_N>` + `Sha3Compression<Sha3_N>` at
+SHA3-256@128 **and SHA3-384@192** (so `κ_FS = κ_bind` ladders; L5 SHA3-512@256 needs B512 for
+`κ_IT`). What remains is the **mechanical rollout**: swapping the type params on the ~33
+EC/ECDSA/epoch prove/verify call sites (they hard-code `Sha256`). Until that rollout lands in
+the *shipped* epoch prover, the combined artifact's L3/L5 label is still 128-epoch-pinned *in
+the current binaries*, but the soundness path to real L3/L5 is demonstrated, not conjectural.
+
+**Edge protocol (three tiers — the amortization shape).** On fetching the epoch package the
+resolver runs, **once per epoch**: (1) the **decider** (statement validity, ~seconds, O(1) in N)
+and (2) the **fold** (distribution integrity, ~18 ms, O(1) in N). Thereafter, **per DNS request**,
+(3) a **µs SHA-3 Merkle-path** check of the record against the already-verified `R*` — not a
+proof re-verification. So the expensive validity proof is paid once; every lookup in the epoch is
+a µs membership check.
 
 **3. Signature trust — algorithm-dependent (the honest caveat).**
 The STARK proves *"this RRSIG verified under algorithm A"*; it does **not**
