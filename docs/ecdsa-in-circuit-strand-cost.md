@@ -37,6 +37,43 @@ and prove+verify at NIST L1 (128-bit) with the FIPS instantiation
   verify is the **offline, per-signature, RSS-bounded** artifact (the two-tier
   "owner proves offline" model), not the live-epoch path.
 
+## Headline positioning — two results, one system
+
+The paper carries **two** results, and they are complementary, not competing. State both
+plainly and let the relationship carry the narrative:
+
+* **Result A — in-circuit ECDSA-P256 (this document).** The **first fully in-circuit
+  ECDSA-P256 DNSSEC-RRSIG verify over Binius binary-tower fields** (`B256`, NIST L1), with
+  **no remaining native exceptions** — every case of the point arithmetic (`O`, `P==Q`,
+  `P==−Q`, generic) is handled and gated in-circuit, and the reduction is in-circuit
+  **end to end** (`SHA-256 → e → u1/u2 → double-and-add rounds → R.x jac_to → x≡r accept`).
+  It proves at **one-strand ~44 MiB RSS** (IoT-fittable) via limb-slivering, with a fully
+  **measured** cost wall (~99 core-hours total work / minutes-latency on a fleet). This is a
+  *completeness + bounded-memory* result: it is the offline, per-signature, two-tier
+  "owner proves once" artifact.
+* **Result B — sound polylog-in-N aggregation** (
+  [`dns-epoch-nist-level-splits.md`](./dns-epoch-nist-level-splits.md) /
+  [`accumulation-recursion.md`](./accumulation-recursion.md)). Sound aggregation of N record
+  proofs over a **non-homomorphic hash commitment** using binius's native batched-sumcheck +
+  interleaved-codes seam (no Nova port, FIPS-clean): the epoch is verified **once** (decider
+  polylog in N, fold O(leaves) sub-second), then every record resolves in µs. This is the
+  *deployability* result.
+
+**The relationship (the load-bearing sentence).** Result A is what makes the aggregated
+statement in Result B **non-trivial** — the records being folded carry a real,
+in-circuit-verifiable FIPS signature semantics, not just a hash commitment to opaque bytes.
+Result B is what makes Result A **deployable at zone scale** — you never pay the ~99
+core-hours on the live path; you aggregate offline-proven records and verify the epoch once.
+
+**Recommended headline.** Lead with **Result B (aggregation)** as the star and cite **Result A
+as the record-layer backbone** — this is the more novel claim (sound polylog-in-N aggregation
+over a non-homomorphic commitment) and the one the FIPS-acceptability thesis needs. **Caveat
+that flips it:** Result B's leaves-independent-decider headline still rests on one *modeled*
+term (the query-path count — ledger item #3) pending a direct interleaved-commit measurement;
+until that closes, Result A is the fully-measured, exception-free result and is the safer
+headline, with aggregation presented as the deployment architecture. Either way the two are
+stated together — this is one system, and the honest framing is the pair, not a single number.
+
 ## Components — all proven in-circuit over B256
 
 | Layer | Gadget (gate) | In-circuit | Measured cost |
@@ -238,7 +275,10 @@ lever**, and it parallelizes on two axes:
 * **Parallel across signatures.** A **zone/epoch of N signatures** is N×512 independent
   strands — parallelism on top of parallelism across a prover fleet. The epoch-scale
   lever.
-* **O(1) edge verify** of the aggregated result is unchanged (the accumulation layer).
+* **Aggregated-result edge verify** is unchanged (the accumulation layer): the epoch is
+  verified **once** — decider **polylog in N**, fold **O(leaves)** sub-second — then every
+  record resolves via a µs Merkle path. (Not "O(1) in N" — see
+  [`dns-epoch-nist-level-splits.md`](./dns-epoch-nist-level-splits.md).)
 
 ## Why the `.se` epoch demo stays hybrid
 
@@ -255,7 +295,8 @@ and proves the **FIPS commitment in-circuit**. The measured wall shows this is t
   zero-knowledge signature verification (e.g. an owner proving offline, once, that a
   key-holder authorized an update — the two-tier NI-gated model);
 * for **live epoch assembly**, native-verify-then-commit is what fits the latency and
-  cost budget, with the aggregation + O(1) edge verify carrying the scale.
+  cost budget, with the aggregation (verify-once-per-epoch: polylog-in-N decider +
+  O(leaves) fold) carrying the scale.
 
 ## Reproducing
 
