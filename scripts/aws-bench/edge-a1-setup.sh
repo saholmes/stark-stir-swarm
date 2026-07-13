@@ -37,8 +37,11 @@ if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq build-essential clang lld pkg-config libssl-dev git curl ca-certificates time util-linux
 elif command -v dnf >/dev/null 2>&1; then
-  sudo dnf -y -q groupinstall "Development Tools" || true
-  sudo dnf -y -q install clang lld pkgconfig openssl-devel git curl time util-linux
+  # Amazon Linux 2023 ships `curl-minimal`; installing full `curl` conflicts with it, and
+  # we do NOT need it (curl-minimal already provides the `curl` binary rustup uses). Omit
+  # curl; --allowerasing resolves any other minimal-vs-full package conflicts (e.g. gnutls).
+  sudo dnf -y -q groupinstall "Development Tools" || sudo dnf -y -q group install "Development Tools" || true
+  sudo dnf -y -q --allowerasing install clang lld pkgconfig openssl-devel git time util-linux
 else
   echo "[setup] unknown package manager; install: gcc/clang, pkg-config, openssl-dev, git, GNU time, util-linux(taskset)"
 fi
