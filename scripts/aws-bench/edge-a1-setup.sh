@@ -23,7 +23,9 @@ SCRIPT_DIR="$(pwd)"
 REPO_ROOT="$(cd ../.. && pwd)"
 SWAP_GIB="${SWAP_GIB:-6}"
 
+SETUP_T0=$SECONDS
 echo "=== STARK-DNS constrained-edge (a1.medium / Cortex-A72) setup ==="
+echo "[progress] setup started at $(date -u +%H:%M:%SZ)"
 echo "arch=$(uname -m)  cores=$(nproc)  ram=$(free -h 2>/dev/null | awk '/Mem:/{print $2}')"
 if [[ "$(uname -m)" != "aarch64" && "$(uname -m)" != "arm64" ]]; then
   echo "WARNING: not an ARM host — this benchmark is meaningful only on Cortex-A72 (a1.*/Pi 4)."
@@ -68,6 +70,11 @@ cd "$REPO_ROOT/crates/binius-substrate"
 CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 \
   cargo test --release --lib --no-run 2>&1 | tail -5
 
+SETUP_TOTAL=$((SECONDS - SETUP_T0))
 echo ""
-echo "=== setup complete ==="
+echo "════════════════════════════════════════════════════════════"
+echo "  ✅ SETUP COMPLETE in ${SETUP_TOTAL}s ($((SETUP_TOTAL/60))m $((SETUP_TOTAL%60))s)  at $(date -u +%H:%M:%SZ)"
+echo "════════════════════════════════════════════════════════════"
 echo "Next:  cd $REPO_ROOT && ./scripts/aws-bench/edge-a1-bench.sh"
+# machine-detectable marker for the nohup log:
+echo "EDGE_A1_SETUP_COMPLETE status=done seconds=$SETUP_TOTAL"

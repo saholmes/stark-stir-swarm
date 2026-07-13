@@ -48,8 +48,13 @@ uname -a > "$RES/host.txt"; (lscpu 2>/dev/null || sysctl -n machdep.cpu.brand_st
 
 command -v taskset >/dev/null 2>&1 || { echo "taskset missing (install util-linux)"; PIN=""; }
 PIN="${PIN-taskset -c $PIN_CORE}"
-TIME_BIN="$(command -v /usr/bin/time || command -v gtime || true)"
-[ -n "$TIME_BIN" ] || echo "WARNING: GNU time not found — external peak RSS unavailable (tests still print internal RSS)."
+# Prefer GNU time (supports -v). On Linux /usr/bin/time is GNU; on macOS it is BSD
+# (no -v), so prefer `gtime` there. If only BSD time is found, skip external RSS.
+TIME_BIN="$(command -v gtime || true)"
+if [ -z "$TIME_BIN" ] && /usr/bin/time -v true >/dev/null 2>&1; then
+  TIME_BIN="/usr/bin/time"
+fi
+[ -n "$TIME_BIN" ] || echo "WARNING: GNU time (-v) not found — external peak RSS unavailable (tests still print their own internal RSS)."
 
 # ─── locate the compiled test binary (built by edge-a1-setup.sh) ─────────
 echo "[bench] locating test binary..."
@@ -65,11 +70,18 @@ echo "[bench] test binary: $TESTBIN"
 CSV="$RES/summary.csv"
 echo "bench,external_peak_rss_mib,status,out_file" > "$CSV"
 
+STEP=0
+NSTEPS=4
+RUN_T0=$SECONDS
+echo "[progress] starting $NSTEPS benchmarks at $(date -u +%H:%M:%SZ) ..."
+
 run_one() {
   local test="$1" tag="$2"
   local out="$RES/$tag.out" tim="$RES/$tag.time"
+  STEP=$((STEP + 1))
+  local t0=$SECONDS
   echo ""
-  echo "─── $tag  ($test) ───"
+  echo "─── [$STEP/$NSTEPS] $tag  ($test) — started $(date -u +%H:%M:%SZ) ───"
   if [ -n "$TIME_BIN" ]; then
     # shellcheck disable=SC2086
     $PIN "$TIME_BIN" -v "$TESTBIN" "$test" --include-ignored --nocapture >"$out" 2>"$tim" || true
@@ -81,9 +93,9 @@ run_one() {
     local mib=0
   fi
   local status="ok"; grep -q "test result: ok" "$out" || status="FAILED/na"
-  echo "external peak RSS: ${mib} MiB   status: $status"
   # echo the tests' own printed tables (verify ms lives here)
   grep -E '^\||VERIFY|verify |leaves ×|GATE epoch|prove |peak RSS' "$out" | sed 's/^/    /' || true
+  echo "[$STEP/$NSTEPS] ✓ $tag DONE in $((SECONDS - t0))s — external peak RSS ${mib} MiB, status: $status"
   echo "$tag,$mib,$status,$out" >> "$CSV"
 }
 
@@ -113,8 +125,14 @@ run_one interleaved_decider_verify_vs_leaves "opening-leaves-indep"
   echo "For the paper: add a row to tab:verify-costs with Node=a1/A72, and replace the extrapolation paragraph."
 } > "$RES/SUMMARY.md"
 
+TOTAL=$((SECONDS - RUN_T0))
 echo ""
-echo "=== done ==="
+echo "════════════════════════════════════════════════════════════"
+echo "  ✅ RUN FINISHED — $NSTEPS/$NSTEPS benchmarks complete"
+echo "     total wall time: ${TOTAL}s ($((TOTAL/60))m $((TOTAL%60))s)   at $(date -u +%H:%M:%SZ)"
+echo "════════════════════════════════════════════════════════════"
 echo "Summary:  $RES/SUMMARY.md"
 echo "CSV:      $CSV"
 echo "Raw:      $RES/*.out  (+ *.time for external peak RSS)"
+# machine-detectable completion marker for `grep`/automation on the nohup log:
+echo "EDGE_A1_BENCH_COMPLETE status=done steps=$NSTEPS seconds=$TOTAL results=$RES"
