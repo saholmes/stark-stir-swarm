@@ -46,6 +46,23 @@ echo "host: $(uname -m), $(nproc) cores, ram $(free -m 2>/dev/null | awk '/Mem:/
 echo "pin:  core $PIN_CORE   results: $RES"
 uname -a > "$RES/host.txt"; (lscpu 2>/dev/null || sysctl -n machdep.cpu.brand_string 2>/dev/null) >> "$RES/host.txt" || true
 
+# ─── detect the ARM core so results are labelled HONESTLY ────────────────
+# The paper's constrained-edge target is Cortex-A72 (Raspberry Pi 4). A faster
+# core (Graviton2/N1, A76, ...) understates that cost — record which one we ran.
+CPU_PART="$(grep -m1 -i 'CPU part' /proc/cpuinfo 2>/dev/null | awk '{print $NF}')"
+CPU_MODEL="$(lscpu 2>/dev/null | grep -iE 'Model name' | head -1 | sed 's/.*: *//')"
+case "${CPU_PART:-}|${CPU_MODEL:-}" in
+  *0xd08*|*A72*)  CORE="Cortex-A72";              FAITHFUL="FAITHFUL to Raspberry Pi 4 / A72 (report as the constrained-edge number)";;
+  *0xd0c*|*N1*)   CORE="Neoverse-N1 (Graviton2)"; FAITHFUL="a LOWER BOUND on the Pi-4/A72 cost (N1 is ~2-3x faster than A72 — the real Pi is SLOWER)";;
+  *0xd0b*|*A76*)  CORE="Cortex-A76 (Pi 5 class)"; FAITHFUL="a LOWER BOUND on the Pi-4/A72 cost (A76 is faster than A72)";;
+  *0xd40*|*V1*)   CORE="Neoverse-V1 (Graviton3)"; FAITHFUL="SERVER-class, NOT a constrained-edge proxy (do not report as edge)";;
+  *0xd4f*|*V2*)   CORE="Neoverse-V2 (Graviton4)"; FAITHFUL="SERVER-class, NOT a constrained-edge proxy (do not report as edge)";;
+  *)              CORE="${CPU_MODEL:-unknown} (part ${CPU_PART:-?})"; FAITHFUL="UNRECOGNISED — verify manually against Cortex-A72 before reporting";;
+esac
+echo "core: $CORE"
+echo "→ these numbers are $FAITHFUL"
+{ echo "core=$CORE"; echo "faithfulness=$FAITHFUL"; } >> "$RES/host.txt"
+
 command -v taskset >/dev/null 2>&1 || { echo "taskset missing (install util-linux)"; PIN=""; }
 PIN="${PIN-taskset -c $PIN_CORE}"
 # Prefer GNU time (supports -v). On Linux /usr/bin/time is GNU; on macOS it is BSD
@@ -111,8 +128,9 @@ run_one interleaved_decider_verify_vs_leaves "opening-leaves-indep"
 
 # ─── summary ────────────────────────────────────────────────────────────
 {
-  echo "# STARK-DNS constrained-edge (a1.medium / Cortex-A72) results"
+  echo "# STARK-DNS constrained-edge results"
   echo ""
+  echo "- **core: $CORE** — these numbers are **$FAITHFUL**"
   echo "- host: \`$(uname -m)\`, $(nproc) core(s); pinned to core $PIN_CORE"
   echo "- date: $STAMP"
   echo "- \`decider\` VERIFY ms is the once-per-epoch edge cost; peak RSS confirms the 2 GiB fit."

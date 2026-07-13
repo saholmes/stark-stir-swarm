@@ -17,6 +17,38 @@ costs **~$0.05–0.10 on-demand** (~$0.0255/hr).
 
 ---
 
+## Quick start — existing instance with the repo already cloned (e.g. t4g)
+
+Already have an ARM instance and cloned `stark-stir-swarm`? Two steps: add the binius fork
+as a **sibling**, then run. `edge-a1-bench.sh` **auto-detects the core** and labels the
+results honestly (A72 = faithful; N1/Graviton2 = *lower bound*), so nothing gets mislabeled.
+
+```bash
+# 1. clone the binius fork NEXT TO your existing clone (sibling, not inside it)
+cd "$(dirname "$(pwd)")"            # move to the PARENT of your stark-stir-swarm/ dir
+git clone -b feature/nist-tower-level-8-9-fext https://github.com/saholmes/binius.git binius
+ls                                   # must show BOTH your repo dir AND binius/
+
+# 2. from inside the repo, run setup + bench under nohup (survives disconnects)
+cd stark-stir-swarm                  # (or whatever your clone dir is named)
+nohup ./scripts/aws-bench/edge-a1-setup.sh > ~/setup.log 2>&1 &   # builds (30-90 min on ARM)
+tail -f ~/setup.log                  # wait for  EDGE_A1_SETUP_COMPLETE
+nohup ./scripts/aws-bench/edge-a1-bench.sh > ~/bench.log 2>&1 &
+tail -f ~/bench.log                  # wait for  EDGE_A1_BENCH_COMPLETE ; read SUMMARY.md
+```
+
+> **t4g = Graviton2 / Neoverse-N1, NOT Cortex-A72.** The scripts run fine and will *print*
+> `core: Neoverse-N1 … LOWER BOUND on the Pi-4/A72 cost`. Report it as such: *"measured on
+> Graviton2/N1; a physical Cortex-A72 (Pi 4) is ~2–3× slower, so this is a lower bound."*
+> Pair it with the M-series→A72 extrapolation (upper-ish bound) to give an honest **range**,
+> or get one physical Pi-4 run for the definitive A72 number.
+>
+> **RAM:** `t4g.micro`=1 GiB (too small — build will fail even with swap), `t4g.small`=2 GiB
+> (tight; `SWAP_GIB=10`), `t4g.medium`=4 GiB (fine). The build needs the memory; the *run*
+> fits easily. If your t4g is 1–2 GiB, cross-compile elsewhere or use `t4g.medium`.
+
+---
+
 ## 1. Launch the instance
 
 - **Region:** one that still offers A1 (e.g. `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` — verify).
