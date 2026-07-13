@@ -21,8 +21,14 @@ costs **~$0.05–0.10 on-demand** (~$0.0255/hr).
 
 - **Region:** one that still offers A1 (e.g. `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` — verify).
 - **AMI:** Ubuntu 22.04/24.04 **arm64**, or Amazon Linux 2023 **arm64**.
-- **Instance type:** `a1.medium` (1 vCPU, 2 GiB). *(`a1.large` if you also want a 2-core check.)*
-- **Storage:** **≥ 30 GiB gp3** — the Rust build + swapfile + target/ need room.
+- **Instance type:** `a1.medium` (1 vCPU, **2 GiB**) works with swap, but the **build**
+  is memory-hungry and slow on 2 GiB. **Prefer `a1.large`** (2 vCPU, **4 GiB**, *same
+  Cortex-A72 core*, ~$0.051/hr) to make the build painless, then **pin to one vCPU**
+  (`PIN_CORE=0`) so the edge measurement stays single-core. (Strict 2 GiB? use
+  `SWAP_GIB=10`, or cross-compile the test binary elsewhere and only *run* here.)
+- **Storage:** **50 GiB gp3** — `target/` alone is ~10–20 GiB for this workspace, plus
+  the toolchain (~7 GiB), cargo cache (~2 GiB), and the swapfile (6–10 GiB). 30 GiB is
+  not enough once all three land; 50 GiB is cheap insurance (~$4/mo, pennies for a run).
 - **Security group:** inbound SSH (22) from your IP only.
 
 CLI equivalent (adjust AMI id / key / SG):
@@ -34,16 +40,56 @@ aws ec2 run-instances --image-id ami-XXXXXXXX_arm64 --instance-type a1.medium \
   --count 1
 ```
 
-## 2. Get the code onto the box
+## 2. Get the code onto the box — TWO repos, side by side
 
-From your workstation (double-blind: use the anonymised repo, or copy your local checkout):
+The build has a **path dependency** on a **forked binius** (the binary-tower NIST
+L8/9 extension: B256/B512, SHA-3-laddered commitments, in-circuit GF(2^512) multiply):
+`crates/binius-substrate/Cargo.toml` → `../../../binius/crates/*`. So the two repos
+must sit as **siblings** under one parent directory:
+
+```
+~/work/
+  stark-binius-swarm/   branch feature/accumulation-recursion   (on GitHub, pushed)
+  binius/               branch feature/nist-tower-level-8-9-fext (the FORK)
+```
+
+> ⚠️ **The binius fork branch is NOT on a cloneable remote** — its `origin` is the
+> upstream `gitlab.com/IrreducibleOSS/binius`, which does not have this branch. A plain
+> `git clone` will not give you a buildable tree. Use one of:
+
+**Option A — rsync both local checkouts (simplest; no push needed).** A working-tree
+copy builds fine — cargo does not need git history for path deps.
 
 ```bash
-# option A — copy your local checkout (no network deps on the instance)
-rsync -az --exclude target/ ./stark-binius-swarm/ ubuntu@<IP>:~/stark-binius-swarm/
-# option B — clone the (anonymised) artifact repo on the instance
-# git clone <ANON_REPO_URL> ~/stark-binius-swarm
+# from your workstation (run one level ABOVE both repos):
+DEST=ubuntu@<IP>
+ssh "$DEST" 'mkdir -p ~/work'
+rsync -az --exclude target/ --exclude .git ./stark-binius-swarm/ "$DEST":~/work/stark-binius-swarm/
+rsync -az --exclude target/ --exclude .git ./binius/             "$DEST":~/work/binius/
 ```
+
+**Option B — clone the main repo (it IS pushed) + rsync only the fork.**
+
+```bash
+ssh ubuntu@<IP>
+mkdir -p ~/work && cd ~/work
+git clone -b feature/accumulation-recursion \
+  https://github.com/saholmes/stark-stir-swarm.git stark-binius-swarm
+# then, from your workstation, copy the fork (branch not on any remote):
+#   rsync -az --exclude target/ --exclude .git ./binius/ ubuntu@<IP>:~/work/binius/
+```
+
+**Option C — push the fork branch to your own remote first**, then clone both:
+```bash
+# on your workstation, in ../binius:
+#   git remote add mine https://github.com/saholmes/binius.git
+#   git push mine feature/nist-tower-level-8-9-fext
+# then on the a1: git clone both into ~/work as siblings, on the branches above.
+```
+
+Verify the layout before setup: `ls ~/work` must show **both** `stark-binius-swarm/` and
+`binius/`, and `~/work/stark-binius-swarm/crates/binius-substrate/Cargo.toml`'s
+`../../../binius` must resolve to `~/work/binius`.
 
 > **Long runs — survive SSH disconnects.** Both the setup build (30–90 min) and the decider
 > bench (minutes on A72) outlive a typical SSH session. Run them detached so a dropped
