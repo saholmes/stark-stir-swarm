@@ -53,9 +53,18 @@ must sit as **siblings** under one parent directory:
   binius/               branch feature/nist-tower-level-8-9-fext (the FORK)
 ```
 
-> ⚠️ **The binius fork branch is NOT on a cloneable remote** — its `origin` is the
-> upstream `gitlab.com/IrreducibleOSS/binius`, which does not have this branch. A plain
-> `git clone` will not give you a buildable tree. Use one of:
+**Simplest (both repos are on GitHub now):**
+```bash
+ssh ubuntu@<IP>
+mkdir -p ~/work && cd ~/work
+git clone -b feature/accumulation-recursion   https://github.com/saholmes/stark-stir-swarm.git stark-binius-swarm
+git clone -b feature/nist-tower-level-8-9-fext https://github.com/saholmes/binius.git          binius
+ls ~/work   # must show BOTH stark-binius-swarm/ and binius/
+```
+(If you later set `saholmes/binius` to **private**, clone it with a token/deploy key, or use
+the bundle Option D below.)
+
+The remaining options are fallbacks (e.g. offline, or a private fork):
 
 **Option A — rsync both local checkouts (simplest; no push needed).** A working-tree
 copy builds fine — cargo does not need git history for path deps.
@@ -79,13 +88,27 @@ git clone -b feature/accumulation-recursion \
 #   rsync -az --exclude target/ --exclude .git ./binius/ ubuntu@<IP>:~/work/binius/
 ```
 
-**Option C — push the fork branch to your own remote first**, then clone both:
+**Option C — push the fork branch to your own remote first** (needs write access to a
+remote you own), then clone both:
 ```bash
 # on your workstation, in ../binius:
-#   git remote add mine https://github.com/saholmes/binius.git
+#   git remote add mine https://github.com/saholmes/binius.git   # must exist + be writable
 #   git push mine feature/nist-tower-level-8-9-fext
 # then on the a1: git clone both into ~/work as siblings, on the branches above.
 ```
+
+**Option D — carry the fork as a git BUNDLE (no remote / no write access needed).** A
+`git bundle` is one self-contained file that clones like a repo:
+```bash
+# on your workstation, in ../binius (already done — see binius-fork-*.bundle):
+#   git bundle create ~/binius-fork.bundle feature/nist-tower-level-8-9-fext
+# copy it up and clone from it on the a1:
+scp binius-fork-*.bundle ubuntu@<IP>:~/work/
+ssh ubuntu@<IP> 'cd ~/work && git clone -b feature/nist-tower-level-8-9-fext binius-fork-*.bundle binius'
+# main repo is on GitHub, so clone it normally alongside:
+ssh ubuntu@<IP> 'cd ~/work && git clone -b feature/accumulation-recursion https://github.com/saholmes/stark-stir-swarm.git stark-binius-swarm'
+```
+This is the smallest transfer (a few MB) and yields a real git tree on the correct branch.
 
 Verify the layout before setup: `ls ~/work` must show **both** `stark-binius-swarm/` and
 `binius/`, and `~/work/stark-binius-swarm/crates/binius-substrate/Cargo.toml`'s
