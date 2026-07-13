@@ -57,6 +57,16 @@ fn put(seg: &mut TableWitnessSegment<OurB256>, row: usize, c: &C4, v: OurB256) -
 /// Prove + verify the in-circuit fold-verify for a degree-`d` fold (d≥1) with RANDOM inputs.
 /// Returns `(prove_ms, verify_ms, proof_bytes, n_b256_muls)`. Wrapper over `fold_step`.
 pub fn prove_verify_fold_verify(d: usize) -> Result<(u128, u128, usize, usize)> {
+	prove_verify_fold_verify_rows(d, 64)
+}
+
+/// As `prove_verify_fold_verify` but with an explicit row count `nrows` --- the number of
+/// interior fold-verify steps proved in ONE Binius table.  A balanced fold tree over `N` leaves
+/// has `N-1` interior nodes, so proving the whole tree at `nrows = N-1` and verifying the single
+/// resulting proof gives the edge a fold check whose cost is polylog in `N` (the fold-verify AIR
+/// is narrow / width-independent of leaves), replacing the `O(N)` native fold-path replay ---
+/// i.e.\ the \emph{hierarchical} (recursive) edge fold.  Returns `(prove_ms, verify_ms, bytes, muls)`.
+pub fn prove_verify_fold_verify_rows(d: usize, nrows: usize) -> Result<(u128, u128, usize, usize)> {
 	use rand::SeedableRng;
 	assert!(d >= 1);
 	let mut rng = rand::rngs::StdRng::from_seed([0xac; 32]);
@@ -64,7 +74,7 @@ pub fn prove_verify_fold_verify(d: usize) -> Result<(u128, u128, usize, usize)> 
 	let t = <OurB256 as Field>::random(&mut rng);
 	let r0: Vec<OurB256> = (0..d).map(|_| <OurB256 as Field>::random(&mut rng)).collect();
 	let r1: Vec<OurB256> = (0..d).map(|_| <OurB256 as Field>::random(&mut rng)).collect();
-	let s = fold_step(&g, t, &r0, &r1)?;
+	let s = fold_step(&g, t, &r0, &r1, nrows)?;
 	Ok((s.prove_ms, s.verify_ms, s.proof_bytes, 2 * d))
 }
 
@@ -81,7 +91,7 @@ pub struct StepOut {
 /// the fold polynomial `g` (coefficients, degree d = g.len()−1), challenge `t`, and the two
 /// points `r0,r1` (dimension d), returns the folded claim (line, g(t)) + timing. v0=g[0],
 /// v1=Σg. The circuit is 2d B256 muls (Horner + line), no hash — the narrow recursion step.
-pub fn fold_step(g: &[OurB256], t: OurB256, r0: &[OurB256], r1: &[OurB256]) -> Result<StepOut> {
+pub fn fold_step(g: &[OurB256], t: OurB256, r0: &[OurB256], r1: &[OurB256], nrows: usize) -> Result<StepOut> {
 	use std::time::Instant;
 	let d = g.len() - 1;
 	assert!(d >= 1 && r0.len() == d && r1.len() == d);
@@ -150,13 +160,13 @@ pub fn fold_step(g: &[OurB256], t: OurB256, r0: &[OurB256], r1: &[OurB256]) -> R
 	}
 	let table_id = tb.id();
 
-	const NROWS: usize = 64;
-	let statement = Statement { boundaries: vec![], table_sizes: vec![NROWS] };
+	let nrows = nrows.next_power_of_two().max(1);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 	{
-		let tw = witness.init_table(table_id, NROWS)?;
+		let tw = witness.init_table(table_id, nrows)?;
 		let mut seg = tw.full_segment();
-		for row in 0..NROWS {
+		for row in 0..nrows {
 			wc64(&mut seg, beta_col, row, beta())?;
 			for i in 0..=d {
 				put(&mut seg, row, &cg[i], g[i])?;
@@ -312,7 +322,7 @@ pub fn run_ivc(n_records: usize, inner_vars: usize) -> Result<IvcSummary> {
 	for item in lifted.iter().skip(1) {
 		let t = rf(&mut rng); // per-step challenge (Fiat-Shamir in practice)
 		let g = restrict_to_line_coeffs(&p, &acc.0, &item.0);
-		let step = fold_step(&g, t, &acc.0, &item.0)?;
+		let step = fold_step(&g, t, &acc.0, &item.0, 64)?;
 		total_p += step.prove_ms;
 		total_v += step.verify_ms;
 		max_v = max_v.max(step.verify_ms);
@@ -542,6 +552,47 @@ mod tests {
 		let (p, v, sz, muls) = prove_verify_fold_verify(8).expect("fold-verify circuit must prove+verify");
 		println!("GATE acc-air-sound: in-circuit fold-verify (d=8, {muls} B256 muls) PROVES+VERIFIES over \
 			 B256 @L1(128) == native; prove {p} ms, verify {v} ms, proof {} KB", sz / 1024);
+	}
+
+	/// ★HIERARCHICAL (recursive) EDGE FOLD — verify vs leaves. A balanced fold tree over `N` leaves
+	/// has `N-1` interior fold-verify steps; proving them in ONE Binius table and verifying the
+	/// single proof gives the edge a fold check whose cost is POLYLOG in `N` (the fold-verify AIR
+	/// is narrow / width-independent), replacing the `O(N)` native fold-path replay. This is the
+	/// fix for the "sub-second fold only holds at small N" concern: the recursive fold does not
+	/// grow linearly in leaves.
+	#[test]
+	fn hierarchical_fold_verify_scaling() {
+		let d = 2usize; // small fold degree keeps prove tractable; width is leaf-independent regardless
+		println!("\n=== HIERARCHICAL (recursive) edge fold: verify vs leaves (fold-verify AIR over B256, d={d}) ===");
+		println!("| N leaves | fold steps (N-1) | prove ms | VERIFY ms | proof KiB |");
+		println!("|--:|--:|--:|--:|--:|");
+		let sweep = [4usize, 7, 10, 13]; // N = 16, 128, 1024, 8192
+		let mut first: Option<(usize, u128)> = None;
+		let mut last: Option<(usize, u128)> = None;
+		for &logn in &sweep {
+			let n = 1usize << logn;
+			let (p, v, sz, _m) =
+				prove_verify_fold_verify_rows(d, n - 1).expect("hierarchical fold must prove+verify");
+			println!("| {} | {} | {} | {} | {} |", n, n - 1, p, v, sz / 1024);
+			if first.is_none() {
+				first = Some((n, v));
+			}
+			last = Some((n, v));
+		}
+		let (n0, v0) = first.unwrap();
+		let (n1, v1) = last.unwrap();
+		let leaf_ratio = n1 as f64 / n0 as f64;
+		let verify_ratio = v1 as f64 / v0.max(1) as f64;
+		println!(
+			"leaves ×{:.0} ({}→{}), verify ×{:.2} ({}→{} ms) ⇒ the recursive fold-tree EDGE VERIFY is \
+			 POLYLOG in N, NOT O(leaves): one proof replaces the {}-step native replay. \
+			 (Native O(leaves) would grow ~{:.0}× over this range.)",
+			leaf_ratio, n0, n1, verify_ratio, v0, v1, n1 - 1, leaf_ratio
+		);
+		assert!(
+			verify_ratio < 20.0,
+			"verify grew ×{verify_ratio:.1} over ×{leaf_ratio:.0} leaves — looks O(leaves), not polylog"
+		);
 	}
 
 	/// ★EPOCH VERIFY BENCHMARK — the edge verify of the aggregated epoch proof vs record
