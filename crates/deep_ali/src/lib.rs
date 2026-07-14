@@ -2180,6 +2180,11 @@ pub mod ecdsa_verify_stranded_gway;
 pub mod p256_ecdsa;
 pub mod p256_ecdsa_air;
 pub mod p256_ecdsa_air_v2;
+pub mod p256_ecdsa_air_v2_wi;
+pub mod p256_joint_msm_air;
+pub mod p256_const_mux_air;
+pub mod p256_windowed_q_air;
+pub mod ed25519_msm_air;
 
 // ML-DSA-44 (FIPS 204) verify AIR — phase 1 scaffolding (2026-05-07).
 // Native references + Z_q field AIR + NTT layout + Keccak-f[1600]
