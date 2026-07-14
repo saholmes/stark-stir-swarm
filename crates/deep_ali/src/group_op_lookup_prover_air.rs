@@ -147,18 +147,23 @@ pub fn fillable_group_add(p1: &AffinePoint, p2: &AffinePoint, alpha: ExtField) -
     (vals.len(), arithmetic_ok, acc_ok)
 }
 
-/// Fill a real group_double of `2·p`; same contract as `fillable_group_add`.
-pub fn fillable_group_double(p: &AffinePoint, alpha: ExtField) -> (usize, bool, bool) {
+/// Fill a real group_double of `2·p` and return every sub-gadget's
+/// range-checked output sub-limbs, with whether the arithmetic is valid.
+pub fn group_double_sublimbs(p: &AffinePoint) -> (Vec<u64>, bool) {
     let (px, py, pz) = (0, NUM_LIMBS, 2 * NUM_LIMBS);
     let (layout, total) = build_group_double_layout(3 * NUM_LIMBS, px, py, pz);
     let mut trace: Vec<Vec<F>> = (0..total).map(|_| vec![F::zero(); 1]).collect();
     place_proj(&mut trace, 0, px, py, pz, p);
     let zo = z_one();
     fill_group_double_gadget(&mut trace, 0, &layout, &p.x, &p.y, &zo);
-
     let row: Vec<F> = (0..total).map(|c| trace[c][0]).collect();
     let arithmetic_ok = eval_group_double_gadget(&row, &layout).iter().all(|v| v.is_zero());
-    let vals = collect_double_sublimbs(&trace, 0, &layout);
+    (collect_double_sublimbs(&trace, 0, &layout), arithmetic_ok)
+}
+
+/// Fill a real group_double of `2·p`; same contract as `fillable_group_add`.
+pub fn fillable_group_double(p: &AffinePoint, alpha: ExtField) -> (usize, bool, bool) {
+    let (vals, arithmetic_ok) = group_double_sublimbs(p);
     let acc_ok = accumulator_holds(&vals, alpha);
     (vals.len(), arithmetic_ok, acc_ok)
 }
