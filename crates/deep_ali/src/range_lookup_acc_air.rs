@@ -326,4 +326,38 @@ mod tests {
         let nz = count_violations(&trace, n_trace, table_size, a);
         assert!(nz > 0, "forged table value must trip the table-pin constraint");
     }
+
+    /// Confirm the lookup's F_ext is large enough for the ACTIVE NIST
+    /// level: κ_lookup = log2|F_ext| − log2(N + 2^S) ≥ level bits.  The
+    /// accumulator inherits ExtField from `permutation_argument` (sextic
+    /// at L1/L3, octic at L5), so this is a checked invariant, not a
+    /// choice.  Sampling α in the BASE field (63 bits) would fail.
+    #[test]
+    fn kappa_lookup_satisfies_active_nist_level() {
+        // Conservative: Goldilocks p > 2^63, so log2|F_ext| ≥ 63·EXT_DEGREE.
+        const GOLDILOCKS_BITS_LB: usize = 63;
+        let ext_bits = GOLDILOCKS_BITS_LB * EXT_DEGREE;
+        // Generous upper bound on log2(N + 2^S) for a WHOLE ECDSA verify
+        // (~2M sub-limbs + the 2^13 table ≈ 2^21; use 2^30 for headroom).
+        let n_values_log2 = 30usize;
+        let kappa_lookup = ext_bits.saturating_sub(n_values_log2 + 1);
+
+        let (required, level) = if cfg!(feature = "sha3-512") {
+            (256usize, "L5/octic")
+        } else if cfg!(feature = "sha3-384") {
+            (192, "L3/sextic")
+        } else {
+            (128, "L1/sextic")
+        };
+
+        // Base field would be catastrophic — assert we are NOT there.
+        assert!(EXT_DEGREE >= 6, "lookup challenge must be in an extension, not Fp");
+        assert!(
+            kappa_lookup >= required,
+            "{level}: kappa_lookup = {kappa_lookup} bits (EXT_DEGREE={EXT_DEGREE}, \
+             ext_bits={ext_bits}) must be ≥ {required}",
+        );
+        // κ_lookup must not be the binding term (it never is here).
+        assert!(kappa_lookup > 256, "kappa_lookup {kappa_lookup} unexpectedly small");
+    }
 }
