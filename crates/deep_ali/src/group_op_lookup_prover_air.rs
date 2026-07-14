@@ -121,10 +121,10 @@ fn z_one() -> FieldElement {
     t
 }
 
-/// Fill a real group_add of `p1 + p2`, confirm its arithmetic, and route
-/// all sub-gadget sub-limbs through one accumulator.  Returns
-/// `(sublimb_count, arithmetic_ok, accumulator_ok)`.
-pub fn fillable_group_add(p1: &AffinePoint, p2: &AffinePoint, alpha: ExtField) -> (usize, bool, bool) {
+/// Fill a real group_add of `p1 + p2` and return every sub-gadget's
+/// range-checked output sub-limbs (the accumulator's lookup value set),
+/// together with whether the RCB arithmetic is valid.
+pub fn group_add_sublimbs(p1: &AffinePoint, p2: &AffinePoint) -> (Vec<u64>, bool) {
     let (px, py, pz) = (0, NUM_LIMBS, 2 * NUM_LIMBS);
     let (qx, qy, qz) = (3 * NUM_LIMBS, 4 * NUM_LIMBS, 5 * NUM_LIMBS);
     let (layout, total) = build_group_add_layout(6 * NUM_LIMBS, px, py, pz, qx, qy, qz);
@@ -133,10 +133,16 @@ pub fn fillable_group_add(p1: &AffinePoint, p2: &AffinePoint, alpha: ExtField) -
     place_proj(&mut trace, 0, qx, qy, qz, p2);
     let zo = z_one();
     fill_group_add_gadget(&mut trace, 0, &layout, &p1.x, &p1.y, &zo, &p2.x, &p2.y, &zo);
-
     let row: Vec<F> = (0..total).map(|c| trace[c][0]).collect();
     let arithmetic_ok = eval_group_add_gadget(&row, &layout).iter().all(|v| v.is_zero());
-    let vals = collect_add_sublimbs(&trace, 0, &layout);
+    (collect_add_sublimbs(&trace, 0, &layout), arithmetic_ok)
+}
+
+/// Fill a real group_add of `p1 + p2`, confirm its arithmetic, and route
+/// all sub-gadget sub-limbs through one accumulator.  Returns
+/// `(sublimb_count, arithmetic_ok, accumulator_ok)`.
+pub fn fillable_group_add(p1: &AffinePoint, p2: &AffinePoint, alpha: ExtField) -> (usize, bool, bool) {
+    let (vals, arithmetic_ok) = group_add_sublimbs(p1, p2);
     let acc_ok = accumulator_holds(&vals, alpha);
     (vals.len(), arithmetic_ok, acc_ok)
 }
