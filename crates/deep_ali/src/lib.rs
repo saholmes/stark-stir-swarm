@@ -2191,6 +2191,7 @@ pub mod range_lookup_wire_air;
 pub mod mul_lookup_air;
 pub mod add_sub_lookup_air;
 pub mod point_op_lookup_air;
+pub mod mul_lookup_prover_air;
 
 // ML-DSA-44 (FIPS 204) verify AIR — phase 1 scaffolding (2026-05-07).
 // Native references + Z_q field AIR + NTT layout + Keccak-f[1600]
