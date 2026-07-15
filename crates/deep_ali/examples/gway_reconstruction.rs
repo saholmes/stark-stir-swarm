@@ -53,7 +53,7 @@ use deep_ali::{
     },
     p256_ecdsa_verify_multirow_air::{
         build_ecdsa_verify_multirow_layout, ecdsa_verify_multirow_constraints,
-        fill_ecdsa_verify_multirow, EcdsaVerifyMultirowLayout, EcdsaVerifyPublicInputs,
+        fill_ecdsa_verify_multirow_strand, EcdsaVerifyMultirowLayout, EcdsaVerifyPublicInputs,
     },
     p256_field::FieldElement,
     p256_group::GENERATOR as P256_GENERATOR,
@@ -153,12 +153,15 @@ fn derive_case(key_bytes: &[u8; 32], msg: &[u8], k: usize) -> SigCase {
     SigCase { native_ok, u1_bits, u2_bits, qx: pk.point.x, qy: pk.point.y, r_fe, pi_hash, pub_inputs }
 }
 
-fn build_full(
+fn fill_strand_direct(
     case: &SigCase,
     layout: &EcdsaVerifyMultirowLayout,
+    cols: &[usize],
     n_trace: usize,
-    total: usize,
 ) -> Vec<Vec<F>> {
+    // DIRECT-FILL: materialise ONLY this strand's columns — the full
+    // ~196k-col trace is never allocated, so per-sliver peak RSS is the
+    // strand trace + its LDE (the IoT-class working set), not the monolith.
     let g = *P256_GENERATOR;
     let z_one = {
         let mut t = FieldElement::zero();
@@ -172,18 +175,14 @@ fn build_full(
         t
     };
     let id_z = FieldElement::zero();
-    let mut trace = vec![vec![F::zero(); n_trace]; total];
-    fill_ecdsa_verify_multirow(
-        &mut trace, layout, n_trace,
+    let mut strand: Vec<Vec<F>> = vec![vec![F::zero(); n_trace]; cols.len()];
+    fill_ecdsa_verify_multirow_strand(
+        cols, &mut strand, layout, n_trace,
         (&id_x, &id_y, &id_z), (&g.x, &g.y, &z_one), &case.u1_bits,
         (&id_x, &id_y, &id_z), (&case.qx, &case.qy, &z_one), &case.u2_bits,
         &case.r_fe,
     );
-    trace
-}
-
-fn extract(full: &[Vec<F>], cols: &[usize]) -> Vec<Vec<F>> {
-    cols.iter().map(|&c| full[c].clone()).collect()
+    strand
 }
 
 fn main() {
@@ -214,104 +213,114 @@ fn main() {
     );
 
     if phase == "prove" {
-        // Memory-light rebuild-mode prove of every strand → StrandedProofG.
+        // ── STREAMING-WRITE PROVE (nothing accumulated) ──
+        // Prove each sliver, WRITE its proof + seam entries to disk, DROP, so
+        // only one sliver's working set is ever live.  Interleaved format:
+        //   [u64 g]
+        //   repeat g: [u64 sp_len][SubAirProofWithTrace]
+        //             [u64 n_entries_s]
+        //             repeat: [u64 gid][u64 blob_len][Vec<BindingCellsCommit>]
+        //
+        // SLIVER=<s> proves ONLY sliver s and APPENDS its record (writing the
+        // [g] header iff s==0).  A shell loop over SLIVER=0..g then runs one
+        // FRESH process per sliver — the fleet-realistic mode where each IoT
+        // device carries one sliver and the allocator resets between slivers,
+        // so peak RSS is a single sliver's ~430 MiB, not the in-process
+        // retention of an all-in-one run.
+        let single: Option<usize> = std::env::var("SLIVER").ok().and_then(|s| s.parse().ok());
         eprintln!("    [rss] prove start: cur={:.0} MiB", rss_mib());
         let t = Instant::now();
-        let mut proofs: Vec<Option<deep_ali::sub_air_with_trace::SubAirProofWithTrace>> =
-            (0..g).map(|_| None).collect();
-        let mut seam_commits: Vec<
-            Vec<(usize, Vec<deep_ali::binding_cells_commit::BindingCellsCommit>)>,
-        > = vec![vec![]; g];
 
-        for s in 0..g {
-            let full = build_full(&case, &layout, n_trace, total);
-            let strand = extract(&full, &cut.strand_cols[s]);
-            drop(full);
+        // Record-writer for one sliver; returns (fri, strand_bytes, seam_bytes, n_entries).
+        let write_sliver = |w: &mut std::io::BufWriter<std::fs::File>, s: usize| {
+            let strand = fill_strand_direct(&case, &layout, &cut.strand_cols[s], n_trace);
             let sep = strand_domain(s);
             let (p, c) = prove_one_strand(
                 &strand, &cut, s, &layout, &case.pub_inputs, n_trace, blowup, case.pi_hash, &sep,
                 params,
             );
             drop(strand);
-            proofs[s] = Some(p);
-            seam_commits[s] = c;
-            if s % 8 == 0 || s + 1 == g {
-                eprintln!("    [rss] strand {s}/{g} proved: cur={:.0} MiB", rss_mib());
-            }
-        }
-        let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let proofs: Vec<SubAirProofWithTrace> = proofs.into_iter().map(|p| p.unwrap()).collect();
-        let fri_total: usize = proofs.iter().map(|p| p.fri_proof_bytes.len()).sum();
-
-        // ── INDEXED STREAMING FORMAT (one strand + one seam-PAIR resident) ──
-        //   [u64 g]
-        //   for s in 0..g:            [u64 len][SubAirProofWithTrace blob]
-        //   [u64 n_seam_entries N]
-        //   index:  for each entry:   [u64 strand][u64 gid][u64 blob_len]
-        //   blobs:  for each entry:   [Vec<BindingCellsCommit> blob]  (index order)
-        // Per-strand seam commits are split into individually-addressable
-        // (strand, gid) entries so the verifier can SEEK+load only the two
-        // commits a given OOD check compares — never the whole 4.7 GB.
-        let f = std::fs::File::create(&proof_file).expect("create proof file");
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-        w.write_all(&(g as u64).to_le_bytes()).unwrap();
-
-        let mut strand_bytes_total = 0usize;
-        for p in &proofs {
+            let fri = p.fri_proof_bytes.len();
             let mut sb: Vec<u8> = Vec::new();
             p.serialize_compressed(&mut sb).expect("serialize strand proof");
             w.write_all(&(sb.len() as u64).to_le_bytes()).unwrap();
             w.write_all(&sb).unwrap();
-            strand_bytes_total += sb.len();
-        }
-        drop(proofs);
-
-        // Seam entries: (strand, gid, serialized Vec<BCC>).  Two-pass so the
-        // index (all lens) precedes the blob region without holding every
-        // blob resident: pass 1 records lens, pass 2 re-serializes to write.
-        let mut index: Vec<(usize, usize, usize)> = Vec::new(); // (strand, gid, len)
-        for (s, entries) in seam_commits.iter().enumerate() {
-            for (gid, bccs) in entries.iter() {
+            let strand_bytes = sb.len();
+            drop(p);
+            drop(sb);
+            w.write_all(&(c.len() as u64).to_le_bytes()).unwrap();
+            let (mut seam_bytes, mut n) = (0usize, 0usize);
+            for (gid, bccs) in &c {
                 let mut blob: Vec<u8> = Vec::new();
                 bccs.serialize_compressed(&mut blob).expect("serialize seam entry");
-                index.push((s, *gid, blob.len()));
-            }
-        }
-        w.write_all(&(index.len() as u64).to_le_bytes()).unwrap();
-        for (s, gid, len) in &index {
-            w.write_all(&(*s as u64).to_le_bytes()).unwrap();
-            w.write_all(&(*gid as u64).to_le_bytes()).unwrap();
-            w.write_all(&(*len as u64).to_le_bytes()).unwrap();
-        }
-        let mut seam_bytes_total = 0usize;
-        for (s, entries) in seam_commits.iter().enumerate() {
-            for (gid, bccs) in entries.iter() {
-                let _ = (s, gid);
-                let mut blob: Vec<u8> = Vec::new();
-                bccs.serialize_compressed(&mut blob).expect("serialize seam entry");
+                w.write_all(&(*gid as u64).to_le_bytes()).unwrap();
+                w.write_all(&(blob.len() as u64).to_le_bytes()).unwrap();
                 w.write_all(&blob).unwrap();
-                seam_bytes_total += blob.len();
+                seam_bytes += blob.len();
+                n += 1;
             }
-        }
-        w.flush().unwrap();
-        let total_mib =
-            (strand_bytes_total + seam_bytes_total) as f64 / (1024.0 * 1024.0);
+            drop(c);
+            (fri, strand_bytes, seam_bytes, n)
+        };
 
+        let mut prove_peak = 0.0f64;
+        let (mut fri_total, mut strand_bytes_total, mut seam_bytes_total, mut seam_entries) =
+            (0usize, 0usize, 0usize, 0usize);
+
+        if let Some(s) = single {
+            // One sliver, one process; append (create+header iff s==0).
+            let f = if s == 0 {
+                let f = std::fs::File::create(&proof_file).expect("create proof file");
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+                w.write_all(&(g as u64).to_le_bytes()).unwrap();
+                w.flush().unwrap();
+                std::fs::OpenOptions::new().append(true).open(&proof_file).expect("reopen append")
+            } else {
+                std::fs::OpenOptions::new().append(true).open(&proof_file).expect("open append")
+            };
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            let (fri, strand_b, seam_b, n) = write_sliver(&mut w, s);
+            w.flush().unwrap();
+            fri_total = fri;
+            strand_bytes_total = strand_b;
+            seam_bytes_total = seam_b;
+            seam_entries = n;
+            prove_peak = prove_peak.max(rss_mib());
+        } else {
+            // All slivers, one process (retention accumulates across slivers).
+            let f = std::fs::File::create(&proof_file).expect("create proof file");
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            w.write_all(&(g as u64).to_le_bytes()).unwrap();
+            for s in 0..g {
+                let (fri, strand_b, seam_b, n) = write_sliver(&mut w, s);
+                fri_total += fri;
+                strand_bytes_total += strand_b;
+                seam_bytes_total += seam_b;
+                seam_entries += n;
+                prove_peak = prove_peak.max(rss_mib());
+                if s % 16 == 0 || s + 1 == g {
+                    eprintln!(
+                        "    [rss] sliver {s}/{g} (w={}) proved+written+dropped: cur={:.0} MiB",
+                        cut.width(s),
+                        rss_mib()
+                    );
+                }
+            }
+            w.flush().unwrap();
+        }
+        let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let total_mib = (strand_bytes_total + seam_bytes_total) as f64 / (1024.0 * 1024.0);
+        eprintln!("    [rss] prove pass done: per-sliver peak {prove_peak:.0} MiB");
+
+        let tag = single.map(|s| format!("SLIVER={s} ")).unwrap_or_default();
         println!(
-            "PROVE G={g} K={k} strands={g} prove_ms={prove_ms:.0} fri_total_kib={} \
-             seam_entries={} seam_mib={:.2} strands_mib={:.2} total_mib={:.2} proof_file={proof_file}",
+            "PROVE {tag}G={g} K={k} prove_ms={prove_ms:.0} per_sliver_peak_mib={prove_peak:.0} \
+             fri_total_kib={} seam_entries={seam_entries} seam_mib={:.2} strands_mib={:.2} \
+             total_mib={:.2} proof_file={proof_file}",
             fri_total / 1024,
-            index.len(),
             seam_bytes_total as f64 / (1024.0 * 1024.0),
             strand_bytes_total as f64 / (1024.0 * 1024.0),
             total_mib,
-        );
-        eprintln!(
-            "    indexed proof written: {} strands {:.1} MiB + {} seam entries {:.1} MiB",
-            g,
-            strand_bytes_total as f64 / (1024.0 * 1024.0),
-            index.len(),
-            seam_bytes_total as f64 / (1024.0 * 1024.0),
         );
     } else {
         // ── FULLY-STREAMING RECONSTRUCTION (fresh process) ──
@@ -356,10 +365,16 @@ fn main() {
         let g_file = read_u64(&mut rdr) as usize;
         assert_eq!(g_file, g, "file G ({g_file}) != env STRAND_G ({g})");
 
-        // ── (1) strand pass ──
+        // ── (1) strand pass — verify each strand AND index its seam blobs ──
+        // The interleaved file lets one pass do both: read+verify the strand
+        // proof, then for each of its seam entries record (strand, gid) ->
+        // (offset, len) and SEEK PAST the blob (never load it here).
         let t_strands = Instant::now();
         let mut fri_total = 0usize;
         let mut peak = 0.0f64;
+        let mut n_entries = 0usize;
+        let mut off_map: std::collections::HashMap<(usize, usize), (u64, u64)> =
+            std::collections::HashMap::new();
         for s in 0..g {
             let len = read_u64(&mut rdr);
             let sp: SubAirProofWithTrace = read_frame(&mut rdr, len);
@@ -372,30 +387,22 @@ fn main() {
             .unwrap_or_else(|e| panic!("strand {s} must verify: {e}"));
             peak = peak.max(rss_mib());
             drop(sp);
+
+            let n_s = read_u64(&mut rdr) as usize;
+            for _ in 0..n_s {
+                let gid = read_u64(&mut rdr) as usize;
+                let blob_len = read_u64(&mut rdr);
+                let off = rdr.stream_position().expect("stream_position");
+                off_map.insert((s, gid), (off, blob_len));
+                rdr.seek(SeekFrom::Current(blob_len as i64)).expect("skip seam blob");
+                n_entries += 1;
+            }
             if s % 16 == 0 || s + 1 == g {
                 eprintln!("    [rss] strand {s}/{g} verified+dropped: cur={:.0} MiB", rss_mib());
             }
         }
         let strands_ms = t_strands.elapsed().as_secs_f64() * 1000.0;
         eprintln!("    [rss] strand pass done: peak-so-far {peak:.0} MiB");
-
-        // ── seam index ──  (strand, gid) -> (file offset, len)
-        let n_entries = read_u64(&mut rdr) as usize;
-        let mut index: Vec<(usize, usize, u64)> = Vec::with_capacity(n_entries);
-        for _ in 0..n_entries {
-            let s = read_u64(&mut rdr) as usize;
-            let gid = read_u64(&mut rdr) as usize;
-            let len = read_u64(&mut rdr);
-            index.push((s, gid, len));
-        }
-        let blob_start = rdr.stream_position().expect("stream_position");
-        let mut off_map: std::collections::HashMap<(usize, usize), (u64, u64)> =
-            std::collections::HashMap::with_capacity(n_entries);
-        let mut off = blob_start;
-        for (s, gid, len) in &index {
-            off_map.insert((*s, *gid), (off, *len));
-            off += *len;
-        }
 
         // ── (2) seam pass — load only the compared PAIR per OOD check ──
         let t_seams = Instant::now();
