@@ -417,35 +417,74 @@ fn main() {
         let strands_ms = t_strands.elapsed().as_secs_f64() * 1000.0;
         eprintln!("    [rss] strand pass done: peak-so-far {peak:.0} MiB");
 
-        // ── (2) seam pass — load only the compared PAIR per OOD check ──
+        // ── (2) seam pass — load each group's entries, then PARALLEL-verify
+        //        its independent OOD checks across `par` threads.  Loading is
+        //        sequential (one file handle) and bounded to one group; the
+        //        CPU-bound OOD checks (each two binding-cell FRI verifies) fan
+        //        out.  RSS stays bounded to one seam group's entries.
+        let par: usize = std::env::var("PAR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        eprintln!("    [seam] parallel OOD verification with {par} threads");
+        let pi_hash = case.pi_hash; // Copy, so threads need no &case
         let t_seams = Instant::now();
         let mut ood_checks = 0usize;
         for (gid, sg) in cut.seams.iter().enumerate() {
-            let refs = sg.holders[0];
+            // Load the whole group: reference holder + every other holder.
             let t_l = Instant::now();
+            let refs = sg.holders[0];
             let (roff, rlen) = off_map[&(refs, gid)];
             let ref_commits: Vec<BindingCellsCommit> = load_entry(&mut rdr, roff, rlen);
+            let holders: Vec<(usize, Vec<BindingCellsCommit>)> = sg.holders[1..]
+                .iter()
+                .map(|&h| {
+                    let (o, l) = off_map[&(h, gid)];
+                    (h, load_entry::<Vec<BindingCellsCommit>>(&mut rdr, o, l))
+                })
+                .collect();
             ld_seam_ms += t_l.elapsed().as_secs_f64() * 1000.0;
-            for &h in &sg.holders[1..] {
-                let t_l = Instant::now();
-                let (hoff, hlen) = off_map[&(h, gid)];
-                let hc: Vec<BindingCellsCommit> = load_entry(&mut rdr, hoff, hlen);
-                ld_seam_ms += t_l.elapsed().as_secs_f64() * 1000.0;
+            for (_, hc) in &holders {
                 assert!(
                     ref_commits.len() == hc.len() && hc.len() == sg.cols.len(),
                     "seam group {gid}: commit-count mismatch"
                 );
-                let t_v = Instant::now();
-                for (j, (ca, cb)) in ref_commits.iter().zip(hc.iter()).enumerate() {
-                    verify_ood_consistency(ca, cb, case.pi_hash, params).unwrap_or_else(|e| {
-                        panic!("seam group {gid} col {} (strands {refs}~{h}): {e}", sg.cols[j])
-                    });
-                    ood_checks += 1;
-                }
-                vf_seam_ms += t_v.elapsed().as_secs_f64() * 1000.0;
-                peak = peak.max(rss_mib());
-                drop(hc);
             }
+            // Flat work list of independent checks: (holder_index, column j).
+            let checks: Vec<(usize, usize)> =
+                (0..holders.len()).flat_map(|hi| (0..sg.cols.len()).map(move |j| (hi, j))).collect();
+            ood_checks += checks.len();
+
+            // Parallel-verify this group's checks with a scoped thread pool.
+            let t_v = Instant::now();
+            if !checks.is_empty() {
+                let n = par.min(checks.len()).max(1);
+                let chunk = checks.len().div_ceil(n);
+                let errors = std::sync::Mutex::new(Vec::<String>::new());
+                let (rc, hs, errs_ref) = (&ref_commits, &holders, &errors);
+                std::thread::scope(|scope| {
+                    for part in checks.chunks(chunk) {
+                        scope.spawn(move || {
+                            for &(hi, j) in part {
+                                let (h, hc) = &hs[hi];
+                                if let Err(e) =
+                                    verify_ood_consistency(&rc[j], &hc[j], pi_hash, params)
+                                {
+                                    errs_ref.lock().unwrap().push(format!(
+                                        "seam group {gid} col {} (strands {refs}~{h}): {e}",
+                                        sg.cols[j]
+                                    ));
+                                }
+                            }
+                        });
+                    }
+                });
+                let errs = errors.into_inner().unwrap();
+                assert!(errs.is_empty(), "seam OOD failures: {errs:?}");
+            }
+            vf_seam_ms += t_v.elapsed().as_secs_f64() * 1000.0;
+            peak = peak.max(rss_mib());
+            drop(holders);
             drop(ref_commits);
             if gid % 16 == 0 || gid + 1 == cut.seams.len() {
                 eprintln!(
