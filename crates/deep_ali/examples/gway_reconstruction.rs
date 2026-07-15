@@ -369,25 +369,37 @@ fn main() {
         // The interleaved file lets one pass do both: read+verify the strand
         // proof, then for each of its seam entries record (strand, gid) ->
         // (offset, len) and SEEK PAST the blob (never load it here).
+        // Split timers: RECON = disk read + deserialize + index/seek (the
+        // splice/loading work, once the proof is on disk); VERIFY = the pure
+        // cryptographic checks (per-strand FRI + seam OOD consistency).
         let t_strands = Instant::now();
         let mut fri_total = 0usize;
         let mut peak = 0.0f64;
         let mut n_entries = 0usize;
+        let mut ld_strand_ms = 0.0f64; // disk read + deserialize of strand proofs + index
+        let mut vf_strand_ms = 0.0f64; // per-strand FRI verification
+        let mut ld_seam_ms = 0.0f64; // seek + read + deserialize of seam commit pairs
+        let mut vf_seam_ms = 0.0f64; // OOD-consistency checks across seams
         let mut off_map: std::collections::HashMap<(usize, usize), (u64, u64)> =
             std::collections::HashMap::new();
         for s in 0..g {
+            let t_l = Instant::now();
             let len = read_u64(&mut rdr);
             let sp: SubAirProofWithTrace = read_frame(&mut rdr, len);
+            ld_strand_ms += t_l.elapsed().as_secs_f64() * 1000.0;
             fri_total += sp.fri_proof_bytes.len();
             let sep = strand_domain(s);
+            let t_v = Instant::now();
             verify_one_strand(
                 &sp, &cut, s, &layout, &case.pub_inputs, n_trace, blowup, case.pi_hash, &sep,
                 &params,
             )
             .unwrap_or_else(|e| panic!("strand {s} must verify: {e}"));
+            vf_strand_ms += t_v.elapsed().as_secs_f64() * 1000.0;
             peak = peak.max(rss_mib());
             drop(sp);
 
+            let t_i = Instant::now();
             let n_s = read_u64(&mut rdr) as usize;
             for _ in 0..n_s {
                 let gid = read_u64(&mut rdr) as usize;
@@ -397,6 +409,7 @@ fn main() {
                 rdr.seek(SeekFrom::Current(blob_len as i64)).expect("skip seam blob");
                 n_entries += 1;
             }
+            ld_strand_ms += t_i.elapsed().as_secs_f64() * 1000.0;
             if s % 16 == 0 || s + 1 == g {
                 eprintln!("    [rss] strand {s}/{g} verified+dropped: cur={:.0} MiB", rss_mib());
             }
@@ -409,21 +422,27 @@ fn main() {
         let mut ood_checks = 0usize;
         for (gid, sg) in cut.seams.iter().enumerate() {
             let refs = sg.holders[0];
+            let t_l = Instant::now();
             let (roff, rlen) = off_map[&(refs, gid)];
             let ref_commits: Vec<BindingCellsCommit> = load_entry(&mut rdr, roff, rlen);
+            ld_seam_ms += t_l.elapsed().as_secs_f64() * 1000.0;
             for &h in &sg.holders[1..] {
+                let t_l = Instant::now();
                 let (hoff, hlen) = off_map[&(h, gid)];
                 let hc: Vec<BindingCellsCommit> = load_entry(&mut rdr, hoff, hlen);
+                ld_seam_ms += t_l.elapsed().as_secs_f64() * 1000.0;
                 assert!(
                     ref_commits.len() == hc.len() && hc.len() == sg.cols.len(),
                     "seam group {gid}: commit-count mismatch"
                 );
+                let t_v = Instant::now();
                 for (j, (ca, cb)) in ref_commits.iter().zip(hc.iter()).enumerate() {
                     verify_ood_consistency(ca, cb, case.pi_hash, params).unwrap_or_else(|e| {
                         panic!("seam group {gid} col {} (strands {refs}~{h}): {e}", sg.cols[j])
                     });
                     ood_checks += 1;
                 }
+                vf_seam_ms += t_v.elapsed().as_secs_f64() * 1000.0;
                 peak = peak.max(rss_mib());
                 drop(hc);
             }
@@ -444,11 +463,22 @@ fn main() {
              end cur={:.0} MiB",
             rss_mib()
         );
+        let recon_ms = ld_strand_ms + ld_seam_ms;
+        let vrf_ms = vf_strand_ms + vf_seam_ms;
+        eprintln!(
+            "    [split] RECONSTRUCT (load/splice from disk) = {recon_ms:.0} ms \
+             (strand-load {ld_strand_ms:.0} + seam-load {ld_seam_ms:.0}); \
+             VERIFY (pure crypto) = {vrf_ms:.0} ms \
+             (strand-FRI {vf_strand_ms:.0} + seam-OOD {vf_seam_ms:.0})",
+        );
         println!(
             "VERIFY-STREAM G={g} K={k} strands_ms={strands_ms:.0} seams_ms={seams_ms:.0} \
-             total_ms={total_ms:.0} fri_total_kib={} seam_entries={n_entries} ood_checks={ood_checks} \
+             recon_ms={recon_ms:.0} verify_ms={vrf_ms:.0} \
+             ld_strand_ms={ld_strand_ms:.0} ld_seam_ms={ld_seam_ms:.0} \
+             vf_strand_ms={vf_strand_ms:.0} vf_seam_ms={vf_seam_ms:.0} total_ms={total_ms:.0} \
+             fri_total_kib={} seam_entries={n_entries} ood_checks={ood_checks} \
              peak_cur_mib={peak:.0} ok=true \
-             (peak RSS via /usr/bin/time -l is the clean streaming reconstruction footprint)",
+             (recon=load/splice from disk; verify=pure crypto; peak RSS via /usr/bin/time -l)",
             fri_total / 1024,
         );
     }
