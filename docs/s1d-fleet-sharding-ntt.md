@@ -1,5 +1,15 @@
 # S1d fleet-sharding: the NTT AIR must go tall-narrow first
 
+> **STATUS: complete end-to-end on a genuine signature.** `fips204_fleet_e2e` drives a real
+> ML-DSA-44 signature through all five fleet strands (NTT / combine / digit / z-norm / closing-hash)
+> on its real intermediates, folds the outputs into the epoch, and the resolver verifies once.
+> **Measured: peak per-shard RSS 53 MiB (< 500 MiB, IoT-viable), parallel fleet wall ~14.7 s
+> (combine-bound; shard finer to cut), aggregate 0.4 ms, RESOLVER verify_epoch 0.17 ms +
+> verify_record 1.0 µs (sub-ms).** The excessive single-machine prove time is now a fleet of
+> small, low-RSS, parallel proofs with a sub-ms resolver verify.
+
+
+
 **Goal.** Prove the S1d ML-DSA verify across a fleet of processors (cut wall-time) with
 **< 500 MiB RSS per shard** (IoT-viable), like `gway_reconstruction` already does for
 ECDSA/Ed25519 and the `nonnative` strand chain does at ≈ 44 MiB/strand.
