@@ -138,7 +138,17 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
    and more shards ⇒ faster per-shard prove; run in parallel across the fleet, wall-time is
    per-shard, not the sum. The excessive-single-machine prove time is now a fleet of small,
    low-RSS, parallel proofs.
-4. Wire the combine/digit/boundary/hash strands into the same fleet + reconstruct; measure the
+4a. **Aggregate shards → record/epoch + resolver verify** — ✅ **DONE + MEASURED**
+   (`s1d_fleet_to_epoch_e2e`). Fleet-prove the NTT stage shards + a combine shard (validity, low
+   RSS, parallel), fold their outputs into the epoch commitment (`epoch_fold`'s interleaved single
+   opening), resolver verifies the ONE aggregated proof. Measured (n=32 stage + combine, 4-way):
+   FLEET per-shard RSS ≤ 52 MiB / parallel wall ~1152 ms; AGGREGATE (fold) 0.6 ms; **RESOLVER
+   verify_epoch 0.16 ms, verify_record 0.9 µs** — sub-millisecond, the network-cost check, NOT the
+   seconds-per-shard verify. Fleet-sharding is prover-side; the resolver pays only the decider
+   opening (matching the previous signatures' low verify). Validity = the fleet shard proofs
+   (verified once by the aggregator = model A, or recursed for trustless — the seconds-per-shard
+   verify is that recursion cost).
+4b. Wire the digit/boundary/hash strands into the same fleet + reconstruct; measure the
    full sharded S1d ML-DSA verify (fleet latency + per-shard RSS).
 
 ## Gotchas (measured this session)
