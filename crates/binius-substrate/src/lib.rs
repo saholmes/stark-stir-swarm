@@ -158,6 +158,7 @@ pub mod m5_air; // Tier-B M5 kernel: FS challenge drives the FRI fold (recursive
 pub mod keccak800_air; // Tier-B: Keccak-f[800] narrow recursion hash (~half the width of f[1600])
 pub mod accumulation; // Option-3 exploration: accumulation/folding for ms-verify recursion (see docs/accumulation-recursion.md)
 pub mod seam_aggregation; // pi_hash-bound aggregation of seam OOD claims via the fold-tree (non-substitutable; adversarial-tested)
+pub mod epoch_fold; // piece 2 (model A): fold epoch record leaves into one proof w/ zone Merkle root R* as public input
 pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narrow? (the ms-recursion measurement)
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
 #[cfg(test)]
