@@ -27,8 +27,7 @@
 use std::time::Instant;
 
 use binius_field::{
-	as_packed_field::PackedType, BinaryField128b as B128, BinaryField8b, BinaryField32b, Field,
-	PackedField,
+	as_packed_field::PackedType, BinaryField8b, BinaryField32b, Field, PackedField,
 };
 use binius_hal::make_portable_backend;
 use binius_hash::sha2::Sha256Compression;
@@ -474,140 +473,9 @@ pub fn committed_decider_measure_all(n_vars_sweep: &[usize]) -> Vec<LabelledRow>
 	out
 }
 
-// ── B128 fold ↔ B256 decider unification (piece 2) ──────────────────────────
-//
-// The epoch fold (accumulation.rs) is over B128; the committed decider is over
-// F1 = B256.  Binary towers nest: B256 = (lo,hi) two B128 limbs, so B128 embeds
-// as `from_halves(x, ZERO)` — a subfield inclusion that preserves +,× and hence
-// the multilinear evaluation.  So the fold's accumulated claim over B128 is
-// discharged by lifting (P, point, value) into B256 and running the L1 decider.
-
-/// Lift a B128 element into B256 (subfield embedding: the "lo" limb, hi = 0).
-pub fn lift_b128_to_b256(x: B128) -> B256 {
-	B256::from_halves(x, B128::ZERO)
-}
-
-/// L1 committed-decider OPEN: commit the multilinear `p_b128` (B128 evals lifted
-/// to B256) and prove `P(point) = value` at `point_b128` (lifted).  Returns
-/// `(proof_bytes, value_b256, n_vars)`; `proof_bytes` carries the commitment.
-pub fn decider_open_l1(p_b128: &[B128], point_b128: &[B128]) -> (Vec<u8>, B256, usize) {
-	let n_vars = point_b128.len();
-	assert_eq!(p_b128.len(), 1usize << n_vars, "P must have 2^|point| evals");
-	let security_bits = 128usize;
-
-	let evals: Vec<P1> = p_b128.iter().map(|&x| P1::broadcast(lift_b128_to_b256(x))).collect();
-	let point: Vec<F1> = point_b128.iter().map(|&x| lift_b128_to_b256(x)).collect();
-	let poly = MultilinearExtension::<P1>::new(n_vars, evals).unwrap();
-	let committed_multilins = vec![MLEDirectAdapter::from(poly)];
-
-	let commit_meta = CommitMeta::with_vars([n_vars]);
-	let merkle_prover = BinaryMerkleTreeProver::<F1, Sha256, _>::new(Sha256Compression::default());
-	let merkle_scheme = merkle_prover.scheme();
-	let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
-		&commit_meta, merkle_scheme, security_bits, 1,
-	)
-	.unwrap();
-	let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
-	let backend = make_portable_backend();
-	let CommitOutput { commitment, committed, codeword } =
-		commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
-
-	let eq = EqIndPartialEval::<F1>::new(point);
-	let eq_mle: MultilinearExtension<P1, _> = eq.multilinear_extension::<P1, _>(&backend).unwrap();
-	let eq_owned = MultilinearExtension::<P1>::new(eq_mle.n_vars(), eq_mle.evals().to_vec()).unwrap();
-	let transparent_multilins = vec![MLEDirectAdapter::from(eq_owned)];
-
-	let value: F1 = (0..(1usize << n_vars))
-		.map(|v| {
-			committed_multilins[0].evaluate_on_hypercube(v).unwrap()
-				* transparent_multilins[0].evaluate_on_hypercube(v).unwrap()
-		})
-		.sum();
-	let claims = vec![PIOPSumcheckClaim::<F1> { n_vars, committed: 0, transparent: 0, sum: value }];
-
-	let domain_factory = DefaultEvaluationDomainFactory::<FDomain>::default();
-	let mut proof = ProverTranscript::<HasherChallenger<Sha256>>::new();
-	proof.message().write(&commitment);
-	prove(
-		&fri_params, &ntt, &merkle_prover, domain_factory, &commit_meta, committed, &codeword,
-		&committed_multilins, &transparent_multilins, &claims, &mut proof, &backend,
-	)
-	.unwrap();
-	(proof.finalize(), value, n_vars)
-}
-
-/// L1 committed-decider VERIFY: accept iff `proof_bytes` proves the committed P
-/// evaluates to `value` at `point_b128` (lifted).  This is the resolver's
-/// succinct epoch check (no P shipped).
-pub fn decider_verify_l1(proof_bytes: Vec<u8>, point_b128: &[B128], value: B256, n_vars: usize) -> bool {
-	let security_bits = 128usize;
-	let point: Vec<F1> = point_b128.iter().map(|&x| lift_b128_to_b256(x)).collect();
-	let commit_meta = CommitMeta::with_vars([n_vars]);
-	let merkle_prover = BinaryMerkleTreeProver::<F1, Sha256, _>::new(Sha256Compression::default());
-	let merkle_scheme = merkle_prover.scheme();
-	let fri_params = match make_commit_params_with_optimal_arity::<_, FEncode, _>(
-		&commit_meta, merkle_scheme, security_bits, 1,
-	) {
-		Ok(p) => p,
-		Err(_) => return false,
-	};
-	let eq = EqIndPartialEval::<F1>::new(point);
-	let eq_dyn: &dyn MultivariatePoly<F1> = &eq;
-	let transparents = vec![eq_dyn];
-	let claims = vec![PIOPSumcheckClaim::<F1> { n_vars, committed: 0, transparent: 0, sum: value }];
-
-	let mut vproof = VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes);
-	let commitment_v = match vproof.message().read() {
-		Ok(c) => c,
-		Err(_) => return false,
-	};
-	verify(&commit_meta, merkle_scheme, &fri_params, &commitment_v, &transparents, &claims, &mut vproof)
-		.is_ok()
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// ★ UNIFICATION: the B128 epoch fold discharged by the B256 decider via the
-	/// subfield lift — the succinct resolver verify (no P shipped) + its cost.
-	#[test]
-	fn epoch_fold_succinct_decider() {
-		use crate::epoch_fold::{fold_epoch, verify_epoch, EpochLeaf};
-		use rand::{rngs::StdRng, RngCore, SeedableRng};
-		use std::time::Instant;
-
-		// 16 leaves × 2^6-value records ⇒ n_vars = 6 + 4 = 10 (the 7.4 ms decider row).
-		let mut rng = StdRng::seed_from_u64(7);
-		let leaves: Vec<EpochLeaf> = (0..16)
-			.map(|_| EpochLeaf {
-				record: (0..64)
-					.map(|_| B128::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128))
-					.collect(),
-			})
-			.collect();
-		let proof = fold_epoch(&leaves, "example.se", 42);
-		assert!(verify_epoch(&proof, "example.se").is_ok(), "native-decider epoch must verify");
-
-		// Succinct decider over B256: lift (P, point, value) and open/verify.
-		let (pf, value_b256, n_vars) = decider_open_l1(&proof.interleaved_p, &proof.acc_claim.point);
-		assert_eq!(
-			value_b256,
-			lift_b128_to_b256(proof.acc_claim.value),
-			"the subfield lift must preserve the multilinear evaluation"
-		);
-		let t = Instant::now();
-		let ok = decider_verify_l1(pf.clone(), &proof.acc_claim.point, value_b256, n_vars);
-		let verify_ms = t.elapsed().as_secs_f64() * 1e3;
-		assert!(ok, "succinct decider verify must accept the honest epoch");
-		let bad = decider_verify_l1(pf.clone(), &proof.acc_claim.point, value_b256 + B256::ONE, n_vars);
-		assert!(!bad, "a tampered claimed value must reject");
-		println!(
-			"[epoch-succinct] n_vars={n_vars} decider proof {} KiB, VERIFY {verify_ms:.2} ms \
-			 (B128 fold ↔ B256 decider lift: eval preserved, tamper rejects)",
-			pf.len() / 1024
-		);
-	}
 
 	#[test]
 	fn committed_decider_opening() {

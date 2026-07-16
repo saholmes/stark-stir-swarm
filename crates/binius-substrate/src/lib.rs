@@ -159,6 +159,7 @@ pub mod keccak800_air; // Tier-B: Keccak-f[800] narrow recursion hash (~half the
 pub mod accumulation; // Option-3 exploration: accumulation/folding for ms-verify recursion (see docs/accumulation-recursion.md)
 pub mod seam_aggregation; // pi_hash-bound aggregation of seam OOD claims via the fold-tree (non-substitutable; adversarial-tested)
 pub mod epoch_fold; // piece 2 (model A): fold epoch record leaves into one proof w/ zone Merkle root R* as public input
+pub mod decider; // committed-decider open/verify (non-test) + B128↔B256 subfield lift for the epoch fold
 pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narrow? (the ms-recursion measurement)
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
 #[cfg(test)]

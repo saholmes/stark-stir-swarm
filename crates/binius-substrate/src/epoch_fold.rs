@@ -27,6 +27,7 @@ use sha3::{Digest, Sha3_256};
 use binius_field::{underlier::WithUnderlier, BinaryField128b as F, Field};
 
 use crate::accumulation::{accumulate, accumulate_verify, mle_eval, EvalClaim, FoldProof, Record};
+use crate::decider::{decider_open_l1, decider_verify_l1, lift_b128_to_b256};
 use crate::recursion::{merkle_path_verify, merkle_tree_sha3};
 
 // ── transcript helpers ──────────────────────────────────────────────────────
@@ -93,15 +94,16 @@ pub struct EpochLeaf {
     pub record: Vec<F>,
 }
 
-/// The epoch proof.  `interleaved_p` is the v1 native-decider witness; it is
-/// replaced by a committed_decider opening in the succinct follow-on.
+/// The epoch proof.  `decider_proof` is the SUCCINCT FRI-Binius opening that
+/// discharges `acc_claim` on the committed interleaved polynomial (the resolver
+/// verifies it in ~ms without the polynomial itself).
 pub struct EpochProof {
     pub rstar: [u8; 32],
     pub sub_roots: Vec<[u8; 32]>,
     pub leaf_values: Vec<F>,
     pub acc_claim: EvalClaim,
     pub fold_proofs: Vec<FoldProof>,
-    pub interleaved_p: Vec<F>, // v1 native decider only (NOT shipped in the succinct version)
+    pub decider_proof: Vec<u8>, // committed-decider opening of acc_claim (succinct)
     pub inner_vars: usize,
     pub epoch: u64,
 }
@@ -138,7 +140,11 @@ pub fn fold_epoch(leaves: &[EpochLeaf], zone: &str, epoch: u64) -> EpochProof {
     let challenges: Vec<F> = (0..n - 1).map(|k| derive_challenge(&pi_hash, &rstar, k)).collect();
     let (interleaved_p, acc_claim, fold_proofs) = accumulate(&records, &challenges);
 
-    EpochProof { rstar, sub_roots, leaf_values, acc_claim, fold_proofs, interleaved_p, inner_vars, epoch }
+    // Succinct decider: open the interleaved P at acc_claim.point (lifted to B256).
+    let (decider_proof, value_b256, _n_vars) = decider_open_l1(&interleaved_p, &acc_claim.point);
+    debug_assert_eq!(value_b256, lift_b128_to_b256(acc_claim.value), "lift must preserve eval");
+
+    EpochProof { rstar, sub_roots, leaf_values, acc_claim, fold_proofs, decider_proof, inner_vars, epoch }
 }
 
 /// RESOLVER (once/epoch): verify the epoch proof against `zone`.
@@ -170,10 +176,13 @@ pub fn verify_epoch(proof: &EpochProof, zone: &str) -> Result<(), String> {
     if acc.point != proof.acc_claim.point || acc.value != proof.acc_claim.value {
         return Err("epoch: replayed root ≠ asserted acc_claim (pi/leaf binding)".into());
     }
-    // (4) DECIDER (v1 native): the accumulated claim holds on the interleaved P.
-    //     Follow-on: committed_decider piop opening (succinct; binds P to R*).
-    if mle_eval(&proof.interleaved_p, &proof.acc_claim.point) != proof.acc_claim.value {
-        return Err("epoch: decider — acc_claim false on P".into());
+    // (4) SUCCINCT DECIDER: the FRI-Binius opening proves the committed
+    //     interleaved P evaluates to acc_claim.value at acc_claim.point (~ms,
+    //     no P shipped).  value is bound to the replayed acc_claim (lifted).
+    let value_b256 = lift_b128_to_b256(proof.acc_claim.value);
+    let n_vars = proof.acc_claim.point.len();
+    if !decider_verify_l1(proof.decider_proof.clone(), &proof.acc_claim.point, value_b256, n_vars) {
+        return Err("epoch: decider opening rejected".into());
     }
     Ok(())
 }
@@ -227,6 +236,30 @@ mod tests {
             }
         }
         println!("GATE epoch-fold: honest epoch verifies + all records open under R*");
+    }
+
+    /// MEASURE: the resolver-facing cost — succinct verify_epoch (once/epoch) +
+    /// per-query verify_record (Merkle path).
+    #[test]
+    fn succinct_epoch_resolver_cost() {
+        use std::time::Instant;
+        let (n, iv) = (16usize, 6usize);
+        let ls = leaves(n, iv, 9);
+        let proof = fold_epoch(&ls, ZONE, EPOCH);
+        let t = Instant::now();
+        assert!(verify_epoch(&proof, ZONE).is_ok());
+        let ve = t.elapsed().as_secs_f64() * 1e3;
+        let op = open_record(&ls, 7);
+        let t = Instant::now();
+        assert!(verify_record(&proof, &op).is_ok());
+        let vr = t.elapsed().as_secs_f64() * 1e6;
+        println!(
+            "[epoch-resolver] N={n} n_vars={} | verify_epoch {ve:.2} ms (decider {} KiB) | \
+             verify_record {vr:.1} µs (Merkle path {} hashes)",
+            proof.acc_claim.point.len(),
+            proof.decider_proof.len() / 1024,
+            op.path.len()
+        );
     }
 
     /// ADVERSARIAL: wrong zone ⇒ pi_hash differs ⇒ fold replay ≠ acc_claim ⇒ reject.

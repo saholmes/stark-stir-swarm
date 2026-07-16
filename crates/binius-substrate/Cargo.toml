@@ -59,13 +59,14 @@ libc    = "0.2"
 p256    = { version = "0.13", features = ["ecdsa"] }
 # SHA3-256 native reference for the .se epoch leaf/commitment (FIPS 202).
 sha3    = "0.10.8"
+# FRI-Binius PCS (committed-decider / epoch-fold resolver verify): the additive NTT +
+# multilinear/eval-domain helpers. Promoted from dev-deps so the decider open/verify are
+# callable in non-test code (epoch_fold::verify_epoch).
+binius_ntt  = { path = "../../../binius/crates/ntt" }
+binius_math = { path = "../../../binius/crates/math" }
 
 [dev-dependencies]
 bytes   = "1"
-# Byte-exact conformance test for the streaming interleaved commit: needs the additive NTT
-# and the packed-field helpers to drive binius's own commit_interleaved / commit_iterated.
-binius_ntt  = { path = "../../../binius/crates/ntt" }
-binius_math = { path = "../../../binius/crates/math" }
 rayon = "1.8.0"
 # Phase-2 cross-check crates (RustCrypto / fips204): the canonical implementations our
 # hand-written native references are gated against, alongside the NIST/RFC vectors. Added
