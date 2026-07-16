@@ -88,11 +88,19 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
    balance — a wrong pulled value unbalances the channel ⇒ verify REJECTS
    (`butterfly_seam_routes_and_tamper_rejected`, the exact `nonnative::ModMul` mid-channel seam
    applied to butterfly coefficients). This is the primitive that wires adjacent layers AND binds
-   fleet strands. **Still to do:** compose it across the WHOLE CT network — a single positional
-   channel keyed by (slot, version, value) with the twiddle ζ and the (slot, version) pinned to
-   the public schedule (via `add_structured(Incrementing)` + a schedule lookup), plus input/output
-   boundary flushes; then **row-block sharding** with seam binding (mirror `gway_reconstruction`)
-   and measure per-shard RSS < 500 MiB + fleet wall-time.
+   fleet strands. **WHOLE-NETWORK composition DONE** (`validate_ntt_network`): every butterfly of
+   a forward n-NTT is wired through per-(slot, version) channels — a source table PUSHes the public
+   inputs at version 0, a sink table PULLs the public `ntt_ref` outputs at the final version, and
+   channel balance forces the network to carry inputs through the fixed CT topology to the pinned
+   outputs. Honest network validates over B256 (n = 4/8/16); corrupting ANY butterfly's twiddle
+   unbalances the output channels ⇒ REJECT (`ntt_network_composed_and_tamper_rejected`). This is
+   the SOUND, GENERAL composition. **Still to do (deployment optimisation):** batch each stage's
+   butterflies into ONE tall-narrow table routed by a single **positional** channel keyed by
+   (slot, version, value), with the twiddle ζ and (slot, version) lookup-pinned to the public
+   schedule (`LookupProducer` + `add_structured(Incrementing)`) — so the composed network keeps the
+   15.6 s / 63 MiB tall-narrow regime instead of one 1-row table per butterfly. Then **row-block
+   sharding** with seam binding (mirror `gway_reconstruction`); measure per-shard RSS + fleet
+   wall-time.
 3. Wire the combine/digit/boundary/hash strands into the same fleet + reconstruct; measure the
    full sharded S1d ML-DSA verify (fleet latency + per-shard RSS).
 

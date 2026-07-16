@@ -822,7 +822,7 @@ pub struct ButterflyBatch {
 
 impl ButterflyBatch {
 	pub fn build(cs: &mut ConstraintSystem<OurB256>) -> Self {
-		Self::build_inner(cs, None, None, None)
+		Self::build_inner(cs, None, None, None, None)
 	}
 
 	/// Seam-enabled build (the fleet-strand / inter-layer routing primitive, mirroring
@@ -838,12 +838,26 @@ impl ButterflyBatch {
 		push_add: Option<ChannelId>,
 		push_sub: Option<ChannelId>,
 	) -> Self {
-		Self::build_inner(cs, pull_u, push_add, push_sub)
+		Self::build_inner(cs, pull_u, None, push_add, push_sub)
+	}
+
+	/// Full-routing seam: pull BOTH inputs (u, v) and push BOTH outputs (o_add, o_sub) on
+	/// channels — the per-token wiring a whole-network CT composition needs (each coefficient
+	/// slot at each stage is a channel produced by one butterfly and consumed by the next).
+	pub fn build_seamed_io(
+		cs: &mut ConstraintSystem<OurB256>,
+		pull_u: Option<ChannelId>,
+		pull_v: Option<ChannelId>,
+		push_add: Option<ChannelId>,
+		push_sub: Option<ChannelId>,
+	) -> Self {
+		Self::build_inner(cs, pull_u, pull_v, push_add, push_sub)
 	}
 
 	fn build_inner(
 		cs: &mut ConstraintSystem<OurB256>,
 		pull_u: Option<ChannelId>,
+		pull_v: Option<ChannelId>,
 		push_add: Option<ChannelId>,
 		push_sub: Option<ChannelId>,
 	) -> Self {
@@ -872,6 +886,9 @@ impl ButterflyBatch {
 		};
 		if let Some(ch) = pull_u {
 			seam(&mut t, u, ch, "seam_u", true);
+		}
+		if let Some(ch) = pull_v {
+			seam(&mut t, v, ch, "seam_v", true);
 		}
 		if let Some(ch) = push_add {
 			seam(&mut t, add.out, ch, "seam_add", false);
@@ -993,6 +1010,128 @@ pub fn prove_butterflies(input: &[u64], n: usize) -> Result<(usize, usize)> {
 		HasherChallenger<Sha256>,
 	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof)?;
 	Ok((proof_size, nrows))
+}
+
+/// Compose the WHOLE forward CT network from seamed butterflies: every coefficient slot at
+/// every stage is a channel `(slot, version)` produced by one butterfly and consumed by the
+/// next; a source table PUSHES the (public) inputs at version 0, a sink table PULLS the
+/// (public) `ntt_ref` outputs at the final version.  Channel balance then forces the network
+/// to carry each input through the fixed CT topology to the pinned output — so a tampered
+/// twiddle or intermediate value makes the network's real output ≠ the pinned output and the
+/// output channels UNBALANCE ⇒ `validate_witness` REJECTS.  `tamper = Some(b)` corrupts
+/// butterfly `b`'s twiddle (a wrong-but-self-consistent butterfly) to exercise that.
+///
+/// (Per-(slot,version) channels + one table per butterfly + public I/O pinning is the
+/// SOUND, GENERAL composition.  The deployment optimisation — batching each stage's
+/// butterflies into ONE tall-narrow table routed by a single positional channel with the
+/// twiddle/position lookup-pinned — is docs/s1d-fleet-sharding-ntt.md step 2.)
+pub fn validate_ntt_network(input: &[u64], n: usize, tamper: Option<usize>) -> Result<()> {
+	use std::collections::HashMap;
+	assert!(n.is_power_of_two() && n >= 2, "n must be a power of two ≥ 2");
+	let logn = n.trailing_zeros() as usize;
+	let arr_of = |x: u64| -> [B1; W] { std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }) };
+
+	// native forward NTT = the pinned public output.
+	let mut expected = input.to_vec();
+	for (start, len, zeta) in forward_groups(n) {
+		for j in start..start + len {
+			let t = ((zeta as u128 * expected[j + len] as u128) % Q as u128) as u64;
+			let u = expected[j];
+			expected[j] = (u + t) % Q;
+			expected[j + len] = (u + Q - t) % Q;
+		}
+	}
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	// (slot, version) → channel, pre-created for versions 0..=logn.
+	let mut chan: HashMap<(usize, usize), ChannelId> = HashMap::new();
+	for s in 0..n {
+		for v in 0..=logn {
+			chan.insert((s, v), cs.add_channel(format!("s{s}v{v}")));
+		}
+	}
+
+	// SOURCE: push the (public) inputs at version 0.
+	let mut src = cs.add_table("ntt-net source");
+	let src_cols: Vec<Col<B1, W>> = (0..n)
+		.map(|j| {
+			let cc = src.add_constant(format!("in{j}"), arr_of(input[j]));
+			let b64 = src.add_packed::<B1, 64, B64, 1>(format!("in{j}_b64"), cc);
+			src.push(chan[&(j, 0)], [b64]);
+			cc
+		})
+		.collect();
+	let src_id = src.id();
+
+	// BUTTERFLIES: walk the CT schedule, wiring each to its (slot,version) channels.
+	let mut ver = vec![0usize; n];
+	let mut a = input.to_vec();
+	let mut bfs: Vec<(ButterflyBatch, u64, u64, u64)> = Vec::new();
+	let mut bi = 0usize;
+	for (start, len, zeta) in forward_groups(n) {
+		for j in start..start + len {
+			let (su, sv) = (ver[j], ver[j + len]);
+			let bb = ButterflyBatch::build_seamed_io(
+				&mut cs,
+				Some(chan[&(j, su)]),
+				Some(chan[&(j + len, sv)]),
+				Some(chan[&(j, su + 1)]),
+				Some(chan[&(j + len, sv + 1)]),
+			);
+			let (u, v) = (a[j], a[j + len]);
+			let z_use = if tamper == Some(bi) { (zeta + 1) % Q } else { zeta };
+			let t = ((zeta as u128 * v as u128) % Q as u128) as u64;
+			a[j] = (u + t) % Q;
+			a[j + len] = (u + Q - t) % Q;
+			bfs.push((bb, u, v, z_use));
+			ver[j] += 1;
+			ver[j + len] += 1;
+			bi += 1;
+		}
+	}
+
+	// SINK: pull the (public) ntt_ref outputs at the final version.
+	let mut snk = cs.add_table("ntt-net sink");
+	let snk_cols: Vec<Col<B1, W>> = (0..n)
+		.map(|j| {
+			let cc = snk.add_constant(format!("out{j}"), arr_of(expected[j]));
+			let b64 = snk.add_packed::<B1, 64, B64, 1>(format!("out{j}_b64"), cc);
+			snk.pull(chan[&(j, logn)], [b64]);
+			cc
+		})
+		.collect();
+	let snk_id = snk.id();
+
+	// table_sizes in declaration order: source, each butterfly, sink.
+	let mut table_sizes = vec![1usize];
+	table_sizes.extend(std::iter::repeat_n(1usize, bfs.len()));
+	table_sizes.push(1);
+	let statement = Statement { boundaries: vec![], table_sizes };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(src_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (j, &cc) in src_cols.iter().enumerate() {
+			write_col::<W>(&mut seg, cc, 0, &bits64(input[j]))?;
+		}
+	}
+	for (bb, u, v, z) in &bfs {
+		let tw = witness.init_table(bb.table_id, 1)?;
+		let mut seg = tw.full_segment();
+		bb.populate(&mut seg, 0, *u, *v, *z)?;
+	}
+	{
+		let tw = witness.init_table(snk_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (j, &cc) in snk_cols.iter().enumerate() {
+			write_col::<W>(&mut seg, cc, 0, &bits64(expected[j]))?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	Ok(())
 }
 
 /// Which honest column to corrupt after populate (the soundness gate).
@@ -1215,6 +1354,30 @@ mod tests {
 		assert!(run(false), "honest butterfly seam must balance + validate");
 		assert!(!run(true), "SOUNDNESS: a consumer pulling a wrong value must unbalance the channel");
 		println!("GATE tall-narrow seam: butterfly o_add PUSHED and PULLED as the next butterfly's u; a wrong pulled value REJECTED (channel unbalanced) — the inter-layer / fleet-strand routing primitive");
+	}
+
+	/// WHOLE-NETWORK composition: every butterfly of a forward n-NTT is wired through
+	/// per-(slot,version) channels, with the public inputs pushed at version 0 and the public
+	/// `ntt_ref` outputs pulled at the final version.  Channel balance forces the network to
+	/// carry inputs through the fixed CT topology to the pinned outputs — so the honest network
+	/// validates, and corrupting ANY butterfly's twiddle unbalances the output channels ⇒ REJECT.
+	#[test]
+	fn ntt_network_composed_and_tamper_rejected() {
+		for &n in &[4usize, 8, 16] {
+			let mut rng = StdRng::seed_from_u64(0xC7C7 ^ n as u64);
+			let x = rand_zq(&mut rng, n);
+			super::validate_ntt_network(&x, n, None)
+				.unwrap_or_else(|e| panic!("n={n}: honest CT network must validate: {e}"));
+			// tamper each of a few butterflies ⇒ the pinned-output channels must unbalance.
+			let nbf = (n / 2) * (n.trailing_zeros() as usize);
+			for &b in &[0usize, nbf / 2, nbf - 1] {
+				assert!(
+					super::validate_ntt_network(&x, n, Some(b)).is_err(),
+					"n={n}: a corrupted twiddle at butterfly {b} must be REJECTED"
+				);
+			}
+		}
+		println!("GATE ntt-network: the whole forward CT network composed from channel-routed butterflies validates over B256 (inputs/outputs pinned); any corrupted butterfly is REJECTED via output-channel balance");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
