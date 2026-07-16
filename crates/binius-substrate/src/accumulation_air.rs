@@ -332,6 +332,65 @@ pub fn run_ivc(n_records: usize, inner_vars: usize) -> Result<IvcSummary> {
 	Ok(IvcSummary { n_records, inner_vars, d, total_prove_ms: total_p, total_verify_ms: total_v, max_step_verify_ms: max_v, final_claim_holds })
 }
 
+/// TRUSTLESS COMBINER: fold the fleet's shard-output claims into ONE accumulated claim, with
+/// EVERY fold step PROVEN in-circuit (`fold_step` — g(0)=v0, g(1)=v1, folded=g(t), 2d B256 muls,
+/// NO in-circuit FRI/hash verify).  So the resolver checks the fold-step proofs + the final claim
+/// against the committed interleaved P — it never trusts the combiner folded correctly, and never
+/// pays the O(width) in-circuit proof-verify.  Each shard's output is a record (2^inner_vars B256
+/// evals); the claim is `P(r ‖ bits(i)) = mle(recordᵢ, r)`.  A combiner that forges a shard's
+/// claimed output (`forge_at`) is CAUGHT: the folded polynomial's `Σg = P(pointᵢ)` no longer
+/// equals the forged claim ⇒ the fold's `g(1)=v1` check fails ⇒ REJECT.  Returns
+/// `(accepted, total_prove_ms, total_verify_ms)`; `accepted=false` iff a forged claim is caught.
+pub fn trustless_combine(records: &[Vec<OurB256>], inner_vars: usize, forge_at: Option<usize>) -> Result<(bool, u128, u128)> {
+	use rand::{RngCore, SeedableRng};
+	let n = records.len();
+	assert!(n.is_power_of_two() && n >= 2, "record count must be a power of two ≥ 2");
+	let m = n.trailing_zeros() as usize;
+	let inner_sz = 1usize << inner_vars;
+	let mut rng = rand::rngs::StdRng::from_seed([0x7c; 32]);
+	let rf = |rng: &mut rand::rngs::StdRng| OurB256::from(binius_field::BinaryField128b::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128));
+
+	// interleaved P (block i = shard-output record i) and the FS-shared inner point r.
+	let mut p: Vec<OurB256> = Vec::with_capacity(inner_sz * n);
+	for rec in records {
+		assert_eq!(rec.len(), inner_sz, "each record must have 2^inner_vars evals");
+		p.extend_from_slice(rec);
+	}
+	let r: Vec<OurB256> = (0..inner_vars).map(|_| rf(&mut rng)).collect();
+
+	// per-shard claims (point = r ‖ bits(i), value = mle(recordᵢ, r)); `forge_at` corrupts one.
+	let mut claims: Vec<(Vec<OurB256>, OurB256)> = Vec::with_capacity(n);
+	for (i, rec) in records.iter().enumerate() {
+		let mut v = mle256(rec, &r);
+		if forge_at == Some(i) {
+			v += OurB256::ONE; // combiner claims a different shard output
+		}
+		let mut point = r.clone();
+		for b in 0..m {
+			point.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO });
+		}
+		claims.push((point, v));
+	}
+
+	// fold the claims one narrow proven step at a time.
+	let mut acc = claims[0].clone();
+	let (mut tp, mut tv) = (0u128, 0u128);
+	for item in claims.iter().skip(1) {
+		let t = rf(&mut rng);
+		let g = restrict_to_line_coeffs(&p, &acc.0, &item.0);
+		// the fold's own check (g(0)=acc.v, Σg=item.v) — a forged claim value fails HERE.
+		if fold_verify_native(&g, t, acc.1, item.1, &acc.0, &item.0).is_none() {
+			return Ok((false, tp, tv)); // forged shard output caught — combiner REJECTED
+		}
+		let step = fold_step(&g, t, &acc.0, &item.0, 64)?; // the PROVEN fold step
+		tp += step.prove_ms;
+		tv += step.verify_ms;
+		acc = (step.line, step.folded);
+	}
+	let holds = mle256(&p, &acc.0) == acc.1;
+	Ok((holds, tp, tv))
+}
+
 /// Benchmark the EDGE VERIFY of an aggregated epoch proof vs the record count N. The epoch
 /// proof commits the N records as a batch (here: `per_record_muls` B256-constraint columns
 /// per record, N records = N rows — the aggregated proof's shape); verify is width-linear +
@@ -638,6 +697,36 @@ mod tests {
 			 no hash gadget, FIPS-clean); accumulator is a constant-size claim; final claim gated on P. Per-step \
 			 verify is constant (fixed d=inner+logN). O(N) narrow steps vs Tier-B O(N) WIDE FRI-verifies (~100× \
 			 per step). The remaining collapse to O(1)-verify = fold the step-instances (Nova) — the decider crux.");
+	}
+
+	/// TRUSTLESS COMBINER: fold the fleet's shard-output claims with every fold step PROVEN.
+	/// The honest accumulation's final claim holds on P; a combiner that forges any shard's
+	/// claimed output is REJECTED (the fold's g(1)=v1 check fails) — so the resolver need not
+	/// trust the combiner, and pays only the narrow fold-step verify (no O(width) proof-verify).
+	#[test]
+	#[ignore = "trustless-combiner accumulation over shard outputs (proven fold steps); run with --ignored"]
+	fn trustless_combiner_folds_and_rejects_forgery() {
+		use rand::{RngCore, SeedableRng};
+		let inner = 3usize; // 2^3 = 8 evals per shard-output record
+		for &n in &[4usize, 8] {
+			// stand-in for N shard outputs (each a block of coefficients the fleet produced).
+			let mut rng = rand::rngs::StdRng::from_seed([0x5c ^ n as u8; 32]);
+			let records: Vec<Vec<OurB256>> = (0..n)
+				.map(|_| (0..(1usize << inner)).map(|_| OurB256::from(binius_field::BinaryField128b::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128))).collect())
+				.collect();
+
+			// HONEST: every fold step proves; the accumulated claim holds on P.
+			let (ok, _tp, tv) = super::trustless_combine(&records, inner, None).expect("trustless combine");
+			assert!(ok, "N={n}: honest accumulated claim must hold on P");
+
+			// FORGERY: a combiner claims a different output for a shard ⇒ caught by the fold.
+			for &f in &[0usize, n / 2, n - 1] {
+				let (acc, _p, _v) = super::trustless_combine(&records, inner, Some(f)).expect("trustless combine");
+				assert!(!acc, "N={n}: a forged shard-output claim at {f} must be REJECTED by the proven fold");
+			}
+			println!("trustless-combiner N={n}: {} proven fold steps, total fold-verify {tv} ms; honest holds, forged claim REJECTED", n - 1);
+		}
+		println!("# TRUSTLESS COMBINER: N shard claims → 1 accumulator via N−1 PROVEN narrow fold steps; the resolver verifies the fold steps + the final claim, never trusting the combiner. A forged shard output fails the fold's g(1)=v1 check ⇒ REJECT. No O(width) in-circuit proof-verify — the ms trustless recursion.");
 	}
 
 	/// ★THE MEASUREMENT — is the fold-verify circuit NARROW? Sweep d (interleaved-poly vars);
