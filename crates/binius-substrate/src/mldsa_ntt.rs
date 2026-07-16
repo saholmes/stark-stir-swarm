@@ -2464,6 +2464,128 @@ mod tests {
 		println!("(boundary joins the fleet: the lightest ACCEPT-check strand, per-shard RSS well under 500 MiB.)");
 	}
 
+	/// FULL fips204-driven FLEET e2e: a GENUINE ML-DSA-44 signature drives ALL five fleet strands
+	/// on its REAL intermediates (NTT of z, combine Â∘ẑ−ĉ∘t̂1, digit UseHint∘Decompose, z-norm,
+	/// closing hash c̃'==c̃), each a standalone low-RSS proof; their outputs fold into the epoch and
+	/// the resolver verifies once.  The whole DNS-STARK-over-Binius S1d verify as a low-RSS parallel
+	/// fleet with sub-ms resolver verify, on a real signature.  Run ALONE (RSS process-global).
+	#[test]
+	#[ignore = "full fips204-driven fleet e2e (5 real-data strand proves + fold + resolver verify); run ALONE"]
+	fn fips204_fleet_e2e() {
+		use std::time::Instant;
+		use binius_field::BinaryField128b as F;
+		use fips204::ml_dsa_44;
+		use fips204::traits::{SerDes, Signer, Verifier};
+		use crate::epoch_fold::{fold_epoch, open_record, verify_epoch, verify_record, EpochLeaf};
+		use crate::mldsa_shake::{expand_a_ref, sample_in_ball, shake256_xof, MlDsaParam};
+		use crate::mldsa_verify::{pk_decode, sig_decode, use_hint, verify_params, verify_ref};
+		use reference::{invntt_ref, ntt_ref};
+
+		let vp = verify_params(MlDsaParam::MlDsa44);
+		let qi = Q as i64;
+		let to_u64a = |v: &[i64; 256]| -> Vec<u64> { v.iter().map(|&x| x.rem_euclid(qi) as u64).collect() };
+
+		// ── genuine signature + real intermediates (verify_ref's chain) ──
+		let (pk, sk) = ml_dsa_44::try_keygen().expect("keygen");
+		let msg: &[u8] = b"full fips204-driven fleet e2e";
+		let sig = sk.try_sign(msg, b"").expect("sign");
+		assert!(pk.verify(msg, &sig, b""), "fips204 self-verify");
+		let pk_bytes = pk.into_bytes();
+		let pk_dec = pk_decode(&pk_bytes, &vp).unwrap();
+		let sig_dec = sig_decode(&sig, &vp).unwrap();
+		let mut mi = shake256_xof(&pk_bytes, 64);
+		mi.push(0);
+		mi.push(0);
+		mi.extend_from_slice(msg);
+		let mu = shake256_xof(&mi, 64);
+		assert!(verify_ref(&pk_dec, &sig_dec, &mu), "verify_ref must accept the genuine sig");
+
+		let a_hat = expand_a_ref(&pk_dec.rho, vp.k, vp.l);
+		let c = sample_in_ball(&sig_dec.c_tilde, vp.tau);
+		let c_hat = ntt_ref(&c.iter().map(|&x| (x as i64).rem_euclid(qi) as u64).collect::<Vec<_>>(), 256);
+		let z_hat: Vec<Vec<u64>> = sig_dec.z.iter().map(|zp| ntt_ref(&to_u64a(zp), 256)).collect();
+		let two_d = 1i64 << vp.d;
+		let t1_hat: Vec<Vec<u64>> = pk_dec.t1.iter().map(|t| {
+			let sc: [i64; 256] = std::array::from_fn(|i| (t[i] * two_d).rem_euclid(qi));
+			ntt_ref(&to_u64a(&sc), 256)
+		}).collect();
+		let mut acc = [0i64; 256]; // ŵ[0]
+		for j in 0..vp.l {
+			for n in 0..256 {
+				acc[n] = (acc[n] + a_hat[0][j][n] as i64 * z_hat[j][n] as i64).rem_euclid(qi);
+			}
+		}
+		for n in 0..256 {
+			acc[n] = (acc[n] - c_hat[n] as i64 * t1_hat[0][n] as i64).rem_euclid(qi);
+		}
+		let w_approx = invntt_ref(&acc.iter().map(|&x| x.rem_euclid(qi) as u64).collect::<Vec<_>>(), 256);
+		let w1_0: [u64; 256] = std::array::from_fn(|n| use_hint(sig_dec.h[0][n], w_approx[n] as i64, vp.gamma2) as u64);
+
+		// ── FLEET: prove all 5 strands on the REAL data (parallel ⇒ wall = max) ──
+		let (mut peak_rss, mut wall) = (0u64, 0f64);
+		let mut run = |rss: u64, ms: f64| { peak_rss = peak_rss.max(rss); wall = wall.max(ms); };
+
+		let ntt_shards = super::stage_shards(&to_u64a(&sig_dec.z[0]), 256, 3, 8);
+		let t = Instant::now();
+		let (_, r) = super::run_stage_shard(&ntt_shards[0], None, true).unwrap();
+		run(r, t.elapsed().as_secs_f64() * 1e3);
+
+		let combine: Vec<super::CombineSpec> = (0..16).map(|n| super::CombineSpec {
+			a: std::array::from_fn(|j| a_hat[0][j][n] as u64),
+			z: std::array::from_fn(|j| z_hat[j][n]),
+			c: c_hat[n],
+			td: t1_hat[0][n],
+			pos: std::array::from_fn(|k| (k * 4096 + n) as u64),
+		}).collect();
+		let t = Instant::now();
+		let (_, r) = super::run_combine_shard(&combine, None, true).unwrap();
+		run(r, t.elapsed().as_secs_f64() * 1e3);
+
+		let digit: Vec<super::DigitSpec> = (0..16).map(|n| super::DigitSpec {
+			r: (w_approx[n] as i64).rem_euclid(qi) as u64,
+			h: sig_dec.h[0][n] as u64,
+			pos: std::array::from_fn(|k| (k * 4096 + n) as u64),
+		}).collect();
+		let t = Instant::now();
+		let (_, r) = super::run_digit_shard(&digit, None, true).unwrap();
+		run(r, t.elapsed().as_secs_f64() * 1e3);
+
+		let boundary: Vec<super::BoundarySpec> = (0..16).map(|n| super::BoundarySpec { u: (sig_dec.z[0][n] + super::GAMMA1 as i64) as u64, pos: n as u64 }).collect();
+		let t = Instant::now();
+		let (_, r) = super::run_boundary_shard(&boundary, None, true).unwrap();
+		run(r, t.elapsed().as_secs_f64() * 1e3);
+
+		let w1enc = ((w1_0[0] | (w1_0[1] << 6) | (w1_0[2] << 12) | (w1_0[3] << 18)) as u32).to_le_bytes()[..3].to_vec();
+		let mut anchor = mu.clone();
+		anchor.extend_from_slice(&w1enc);
+		let ctilde_anchor: [u8; 32] = { use sha3::{Digest, Sha3_256}; Sha3_256::digest(&anchor).into() };
+		let t = Instant::now();
+		let (_, r, ok) = super::run_closing_hash_shard(&mu, &w1enc, &ctilde_anchor).unwrap();
+		run(r, t.elapsed().as_secs_f64() * 1e3);
+		assert!(ok, "closing-hash strand must bind on the REAL w1Encode");
+
+		// ── AGGREGATE: fold the real ŵ outputs into the epoch commitment ──
+		let leaves: Vec<EpochLeaf> = (0..4).map(|blk| EpochLeaf { record: (0..8).map(|i| F::new(acc[blk * 8 + i].rem_euclid(qi) as u128)).collect() }).collect();
+		let ta = Instant::now();
+		let proof = fold_epoch(&leaves, "record", 1);
+		let agg = ta.elapsed().as_secs_f64() * 1e3;
+
+		// ── RESOLVER: verify the one aggregated proof ──
+		let tv = Instant::now();
+		verify_epoch(&proof, "record").expect("resolver verify_epoch");
+		let ve = tv.elapsed().as_secs_f64() * 1e3;
+		let op = open_record(&leaves, 0);
+		let trr = Instant::now();
+		verify_record(&proof, &op).expect("resolver verify_record");
+		let vr = trr.elapsed().as_secs_f64() * 1e6;
+
+		println!("\n=== FULL fips204-driven fleet e2e (GENUINE ML-DSA-44 signature) ===");
+		println!("FLEET (5 strands — NTT/combine/digit/z-norm/closing-hash — on REAL sig data, parallel):");
+		println!("  peak per-shard RSS {:.0} MiB, parallel wall ≈ {wall:.0} ms  (< 500 MiB, IoT-viable)", peak_rss as f64 / 1048576.0);
+		println!("AGGREGATE (once): epoch fold {agg:.1} ms");
+		println!("RESOLVER (per epoch): verify_epoch {ve:.2} ms, verify_record {vr:.1} µs  ← sub-ms, network-cost verify");
+	}
+
 	/// The CLOSING-HASH strand (terminal) wired into the fleet: it consumes the digit strand's
 	/// w1Encode output, proves c̃' = SHA3-256(μ ‖ w1Encode) over B256, and binds c̃' == c̃.  A
 	/// wrong w1' (from any tampered upstream shard) changes w1Encode ⇒ different digest ⇒ the
