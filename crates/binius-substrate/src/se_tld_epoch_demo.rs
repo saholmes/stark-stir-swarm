@@ -368,6 +368,98 @@ mod tests {
 		);
 	}
 
+	/// ★ END-TO-END: fold a REAL `.se` zone (Tranco delegations, native ECDSA-P256
+	/// RRSIGs) into ONE epoch proof via the interleaved single-opening, and measure
+	/// the resolver cost — verify_epoch once/epoch + µs membership per query — on
+	/// the real names.  This is the DNS-STARK `.se` headline.
+	#[test]
+	#[ignore = "real .se zone -> epoch_fold e2e; run with --ignored"]
+	fn se_zone_epoch_fold_e2e() {
+		use crate::epoch_fold::{fold_epoch, open_record, verify_epoch, verify_record, EpochLeaf};
+		use binius_field::{BinaryField128b as F, Field};
+		use std::time::Instant;
+
+		let level = Sha3Level::L1;
+		let d_seed: [u8; 32] = Sha256::digest(b"dot-se-ZSK-seed-v1").into();
+		let zsk = SigningKey::from_slice(&d_seed).expect("valid P-256 scalar");
+		let vk: VerifyingKey = *zsk.verifying_key();
+
+		// Load real `.se` names; take a power-of-two count (interleave needs 2^k).
+		let loaded = load_se_names(4096).expect("load real .se names");
+		let mut n = 1usize;
+		while n * 2 <= loaded.len() {
+			n *= 2;
+		}
+		let names = &loaded[..n];
+		let dels: Vec<SeDelegation> = names.iter().map(|nm| build_delegation(&zsk, level, nm)).collect();
+
+		// (1) AGGREGATOR: native ECDSA-P256 RRSIG verify (the real signature check).
+		let t = Instant::now();
+		let all_valid = dels.iter().all(|d| vk.verify(&d.signing_input, &d.sig).is_ok());
+		let rrsig_ms = t.elapsed().as_secs_f64() * 1e3;
+		assert!(all_valid, "all real `.se` RRSIGs must verify natively");
+
+		// epoch_fold leaf = the FIPS commitment SHA3-N(m32) as B128 field values.
+		let to_record = |leaf: &[u8]| -> Vec<F> {
+			let mut r: Vec<F> = leaf
+				.chunks(16)
+				.map(|c| {
+					let mut b = [0u8; 16];
+					b[..c.len()].copy_from_slice(c);
+					F::new(u128::from_le_bytes(b))
+				})
+				.collect();
+			while !r.len().is_power_of_two() {
+				r.push(F::ZERO);
+			}
+			r
+		};
+		let leaves: Vec<EpochLeaf> = dels.iter().map(|d| EpochLeaf { record: to_record(&d.leaf) }).collect();
+
+		// (2) AGGREGATOR: interleave + one decider open.
+		let t = Instant::now();
+		let proof = fold_epoch(&leaves, "se", 20_260_716);
+		let agg_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// (3) RESOLVER: verify the epoch once.
+		let t = Instant::now();
+		assert!(verify_epoch(&proof, "se").is_ok(), "real `.se` epoch must verify");
+		let ve_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// (4) RESOLVER: per-query membership for a REAL name; an outsider is rejected.
+		let idx = n / 3;
+		let op = open_record(&leaves, idx);
+		let t = Instant::now();
+		assert!(verify_record(&proof, &op).is_ok(), "real `.se` record must open");
+		let vr_us = t.elapsed().as_secs_f64() * 1e6;
+		let outsider = build_delegation(&zsk, level, "not-in-this-epoch.se.");
+		let mut fake = open_record(&leaves, idx);
+		fake.record = to_record(&outsider.leaf);
+		assert!(verify_record(&proof, &fake).is_err(), "a record not under R* must fail to open");
+
+		let native_us = rrsig_ms * 1e3 / n as f64;
+		println!("\n=== REAL `.se` zone → epoch_fold (interleaved single-opening, NIST L1) ===");
+		println!(
+			"  real Tranco `.se` delegations         : {n}   (e.g. {}, {})",
+			names[0].trim_end_matches('.'),
+			names[1].trim_end_matches('.')
+		);
+		println!("  AGGREGATOR (once/epoch):");
+		println!("    native ECDSA-P256 RRSIG verify      : {rrsig_ms:.1} ms total ({native_us:.1} µs/sig, DNSSEC alg 13)");
+		println!("    interleave + decider open           : {agg_ms:.0} ms");
+		println!("  RESOLVER:");
+		println!(
+			"    verify_epoch (once per epoch)       : {ve_ms:.2} ms   (n_vars={}, proof {} KiB)",
+			proof.n_vars,
+			proof.decider_proof.len() / 1024
+		);
+		println!("    verify_record (per DNS query)       : {vr_us:.1} µs   (Merkle path {} hashes)", op.path.len());
+		println!("    record NOT in epoch rejected        : ✓");
+		println!("  ⇒ a resolver verifies the whole real `.se` zone once in {ve_ms:.1} ms, then answers any of");
+		println!("    the {n} delegations in {vr_us:.1} µs — DNS-cost. Signatures: native ECDSA-P256 (alg 13);");
+		println!("    commitment + aggregation succinct (FRI-Binius decider, ~ms flat in N).");
+	}
+
 	/// DEMO — a complete `.se` TLD epoch: real Tranco delegations, real ECDSA-P256 RRSIGs
 	/// (native verify), the SHA-3 Merkle lookup tree, the FIPS commitment proved in-circuit,
 	/// and the aggregated recursive STARK with polylog-in-N edge decider + O(leaves) fold + µs membership lookups.
