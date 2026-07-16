@@ -41,11 +41,11 @@
 // strand cut can partition without touching the arithmetic — see `Butterfly`/`InvOp`.
 
 use anyhow::Result;
-use binius_core::{fiat_shamir::HasherChallenger, oracle::ShiftVariant};
+use binius_core::{constraint_system::channel::ChannelId, fiat_shamir::HasherChallenger, oracle::ShiftVariant};
 use binius_field::Field;
 use binius_hash::sha2::Sha256Compression;
 use binius_m3::builder::{
-	Col, ConstraintSystem, Statement, TableBuilder, TableId, TableWitnessSegment, WitnessIndex, B1,
+	Col, ConstraintSystem, Statement, TableBuilder, TableId, TableWitnessSegment, WitnessIndex, B1, B64,
 };
 use bumpalo::Bump;
 use sha2::Sha256;
@@ -822,6 +822,31 @@ pub struct ButterflyBatch {
 
 impl ButterflyBatch {
 	pub fn build(cs: &mut ConstraintSystem<OurB256>) -> Self {
+		Self::build_inner(cs, None, None, None)
+	}
+
+	/// Seam-enabled build (the fleet-strand / inter-layer routing primitive, mirroring
+	/// `nonnative::ModMul::build_seamed*`).  When `pull_u` is set, u is PULLED from that
+	/// channel (binding u to a value a prior strand PUSHED — the input seam); when
+	/// `push_add`/`push_sub` are set, o_add / o_sub are PUSHED to those channels (the output
+	/// seam).  Coefficients are < q < 2^23, so one B64 lane carries each value.  Balance then
+	/// forces a consumer's input to equal exactly the producer's output — connectivity
+	/// soundness across the seam (a wrong value unbalances the channel ⇒ verify REJECTS).
+	pub fn build_seamed(
+		cs: &mut ConstraintSystem<OurB256>,
+		pull_u: Option<ChannelId>,
+		push_add: Option<ChannelId>,
+		push_sub: Option<ChannelId>,
+	) -> Self {
+		Self::build_inner(cs, pull_u, push_add, push_sub)
+	}
+
+	fn build_inner(
+		cs: &mut ConstraintSystem<OurB256>,
+		pull_u: Option<ChannelId>,
+		push_add: Option<ChannelId>,
+		push_sub: Option<ChannelId>,
+	) -> Self {
 		let mut t = cs.add_table("mldsa tall-narrow forward-butterfly batch");
 		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
 		let c_col = t.add_constant("c_q", c_arr);
@@ -835,6 +860,25 @@ impl ButterflyBatch {
 		let mul = ModMulVar::build(&mut t, "mul", v, zeta, c_col, &q_set);
 		let add = ModAdd::build(&mut t, "add", u, mul.out, c_col, &q_set);
 		let sub = ModSub::build(&mut t, "sub", u, mul.out, c_col, &q_set);
+		// Seams: a coefficient column is exactly W=64 bits = one B64 lane, so pack it directly
+		// (no sub-block projection) and push/pull it on the channel.
+		let seam = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, chan: ChannelId, nm: &str, pull: bool| {
+			let b64 = t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64"), col);
+			if pull {
+				t.pull(chan, [b64]);
+			} else {
+				t.push(chan, [b64]);
+			}
+		};
+		if let Some(ch) = pull_u {
+			seam(&mut t, u, ch, "seam_u", true);
+		}
+		if let Some(ch) = push_add {
+			seam(&mut t, add.out, ch, "seam_add", false);
+		}
+		if let Some(ch) = push_sub {
+			seam(&mut t, sub.out, ch, "seam_sub", false);
+		}
 		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub }
 	}
 
@@ -1129,6 +1173,48 @@ mod tests {
 		let v = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness);
 		assert!(v.is_err(), "SOUNDNESS FAILURE: a tampered butterfly output was ACCEPTED");
 		println!("GATE tall-narrow tamper: a corrupted ζ·v output is REJECTED by validate_witness");
+	}
+
+	/// CONNECTIVITY: two butterflies chained by a channel — producer A PUSHES its o_add, and
+	/// consumer B PULLS it as its input u.  The channel must net-balance, so B's input is bound
+	/// to equal A's output (the seam that wires adjacent NTT layers and fleet strands, mirroring
+	/// the proven `nonnative::ModMul` mid-channel seam).  A consumer that pulls the WRONG value
+	/// unbalances the channel ⇒ `validate_witness` REJECTS — connectivity soundness across the seam.
+	#[test]
+	fn butterfly_seam_routes_and_tamper_rejected() {
+		use binius_core::constraint_system::channel::ChannelId;
+		let run = |bad: bool| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let wire: ChannelId = cs.add_channel("wire"); // carries A.o_add → B.u
+			let a = super::ButterflyBatch::build_seamed(&mut cs, None, Some(wire), None);
+			let b = super::ButterflyBatch::build_seamed(&mut cs, Some(wire), None, None);
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			// A: (u,v,ζ) → o_add, pushed onto `wire`.
+			let (ua, va, za) = (100u64, 7u64, 1753u64);
+			let ta = ((za as u128 * va as u128) % Q as u128) as u64;
+			let oa = (ua + ta) % Q;
+			{
+				let tw = witness.init_table(a.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let (goa, _) = a.populate(&mut seg, 0, ua, va, za).unwrap();
+				assert_eq!(goa, oa);
+			}
+			// B: pulls u from `wire`; honest u == A.o_add, tampered u == A.o_add + 1.
+			let ub = if bad { (oa + 1) % Q } else { oa };
+			{
+				let tw = witness.init_table(b.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				b.populate(&mut seg, 0, ub, 3, 17).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness).is_ok()
+		};
+		assert!(run(false), "honest butterfly seam must balance + validate");
+		assert!(!run(true), "SOUNDNESS: a consumer pulling a wrong value must unbalance the channel");
+		println!("GATE tall-narrow seam: butterfly o_add PUSHED and PULLED as the next butterfly's u; a wrong pulled value REJECTED (channel unbalanced) — the inter-layer / fleet-strand routing primitive");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same

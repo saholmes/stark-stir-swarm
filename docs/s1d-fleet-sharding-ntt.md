@@ -82,8 +82,17 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
    butterfly feeding the next layer's inputs) via a channel/seam — today the batch proves the
    per-butterfly *arithmetic* tall-narrow; the CT connectivity is followed by the witness trace
    (native) and must become a channel copy-constraint for full connectivity soundness.
-2. **Inter-layer channel routing** + **row-block sharding** of the butterfly batch with seam
-   binding (mirror `gway_reconstruction`); measure per-shard RSS < 500 MiB and fleet wall-time.
+2. **Inter-layer channel routing** — ◐ **seam primitive DONE** (`ButterflyBatch::build_seamed`):
+   a butterfly PULLs its input u from a channel and PUSHes o_add / o_sub to channels (a
+   coefficient is one B64 lane), so a consumer's input is bound to a producer's output by channel
+   balance — a wrong pulled value unbalances the channel ⇒ verify REJECTS
+   (`butterfly_seam_routes_and_tamper_rejected`, the exact `nonnative::ModMul` mid-channel seam
+   applied to butterfly coefficients). This is the primitive that wires adjacent layers AND binds
+   fleet strands. **Still to do:** compose it across the WHOLE CT network — a single positional
+   channel keyed by (slot, version, value) with the twiddle ζ and the (slot, version) pinned to
+   the public schedule (via `add_structured(Incrementing)` + a schedule lookup), plus input/output
+   boundary flushes; then **row-block sharding** with seam binding (mirror `gway_reconstruction`)
+   and measure per-shard RSS < 500 MiB + fleet wall-time.
 3. Wire the combine/digit/boundary/hash strands into the same fleet + reconstruct; measure the
    full sharded S1d ML-DSA verify (fleet latency + per-shard RSS).
 
