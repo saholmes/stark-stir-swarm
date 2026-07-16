@@ -678,6 +678,279 @@ pub fn validate(n: usize, roundtrip: bool, input: &[u64]) -> Result<Vec<u64>> {
 	Ok(outputs)
 }
 
+// ══════════════ TALL-NARROW butterfly batch (row-per-butterfly) ══════════════
+//
+// The `Ntt` above lays a whole transform in ONE row (all butterflies as columns) —
+// FRI-pathological (RSS/time ∝ trace AREA ≈ width; measured 880 MiB at n=32). This
+// section lays butterflies as ROWS (table_sizes=[nrows], ~fixed narrow columns/row),
+// the tall-narrow shape every low-RSS strand uses (nonnative mod-mul, ec_verify).
+// A full n-point transform's (n/2)·log₂n butterflies become that many rows; the
+// per-row arithmetic is proven identically, but the trace is tall-narrow ⇒ low RSS
+// and it shards by row-block across a fleet (seam-bound; docs/s1d-fleet-sharding-ntt.md).
+// The twiddle ζ therefore varies per row, so ζ·v is a var×var multiply (`ModMulVar`).
+// Inter-layer routing (o_add/o_sub of one butterfly feeding the next layer's inputs)
+// is NOT yet enforced in-circuit here — it is the next increment (channel/seam);
+// this table proves the per-butterfly ARITHMETIC tall-narrow and its RSS/time regime.
+
+const WLOG: usize = 6; // log2(W), W = 64
+
+/// `(ζ · v) mod q` with BOTH ζ and v witness columns (the row-per-butterfly twiddle
+/// varies per row).  v's low NBITS_Q bits gate shifts of the ζ column into partial
+/// products (broadcast-bit × ζ<<i, the decompose-gadget recipe), summed to the < 2^46
+/// product, then reduced `prod = quo·q + out`, `out < q`, `quo < 2^NBITS_Q`.
+struct ModMulVar {
+	vbits: Vec<Col<B1, 1>>,
+	bcast: Vec<Col<B1, W>>,
+	bcast_rot: Vec<Col<B1, W>>,
+	bcast_l0: Vec<Col<B1, 1>>,
+	zshl: Vec<Col<B1, W>>,
+	pp: Vec<Col<B1, W>>,
+	adders: Vec<Adder<W>>,
+	quo: Col<B1, W>,
+	quo_rng: ShrZero,
+	quoq: ShiftSumMul,
+	rhs: Adder<W>,
+	out: Col<B1, W>,
+	out_lt: LtQ,
+}
+
+impl ModMulVar {
+	fn build(t: &mut TableBuilder<OurB256>, name: &str, v: Col<B1, W>, zeta: Col<B1, W>, c_col: Col<B1, W>, q_set: &[usize]) -> Self {
+		let mut vbits = Vec::new();
+		let mut bcast = Vec::new();
+		let mut bcast_rot = Vec::new();
+		let mut bcast_l0 = Vec::new();
+		let mut zshl = Vec::new();
+		let mut pp = Vec::new();
+		for i in 0..NBITS_Q {
+			// v's bit i, broadcast to all lanes (rotate-invariant + lane0 == the bit).
+			let vb = t.add_selected(format!("{name}_vb{i}"), v, i);
+			let bc = t.add_committed::<B1, W>(format!("{name}_bc{i}"));
+			let bc_rot = t.add_shifted(format!("{name}_bc{i}rot"), bc, WLOG, 1, ShiftVariant::CircularLeft);
+			t.assert_zero(format!("{name}_bc{i}eq"), bc - bc_rot);
+			let bc_l0 = t.add_selected(format!("{name}_bc{i}l0"), bc, 0);
+			t.assert_zero(format!("{name}_bc{i}bind"), bc_l0 - vb);
+			// partial product pp_i = bit_i(v) · (ζ << i).
+			let zs = if i == 0 {
+				zeta
+			} else {
+				t.add_shifted(format!("{name}_zshl{i}"), zeta, WLOG, i, ShiftVariant::LogicalLeft)
+			};
+			let p = t.add_committed::<B1, W>(format!("{name}_pp{i}"));
+			t.assert_zero(format!("{name}_pp{i}def"), p - bc * zs);
+			vbits.push(vb);
+			bcast.push(bc);
+			bcast_rot.push(bc_rot);
+			bcast_l0.push(bc_l0);
+			zshl.push(zs);
+			pp.push(p);
+		}
+		// prod = Σ_i pp_i (< 2^46, no overflow in W=64).
+		let mut adders = Vec::new();
+		let mut acc = pp[0];
+		for p in pp.iter().skip(1) {
+			let a = Adder::<W>::build(t, acc, *p, &format!("{name}_sum{}", adders.len()));
+			acc = a.sum;
+			adders.push(a);
+		}
+		let prod = acc;
+		// reduce: prod == quo·q + out, out < q, quo < 2^NBITS_Q.
+		let quo = t.add_committed::<B1, W>(format!("{name}_quo"));
+		let quo_rng = ShrZero::build(t, &format!("{name}_quo"), quo, NBITS_Q);
+		let quoq = ShiftSumMul::build(t, &format!("{name}_quoq"), quo, q_set);
+		let out = t.add_committed::<B1, W>(format!("{name}_out"));
+		let rhs = Adder::<W>::build(t, quoq.result, out, &format!("{name}_rhs"));
+		t.assert_zero(format!("{name}_identity"), prod - rhs.sum);
+		let out_lt = LtQ::build(t, &format!("{name}_out"), out, c_col);
+		Self { vbits, bcast, bcast_rot, bcast_l0, zshl, pp, adders, quo, quo_rng, quoq, rhs, out, out_lt }
+	}
+
+	fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, v: &[bool], zeta: &[bool], c: &[bool]) -> Result<Vec<bool>> {
+		let vv = to_u64(v);
+		let zz = to_u64(zeta);
+		let p = zz as u128 * vv as u128; // < 2^46
+		let quo_v = (p / Q as u128) as u64;
+		let out_v = (p % Q as u128) as u64;
+		let mut acc = vec![false; W];
+		for i in 0..NBITS_Q {
+			let vb = (vv >> i) & 1 == 1;
+			let uni = vec![vb; W];
+			write_bit(seg, self.vbits[i], row, vb)?;
+			write_col::<W>(seg, self.bcast[i], row, &uni)?;
+			write_col::<W>(seg, self.bcast_rot[i], row, &uni)?;
+			write_bit(seg, self.bcast_l0[i], row, vb)?;
+			let zshl_bits = shl(zeta, i);
+			if i != 0 {
+				write_col::<W>(seg, self.zshl[i], row, &zshl_bits)?;
+			}
+			let ppv = if vb { zshl_bits.clone() } else { vec![false; W] };
+			write_col::<W>(seg, self.pp[i], row, &ppv)?;
+			if i == 0 {
+				acc = ppv;
+			} else {
+				acc = self.adders[i - 1].populate(seg, row, &acc, &ppv)?;
+			}
+		}
+		debug_assert_eq!(to_u64(&acc), p as u64, "var mul product desync");
+		let quo_bits = bits64(quo_v);
+		write_col::<W>(seg, self.quo, row, &quo_bits)?;
+		self.quo_rng.populate(seg, row, &quo_bits)?;
+		let quoq_bits = self.quoq.populate(seg, row, &quo_bits)?;
+		let out_bits = bits64(out_v);
+		write_col::<W>(seg, self.out, row, &out_bits)?;
+		self.rhs.populate(seg, row, &quoq_bits, &out_bits)?;
+		self.out_lt.populate(seg, row, &out_bits, c)?;
+		Ok(out_bits)
+	}
+}
+
+/// A tall-narrow batch of forward CT butterflies: each ROW proves one
+/// `(u, v, ζ) → (u + ζ·v, u − ζ·v) mod q`, with u, v, ζ range-checked `< q`.
+pub struct ButterflyBatch {
+	pub table_id: TableId,
+	c_col: Col<B1, W>,
+	u: Col<B1, W>,
+	v: Col<B1, W>,
+	zeta: Col<B1, W>,
+	u_lt: LtQ,
+	v_lt: LtQ,
+	z_lt: LtQ,
+	mul: ModMulVar,
+	add: ModAdd,
+	sub: ModSub,
+}
+
+impl ButterflyBatch {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow forward-butterfly batch");
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("c_q", c_arr);
+		let q_set = set_bits_of(Q);
+		let u = t.add_committed::<B1, W>("u");
+		let v = t.add_committed::<B1, W>("v");
+		let zeta = t.add_committed::<B1, W>("zeta");
+		let u_lt = LtQ::build(&mut t, "u", u, c_col);
+		let v_lt = LtQ::build(&mut t, "v", v, c_col);
+		let z_lt = LtQ::build(&mut t, "zeta", zeta, c_col);
+		let mul = ModMulVar::build(&mut t, "mul", v, zeta, c_col, &q_set);
+		let add = ModAdd::build(&mut t, "add", u, mul.out, c_col, &q_set);
+		let sub = ModSub::build(&mut t, "sub", u, mul.out, c_col, &q_set);
+		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub }
+	}
+
+	/// Fill one butterfly row from `(u, v, ζ)`; returns `(o_add, o_sub)` = the reduced outputs.
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, u: u64, v: u64, zeta: u64) -> Result<(u64, u64)> {
+		let c = c_q_bits();
+		let (ub, vb, zb) = (bits64(u), bits64(v), bits64(zeta));
+		write_col::<W>(seg, self.c_col, row, &c)?;
+		write_col::<W>(seg, self.u, row, &ub)?;
+		write_col::<W>(seg, self.v, row, &vb)?;
+		write_col::<W>(seg, self.zeta, row, &zb)?;
+		self.u_lt.populate(seg, row, &ub, &c)?;
+		self.v_lt.populate(seg, row, &vb, &c)?;
+		self.z_lt.populate(seg, row, &zb, &c)?;
+		let tb = self.mul.populate(seg, row, &vb, &zb, &c)?;
+		let oa = self.add.populate(seg, row, &ub, &tb, &c)?;
+		let os = self.sub.populate(seg, row, &ub, &tb, &c)?;
+		Ok((to_u64(&oa), to_u64(&os)))
+	}
+
+	fn read_outputs(&self, seg: &TableWitnessSegment<OurB256>, row: usize) -> Result<(u64, u64)> {
+		Ok((to_u64(&read_col::<W>(seg, self.add.out, row)?), to_u64(&read_col::<W>(seg, self.sub.out, row)?)))
+	}
+}
+
+/// The forward-NTT butterfly trace: walk the CT schedule and emit every butterfly's
+/// `(u, v, ζ, o_add, o_sub)` in order.  The final state equals `reference::ntt_ref`.
+pub fn forward_butterfly_trace(input: &[u64], n: usize) -> Vec<(u64, u64, u64, u64, u64)> {
+	let q = Q as u128;
+	let mut a: Vec<u64> = input.to_vec();
+	let mut rows = Vec::new();
+	for (start, len, zeta) in forward_groups(n) {
+		for j in start..start + len {
+			let (u, v) = (a[j], a[j + len]);
+			let t = ((zeta as u128 * v as u128) % q) as u64;
+			let oa = (u + t) % Q;
+			let os = (u + Q - t) % Q;
+			rows.push((u, v, zeta, oa, os));
+			a[j] = oa;
+			a[j + len] = os;
+		}
+	}
+	rows
+}
+
+/// Build the tall-narrow butterfly batch for a full forward `n`-NTT of `input`, populate
+/// every butterfly row (padded to a power of two), and `validate_witness` (no FRI). Returns
+/// `Ok(())` iff every in-circuit butterfly output matches the trace (the arithmetic gate).
+pub fn validate_butterflies(input: &[u64], n: usize) -> Result<()> {
+	let trace = forward_butterfly_trace(input, n);
+	let nrows = trace.len().next_power_of_two();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let bb = ButterflyBatch::build(&mut cs);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(bb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, &(u, v, z, oa, os)) in trace.iter().enumerate() {
+			let (goa, gos) = bb.populate(&mut seg, row, u, v, z)?;
+			assert_eq!((goa, gos), (oa, os), "butterfly row {row} output != trace");
+		}
+		for row in trace.len()..nrows {
+			bb.populate(&mut seg, row, 0, 0, 0)?; // valid padding butterfly (0,0,0)→(0,0)
+		}
+		let _ = bb.read_outputs(&seg, 0)?;
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	Ok(())
+}
+
+/// Full FRI PROVE+VERIFY of the tall-narrow butterfly batch for a forward `n`-NTT.
+/// Returns `(proof_bytes, nrows)`.  This is the shape whose RSS stays IoT-viable.
+pub fn prove_butterflies(input: &[u64], n: usize) -> Result<(usize, usize)> {
+	let trace = forward_butterfly_trace(input, n);
+	let nrows = trace.len().next_power_of_two();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let bb = ButterflyBatch::build(&mut cs);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(bb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, &(u, v, z, _oa, _os)) in trace.iter().enumerate() {
+			bb.populate(&mut seg, row, u, v, z)?;
+		}
+		for row in trace.len()..nrows {
+			bb.populate(&mut seg, row, 0, 0, 0)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+	let proof_size = proof.get_proof_size();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof)?;
+	Ok((proof_size, nrows))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -791,6 +1064,92 @@ mod tests {
 			println!("| {n} | {bf} | {ms:.0} | {bytes} | {rss:.0} |");
 		}
 		println!("(full 256-pt NTT = 1024 butterflies; extrapolate prove-time, and shard so each fleet strand's RSS < 500 MiB.)");
+	}
+
+	/// The TALL-NARROW butterfly batch's arithmetic == the reference forward NTT: every
+	/// butterfly row's `(o_add,o_sub)` matches the CT-schedule trace (asserted inside
+	/// `validate_butterflies`), the whole constraint system validates, and the trace's final
+	/// state == `ntt_ref`.  Fast (validate_witness, no FRI) so it runs in the normal suite.
+	#[test]
+	fn butterfly_batch_matches_reference() {
+		for &n in &[8usize, 16, 32, 64, 128, 256] {
+			let mut rng = StdRng::seed_from_u64(0xB77F ^ n as u64);
+			let x = rand_zq(&mut rng, n);
+			// reconstruct the transform from the butterfly trace and check against ntt_ref.
+			let trace = super::forward_butterfly_trace(&x, n);
+			let mut a = x.clone();
+			let mut ri = 0;
+			for (start, len, _z) in super::forward_groups(n) {
+				for j in start..start + len {
+					let (_, _, _, oa, os) = trace[ri];
+					a[j] = oa;
+					a[j + len] = os;
+					ri += 1;
+				}
+			}
+			assert_eq!(a, ntt_ref(&x, n), "n={n}: butterfly trace final != ntt_ref");
+			assert_eq!(trace.len(), (n / 2) * (n.trailing_zeros() as usize), "n={n}: butterfly count");
+			super::validate_butterflies(&x, n).unwrap_or_else(|e| panic!("n={n}: tall-narrow batch must validate: {e}"));
+		}
+		println!("GATE tall-narrow: forward-butterfly batch (row-per-butterfly) validates over B256 and == ntt_ref for n∈{{8..256}}");
+	}
+
+	/// Soundness: corrupt one butterfly's ζ·v output column ⇒ its mod-add/sub identities no
+	/// longer close ⇒ `validate_witness` REJECTS (the tall-narrow gadget is sound, not just
+	/// arithmetic-checked in populate).
+	#[test]
+	fn butterfly_batch_tamper_rejected() {
+		use crate::nonnative::write_col;
+		let n = 16usize;
+		let mut rng = StdRng::seed_from_u64(0xDEAD);
+		let x = rand_zq(&mut rng, n);
+		let trace = super::forward_butterfly_trace(&x, n);
+		let nrows = trace.len().next_power_of_two();
+		let allocator = Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let bb = super::ButterflyBatch::build(&mut cs);
+		let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+		let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		{
+			let tw = witness.init_table(bb.table_id, nrows).unwrap();
+			let mut seg = tw.full_segment();
+			for (row, &(u, v, z, _, _)) in trace.iter().enumerate() {
+				bb.populate(&mut seg, row, u, v, z).unwrap();
+			}
+			for row in trace.len()..nrows {
+				bb.populate(&mut seg, row, 0, 0, 0).unwrap();
+			}
+			// TAMPER: flip a bit of row 0's ζ·v result (mul.out) — breaks add/sub identities.
+			let mut bad = bits64(to_u64(&read_col::<W>(&seg, bb.mul.out, 0).unwrap()));
+			bad[0] = !bad[0];
+			write_col::<W>(&mut seg, bb.mul.out, 0, &bad).unwrap();
+		}
+		let ccs = cs.compile(&statement).unwrap();
+		let witness = witness.into_multilinear_extension_index();
+		let v = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness);
+		assert!(v.is_err(), "SOUNDNESS FAILURE: a tampered butterfly output was ACCEPTED");
+		println!("GATE tall-narrow tamper: a corrupted ζ·v output is REJECTED by validate_witness");
+	}
+
+	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
+	/// n as `ntt_prove_scaling` — the direct comparison that shows row-per-butterfly is
+	/// IoT-viable where the wide-single-row `Ntt` is not.  Run ALONE (RSS is process-global).
+	#[test]
+	#[ignore = "tall-narrow butterfly-batch prove-scaling (time+RSS); run ALONE with --ignored"]
+	fn butterfly_batch_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== TALL-NARROW butterfly-batch prove scaling over B256 @L1(128) — time + peak RSS ===");
+		println!("| n | butterflies(rows) | prove_ms | proof_bytes | peak_rss_MiB (running high-water) |");
+		for &n in &[8usize, 16, 32, 64, 128, 256] {
+			let mut rng = StdRng::seed_from_u64(0x7A11 ^ n as u64);
+			let x = rand_zq(&mut rng, n);
+			let t = Instant::now();
+			let (bytes, nrows) = super::prove_butterflies(&x, n).expect("tall-narrow butterfly prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			let rss = crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0);
+			println!("| {n} | {nrows} | {ms:.0} | {bytes} | {rss:.0} |");
+		}
+		println!("(compare vs ntt_prove_scaling: wide-row hit 880 MiB at n=32; tall-narrow should stay IoT-viable at n=256.)");
 	}
 
 	/// Pure-integer round-trip: the constructed inverse truly inverts the forward.

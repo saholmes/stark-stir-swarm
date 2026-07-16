@@ -62,10 +62,28 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
 
 ## Build order
 
-1. **Row-per-butterfly NTT AIR** (`Ntt::build` rewrite, channel-routed) + gate honest == `ntt_ref`
-   and tamper-rejects, at n = 8..256. Re-run `ntt_prove_scaling` — expect tens of MiB at n = 256.
-2. **Row-block sharding** of that NTT with seam binding (mirror `gway_reconstruction`); measure
-   per-shard RSS < 500 MiB and fleet wall-time.
+1. **Row-per-butterfly NTT AIR** — ✅ **DONE + MEASURED** (`mldsa_ntt::ButterflyBatch` /
+   `ModMulVar` / `forward_butterfly_trace` / `validate_butterflies` / `prove_butterflies`).
+   Validates over B256 and == `ntt_ref` for n = 8..256; a corrupted ζ·v output is rejected.
+   `butterfly_batch_prove_scaling` vs the wide-row `ntt_prove_scaling`:
+
+   | n | rows | tall-narrow prove / RSS | wide-row prove / RSS |
+   |---|------|-------------------------|----------------------|
+   | 8 | 16 | 3.4 s / **24 MiB** | 5.8 s / 64 MiB |
+   | 16 | 32 | 4.6 s / **27 MiB** | 18.7 s / 187 MiB |
+   | 32 | 128 | 7.5 s / **30 MiB** | 68 s / **880 MiB** |
+   | 64 | 256 | 9.2 s / **34 MiB** | — |
+   | 128 | 512 | 11.7 s / **45 MiB** | — |
+   | **256** | **1024** | **15.6 s / 63 MiB** | ~37 min / multi-GB (extrapolated) |
+
+   The full 256-pt NTT proves in **15.6 s at 63 MiB** — IoT-viable with a 7× margin under 500 MiB,
+   and ~linear in butterfly count (vs the wide-row's area-bound blow-up). This unblocks S1d
+   fleet-sharding. **Still to add here:** in-circuit inter-layer routing (o_add/o_sub of a
+   butterfly feeding the next layer's inputs) via a channel/seam — today the batch proves the
+   per-butterfly *arithmetic* tall-narrow; the CT connectivity is followed by the witness trace
+   (native) and must become a channel copy-constraint for full connectivity soundness.
+2. **Inter-layer channel routing** + **row-block sharding** of the butterfly batch with seam
+   binding (mirror `gway_reconstruction`); measure per-shard RSS < 500 MiB and fleet wall-time.
 3. Wire the combine/digit/boundary/hash strands into the same fleet + reconstruct; measure the
    full sharded S1d ML-DSA verify (fleet latency + per-shard RSS).
 
