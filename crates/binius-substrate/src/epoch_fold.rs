@@ -84,10 +84,33 @@ fn zone_root(sub_roots: &[[u8; 32]]) -> [u8; 32] {
     *merkle_tree_sha3(&leaves).last().unwrap().first().unwrap()
 }
 
+// ── trust model ─────────────────────────────────────────────────────────────
+
+/// Which trust model an epoch proof is produced/verified under.  Both are meant
+/// to coexist in this (trustless) branch; `feature/accumulation-recursion` is the
+/// pure `TrustedA` line.  See docs/model-c-trustless-epoch.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustModel {
+    /// Model A (trusted aggregation, TM-1 baseline) — SHIPPED / DEFAULT.
+    /// P is committed with the decider's own Merkle commitment; the resolver
+    /// trusts the aggregator committed `P = interleave(R*'s records)` and
+    /// native-verified each record's validity.  `verify_epoch` ~ms, flat in N
+    /// (MEASURED: 6.6–15.8 ms for N=256..16384 @L1).
+    TrustedA,
+    /// Model C (trustless) — C1 BUILD TARGET on this branch.
+    /// R* IS the opened commitment, so `P` provably = interleave(R*'s records)
+    /// (the "decider crux": whether R* is FRI-openable as P's codeword,
+    /// accumulation.rs:127).  `verify_epoch` ~9–13 s/epoch @L1 (batch-width
+    /// binius verify; the prove decomposes batch-local via
+    /// P(a,b)=Σ eq(b,i)·P_i(a)).  NOT yet wired — see docs/model-c-trustless-epoch.md.
+    TrustlessC,
+}
+
 // ── surface ─────────────────────────────────────────────────────────────────
 
 /// One epoch leaf: a validated record's witness (2^inner_vars B128 values).
-/// Model A: validity already checked natively by the aggregator.
+/// Model A: validity already checked natively by the aggregator.  Model C: the
+/// leaf carries the record's validity-AIR ACCEPT claim (docs §3, C2).
 pub struct EpochLeaf {
     pub record: Vec<F>,
 }
@@ -170,6 +193,27 @@ pub fn verify_epoch(proof: &EpochProof, zone: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// RESOLVER: verify the epoch under an explicit trust model.  `TrustedA` is the
+/// shipped `verify_epoch`; `TrustlessC` is the C1 build target (R*-bound opening),
+/// not yet wired — see docs/model-c-trustless-epoch.md.
+pub fn verify_epoch_with(proof: &EpochProof, zone: &str, model: TrustModel) -> Result<(), String> {
+    match model {
+        TrustModel::TrustedA => verify_epoch(proof, zone),
+        TrustModel::TrustlessC => verify_epoch_c1(proof, zone),
+    }
+}
+
+/// C1 (model C, trustless) resolver verify: the R*-committed opening — P provably
+/// is the interleave of the R*-committed records (R* FRI-openable as P's codeword,
+/// the "decider crux").  Cost ~9–13 s/epoch @L1.  NOT yet wired.
+pub fn verify_epoch_c1(_proof: &EpochProof, _zone: &str) -> Result<(), String> {
+    // C1 build target (feature/model-c-trustless): replace epoch_fold's piop
+    // commitment with a commit_interleaved commitment whose root IS R*, then
+    // verify the R*-committed opening at the FS point.  Prove decomposes
+    // batch-local via P(a,b)=Σ eq(b,i)·P_i(a).  See docs/model-c-trustless-epoch.md §2.
+    Err("model C (trustless P↔R*) not yet wired — C1 crux; see docs/model-c-trustless-epoch.md".into())
+}
+
 /// RESOLVER (per query): verify a record is committed under the epoch's R*.
 pub fn verify_record(proof: &EpochProof, opening: &RecordOpening) -> Result<(), String> {
     let sr = sub_root(opening.index, &opening.record);
@@ -219,6 +263,20 @@ mod tests {
             }
         }
         println!("GATE epoch-fold: honest epoch verifies + all records open under R*");
+    }
+
+    /// Both trust models share one API: TrustedA verifies (shipped); TrustlessC
+    /// is the C1 build target and reports pending until wired.
+    #[test]
+    fn trust_model_dispatch() {
+        let ls = leaves(8, 5, 1);
+        let proof = fold_epoch(&ls, ZONE, EPOCH);
+        assert!(verify_epoch_with(&proof, ZONE, TrustModel::TrustedA).is_ok(), "model A must verify");
+        assert!(
+            verify_epoch_with(&proof, ZONE, TrustModel::TrustlessC).is_err(),
+            "model C (trustless) is the C1 build target — pending until wired"
+        );
+        println!("GATE epoch-fold: TrustModel dispatch — TrustedA verifies, TrustlessC pending (C1)");
     }
 
     /// MEASURE: the resolver-facing cost — succinct verify_epoch (once/epoch) +
