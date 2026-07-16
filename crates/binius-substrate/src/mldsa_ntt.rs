@@ -818,11 +818,65 @@ pub struct ButterflyBatch {
 	mul: ModMulVar,
 	add: ModAdd,
 	sub: ModSub,
+	/// Positional-seam key columns [pos_u, pos_v, pos_add, pos_sub] when built positional.
+	pos: Option<[Col<B1, W>; 4]>,
 }
 
 impl ButterflyBatch {
 	pub fn build(cs: &mut ConstraintSystem<OurB256>) -> Self {
 		Self::build_inner(cs, None, None, None, None)
+	}
+
+	/// POSITIONAL batched seam: a whole STAGE's n/2 butterflies share ONE channel, the token
+	/// key being `(position, value)` where `position` encodes `(slot, version)`.  Each row
+	/// PULLs `[pos_u, u]` and `[pos_v, v]` and PUSHes `[pos_add, o_add]` and `[pos_sub, o_sub]`
+	/// on `chan` — a uniform flush, so the entire stage batches into one tall-narrow table
+	/// (keeping the 15.6 s / 63 MiB regime) while the position in the key distinguishes slots.
+	/// Positions are committed columns (populated from the public CT schedule); pinning them —
+	/// and the twiddle ζ — to the schedule in-circuit (a manual B256 lookup, since M3's
+	/// `LookupProducer` is B128-only) is the remaining soundness step (docs step 2).
+	pub fn build_seamed_positional(cs: &mut ConstraintSystem<OurB256>, chan: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow POSITIONAL forward-butterfly stage");
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("c_q", c_arr);
+		let q_set = set_bits_of(Q);
+		let u = t.add_committed::<B1, W>("u");
+		let v = t.add_committed::<B1, W>("v");
+		let zeta = t.add_committed::<B1, W>("zeta");
+		let u_lt = LtQ::build(&mut t, "u", u, c_col);
+		let v_lt = LtQ::build(&mut t, "v", v, c_col);
+		let z_lt = LtQ::build(&mut t, "zeta", zeta, c_col);
+		let mul = ModMulVar::build(&mut t, "mul", v, zeta, c_col, &q_set);
+		let add = ModAdd::build(&mut t, "add", u, mul.out, c_col, &q_set);
+		let sub = ModSub::build(&mut t, "sub", u, mul.out, c_col, &q_set);
+		let pos_u = t.add_committed::<B1, W>("pos_u");
+		let pos_v = t.add_committed::<B1, W>("pos_v");
+		let pos_a = t.add_committed::<B1, W>("pos_a");
+		let pos_s = t.add_committed::<B1, W>("pos_s");
+		let flush = |t: &mut TableBuilder<OurB256>, pos: Col<B1, W>, val: Col<B1, W>, nm: &str, pull: bool| {
+			let pb = t.add_packed::<B1, 64, B64, 1>(format!("{nm}_pos_b64"), pos);
+			let vb = t.add_packed::<B1, 64, B64, 1>(format!("{nm}_val_b64"), val);
+			if pull {
+				t.pull(chan, [pb, vb]);
+			} else {
+				t.push(chan, [pb, vb]);
+			}
+		};
+		flush(&mut t, pos_u, u, "pu", true);
+		flush(&mut t, pos_v, v, "pv", true);
+		flush(&mut t, pos_a, add.out, "pa", false);
+		flush(&mut t, pos_s, sub.out, "ps", false);
+		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub, pos: Some([pos_u, pos_v, pos_a, pos_s]) }
+	}
+
+	/// Populate a positional row: the butterfly plus its four `(slot,version)` position keys.
+	pub fn populate_positional(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, u: u64, v: u64, zeta: u64, pos: [u64; 4]) -> Result<(u64, u64)> {
+		let out = self.populate(seg, row, u, v, zeta)?;
+		let cols = self.pos.expect("populate_positional on a non-positional table");
+		for (k, &p) in pos.iter().enumerate() {
+			write_col::<W>(seg, cols[k], row, &bits64(p))?;
+		}
+		Ok(out)
 	}
 
 	/// Seam-enabled build (the fleet-strand / inter-layer routing primitive, mirroring
@@ -896,7 +950,7 @@ impl ButterflyBatch {
 		if let Some(ch) = push_sub {
 			seam(&mut t, sub.out, ch, "seam_sub", false);
 		}
-		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub }
+		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub, pos: None }
 	}
 
 	/// Fill one butterfly row from `(u, v, ζ)`; returns `(o_add, o_sub)` = the reduced outputs.
@@ -1126,6 +1180,116 @@ pub fn validate_ntt_network(input: &[u64], n: usize, tamper: Option<usize>) -> R
 		let mut seg = tw.full_segment();
 		for (j, &cc) in snk_cols.iter().enumerate() {
 			write_col::<W>(&mut seg, cc, 0, &bits64(expected[j]))?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	Ok(())
+}
+
+/// Batched composition: each STAGE's n/2 butterflies are ONE tall-narrow positional table
+/// (n/2 rows), all routed through a single channel whose key is `(position, value)` with
+/// `position = version·n + slot`.  A source pushes the public inputs at version 0, a sink
+/// pulls the public `ntt_ref` outputs at version log₂n, and each stage pulls its inputs /
+/// pushes its outputs at the matching positions.  This keeps the tall-narrow prove regime
+/// (n/2 rows per stage) while the position in the key does the slot routing — the deployment
+/// structure.  Honest network validates; corrupting a butterfly makes its pushed output
+/// mismatch the position the next stage pulls ⇒ channel UNBALANCE ⇒ REJECT.  (`tamper = Some(b)`
+/// corrupts the b-th butterfly's twiddle.)  NOTE: positions/twiddles are committed and
+/// populated from the public schedule; pinning them in-circuit (a manual B256 lookup) is the
+/// final soundness step — docs/s1d-fleet-sharding-ntt.md step 2.
+pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usize>) -> Result<()> {
+	assert!(n.is_power_of_two() && n >= 2, "n must be a power of two ≥ 2");
+	let logn = n.trailing_zeros() as usize;
+	let arr_of = |x: u64| -> [B1; W] { std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }) };
+
+	// native forward NTT (pinned output) + per-stage butterfly rows with their positions.
+	let mut a = input.to_vec();
+	let mut stage_rows: Vec<Vec<(u64, u64, u64, [u64; 4])>> = vec![Vec::new(); logn];
+	let mut bi = 0usize;
+	for (start, len, zeta) in forward_groups(n) {
+		let s = (n.trailing_zeros() - len.trailing_zeros() - 1) as usize;
+		for j in start..start + len {
+			let (u, v) = (a[j], a[j + len]);
+			let z_use = if tamper == Some(bi) { (zeta + 1) % Q } else { zeta };
+			let pos = [
+				(s * n + j) as u64,
+				(s * n + j + len) as u64,
+				((s + 1) * n + j) as u64,
+				((s + 1) * n + j + len) as u64,
+			];
+			let t = ((zeta as u128 * v as u128) % Q as u128) as u64;
+			a[j] = (u + t) % Q;
+			a[j + len] = (u + Q - t) % Q;
+			stage_rows[s].push((u, v, z_use, pos));
+			bi += 1;
+		}
+	}
+	let expected = a;
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let net: ChannelId = cs.add_channel("net");
+
+	// SOURCE: 1 row, push n tokens [pos(j,0)=j, input[j]].
+	let mut src = cs.add_table("batched-net source");
+	let src_cols: Vec<(Col<B1, W>, Col<B1, W>, u64, u64)> = (0..n)
+		.map(|j| {
+			let pc = src.add_constant(format!("sp{j}"), arr_of(j as u64));
+			let vc = src.add_constant(format!("sv{j}"), arr_of(input[j]));
+			let pb = src.add_packed::<B1, 64, B64, 1>(format!("sp{j}b"), pc);
+			let vb = src.add_packed::<B1, 64, B64, 1>(format!("sv{j}b"), vc);
+			src.push(net, [pb, vb]);
+			(pc, vc, j as u64, input[j])
+		})
+		.collect();
+	let src_id = src.id();
+
+	// STAGES: one positional tall-narrow table per stage (n/2 rows).
+	let stages: Vec<ButterflyBatch> = (0..logn).map(|_| ButterflyBatch::build_seamed_positional(&mut cs, net)).collect();
+
+	// SINK: 1 row, pull n tokens [pos(j,logn)=logn·n+j, expected[j]].
+	let mut snk = cs.add_table("batched-net sink");
+	let snk_cols: Vec<(Col<B1, W>, Col<B1, W>, u64, u64)> = (0..n)
+		.map(|j| {
+			let posv = (logn * n + j) as u64;
+			let pc = snk.add_constant(format!("kp{j}"), arr_of(posv));
+			let vc = snk.add_constant(format!("kv{j}"), arr_of(expected[j]));
+			let pb = snk.add_packed::<B1, 64, B64, 1>(format!("kp{j}b"), pc);
+			let vb = snk.add_packed::<B1, 64, B64, 1>(format!("kv{j}b"), vc);
+			snk.pull(net, [pb, vb]);
+			(pc, vc, posv, expected[j])
+		})
+		.collect();
+	let snk_id = snk.id();
+
+	let mut table_sizes = vec![1usize];
+	table_sizes.extend(std::iter::repeat_n(n / 2, logn));
+	table_sizes.push(1);
+	let statement = Statement { boundaries: vec![], table_sizes };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(src_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (pc, vc, p, val) in &src_cols {
+			write_col::<W>(&mut seg, *pc, 0, &bits64(*p))?;
+			write_col::<W>(&mut seg, *vc, 0, &bits64(*val))?;
+		}
+	}
+	for (s, bb) in stages.iter().enumerate() {
+		let tw = witness.init_table(bb.table_id, n / 2)?;
+		let mut seg = tw.full_segment();
+		for (row, &(u, v, z, pos)) in stage_rows[s].iter().enumerate() {
+			bb.populate_positional(&mut seg, row, u, v, z, pos)?;
+		}
+	}
+	{
+		let tw = witness.init_table(snk_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (pc, vc, p, val) in &snk_cols {
+			write_col::<W>(&mut seg, *pc, 0, &bits64(*p))?;
+			write_col::<W>(&mut seg, *vc, 0, &bits64(*val))?;
 		}
 	}
 	let ccs = cs.compile(&statement).unwrap();
@@ -1378,6 +1542,28 @@ mod tests {
 			}
 		}
 		println!("GATE ntt-network: the whole forward CT network composed from channel-routed butterflies validates over B256 (inputs/outputs pinned); any corrupted butterfly is REJECTED via output-channel balance");
+	}
+
+	/// BATCHED composition: each stage's n/2 butterflies are ONE tall-narrow positional table,
+	/// routed by a single channel keyed `(position, value)`.  Honest validates over B256; a
+	/// corrupted butterfly mismatches the position the next stage pulls ⇒ channel UNBALANCE ⇒
+	/// REJECT.  This is the deployment structure (tall-narrow per stage, not 1 table/butterfly).
+	#[test]
+	fn ntt_network_batched_composed_and_tamper_rejected() {
+		for &n in &[4usize, 8, 16] {
+			let mut rng = StdRng::seed_from_u64(0xBA7C ^ n as u64);
+			let x = rand_zq(&mut rng, n);
+			super::validate_ntt_network_batched(&x, n, None)
+				.unwrap_or_else(|e| panic!("n={n}: honest batched CT network must validate: {e}"));
+			let nbf = (n / 2) * (n.trailing_zeros() as usize);
+			for &b in &[0usize, nbf / 2, nbf - 1] {
+				assert!(
+					super::validate_ntt_network_batched(&x, n, Some(b)).is_err(),
+					"n={n}: a corrupted twiddle at butterfly {b} must be REJECTED (batched)"
+				);
+			}
+		}
+		println!("GATE ntt-network-batched: each stage is ONE tall-narrow positional table routed by a single (pos,value) channel; honest validates, any corrupted butterfly REJECTED");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
