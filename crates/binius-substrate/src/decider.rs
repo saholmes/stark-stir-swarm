@@ -33,18 +33,28 @@ use binius_ntt::SingleThreadedNTT;
 use sha2::Sha256;
 
 use crate::b256_field::{B256, U256};
+use crate::b512_field::{B512, U512};
 
-// Shared RS/domain sub-fields (valid at L1/L3 over B256).
+// Shared RS/domain sub-fields (valid at L1/L3 over B256, and L5 over B512 —
+// B512 also holds ExtensionField<B8>/<B32>, so FEncode/FDomain are unchanged).
 type FEncode = BinaryField32b;
 type FDomain = BinaryField8b;
 type F1 = B256;
 type P1 = PackedType<U256, F1>;
+type F5 = B512; // L5 challenge/extension field
+type P5 = PackedType<U512, F5>; // width-1 packed (B512 is its own packed field)
 
 const SECURITY_BITS_L1: usize = 128;
 
 /// Lift a B128 element into B256 (subfield embedding: the "lo" limb, hi = 0).
 pub fn lift_b128_to_b256(x: B128) -> B256 {
     B256::from_halves(x, B128::ZERO)
+}
+
+/// Lift a B128 element into B512 (nested subfield inclusion B128 ⊂ B256 ⊂ B512,
+/// each as the "lo" limb) — preserves +,× and hence the multilinear evaluation.
+pub fn lift_b128_to_b512(x: B128) -> B512 {
+    B512::from_halves(lift_b128_to_b256(x), B256::ZERO)
 }
 
 /// L1 committed-decider OPEN: commit the multilinear `p_b128` (B128 evals lifted
@@ -335,4 +345,132 @@ pub fn decider_verify_l1(proof_bytes: Vec<u8>, point_b128: &[B128], value: B256,
     };
     verify(&commit_meta, merkle_scheme, &fri_params, &commitment_v, &transparents, &claims, &mut vproof)
         .is_ok()
+}
+
+// ============================================================================
+// L5 (B512 @ 256-bit): the trustless-C1 decider trio over the B512 tower field.
+// Byte-for-byte the same piop wiring as the B256 (L1/L3) functions above, only
+// the challenge/extension field is B512 (F5) and the record lift is B128 ⊂ B512.
+// FEncode/FDomain (B32/B8) are unchanged — B512 holds both.  Mirrors the L5 row
+// of `committed_decider::measure_cdec` (which proves the piop works at B512@256).
+// ============================================================================
+
+/// L5 (C1) pass 1: commit only, returning the record's B512 FRI commitment R*_i.
+pub fn decider_commit_root_l5(p_b128: &[B128], security_bits: usize) -> [u8; 32] {
+    let n_vars = p_b128.len().trailing_zeros() as usize;
+    let evals: Vec<P5> = p_b128.iter().map(|&x| P5::broadcast(lift_b128_to_b512(x))).collect();
+    let poly = MultilinearExtension::<P5>::new(n_vars, evals).unwrap();
+    let committed_multilins = vec![MLEDirectAdapter::from(poly)];
+    let commit_meta = CommitMeta::with_vars([n_vars]);
+    let merkle_prover = BinaryMerkleTreeProver::<F5, Sha256, _>::new(Sha256Compression::default());
+    let merkle_scheme = merkle_prover.scheme();
+    let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
+        &commit_meta, merkle_scheme, security_bits, 1,
+    )
+    .unwrap();
+    let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
+    let CommitOutput { commitment, .. } =
+        commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
+    let mut root = [0u8; 32];
+    root.copy_from_slice(commitment.as_slice());
+    root
+}
+
+/// L5 (C1) pass 2: commit + open at a genuine B512 point.  ε ≤ n/2⁵¹² (well
+/// beyond the 256-bit target — the B512 field is the L5 challenge space).
+pub fn decider_open_at_ext_l5(p_b128: &[B128], point_ext: &[B512], security_bits: usize) -> ([u8; 32], Vec<u8>, B512, usize) {
+    let n_vars = point_ext.len();
+    assert_eq!(p_b128.len(), 1usize << n_vars, "P must have 2^|point| evals");
+    let evals: Vec<P5> = p_b128.iter().map(|&x| P5::broadcast(lift_b128_to_b512(x))).collect();
+    let point: Vec<F5> = point_ext.to_vec();
+    let poly = MultilinearExtension::<P5>::new(n_vars, evals).unwrap();
+    let committed_multilins = vec![MLEDirectAdapter::from(poly)];
+
+    let commit_meta = CommitMeta::with_vars([n_vars]);
+    let merkle_prover = BinaryMerkleTreeProver::<F5, Sha256, _>::new(Sha256Compression::default());
+    let merkle_scheme = merkle_prover.scheme();
+    let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
+        &commit_meta, merkle_scheme, security_bits, 1,
+    )
+    .unwrap();
+    let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
+    let backend = make_portable_backend();
+    let CommitOutput { commitment, committed, codeword } =
+        commit(&fri_params, &ntt, &merkle_prover, &committed_multilins).unwrap();
+    let mut root = [0u8; 32];
+    root.copy_from_slice(commitment.as_slice());
+
+    let eq = EqIndPartialEval::<F5>::new(point);
+    let eq_mle: MultilinearExtension<P5, _> = eq.multilinear_extension::<P5, _>(&backend).unwrap();
+    let eq_owned = MultilinearExtension::<P5>::new(eq_mle.n_vars(), eq_mle.evals().to_vec()).unwrap();
+    let transparent_multilins = vec![MLEDirectAdapter::from(eq_owned)];
+    let value: F5 = (0..(1usize << n_vars))
+        .map(|v| {
+            committed_multilins[0].evaluate_on_hypercube(v).unwrap()
+                * transparent_multilins[0].evaluate_on_hypercube(v).unwrap()
+        })
+        .sum();
+    let claims = vec![PIOPSumcheckClaim::<F5> { n_vars, committed: 0, transparent: 0, sum: value }];
+    let domain_factory = DefaultEvaluationDomainFactory::<FDomain>::default();
+    let mut proof = ProverTranscript::<HasherChallenger<Sha256>>::new();
+    proof.message().write(&commitment);
+    prove(
+        &fri_params, &ntt, &merkle_prover, domain_factory, &commit_meta, committed, &codeword,
+        &committed_multilins, &transparent_multilins, &claims, &mut proof, &backend,
+    )
+    .unwrap();
+    (root, proof.finalize(), value, n_vars)
+}
+
+/// L5 (C1) VERIFY at a B512 point, bound to `expected_root`.
+pub fn decider_verify_rooted_ext_l5(
+    expected_root: [u8; 32],
+    proof_bytes: Vec<u8>,
+    point_ext: &[B512],
+    value: B512,
+    n_vars: usize,
+    security_bits: usize,
+) -> bool {
+    let point: Vec<F5> = point_ext.to_vec();
+    let commit_meta = CommitMeta::with_vars([n_vars]);
+    let merkle_prover = BinaryMerkleTreeProver::<F5, Sha256, _>::new(Sha256Compression::default());
+    let merkle_scheme = merkle_prover.scheme();
+    let fri_params = match make_commit_params_with_optimal_arity::<_, FEncode, _>(
+        &commit_meta, merkle_scheme, security_bits, 1,
+    ) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let eq = EqIndPartialEval::<F5>::new(point);
+    let eq_dyn: &dyn MultivariatePoly<F5> = &eq;
+    let transparents = vec![eq_dyn];
+    let claims = vec![PIOPSumcheckClaim::<F5> { n_vars, committed: 0, transparent: 0, sum: value }];
+    let mut vproof = VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_bytes);
+    let commitment_v: sha2::digest::Output<Sha256> = match vproof.message().read() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut got = [0u8; 32];
+    got.copy_from_slice(commitment_v.as_slice());
+    if got != expected_root {
+        return false;
+    }
+    verify(&commit_meta, merkle_scheme, &fri_params, &commitment_v, &transparents, &claims, &mut vproof)
+        .is_ok()
+}
+
+/// Multilinear eval of a B128 record's MLE at a B512 point — the L5 analog of
+/// `mle_eval_ext`, for the record↔R*_i binding.  Over B512 ε ≤ n/2⁵¹².
+pub fn mle_eval_ext_l5(evals_b128: &[B128], point_ext: &[B512]) -> B512 {
+    let n = point_ext.len();
+    assert_eq!(evals_b128.len(), 1usize << n, "evals must be 2^|point|");
+    let mut acc = B512::ZERO;
+    for (i, &e) in evals_b128.iter().enumerate() {
+        let mut w = B512::ONE;
+        for (j, &pj) in point_ext.iter().enumerate() {
+            w *= if (i >> j) & 1 == 1 { pj } else { B512::ONE + pj };
+        }
+        acc += lift_b128_to_b512(e) * w;
+    }
+    acc
 }

@@ -31,8 +31,10 @@ use binius_field::BinaryField128b as F;
 use binius_field::BinaryField128b as B128;
 
 use crate::b256_field::B256;
+use crate::b512_field::B512;
 use crate::decider::{
-    decider_commit_root_l1, decider_open_at_ext_l1, decider_verify_rooted_ext_l1, mle_eval_ext,
+    decider_commit_root_l1, decider_commit_root_l5, decider_open_at_ext_l1, decider_open_at_ext_l5,
+    decider_verify_rooted_ext_l1, decider_verify_rooted_ext_l5, mle_eval_ext, mle_eval_ext_l5,
 };
 use crate::epoch_fold::EpochLeaf;
 use crate::recursion::{merkle_auth_path, merkle_path_verify, merkle_tree_sha3};
@@ -189,6 +191,119 @@ pub fn open_record_c1(proof: &EpochProofC1, index: usize, record: &[F]) -> Recor
     }
 }
 
+// ============================================================================
+// L5 (B512 @ 256-bit): the trustless C1 epoch over the B512 tower field.  Same
+// construction as above — per-record FRI commitment R*_i, zone tree R*, N rooted
+// openings at a shared point a — but every field-valued step (commitment, the
+// opening point, the record-binding MLE eval) is over B512 (F5).  The R*/Merkle
+// scaffolding (sub_roots, zone_root, f_bytes_of, paths) is field-agnostic and
+// reused verbatim, as is `RecordOpeningC1`.  ε_bind ≤ inner/2⁵¹² (past L5's 256).
+// ============================================================================
+
+/// FS opening point `a` over B512 — four hash-derived B128 limbs per dimension
+/// (B512 = (B256,B256), B256 = (B128,B128)), derived from R* so it follows the
+/// commitments (non-adaptive), same as the B256 `derive_point_a`.
+fn derive_point_a_l5(rstar: &[u8; 32], zone: &str, epoch: u64, inner_vars: usize) -> Vec<B512> {
+    (0..inner_vars)
+        .map(|j| {
+            let jb = (j as u64).to_le_bytes();
+            let z = zone.as_bytes();
+            let e = epoch.to_le_bytes();
+            let ll = f_from(&[rstar, z, &e, b"c1l5-a-ll", &jb]);
+            let lh = f_from(&[rstar, z, &e, b"c1l5-a-lh", &jb]);
+            let hl = f_from(&[rstar, z, &e, b"c1l5-a-hl", &jb]);
+            let hh = f_from(&[rstar, z, &e, b"c1l5-a-hh", &jb]);
+            B512::from_halves(B256::from_halves(ll, lh), B256::from_halves(hl, hh))
+        })
+        .collect()
+}
+
+/// The trustless (C1) epoch proof at L5 — per-record B512 FRI commitments + openings.
+pub struct EpochProofC1L5 {
+    pub rstar: [u8; 32],
+    pub sub_roots: Vec<[u8; 32]>,
+    pub roots: Vec<[u8; 32]>,
+    pub proofs: Vec<Vec<u8>>,
+    pub values: Vec<B512>, // P_i(a) over B512
+    pub inner_vars: usize,
+    pub epoch: u64,
+    pub security_bits: usize, // 256 (NIST L5)
+}
+
+/// AGGREGATOR (once/epoch), NIST L5: B512 FRI-commit each record and open at `a`.
+pub fn fold_epoch_c1_l5(leaves: &[EpochLeaf], zone: &str, epoch: u64) -> EpochProofC1L5 {
+    let security_bits = 256usize;
+    let n = leaves.len();
+    assert!(n.is_power_of_two() && n >= 2, "leaf count must be a power of two ≥ 2");
+    let inner_len = leaves[0].record.len();
+    assert!(inner_len.is_power_of_two(), "record length must be a power of two");
+    let inner_vars = inner_len.trailing_zeros() as usize;
+
+    let roots: Vec<[u8; 32]> = leaves.iter().map(|l| decider_commit_root_l5(&l.record, security_bits)).collect();
+    let sub_roots: Vec<[u8; 32]> =
+        leaves.iter().zip(&roots).map(|(l, r)| f_bytes_of(r, &l.record)).collect();
+    let rstar = zone_root(&sub_roots);
+
+    let a = derive_point_a_l5(&rstar, zone, epoch, inner_vars);
+    let mut proofs = Vec::with_capacity(n);
+    let mut values = Vec::with_capacity(n);
+    for (l, &root) in leaves.iter().zip(&roots) {
+        let (root2, proof, v, _nv) = decider_open_at_ext_l5(&l.record, &a, security_bits);
+        debug_assert_eq!(root2, root, "commit is deterministic across passes");
+        proofs.push(proof);
+        values.push(v);
+    }
+    EpochProofC1L5 { rstar, sub_roots, roots, proofs, values, inner_vars, epoch, security_bits }
+}
+
+/// RESOLVER (once/epoch), L5: TRUSTLESS verify — N per-record B512 FRI openings.
+pub fn verify_epoch_c1_l5(proof: &EpochProofC1L5, zone: &str) -> Result<(), String> {
+    let n = proof.roots.len();
+    if !n.is_power_of_two() || n < 2 || proof.proofs.len() != n || proof.values.len() != n || proof.sub_roots.len() != n {
+        return Err("epoch-c1-l5: malformed proof".into());
+    }
+    if zone_root(&proof.sub_roots) != proof.rstar {
+        return Err("epoch-c1-l5: R* does not commit the sub-roots".into());
+    }
+    let a = derive_point_a_l5(&proof.rstar, zone, proof.epoch, proof.inner_vars);
+    for i in 0..n {
+        if !decider_verify_rooted_ext_l5(proof.roots[i], proof.proofs[i].clone(), &a, proof.values[i], proof.inner_vars, proof.security_bits) {
+            return Err(format!("epoch-c1-l5: record {i} opening/root check failed"));
+        }
+    }
+    Ok(())
+}
+
+/// RESOLVER (per query), L5: TRUSTLESS membership + record↔R*_i byte binding over B512.
+pub fn verify_record_c1_l5(proof: &EpochProofC1L5, opening: &RecordOpeningC1, zone: &str) -> Result<(), String> {
+    let i = opening.index;
+    if proof.roots.get(i) != Some(&opening.root) {
+        return Err("record-c1-l5: R*_i ≠ epoch's committed root".into());
+    }
+    let sub_root = f_bytes_of(&opening.root, &opening.record);
+    if proof.sub_roots.get(i) != Some(&sub_root) {
+        return Err("record-c1-l5: SHA3(R*_i ‖ record) ≠ epoch's sub-root".into());
+    }
+    if !merkle_path_verify(sub_root, i, &opening.path, proof.rstar) {
+        return Err("record-c1-l5: Merkle path to R* invalid".into());
+    }
+    let a = derive_point_a_l5(&proof.rstar, zone, proof.epoch, proof.inner_vars);
+    if mle_eval_ext_l5(&opening.record, &a) != proof.values[i] {
+        return Err("record-c1-l5: record's MLE(a) ≠ R*_i's opened value — R*_i does not commit this record".into());
+    }
+    Ok(())
+}
+
+pub fn open_record_c1_l5(proof: &EpochProofC1L5, index: usize, record: &[F]) -> RecordOpeningC1 {
+    let tree = merkle_tree_sha3(&proof.sub_roots);
+    RecordOpeningC1 {
+        index,
+        record: record.to_vec(),
+        root: proof.roots[index],
+        path: merkle_auth_path(&tree, index),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +397,47 @@ mod tests {
             println!("| {name} | {bits} | {n} | {agg:.0} | {ve:.1} | {vr:.1} | {bytes} |");
         }
         println!("(Same trustless C1 construction over B256; L3's extra FRI queries buy 192-bit soundness.)");
+    }
+
+    /// GATE + MEASURE: the trustless C1 epoch at NIST L5 (256-bit) over B512.
+    /// Same construction as L1/L3 but every field-valued step is over the B512
+    /// tower field.  Soundness preserved: a tampered record still breaks R*, and
+    /// a foreign R*_i / lying record are rejected — now at the 256-bit level.
+    #[test]
+    #[ignore = "C1 trustless epoch at L5 over B512 (per-record FRI); run with --ignored"]
+    fn c1_trustless_epoch_l5() {
+        println!("\n=== C1 trustless epoch: NIST L5 (256) over B512 ===");
+        println!("| level | field | bits | N | aggregator ms | verify_epoch ms | verify_record µs | proof bytes |");
+        let n = 8usize;
+        let iv = 10usize; // wide enough that the FRI folds + runs a real query phase
+        let ls = leaves(n, iv, 13);
+        let t = Instant::now();
+        let proof = fold_epoch_c1_l5(&ls, "se", 300);
+        let agg = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(proof.security_bits, 256);
+        let t = Instant::now();
+        assert!(verify_epoch_c1_l5(&proof, "se").is_ok(), "honest L5 epoch must verify");
+        let ve = t.elapsed().as_secs_f64() * 1e3;
+        let op = open_record_c1_l5(&proof, n / 2, &ls[n / 2].record);
+        let t = Instant::now();
+        assert!(verify_record_c1_l5(&proof, &op, "se").is_ok(), "L5 record must open");
+        let vr = t.elapsed().as_secs_f64() * 1e6;
+        let bytes: usize = proof.proofs.iter().map(|p| p.len()).sum();
+        println!("| L5 | B512 | 256 | {n} | {agg:.0} | {ve:.1} | {vr:.1} | {bytes} |");
+
+        // ★ soundness at L5: a lying record for the same slot is rejected
+        //   (sub_root mismatch AND MLE(a) ≠ opened value over B512).
+        let mut lying = open_record_c1_l5(&proof, n / 2, &ls[n / 2].record);
+        lying.record[0] += F::ONE;
+        assert!(verify_record_c1_l5(&proof, &lying, "se").is_err(), "a record not committed by R*_i must be rejected");
+        // a tampered record changes R*; a substituted R*_i breaks the rooted opening.
+        let mut bad = leaves(n, iv, 13);
+        bad[1].record[0] += F::ONE;
+        let badp = fold_epoch_c1_l5(&bad, "se", 300);
+        assert_ne!(badp.rstar, proof.rstar, "a tampered record must change R* at L5");
+        let mut forged = fold_epoch_c1_l5(&ls, "se", 300);
+        forged.roots[1] = badp.roots[1];
+        assert!(verify_epoch_c1_l5(&forged, "se").is_err(), "a substituted R*_i must be rejected at L5");
+        println!("(Trustless C1 over B512: commitment + membership at NIST L5, soundness preserved. ε_bind ≤ inner/2⁵¹².)");
     }
 }
