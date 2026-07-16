@@ -17,9 +17,10 @@
 // record's own MLE at a — so R*_i's committed P_i = record's MLE (Schwartz–Zippel),
 // i.e. R*_i commits EXACTLY that record.  No recommit; ~40 µs/query.
 //
-// SCOPE caveats: point a = FS(zone‖epoch) (production: FS(R*) via a commit-only
-// pass so a follows the commitments); the record-binding Schwartz–Zippel over
-// a ∈ B128^inner is ε ≤ inner/2^128 — for full L1 use an F_ext point or a second a.
+// SOUNDNESS (both prior caveats tightened): the opening point a = FS(R*) via a
+// COMMIT-ONLY pass 1 — so a follows the commitments (the aggregator cannot craft
+// P_i to agree with a record only at a) — and a is over F_ext (B256), so the
+// record-binding Schwartz–Zippel error is ε ≤ inner/2²⁵⁶ (full L1).
 //
 // Run: cargo test --release --lib epoch_c1 -- --ignored
 
@@ -27,9 +28,12 @@ use sha3::{Digest, Sha3_256};
 
 use binius_field::BinaryField128b as F;
 
-use crate::accumulation::mle_eval;
+use binius_field::BinaryField128b as B128;
+
 use crate::b256_field::B256;
-use crate::decider::{decider_commit_open_l1, decider_verify_rooted_l1, lift_b128_to_b256};
+use crate::decider::{
+    decider_commit_root_l1, decider_open_at_ext_l1, decider_verify_rooted_ext_l1, mle_eval_ext,
+};
 use crate::epoch_fold::EpochLeaf;
 use crate::recursion::{merkle_auth_path, merkle_path_verify, merkle_tree_sha3};
 
@@ -53,12 +57,17 @@ fn f_from(parts: &[&[u8]]) -> F {
     F::new(u64::from_le_bytes(b) as u128)
 }
 
-/// FS opening point `a` (inner_vars dims) from zone ‖ epoch.  (Prototype: bound
-/// to the public statement; the production point is FS from R* via a commit-only
-/// pass so it follows the commitments.)
-fn derive_point_a(zone: &str, epoch: u64, inner_vars: usize) -> Vec<F> {
+/// FS opening point `a` (inner_vars dims) over F_ext (B256), derived from R* —
+/// so it FOLLOWS the record commitments (non-adaptive: the aggregator cannot
+/// craft P_i to agree with a record only at `a`) — and over B256 the record
+/// binding's Schwartz–Zippel error is ε ≤ inner/2²⁵⁶ (full L1).
+fn derive_point_a(rstar: &[u8; 32], zone: &str, epoch: u64, inner_vars: usize) -> Vec<B256> {
     (0..inner_vars)
-        .map(|j| f_from(&[zone.as_bytes(), &epoch.to_le_bytes(), b"c1-a", &(j as u64).to_le_bytes()]))
+        .map(|j| {
+            let lo = f_from(&[rstar, zone.as_bytes(), &epoch.to_le_bytes(), b"c1-a-lo", &(j as u64).to_le_bytes()]);
+            let hi = f_from(&[rstar, zone.as_bytes(), &epoch.to_le_bytes(), b"c1-a-hi", &(j as u64).to_le_bytes()]);
+            B256::from_halves(lo, hi)
+        })
         .collect()
 }
 
@@ -95,20 +104,24 @@ pub fn fold_epoch_c1(leaves: &[EpochLeaf], zone: &str, epoch: u64) -> EpochProof
     let inner_len = leaves[0].record.len();
     assert!(inner_len.is_power_of_two(), "record length must be a power of two");
     let inner_vars = inner_len.trailing_zeros() as usize;
-    let a = derive_point_a(zone, epoch, inner_vars);
 
-    let mut roots = Vec::with_capacity(n);
-    let mut sub_roots = Vec::with_capacity(n);
+    // PASS 1 (commit only): per-record roots R*_i → sub_roots → R*.  R* must
+    // exist before the opening point so `a` follows the commitments.
+    let roots: Vec<[u8; 32]> = leaves.iter().map(|l| decider_commit_root_l1(&l.record)).collect();
+    let sub_roots: Vec<[u8; 32]> =
+        leaves.iter().zip(&roots).map(|(l, r)| f_bytes_of(r, &l.record)).collect();
+    let rstar = zone_root(&sub_roots);
+
+    // PASS 2 (open at the R*-bound F_ext point a): per-record openings at `a`.
+    let a = derive_point_a(&rstar, zone, epoch, inner_vars);
     let mut proofs = Vec::with_capacity(n);
     let mut values = Vec::with_capacity(n);
-    for l in leaves {
-        let (root, proof, v, _nv) = decider_commit_open_l1(&l.record, &a);
-        sub_roots.push(f_bytes_of(&root, &l.record)); // bind record to its commitment
-        roots.push(root);
+    for (l, &root) in leaves.iter().zip(&roots) {
+        let (root2, proof, v, _nv) = decider_open_at_ext_l1(&l.record, &a);
+        debug_assert_eq!(root2, root, "commit is deterministic across passes");
         proofs.push(proof);
         values.push(v);
     }
-    let rstar = zone_root(&sub_roots);
     EpochProofC1 { rstar, sub_roots, roots, proofs, values, inner_vars, epoch }
 }
 
@@ -122,9 +135,9 @@ pub fn verify_epoch_c1(proof: &EpochProofC1, zone: &str) -> Result<(), String> {
     if zone_root(&proof.sub_roots) != proof.rstar {
         return Err("epoch-c1: R* does not commit the sub-roots".into());
     }
-    let a = derive_point_a(zone, proof.epoch, proof.inner_vars);
+    let a = derive_point_a(&proof.rstar, zone, proof.epoch, proof.inner_vars);
     for i in 0..n {
-        if !decider_verify_rooted_l1(proof.roots[i], proof.proofs[i].clone(), &a, proof.values[i], proof.inner_vars) {
+        if !decider_verify_rooted_ext_l1(proof.roots[i], proof.proofs[i].clone(), &a, proof.values[i], proof.inner_vars) {
             return Err(format!("epoch-c1: record {i} opening/root check failed"));
         }
     }
@@ -148,9 +161,10 @@ pub fn verify_record_c1(proof: &EpochProofC1, opening: &RecordOpeningC1, zone: &
     if !merkle_path_verify(sub_root, i, &opening.path, proof.rstar) {
         return Err("record-c1: Merkle path to R* invalid".into());
     }
-    // Byte binding: R*_i's committed poly agrees with this record's MLE at a.
-    let a = derive_point_a(zone, proof.epoch, proof.inner_vars);
-    if lift_b128_to_b256(mle_eval(&opening.record, &a)) != proof.values[i] {
+    // Byte binding: R*_i's committed poly agrees with this record's MLE at the
+    // R*-derived F_ext point a (ε ≤ inner/2²⁵⁶).
+    let a = derive_point_a(&proof.rstar, zone, proof.epoch, proof.inner_vars);
+    if mle_eval_ext(&opening.record, &a) != proof.values[i] {
         return Err("record-c1: record's MLE(a) ≠ R*_i's opened value — R*_i does not commit this record".into());
     }
     Ok(())
