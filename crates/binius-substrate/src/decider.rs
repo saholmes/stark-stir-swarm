@@ -206,7 +206,7 @@ pub fn mle_eval_ext(evals_b128: &[B128], point_ext: &[B256]) -> B256 {
 
 /// Model C (C1) pass 1: commit only, returning the record's FRI commitment root
 /// R*_i (so R* = Merkle over {R*_i} can be built before the FS opening point).
-pub fn decider_commit_root_l1(p_b128: &[B128]) -> [u8; 32] {
+pub fn decider_commit_root_l1(p_b128: &[B128], security_bits: usize) -> [u8; 32] {
     let n_vars = p_b128.len().trailing_zeros() as usize;
     let evals: Vec<P1> = p_b128.iter().map(|&x| P1::broadcast(lift_b128_to_b256(x))).collect();
     let poly = MultilinearExtension::<P1>::new(n_vars, evals).unwrap();
@@ -215,7 +215,7 @@ pub fn decider_commit_root_l1(p_b128: &[B128]) -> [u8; 32] {
     let merkle_prover = BinaryMerkleTreeProver::<F1, Sha256, _>::new(Sha256Compression::default());
     let merkle_scheme = merkle_prover.scheme();
     let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
-        &commit_meta, merkle_scheme, SECURITY_BITS_L1, 1,
+        &commit_meta, merkle_scheme, security_bits, 1,
     )
     .unwrap();
     let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
@@ -228,7 +228,7 @@ pub fn decider_commit_root_l1(p_b128: &[B128]) -> [u8; 32] {
 
 /// Model C (C1) pass 2: commit + open at a genuine F_ext point (B256, no lift),
 /// returning `(root, proof_bytes, value, n_vars)`.  ε ≤ n/2²⁵⁶.
-pub fn decider_open_at_ext_l1(p_b128: &[B128], point_ext: &[B256]) -> ([u8; 32], Vec<u8>, B256, usize) {
+pub fn decider_open_at_ext_l1(p_b128: &[B128], point_ext: &[B256], security_bits: usize) -> ([u8; 32], Vec<u8>, B256, usize) {
     let n_vars = point_ext.len();
     assert_eq!(p_b128.len(), 1usize << n_vars, "P must have 2^|point| evals");
     let evals: Vec<P1> = p_b128.iter().map(|&x| P1::broadcast(lift_b128_to_b256(x))).collect();
@@ -240,7 +240,7 @@ pub fn decider_open_at_ext_l1(p_b128: &[B128], point_ext: &[B256]) -> ([u8; 32],
     let merkle_prover = BinaryMerkleTreeProver::<F1, Sha256, _>::new(Sha256Compression::default());
     let merkle_scheme = merkle_prover.scheme();
     let fri_params = make_commit_params_with_optimal_arity::<_, FEncode, _>(
-        &commit_meta, merkle_scheme, SECURITY_BITS_L1, 1,
+        &commit_meta, merkle_scheme, security_bits, 1,
     )
     .unwrap();
     let ntt = SingleThreadedNTT::<FEncode>::new(fri_params.rs_code().log_len()).unwrap();
@@ -279,13 +279,14 @@ pub fn decider_verify_rooted_ext_l1(
     point_ext: &[B256],
     value: B256,
     n_vars: usize,
+    security_bits: usize,
 ) -> bool {
     let point: Vec<F1> = point_ext.to_vec();
     let commit_meta = CommitMeta::with_vars([n_vars]);
     let merkle_prover = BinaryMerkleTreeProver::<F1, Sha256, _>::new(Sha256Compression::default());
     let merkle_scheme = merkle_prover.scheme();
     let fri_params = match make_commit_params_with_optimal_arity::<_, FEncode, _>(
-        &commit_meta, merkle_scheme, SECURITY_BITS_L1, 1,
+        &commit_meta, merkle_scheme, security_bits, 1,
     ) {
         Ok(p) => p,
         Err(_) => return false,
