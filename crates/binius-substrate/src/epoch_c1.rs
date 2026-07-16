@@ -12,10 +12,14 @@
 // COST: N per-record FRI verifies ⇒ ~seconds/epoch (the honest ~9–13 s at scale),
 // vs model A's ~ms — the trust↔cost tradeoff (docs/model-c-trustless-epoch.md §1).
 //
-// SCOPE (first C1 step): this wires + measures the epoch-level P↔R* binding.  The
-// remaining C1 sub-problem is CHEAP per-query record↔R*_i binding: R*_i is a FRI
-// commitment, so binding a record to it at µs cost (not recommitting ~ms/query)
-// needs a batched record-position opening — noted, not yet built.
+// Per-query record↔R*_i binding (trustless, µs): sub_root_i = SHA3(R*_i ‖ record_i)
+// is under R* (Merkle path), AND the epoch's opened value v_i at point a equals the
+// record's own MLE at a — so R*_i's committed P_i = record's MLE (Schwartz–Zippel),
+// i.e. R*_i commits EXACTLY that record.  No recommit; ~40 µs/query.
+//
+// SCOPE caveats: point a = FS(zone‖epoch) (production: FS(R*) via a commit-only
+// pass so a follows the commitments); the record-binding Schwartz–Zippel over
+// a ∈ B128^inner is ε ≤ inner/2^128 — for full L1 use an F_ext point or a second a.
 //
 // Run: cargo test --release --lib epoch_c1 -- --ignored
 
@@ -23,10 +27,20 @@ use sha3::{Digest, Sha3_256};
 
 use binius_field::BinaryField128b as F;
 
+use crate::accumulation::mle_eval;
 use crate::b256_field::B256;
 use crate::decider::{decider_commit_open_l1, decider_verify_rooted_l1, lift_b128_to_b256};
 use crate::epoch_fold::EpochLeaf;
 use crate::recursion::{merkle_auth_path, merkle_path_verify, merkle_tree_sha3};
+
+fn f_bytes_of(root: &[u8; 32], record: &[F]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(root);
+    for &e in record {
+        h.update(u128::from(binius_field::underlier::WithUnderlier::to_underlier(e)).to_le_bytes());
+    }
+    h.finalize().into()
+}
 
 fn f_from(parts: &[&[u8]]) -> F {
     let mut h = Sha3_256::new();
@@ -54,18 +68,22 @@ fn zone_root(roots: &[[u8; 32]]) -> [u8; 32] {
 }
 
 /// The trustless (C1) epoch proof: per-record FRI commitments + openings.
+/// `sub_roots[i] = SHA3(R*_i ‖ record_i)` binds each record to its commitment;
+/// R* is the Merkle parent over {sub_roots}.
 pub struct EpochProofC1 {
     pub rstar: [u8; 32],
-    pub roots: Vec<[u8; 32]>,   // R*_i per record
-    pub proofs: Vec<Vec<u8>>,   // per-record rooted opening
-    pub values: Vec<B256>,      // P_i(a)
+    pub sub_roots: Vec<[u8; 32]>, // SHA3(R*_i ‖ record_i)
+    pub roots: Vec<[u8; 32]>,     // R*_i per record (FRI commitment)
+    pub proofs: Vec<Vec<u8>>,     // per-record rooted opening
+    pub values: Vec<B256>,        // P_i(a)
     pub inner_vars: usize,
     pub epoch: u64,
 }
 
-/// Per-query membership opening: the record's commitment R*_i + Merkle path to R*.
+/// Per-query membership opening: the record + its commitment R*_i + Merkle path.
 pub struct RecordOpeningC1 {
     pub index: usize,
+    pub record: Vec<F>,
     pub root: [u8; 32],
     pub path: Vec<[u8; 32]>,
 }
@@ -80,27 +98,29 @@ pub fn fold_epoch_c1(leaves: &[EpochLeaf], zone: &str, epoch: u64) -> EpochProof
     let a = derive_point_a(zone, epoch, inner_vars);
 
     let mut roots = Vec::with_capacity(n);
+    let mut sub_roots = Vec::with_capacity(n);
     let mut proofs = Vec::with_capacity(n);
     let mut values = Vec::with_capacity(n);
     for l in leaves {
         let (root, proof, v, _nv) = decider_commit_open_l1(&l.record, &a);
+        sub_roots.push(f_bytes_of(&root, &l.record)); // bind record to its commitment
         roots.push(root);
         proofs.push(proof);
         values.push(v);
     }
-    let rstar = zone_root(&roots);
-    EpochProofC1 { rstar, roots, proofs, values, inner_vars, epoch }
+    let rstar = zone_root(&sub_roots);
+    EpochProofC1 { rstar, sub_roots, roots, proofs, values, inner_vars, epoch }
 }
 
 /// RESOLVER (once/epoch): TRUSTLESS verify — R* commits exactly {R*_i}, and each
 /// R*_i is a valid FRI commitment opening to P_i(a).  N per-record verifies.
 pub fn verify_epoch_c1(proof: &EpochProofC1, zone: &str) -> Result<(), String> {
     let n = proof.roots.len();
-    if !n.is_power_of_two() || n < 2 || proof.proofs.len() != n || proof.values.len() != n {
+    if !n.is_power_of_two() || n < 2 || proof.proofs.len() != n || proof.values.len() != n || proof.sub_roots.len() != n {
         return Err("epoch-c1: malformed proof".into());
     }
-    if zone_root(&proof.roots) != proof.rstar {
-        return Err("epoch-c1: R* does not commit the per-record roots".into());
+    if zone_root(&proof.sub_roots) != proof.rstar {
+        return Err("epoch-c1: R* does not commit the sub-roots".into());
     }
     let a = derive_point_a(zone, proof.epoch, proof.inner_vars);
     for i in 0..n {
@@ -111,21 +131,39 @@ pub fn verify_epoch_c1(proof: &EpochProofC1, zone: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// RESOLVER (per query): the record's commitment R*_i is under R*.  (See the SCOPE
-/// note: binding R*_i to the record's bytes at µs cost is the remaining C1 piece.)
-pub fn verify_record_c1(proof: &EpochProofC1, opening: &RecordOpeningC1) -> Result<(), String> {
-    if !merkle_path_verify(opening.root, opening.index, &opening.path, proof.rstar) {
+/// RESOLVER (per query): TRUSTLESS membership — the record is committed under R*
+/// AND R*_i (the epoch-verified FRI commitment) commits THIS record's bytes.
+/// (1) sub_root = SHA3(R*_i ‖ record) is under R* (Merkle path); (2) the epoch's
+/// opened value at `a` equals the record's own MLE at `a` — so R*_i's committed
+/// P_i = record's MLE (Schwartz–Zippel), i.e. R*_i commits exactly this record.
+pub fn verify_record_c1(proof: &EpochProofC1, opening: &RecordOpeningC1, zone: &str) -> Result<(), String> {
+    let i = opening.index;
+    if proof.roots.get(i) != Some(&opening.root) {
+        return Err("record-c1: R*_i ≠ epoch's committed root".into());
+    }
+    let sub_root = f_bytes_of(&opening.root, &opening.record);
+    if proof.sub_roots.get(i) != Some(&sub_root) {
+        return Err("record-c1: SHA3(R*_i ‖ record) ≠ epoch's sub-root".into());
+    }
+    if !merkle_path_verify(sub_root, i, &opening.path, proof.rstar) {
         return Err("record-c1: Merkle path to R* invalid".into());
     }
-    if proof.roots.get(opening.index) != Some(&opening.root) {
-        return Err("record-c1: root ≠ epoch's committed R*_i".into());
+    // Byte binding: R*_i's committed poly agrees with this record's MLE at a.
+    let a = derive_point_a(zone, proof.epoch, proof.inner_vars);
+    if lift_b128_to_b256(mle_eval(&opening.record, &a)) != proof.values[i] {
+        return Err("record-c1: record's MLE(a) ≠ R*_i's opened value — R*_i does not commit this record".into());
     }
     Ok(())
 }
 
-pub fn open_record_c1(proof: &EpochProofC1, index: usize) -> RecordOpeningC1 {
-    let tree = merkle_tree_sha3(&proof.roots);
-    RecordOpeningC1 { index, root: proof.roots[index], path: merkle_auth_path(&tree, index) }
+pub fn open_record_c1(proof: &EpochProofC1, index: usize, record: &[F]) -> RecordOpeningC1 {
+    let tree = merkle_tree_sha3(&proof.sub_roots);
+    RecordOpeningC1 {
+        index,
+        record: record.to_vec(),
+        root: proof.roots[index],
+        path: merkle_auth_path(&tree, index),
+    }
 }
 
 #[cfg(test)]
@@ -162,16 +200,21 @@ mod tests {
             let t = Instant::now();
             assert!(verify_epoch_c1(&proof, "se").is_ok(), "honest C1 epoch must verify (N={n})");
             let ve = t.elapsed().as_secs_f64() * 1e3;
-            let op = open_record_c1(&proof, n / 2);
+            let op = open_record_c1(&proof, n / 2, &ls[n / 2].record);
             let t = Instant::now();
-            assert!(verify_record_c1(&proof, &op).is_ok(), "record must open");
+            assert!(verify_record_c1(&proof, &op, "se").is_ok(), "record must open");
             let vr = t.elapsed().as_secs_f64() * 1e6;
-            // a tampered record commits to a different R*_i ⇒ R* recompute / opening fails.
+            // ★ record↔R*_i BYTE binding: claim a DIFFERENT record for the same slot ⇒
+            //   sub_root mismatch AND MLE(a) ≠ opened value ⇒ rejected.
+            let mut lying = open_record_c1(&proof, n / 2, &ls[n / 2].record);
+            lying.record[0] += F::ONE;
+            assert!(verify_record_c1(&proof, &lying, "se").is_err(), "a record not committed by R*_i must be rejected");
+            // a tampered record commits to a different R*_i ⇒ different R*.
             let mut bad_leaves = leaves(n, iv, 7);
             bad_leaves[1].record[0] += F::ONE;
             let bad = fold_epoch_c1(&bad_leaves, "se", 100);
             assert_ne!(bad.rstar, proof.rstar, "a tampered record must change R*");
-            // and swapping a proof's root vs a foreign one breaks the rooted opening.
+            // substituting a foreign R*_i breaks the rooted opening.
             let mut forged = fold_epoch_c1(&ls, "se", 100);
             forged.roots[1] = bad.roots[1];
             assert!(verify_epoch_c1(&forged, "se").is_err(), "a substituted R*_i must be rejected");
