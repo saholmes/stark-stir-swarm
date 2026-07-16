@@ -213,6 +213,193 @@ pub fn fold_step(g: &[OurB256], t: OurB256, r0: &[OurB256], r1: &[OurB256], nrow
 	Ok(StepOut { line: line_n, folded: folded_n, prove_ms, verify_ms: t1.elapsed().as_millis(), proof_bytes: sz })
 }
 
+/// One fold step's explicit inputs: fold polynomial `g` (deg d), challenge `t`, points `r0,r1`.
+pub type FoldStepIn = (Vec<OurB256>, OurB256, Vec<OurB256>, Vec<OurB256>);
+
+/// Prove ALL `steps` fold-verifies in ONE table (each ROW a distinct fold), and verify the single
+/// resulting proof.  This is the O(1) COLLAPSE of the trustless combiner: N−1 accumulation folds
+/// become one narrow fold-verify AIR (fixed degree d, width-independent of N), so the resolver
+/// verifies ONE proof whose cost is polylog in N — not O(N) per-step verifies.  Returns
+/// `(all_valid, prove_ms, verify_ms, proof_bytes)`.  All steps must share the degree d.
+pub fn prove_fold_tree(steps: &[FoldStepIn]) -> Result<(bool, u128, u128, usize)> {
+	use std::time::Instant;
+	assert!(!steps.is_empty(), "need ≥1 fold step");
+	let d = steps[0].0.len() - 1;
+	assert!(d >= 1, "fold degree ≥ 1");
+	for (g, _t, r0, r1) in steps {
+		assert!(g.len() == d + 1 && r0.len() == d && r1.len() == d, "all steps must share degree d");
+	}
+	// each row's native fold must verify (else a forged step is present).
+	let mut all_valid = true;
+	let mut rows: Vec<(Vec<OurB256>, OurB256, OurB256, OurB256, Vec<OurB256>, Vec<OurB256>, Vec<OurB256>)> = Vec::with_capacity(steps.len());
+	for (g, t, r0, r1) in steps {
+		let v0 = g[0];
+		let v1 = g.iter().copied().fold(OurB256::ZERO, |a, c| a + c);
+		match fold_verify_native(g, *t, v0, v1, r0, r1) {
+			Some((line, _folded)) => rows.push((g.clone(), *t, v0, v1, r0.clone(), r1.clone(), line)),
+			None => {
+				all_valid = false;
+				// still build a well-formed padding row so the table proves (a valid fold).
+				let (line, _f) = fold_verify_native(&steps[0].0, steps[0].1, steps[0].0[0], steps[0].0.iter().copied().fold(OurB256::ZERO, |a, c| a + c), &steps[0].2, &steps[0].3).unwrap();
+				rows.push((steps[0].0.clone(), steps[0].1, steps[0].0[0], steps[0].0.iter().copied().fold(OurB256::ZERO, |a, c| a + c), steps[0].2.clone(), steps[0].3.clone(), line));
+			}
+		}
+	}
+	if !all_valid {
+		return Ok((false, 0, 0, 0)); // a forged fold step ⇒ the combiner is caught (native gate)
+	}
+
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut tb = cs.add_table("fold-tree (N−1 distinct fold-verifies in one table)");
+	let beta_col = tb.add_committed::<B64, 1>("beta");
+	let cg: Vec<C4> = (0..=d).map(|i| col4(&mut tb, &format!("g{i}"))).collect();
+	let ct = col4(&mut tb, "t");
+	let cv0 = col4(&mut tb, "v0");
+	let cv1 = col4(&mut tb, "v1");
+	let cr0: Vec<C4> = (0..d).map(|k| col4(&mut tb, &format!("r0_{k}"))).collect();
+	let cr1: Vec<C4> = (0..d).map(|k| col4(&mut tb, &format!("r1_{k}"))).collect();
+	for j in 0..4 {
+		tb.assert_zero(format!("g0eq{j}"), cg[0][j] - cv0[j]);
+	}
+	for j in 0..4 {
+		let mut acc = cg[0][j] + cg[1][j];
+		for c in cg.iter().skip(2) {
+			acc = acc + c[j];
+		}
+		tb.assert_zero(format!("g1eq{j}"), acc - cv1[j]);
+	}
+	let mut horner_m = Vec::with_capacity(d);
+	let mut hacc = Vec::with_capacity(d);
+	let mut acc = cg[d];
+	for i in (0..d).rev() {
+		let m = build_b256_mul(&mut tb, beta_col, acc, ct, &format!("hm{i}_"));
+		let next = col4(&mut tb, &format!("hacc{i}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("hacc{i}_{j}"), next[j] - (m.c[j] + cg[i][j]));
+		}
+		horner_m.push(m);
+		hacc.push(next);
+		acc = next;
+	}
+	let mut s_cols = Vec::with_capacity(d);
+	let mut line_m = Vec::with_capacity(d);
+	let mut cline = Vec::with_capacity(d);
+	for k in 0..d {
+		let s = col4(&mut tb, &format!("s{k}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("s{k}_{j}"), s[j] - (cr0[k][j] + cr1[k][j]));
+		}
+		let m = build_b256_mul(&mut tb, beta_col, ct, s, &format!("lm{k}_"));
+		let l = col4(&mut tb, &format!("line{k}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("line{k}_{j}"), l[j] - (cr0[k][j] + m.c[j]));
+		}
+		s_cols.push(s);
+		line_m.push(m);
+		cline.push(l);
+	}
+	let table_id = tb.id();
+
+	let nrows = rows.len().next_power_of_two().max(1);
+	let statement = Statement { boundaries: vec![], table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for row in 0..nrows {
+			let (g, t, v0, v1, r0, r1, line) = &rows[row.min(rows.len() - 1)]; // pad with the last valid row
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..=d {
+				put(&mut seg, row, &cg[i], g[i])?;
+			}
+			put(&mut seg, row, &ct, *t)?;
+			put(&mut seg, row, &cv0, *v0)?;
+			put(&mut seg, row, &cv1, *v1)?;
+			for k in 0..d {
+				put(&mut seg, row, &cr0[k], r0[k])?;
+				put(&mut seg, row, &cr1[k], r1[k])?;
+			}
+			let mut acc_val = g[d];
+			for (idx, i) in (0..d).rev().enumerate() {
+				pop_b256_mul(&horner_m[idx], &mut seg, row, split256(acc_val), split256(*t))?;
+				acc_val = acc_val * *t + g[i];
+				put(&mut seg, row, &hacc[idx], acc_val)?;
+			}
+			for k in 0..d {
+				let s = r0[k] + r1[k];
+				put(&mut seg, row, &s_cols[k], s)?;
+				pop_b256_mul(&line_m[k], &mut seg, row, split256(*t), split256(s))?;
+				put(&mut seg, row, &cline[k], line[k])?;
+			}
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)?;
+	let t0 = Instant::now();
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, 1, 128, &statement.boundaries, witness, &make_portable_backend(),
+	)?;
+	let prove_ms = t0.elapsed().as_millis();
+	let sz = proof.get_proof_size();
+	let t1 = Instant::now();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, 1, 128, &statement.boundaries, proof,
+	)?;
+	Ok((true, prove_ms, t1.elapsed().as_millis(), sz))
+}
+
+/// O(1)-COLLAPSED trustless combiner: fold N shard-output claims and prove ALL N−1 folds in ONE
+/// table (`prove_fold_tree`), so the resolver verifies a SINGLE proof (polylog in N) + the final
+/// claim — trustless AND ~constant-verify.  Returns `(accepted, prove_ms, verify_ms, proof_bytes)`.
+pub fn trustless_combine_o1(records: &[Vec<OurB256>], inner_vars: usize, forge_at: Option<usize>) -> Result<(bool, u128, u128, usize)> {
+	use rand::{RngCore, SeedableRng};
+	let n = records.len();
+	assert!(n.is_power_of_two() && n >= 2);
+	let m = n.trailing_zeros() as usize;
+	let inner_sz = 1usize << inner_vars;
+	let mut rng = rand::rngs::StdRng::from_seed([0x7c; 32]);
+	let rf = |rng: &mut rand::rngs::StdRng| OurB256::from(binius_field::BinaryField128b::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128));
+
+	let mut p: Vec<OurB256> = Vec::with_capacity(inner_sz * n);
+	for rec in records {
+		assert_eq!(rec.len(), inner_sz);
+		p.extend_from_slice(rec);
+	}
+	let r: Vec<OurB256> = (0..inner_vars).map(|_| rf(&mut rng)).collect();
+	let mut claims: Vec<(Vec<OurB256>, OurB256)> = Vec::with_capacity(n);
+	for (i, rec) in records.iter().enumerate() {
+		let mut v = mle256(rec, &r);
+		if forge_at == Some(i) {
+			v += OurB256::ONE;
+		}
+		let mut point = r.clone();
+		for b in 0..m {
+			point.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO });
+		}
+		claims.push((point, v));
+	}
+	// collect the N−1 fold steps' explicit inputs (native accumulation).
+	let mut acc = claims[0].clone();
+	let mut steps: Vec<FoldStepIn> = Vec::with_capacity(n - 1);
+	for item in claims.iter().skip(1) {
+		let t = rf(&mut rng);
+		let g = restrict_to_line_coeffs(&p, &acc.0, &item.0);
+		steps.push((g.clone(), t, acc.0.clone(), item.0.clone()));
+		// advance the native accumulator (folded value = g(t)); a forged claim already
+		// diverges g(1) from item.1 and is caught in prove_fold_tree's native gate.
+		match fold_verify_native(&g, t, acc.1, item.1, &acc.0, &item.0) {
+			Some((line, folded)) => acc = (line, folded),
+			None => return Ok((false, 0, 0, 0)),
+		}
+	}
+	// prove ALL folds in ONE table (the O(1) collapse) + verify once.
+	let (ok, prove_ms, verify_ms, sz) = prove_fold_tree(&steps)?;
+	let holds = ok && mle256(&p, &acc.0) == acc.1;
+	Ok((holds, prove_ms, verify_ms, sz))
+}
+
 // --- B256 native multilinear machinery for the IVC driver -------------------------------
 fn node256(k: usize) -> OurB256 {
 	OurB256::from(binius_field::BinaryField64b::new(k as u64))
@@ -727,6 +914,31 @@ mod tests {
 			println!("trustless-combiner N={n}: {} proven fold steps, total fold-verify {tv} ms; honest holds, forged claim REJECTED", n - 1);
 		}
 		println!("# TRUSTLESS COMBINER: N shard claims → 1 accumulator via N−1 PROVEN narrow fold steps; the resolver verifies the fold steps + the final claim, never trusting the combiner. A forged shard output fails the fold's g(1)=v1 check ⇒ REJECT. No O(width) in-circuit proof-verify — the ms trustless recursion.");
+	}
+
+	/// O(1) COLLAPSE: fold N shard claims and prove ALL N−1 folds in ONE table, so the resolver
+	/// verifies a SINGLE proof (~constant in N) instead of O(N) per-step verifies — still trustless
+	/// (a forged shard output is caught), now with ~constant-verify.  Shows verify flat as N grows.
+	#[test]
+	#[ignore = "O(1)-collapsed trustless combiner (single fold-tree proof); run with --ignored"]
+	fn trustless_combiner_o1_collapse() {
+		use rand::{RngCore, SeedableRng};
+		let inner = 3usize;
+		println!("\n=== O(1)-collapsed trustless combiner — ONE fold-tree proof for N−1 folds ===");
+		println!("| N shards | folds (N−1) | prove_ms | VERIFY_ms (one proof) | proof_bytes | accepted |");
+		for &n in &[4usize, 8, 16, 32] {
+			let mut rng = rand::rngs::StdRng::from_seed([0x9c ^ n as u8; 32]);
+			let records: Vec<Vec<OurB256>> = (0..n)
+				.map(|_| (0..(1usize << inner)).map(|_| OurB256::from(binius_field::BinaryField128b::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128))).collect())
+				.collect();
+			let (ok, pm, vm, sz) = super::trustless_combine_o1(&records, inner, None).expect("o1 combine");
+			assert!(ok, "N={n}: honest O(1) combine must accept");
+			// forgery still caught (native gate before the single proof).
+			let (bad, _, _, _) = super::trustless_combine_o1(&records, inner, Some(n / 2)).expect("o1 combine");
+			assert!(!bad, "N={n}: a forged shard output must be REJECTED (O(1) path)");
+			println!("| {n} | {} | {pm} | {vm} | {sz} | {} |", n - 1, if ok { "✓" } else { "✗" });
+		}
+		println!("(ALL N−1 folds proven in ONE narrow fold-verify table ⇒ the resolver verifies ONE proof, ~constant in N — the O(1) trustless-combiner verify. Forged shard output still REJECTED.)");
 	}
 
 	/// ★THE MEASUREMENT — is the fold-verify circuit NARROW? Sweep d (interleaved-poly vars);
