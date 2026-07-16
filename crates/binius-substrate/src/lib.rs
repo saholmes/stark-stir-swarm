@@ -161,6 +161,7 @@ pub mod seam_aggregation; // pi_hash-bound aggregation of seam OOD claims via th
 pub mod epoch_fold; // piece 2 (model A): fold epoch record leaves into one proof w/ zone Merkle root R* as public input
 pub mod decider; // committed-decider open/verify (non-test) + B128↔B256 subfield lift for the epoch fold
 pub mod epoch_c1; // model C / C1: trustless P<->R* via per-record FRI commitments
+pub mod epoch_c2; // model C / C2: attest record validity (statement leaf + validity slot)
 pub mod standalone_record; // Outcome 1: ML-DSA-signed record update -> epoch_fold leaf
 pub mod accumulation_air; // Option-3: the in-circuit fold-verify — is it narrow? (the ms-recursion measurement)
 pub mod streaming_commit; // Option-3: low-RSS streaming interleaved-batch commit (closes the integration gap)
