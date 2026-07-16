@@ -1626,6 +1626,256 @@ pub fn run_combine_shard(specs: &[CombineSpec], tamper: Option<usize>, do_prove:
 	Ok((proof_size, rss))
 }
 
+// ── DIGIT strand constants (ML-DSA-44 / NIST L1) ────────────────────────────
+const GAMMA2: u64 = 95232;
+const ALPHA: u64 = 190464; // 2·γ2
+const MM: u64 = 44; // (q−1)/α — the HighBits modulus
+
+/// Native Decompose+UseHint (FIPS 204 Alg 36/40): returns `(r1, v0, s, sp, hs, w1, qp)` for
+/// a reduced input `r < q` and hint bit `h`, all the witness values the DigitBatch commits.
+pub fn digit_native(r: u64, h: u64) -> (u64, u64, u64, u64, u64, u64, u64) {
+	let (q, a, m) = (Q as i64, ALPHA as i64, MM as i64);
+	let rp = (r as i64).rem_euclid(q);
+	let mut r0 = rp.rem_euclid(a);
+	if r0 > a / 2 {
+		r0 -= a;
+	}
+	// FIPS 204 Decompose special case: if r⁺ − r0 == q−1 then r1 = 0 and r0 -= 1.
+	let r1 = if rp - r0 == q - 1 {
+		r0 -= 1;
+		0
+	} else {
+		(rp - r0) / a
+	};
+	let v0 = (r0 + GAMMA2 as i64) as u64; // ∈ [1, α]
+	let s = ((rp + GAMMA2 as i64 - r1 * a - v0 as i64) / q) as u64; // ∈ {0,1}
+	let sp = if r0 > 0 { 1u64 } else { 0 };
+	let hs = h * sp;
+	let w1 = if h == 1 {
+		if r0 > 0 { (r1 + 1).rem_euclid(m) as u64 } else { (r1 - 1).rem_euclid(m) as u64 }
+	} else {
+		r1 as u64
+	};
+	let qp = ((w1 as i64 + m + h as i64 - r1 - 2 * hs as i64) / m) as u64; // ∈ {0,1,2}
+	(r1 as u64, v0, s, sp, hs, w1, qp)
+}
+
+/// Tall-narrow DIGIT strand (S1d prove-4a/4b): each ROW takes one coefficient's w′ (= `r`, from
+/// the InvNTT output seam) and hint bit `h`, and computes `w1 = UseHint(h, Decompose(r))` — the
+/// two load-bearing digit identities in one row, row-per-coefficient ⇒ tall-narrow + shardable.
+///   Decompose:  r + γ2 = r1·α + v0 + s·q,  r1 < m,  v0 ∈ [1, α],  s ∈ {0,1}
+///   UseHint:    w1 + m + h = r1 + 2·hs + qp·m,  hs = h·sp,  w1 < m,  qp ∈ {0,1,2}
+/// r is PULLED from `flow` (the InvNTT output seam), h pulled, w1 PUSHED downstream (→ w1Encode).
+pub struct DigitBatch {
+	pub table_id: TableId,
+	r: Col<B1, W>,
+	v0: Col<B1, W>,
+	r1: Col<B1, W>,
+	s: Col<B1, W>,
+	h: Col<B1, W>,
+	sp: Col<B1, W>,
+	hs: Col<B1, W>,
+	w1: Col<B1, W>,
+	qp: Col<B1, W>,
+	r1a: ShiftSumMul,
+	sq: ShiftSumMul,
+	dadd0: Adder<W>,
+	dadd1: Adder<W>,
+	dlhs: Adder<W>,
+	v0m1: Adder<W>,
+	r1_lt: LtQ,
+	v0_lt: LtQ,
+	s_rng: ShrZero,
+	sp_rng: ShrZero,
+	h_rng: ShrZero,
+	qp_lt: LtQ,
+	w1_lt: LtQ,
+	hs2: Col<B1, W>,
+	qpm: ShiftSumMul,
+	ulhs0: Adder<W>,
+	ulhs: Adder<W>,
+	urhs0: Adder<W>,
+	urhs1: Adder<W>,
+	pos: [Col<B1, W>; 3], // [pos_r, pos_h, pos_w1]
+	c_m: Col<B1, W>,
+	c_a: Col<B1, W>,
+	c_3: Col<B1, W>,
+	g2: Col<B1, W>,
+	mc: Col<B1, W>,
+	allones: Col<B1, W>,
+}
+
+impl DigitBatch {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, flow: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow DIGIT batch (Decompose+UseHint)");
+		let cst = |t: &mut TableBuilder<OurB256>, nm: &str, x: u64| -> Col<B1, W> {
+			t.add_constant(nm, std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }))
+		};
+		let q_set = set_bits_of(Q);
+		let alpha_set = set_bits_of(ALPHA);
+		let m_set = set_bits_of(MM);
+		let c_m = cst(&mut t, "c_m", to_u64(&two_pow_w_minus(&bits64(MM))));
+		let c_a = cst(&mut t, "c_a", to_u64(&two_pow_w_minus(&bits64(ALPHA))));
+		let c_3 = cst(&mut t, "c_3", to_u64(&two_pow_w_minus(&bits64(3))));
+		let g2 = cst(&mut t, "g2", GAMMA2);
+		let mc = cst(&mut t, "mc", MM);
+		let allones = cst(&mut t, "allones", u64::MAX);
+
+		let r = t.add_committed::<B1, W>("r");
+		let v0 = t.add_committed::<B1, W>("v0");
+		let r1 = t.add_committed::<B1, W>("r1");
+		let s = t.add_committed::<B1, W>("s");
+		let h = t.add_committed::<B1, W>("h");
+		let sp = t.add_committed::<B1, W>("sp");
+		let hs = t.add_committed::<B1, W>("hs");
+		let w1 = t.add_committed::<B1, W>("w1");
+		let qp = t.add_committed::<B1, W>("qp");
+
+		// DECOMPOSE: r + γ2 == r1·α + v0 + s·q.
+		let r1a = ShiftSumMul::build(&mut t, "r1a", r1, &alpha_set);
+		let sq = ShiftSumMul::build(&mut t, "sq", s, &q_set);
+		let dadd0 = Adder::<W>::build(&mut t, r1a.result, v0, "dadd0");
+		let dadd1 = Adder::<W>::build(&mut t, dadd0.sum, sq.result, "dadd1");
+		let dlhs = Adder::<W>::build(&mut t, r, g2, "dlhs");
+		t.assert_zero("decompose_id", dlhs.sum - dadd1.sum);
+		let r1_lt = LtQ::build(&mut t, "r1", r1, c_m); // r1 < m
+		let v0m1 = Adder::<W>::build(&mut t, v0, allones, "v0m1"); // v0 − 1
+		let v0_lt = LtQ::build(&mut t, "v0", v0m1.sum, c_a); // v0 − 1 < α
+		let s_rng = ShrZero::build(&mut t, "s", s, 1);
+
+		// USEHINT: w1 + m + h == r1 + 2·hs + qp·m, hs = h·sp.
+		let sp_rng = ShrZero::build(&mut t, "sp", sp, 1);
+		let h_rng = ShrZero::build(&mut t, "h", h, 1);
+		t.assert_zero("hs_def", hs - h * sp);
+		let qp_lt = LtQ::build(&mut t, "qp", qp, c_3); // qp < 3
+		let qpm = ShiftSumMul::build(&mut t, "qpm", qp, &m_set); // qp·m
+		let hs2 = t.add_shifted("hs2", hs, WLOG, 1, ShiftVariant::LogicalLeft); // 2·hs
+		let ulhs0 = Adder::<W>::build(&mut t, w1, mc, "ulhs0"); // w1 + m
+		let ulhs = Adder::<W>::build(&mut t, ulhs0.sum, h, "ulhs"); // + h
+		let urhs0 = Adder::<W>::build(&mut t, hs2, qpm.result, "urhs0"); // 2hs + qp·m
+		let urhs1 = Adder::<W>::build(&mut t, r1, urhs0.sum, "urhs1"); // r1 + …
+		t.assert_zero("usehint_id", ulhs.sum - urhs1.sum);
+		let w1_lt = LtQ::build(&mut t, "w1", w1, c_m); // w1 < m
+
+		// seam: pull r (w′ from InvNTT), h; push w1.
+		let pos: [Col<B1, W>; 3] = std::array::from_fn(|k| t.add_committed::<B1, W>(format!("pos{k}")));
+		let b = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, nm: &str| -> Col<B64, 1> { t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b"), col) };
+		let (pr, vr) = (b(&mut t, pos[0], "pr"), b(&mut t, r, "vr"));
+		t.pull(flow, [pr, vr]);
+		let (ph, vh) = (b(&mut t, pos[1], "ph"), b(&mut t, h, "vh"));
+		t.pull(flow, [ph, vh]);
+		let (pw, vw) = (b(&mut t, pos[2], "pw"), b(&mut t, w1, "vw"));
+		t.push(flow, [pw, vw]);
+
+		Self {
+			table_id: t.id(), r, v0, r1, s, h, sp, hs, w1, qp,
+			r1a, sq, dadd0, dadd1, dlhs, v0m1, r1_lt, v0_lt, s_rng, sp_rng, h_rng, qp_lt, w1_lt,
+			hs2, qpm, ulhs0, ulhs, urhs0, urhs1, pos, c_m, c_a, c_3, g2, mc, allones,
+		}
+	}
+
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, r: u64, h: u64, pos: [u64; 3]) -> Result<u64> {
+		let (r1, v0, s, sp, hs, w1, qp) = digit_native(r, h);
+		let wr = |seg: &mut TableWitnessSegment<OurB256>, c: Col<B1, W>, x: u64| write_col::<W>(seg, c, row, &bits64(x));
+		wr(seg, self.r, r)?;
+		wr(seg, self.v0, v0)?;
+		wr(seg, self.r1, r1)?;
+		wr(seg, self.s, s)?;
+		wr(seg, self.h, h)?;
+		wr(seg, self.sp, sp)?;
+		wr(seg, self.hs, hs)?;
+		wr(seg, self.w1, w1)?;
+		wr(seg, self.qp, qp)?;
+		wr(seg, self.c_m, to_u64(&two_pow_w_minus(&bits64(MM))))?;
+		wr(seg, self.c_a, to_u64(&two_pow_w_minus(&bits64(ALPHA))))?;
+		wr(seg, self.c_3, to_u64(&two_pow_w_minus(&bits64(3))))?;
+		wr(seg, self.g2, GAMMA2)?;
+		wr(seg, self.mc, MM)?;
+		wr(seg, self.allones, u64::MAX)?;
+		// decompose
+		let r1a = self.r1a.populate(seg, row, &bits64(r1))?;
+		let sq = self.sq.populate(seg, row, &bits64(s))?;
+		let d0 = self.dadd0.populate(seg, row, &r1a, &bits64(v0))?;
+		self.dadd1.populate(seg, row, &d0, &sq)?;
+		self.dlhs.populate(seg, row, &bits64(r), &bits64(GAMMA2))?;
+		self.r1_lt.populate(seg, row, &bits64(r1), &two_pow_w_minus(&bits64(MM)))?;
+		let v0m1 = self.v0m1.populate(seg, row, &bits64(v0), &bits64(u64::MAX))?;
+		self.v0_lt.populate(seg, row, &v0m1, &two_pow_w_minus(&bits64(ALPHA)))?;
+		self.s_rng.populate(seg, row, &bits64(s))?;
+		// usehint
+		self.sp_rng.populate(seg, row, &bits64(sp))?;
+		self.h_rng.populate(seg, row, &bits64(h))?;
+		self.qp_lt.populate(seg, row, &bits64(qp), &two_pow_w_minus(&bits64(3)))?;
+		let qpm = self.qpm.populate(seg, row, &bits64(qp))?;
+		write_col::<W>(seg, self.hs2, row, &shl(&bits64(hs), 1))?;
+		let ul0 = self.ulhs0.populate(seg, row, &bits64(w1), &bits64(MM))?;
+		self.ulhs.populate(seg, row, &ul0, &bits64(h))?;
+		let ur0 = self.urhs0.populate(seg, row, &shl(&bits64(hs), 1), &qpm)?;
+		self.urhs1.populate(seg, row, &bits64(r1), &ur0)?;
+		self.w1_lt.populate(seg, row, &bits64(w1), &two_pow_w_minus(&bits64(MM)))?;
+		for (k, &p) in pos.iter().enumerate() {
+			write_col::<W>(seg, self.pos[k], row, &bits64(p))?;
+		}
+		Ok(w1)
+	}
+}
+
+/// One digit coefficient's fleet-shard spec: `(r = w′, h)` and seam positions `[pos_r, pos_h, pos_w1]`.
+#[derive(Clone, Copy)]
+pub struct DigitSpec {
+	pub r: u64,
+	pub h: u64,
+	pub pos: [u64; 3],
+}
+
+/// FLEET SHARD of the DIGIT strand: prove a row-block of Decompose+UseHint coefficients as a
+/// standalone low-RSS proof, I/O as seam boundary flushes on `flow` (r/h boundary-PUSHed = the
+/// InvNTT output + the signature hint; w1 boundary-PULLed = the w1Encode input).  `tamper`
+/// corrupts a coefficient's committed hint `h`.
+pub fn run_digit_shard(specs: &[DigitSpec], tamper: Option<usize>, do_prove: bool) -> Result<(usize, u64)> {
+	assert!(specs.len().is_power_of_two(), "digit shard size must be a power of two");
+	let nrows = specs.len();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let flow = cs.add_channel("digit-flow");
+	let db = DigitBatch::build(&mut cs, flow);
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for sp in specs {
+		let (_, _, _, _, _, w1, _) = digit_native(sp.r, sp.h);
+		boundaries.push(Boundary { values: vec![bval(sp.pos[0]), bval(sp.r)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(sp.pos[1]), bval(sp.h)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(sp.pos[2]), bval(w1)], channel_id: flow, direction: FlushDirection::Pull, multiplicity: 1 });
+	}
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(db.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, sp) in specs.iter().enumerate() {
+			let h_use = if tamper == Some(row) { 1 - sp.h } else { sp.h };
+			db.populate(&mut seg, row, sp.r, h_use, sp.pos)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	if !do_prove {
+		return Ok((0, 0));
+	}
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+	)?;
+	let proof_size = proof.get_proof_size();
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	let vt = std::time::Instant::now();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof,
+	)?;
+	VERIFY_US.store(vt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+	Ok((proof_size, rss))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -1989,6 +2239,55 @@ mod tests {
 			println!("| {g} | {per} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
 		}
 		println!("(combine joins the fleet: independent per-shard proofs; per-shard VERIFY is aggregation cost, folded into the succinct epoch proof.)");
+	}
+
+	fn digit_specs(count: usize, seed: u64) -> Vec<super::DigitSpec> {
+		let mut rng = StdRng::seed_from_u64(seed);
+		(0..count)
+			.map(|i| super::DigitSpec { r: rng.next_u64() % Q, h: rng.next_u64() % 2, pos: std::array::from_fn(|k| (k * 4096 + i) as u64) })
+			.collect()
+	}
+
+	/// The DIGIT strand wired into the fleet: a row-block of w1 = UseHint(h, Decompose(w′))
+	/// coefficients proves as a standalone shard (r/h/w1 = seam boundary flushes on `flow`).
+	/// Honest validates over B256; a flipped hint bit (committed h ≠ boundary seam token) is
+	/// REJECTED.  Same shard shape as NTT/combine — so digit joins the fleet on `flow`.
+	#[test]
+	fn digit_strand_sharded_across_fleet() {
+		// spot-check the native Decompose+UseHint identities hold for the witness it commits.
+		for r in [0u64, 1, 95232, 190464, Q - 1, 4_000_000] {
+			for h in [0u64, 1] {
+				let (r1, v0, s, sp, hs, w1, qp) = super::digit_native(r, h);
+				assert_eq!(r + super::GAMMA2, r1 * super::ALPHA + v0 + s * Q, "decompose id r={r}");
+				assert_eq!(w1 + super::MM + h, r1 + 2 * hs + qp * super::MM, "usehint id r={r} h={h}");
+				assert!(r1 < super::MM && w1 < super::MM && qp < 3 && s < 2 && sp < 2, "ranges r={r}");
+			}
+		}
+		for &sz in &[4usize, 8, 16] {
+			let specs = digit_specs(sz, 0xD1671 ^ sz as u64);
+			super::run_digit_shard(&specs, None, false).unwrap_or_else(|e| panic!("digit shard sz={sz} must validate: {e}"));
+			assert!(super::run_digit_shard(&specs, Some(sz / 2), false).is_err(), "digit shard sz={sz}: a flipped hint must be REJECTED");
+		}
+		println!("GATE digit-fleet: the Decompose+UseHint digit strand shards as standalone low-RSS proofs (I/O seams on `flow`); honest validates, flipped hint REJECTED");
+	}
+
+	/// MEASURE: the digit strand's per-shard FRI-prove time + peak RSS (256 coeffs split G ways).
+	#[test]
+	#[ignore = "digit per-shard prove RSS/time; run ALONE with --ignored"]
+	fn digit_shard_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== fleet per-shard DIGIT prove over B256 @L1(128) — 256 coeffs split G ways ===");
+		println!("| G shards | coeffs/shard | prove_ms/shard | VERIFY_ms/shard | proof_bytes | peak_rss_MiB |");
+		for &g in &[4usize, 8, 16, 32] {
+			let per = 256 / g;
+			let specs = digit_specs(per, 0xD1671 ^ (g as u64) << 20);
+			let t = Instant::now();
+			let (bytes, rss) = super::run_digit_shard(&specs, None, true).expect("digit shard prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			let vms = super::VERIFY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+			println!("| {g} | {per} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
+		}
+		println!("(digit joins the fleet: independent per-shard proofs, per-shard RSS well under 500 MiB.)");
 	}
 
 	/// END-TO-END: fleet-prove the NTT + combine shards (validity, low RSS, parallel), then
