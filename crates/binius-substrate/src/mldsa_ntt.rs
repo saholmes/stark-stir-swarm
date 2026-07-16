@@ -1395,6 +1395,7 @@ pub fn run_stage_shard(specs: &[ButterflySpec], tamper: Option<usize>, do_prove:
 	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
 	let proof_size = proof.get_proof_size();
 	let rss = crate::b256_sha3::peak_rss_bytes();
+	let vt = std::time::Instant::now();
 	binius_core::constraint_system::verify::<
 		U256,
 		B256TowerFamily,
@@ -1402,8 +1403,12 @@ pub fn run_stage_shard(specs: &[ButterflySpec], tamper: Option<usize>, do_prove:
 		Sha256Compression,
 		HasherChallenger<Sha256>,
 	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof)?;
+	VERIFY_US.store(vt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 	Ok((proof_size, rss))
 }
+
+/// Last shard VERIFY time in µs (for the measurement tests; a shard's resolver-side cost).
+pub static VERIFY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Split a full forward `n`-NTT's stage `s` into `g` fleet-shard specs (row-blocks of its n/2
 /// butterflies).  Each returned Vec is one shard's butterflies, ready for `run_stage_shard`.
@@ -1613,9 +1618,11 @@ pub fn run_combine_shard(specs: &[CombineSpec], tamper: Option<usize>, do_prove:
 	)?;
 	let proof_size = proof.get_proof_size();
 	let rss = crate::b256_sha3::peak_rss_bytes();
+	let vt = std::time::Instant::now();
 	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
 		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof,
 	)?;
+	VERIFY_US.store(vt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 	Ok((proof_size, rss))
 }
 
@@ -1921,7 +1928,7 @@ mod tests {
 	fn stage_shard_prove_scaling() {
 		use std::time::Instant;
 		println!("\n=== fleet per-shard prove over B256 @L1(128) — stage of a 256-NTT, split G ways ===");
-		println!("| G shards | butterflies/shard | prove_ms/shard | proof_bytes | peak_rss_MiB |");
+		println!("| G shards | butterflies/shard | prove_ms/shard | VERIFY_ms/shard | proof_bytes | peak_rss_MiB |");
 		let n = 256usize;
 		let mut rng = StdRng::seed_from_u64(0xF1EE7);
 		let x = rand_zq(&mut rng, n);
@@ -1930,9 +1937,10 @@ mod tests {
 			let t = Instant::now();
 			let (bytes, rss) = super::run_stage_shard(&shards[0], None, true).expect("shard prove");
 			let ms = t.elapsed().as_secs_f64() * 1e3;
-			println!("| {g} | {} | {ms:.0} | {bytes} | {:.0} |", shards[0].len(), rss as f64 / (1024.0 * 1024.0));
+			let vms = super::VERIFY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+			println!("| {g} | {} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", shards[0].len(), rss as f64 / (1024.0 * 1024.0));
 		}
-		println!("(each shard is an independent proof ⇒ runs on its own fleet processor; peak RSS is per-shard, well under 500 MiB.)");
+		println!("(each shard is an independent proof ⇒ runs on its own fleet processor; peak RSS per-shard < 500 MiB; per-shard VERIFY is the aggregation cost — shards recurse into ONE succinct epoch proof the resolver verifies once.)");
 	}
 
 	fn combine_specs(count: usize, seed: u64) -> Vec<super::CombineSpec> {
@@ -1970,16 +1978,17 @@ mod tests {
 	fn combine_shard_prove_scaling() {
 		use std::time::Instant;
 		println!("\n=== fleet per-shard COMBINE prove over B256 @L1(128) — 256 coeffs split G ways ===");
-		println!("| G shards | coeffs/shard | prove_ms/shard | proof_bytes | peak_rss_MiB |");
+		println!("| G shards | coeffs/shard | prove_ms/shard | VERIFY_ms/shard | proof_bytes | peak_rss_MiB |");
 		for &g in &[4usize, 8, 16, 32] {
 			let per = 256 / g;
 			let specs = combine_specs(per, 0xC0FFEE ^ (g as u64) << 20);
 			let t = Instant::now();
 			let (bytes, rss) = super::run_combine_shard(&specs, None, true).expect("combine shard prove");
 			let ms = t.elapsed().as_secs_f64() * 1e3;
-			println!("| {g} | {per} | {ms:.0} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
+			let vms = super::VERIFY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+			println!("| {g} | {per} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
 		}
-		println!("(combine joins the fleet: independent per-shard proofs, per-shard RSS well under 500 MiB.)");
+		println!("(combine joins the fleet: independent per-shard proofs; per-shard VERIFY is aggregation cost, folded into the succinct epoch proof.)");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
