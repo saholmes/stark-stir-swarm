@@ -769,6 +769,30 @@ mod tests {
 		println!("GATE twiddles: forward NTT evaluates at n distinct roots of X^n+1 for n∈{{8..256}}; ntt_ref == direct evaluation");
 	}
 
+	/// MEASURE: forward-NTT FRI-prove wall-time + peak RSS over B256 @L1, swept over n.
+	/// Sizes the S1d fleet shards: a full 256-pt NTT is 1024 butterflies in ONE wide row —
+	/// FRI-impractical as a single strand (see `validate`'s docstring); this curve shows how
+	/// prove-time grows with butterfly count so the transform can be sharded into fleet-sized
+	/// strands whose peak RSS stays IoT-viable (<500 MiB).  Run ALONE (RSS is process-global).
+	#[test]
+	#[ignore = "NTT prove-scaling sweep (time+RSS); run ALONE: cargo test --release --lib --features parallel ntt_prove_scaling -- --ignored --nocapture"]
+	fn ntt_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== NTT forward-prove scaling over B256 @L1(128) — time + peak RSS ===");
+		println!("| n | butterflies | prove_ms | proof_bytes | peak_rss_MiB (running high-water) |");
+		for &n in &[8usize, 16, 32, 64] {
+			let mut rng = StdRng::seed_from_u64(0x4E7700 ^ n as u64);
+			let x = rand_zq(&mut rng, n);
+			let t = Instant::now();
+			let (bytes, _out) = super::prove(n, false, &x).expect("NTT prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			let rss = crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0);
+			let bf = (n / 2) * (n.trailing_zeros() as usize); // n/2 per layer × log2(n) layers
+			println!("| {n} | {bf} | {ms:.0} | {bytes} | {rss:.0} |");
+		}
+		println!("(full 256-pt NTT = 1024 butterflies; extrapolate prove-time, and shard so each fleet strand's RSS < 500 MiB.)");
+	}
+
 	/// Pure-integer round-trip: the constructed inverse truly inverts the forward.
 	#[test]
 	fn reference_roundtrip_is_identity() {
