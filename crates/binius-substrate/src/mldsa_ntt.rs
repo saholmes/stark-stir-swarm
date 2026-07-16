@@ -41,7 +41,11 @@
 // strand cut can partition without touching the arithmetic — see `Butterfly`/`InvOp`.
 
 use anyhow::Result;
-use binius_core::{constraint_system::channel::ChannelId, fiat_shamir::HasherChallenger, oracle::ShiftVariant};
+use binius_core::{
+	constraint_system::channel::{Boundary, ChannelId, FlushDirection},
+	fiat_shamir::HasherChallenger,
+	oracle::ShiftVariant,
+};
 use binius_field::Field;
 use binius_hash::sha2::Sha256Compression;
 use binius_m3::builder::{
@@ -832,10 +836,12 @@ impl ButterflyBatch {
 	/// PULLs `[pos_u, u]` and `[pos_v, v]` and PUSHes `[pos_add, o_add]` and `[pos_sub, o_sub]`
 	/// on `chan` — a uniform flush, so the entire stage batches into one tall-narrow table
 	/// (keeping the 15.6 s / 63 MiB regime) while the position in the key distinguishes slots.
-	/// Positions are committed columns (populated from the public CT schedule); pinning them —
-	/// and the twiddle ζ — to the schedule in-circuit (a manual B256 lookup, since M3's
-	/// `LookupProducer` is B128-only) is the remaining soundness step (docs step 2).
-	pub fn build_seamed_positional(cs: &mut ConstraintSystem<OurB256>, chan: ChannelId) -> Self {
+	/// `sched` PINS the schedule: each row PULLs its `[pos_u, pos_v, pos_a, pos_s, ζ]` tuple from
+	/// `sched`, and the caller PUSHes the stage's n/2 public schedule tuples as boundary flushes
+	/// (Statement boundaries).  Balance then forces every row's positions AND twiddle to be a
+	/// genuine schedule entry, each used exactly once — so positions/ζ are constrained, not merely
+	/// populated.  Row order is irrelevant (positions pin the routing; ζ is bound to its slots).
+	pub fn build_seamed_positional(cs: &mut ConstraintSystem<OurB256>, chan: ChannelId, sched: ChannelId) -> Self {
 		let mut t = cs.add_table("mldsa tall-narrow POSITIONAL forward-butterfly stage");
 		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
 		let c_col = t.add_constant("c_q", c_arr);
@@ -853,19 +859,21 @@ impl ButterflyBatch {
 		let pos_v = t.add_committed::<B1, W>("pos_v");
 		let pos_a = t.add_committed::<B1, W>("pos_a");
 		let pos_s = t.add_committed::<B1, W>("pos_s");
-		let flush = |t: &mut TableBuilder<OurB256>, pos: Col<B1, W>, val: Col<B1, W>, nm: &str, pull: bool| {
-			let pb = t.add_packed::<B1, 64, B64, 1>(format!("{nm}_pos_b64"), pos);
-			let vb = t.add_packed::<B1, 64, B64, 1>(format!("{nm}_val_b64"), val);
-			if pull {
-				t.pull(chan, [pb, vb]);
-			} else {
-				t.push(chan, [pb, vb]);
-			}
+		// pack every routed/pinned coefficient to its single B64 lane.
+		let b64 = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, nm: &str| -> Col<B64, 1> {
+			t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64"), col)
 		};
-		flush(&mut t, pos_u, u, "pu", true);
-		flush(&mut t, pos_v, v, "pv", true);
-		flush(&mut t, pos_a, add.out, "pa", false);
-		flush(&mut t, pos_s, sub.out, "ps", false);
+		let (pu_b, pv_b, pa_b, ps_b, z_b) =
+			(b64(&mut t, pos_u, "pu"), b64(&mut t, pos_v, "pv"), b64(&mut t, pos_a, "pa"), b64(&mut t, pos_s, "ps"), b64(&mut t, zeta, "z"));
+		let (u_b, v_b, oa_b, os_b) =
+			(b64(&mut t, u, "u"), b64(&mut t, v, "v"), b64(&mut t, add.out, "oa"), b64(&mut t, sub.out, "os"));
+		// ROUTING on `chan`: pull inputs at their positions, push outputs at theirs.
+		t.pull(chan, [pu_b, u_b]);
+		t.pull(chan, [pv_b, v_b]);
+		t.push(chan, [pa_b, oa_b]);
+		t.push(chan, [ps_b, os_b]);
+		// PIN on `sched`: this row's (positions, ζ) must be a public schedule tuple.
+		t.pull(sched, [pu_b, pv_b, pa_b, ps_b, z_b]);
 		Self { table_id: t.id(), c_col, u, v, zeta, u_lt, v_lt, z_lt, mul, add, sub, pos: Some([pos_u, pos_v, pos_a, pos_s]) }
 	}
 
@@ -1199,14 +1207,16 @@ pub fn validate_ntt_network(input: &[u64], n: usize, tamper: Option<usize>) -> R
 /// corrupts the b-th butterfly's twiddle.)  NOTE: positions/twiddles are committed and
 /// populated from the public schedule; pinning them in-circuit (a manual B256 lookup) is the
 /// final soundness step — docs/s1d-fleet-sharding-ntt.md step 2.
-pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usize>) -> Result<()> {
+pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usize>, pos_tamper: Option<usize>) -> Result<()> {
 	assert!(n.is_power_of_two() && n >= 2, "n must be a power of two ≥ 2");
 	let logn = n.trailing_zeros() as usize;
 	let arr_of = |x: u64| -> [B1; W] { std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }) };
 
 	// native forward NTT (pinned output) + per-stage butterfly rows with their positions.
+	// each row: (u, v, ζ_witness, positions[4], ζ_honest).  ζ_witness may be tampered; ζ_honest
+	// is the public schedule value pushed as a boundary (so a tampered ζ mismatches the schedule).
 	let mut a = input.to_vec();
-	let mut stage_rows: Vec<Vec<(u64, u64, u64, [u64; 4])>> = vec![Vec::new(); logn];
+	let mut stage_rows: Vec<Vec<(u64, u64, u64, [u64; 4], u64)>> = vec![Vec::new(); logn];
 	let mut bi = 0usize;
 	for (start, len, zeta) in forward_groups(n) {
 		let s = (n.trailing_zeros() - len.trailing_zeros() - 1) as usize;
@@ -1222,7 +1232,7 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 			let t = ((zeta as u128 * v as u128) % Q as u128) as u64;
 			a[j] = (u + t) % Q;
 			a[j + len] = (u + Q - t) % Q;
-			stage_rows[s].push((u, v, z_use, pos));
+			stage_rows[s].push((u, v, z_use, pos, zeta));
 			bi += 1;
 		}
 	}
@@ -1231,6 +1241,7 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 	let allocator = Bump::new();
 	let mut cs = ConstraintSystem::<OurB256>::new();
 	let net: ChannelId = cs.add_channel("net");
+	let sched: Vec<ChannelId> = (0..logn).map(|s| cs.add_channel(format!("sched{s}"))).collect();
 
 	// SOURCE: 1 row, push n tokens [pos(j,0)=j, input[j]].
 	let mut src = cs.add_table("batched-net source");
@@ -1246,8 +1257,24 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 		.collect();
 	let src_id = src.id();
 
-	// STAGES: one positional tall-narrow table per stage (n/2 rows).
-	let stages: Vec<ButterflyBatch> = (0..logn).map(|_| ButterflyBatch::build_seamed_positional(&mut cs, net)).collect();
+	// STAGES: one positional tall-narrow table per stage (n/2 rows), each pinned to sched[s].
+	let stages: Vec<ButterflyBatch> = (0..logn).map(|s| ButterflyBatch::build_seamed_positional(&mut cs, net, sched[s])).collect();
+
+	// PUBLIC SCHEDULE: push each stage's n/2 honest [pos_u,pos_v,pos_a,pos_s,ζ] tuples as
+	// boundary flushes on sched[s].  Balance forces every row's committed positions+ζ to be one
+	// of these public tuples (a tampered ζ / wrong position mismatches ⇒ REJECT).
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for (s, rows) in stage_rows.iter().enumerate() {
+		for &(_, _, _, pos, z_honest) in rows {
+			boundaries.push(Boundary {
+				values: vec![bval(pos[0]), bval(pos[1]), bval(pos[2]), bval(pos[3]), bval(z_honest)],
+				channel_id: sched[s],
+				direction: FlushDirection::Push,
+				multiplicity: 1,
+			});
+		}
+	}
 
 	// SINK: 1 row, pull n tokens [pos(j,logn)=logn·n+j, expected[j]].
 	let mut snk = cs.add_table("batched-net sink");
@@ -1267,7 +1294,7 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 	let mut table_sizes = vec![1usize];
 	table_sizes.extend(std::iter::repeat_n(n / 2, logn));
 	table_sizes.push(1);
-	let statement = Statement { boundaries: vec![], table_sizes };
+	let statement = Statement { boundaries, table_sizes };
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 	{
 		let tw = witness.init_table(src_id, 1)?;
@@ -1277,11 +1304,19 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 			write_col::<W>(&mut seg, *vc, 0, &bits64(*val))?;
 		}
 	}
+	let mut gi = 0usize;
 	for (s, bb) in stages.iter().enumerate() {
 		let tw = witness.init_table(bb.table_id, n / 2)?;
 		let mut seg = tw.full_segment();
-		for (row, &(u, v, z, pos)) in stage_rows[s].iter().enumerate() {
-			bb.populate_positional(&mut seg, row, u, v, z, pos)?;
+		for (row, &(u, v, z, pos, _z_honest)) in stage_rows[s].iter().enumerate() {
+			// pos_tamper corrupts the WITNESS position while the boundary schedule stays honest,
+			// isolating the schedule-pin (sched channel) as the rejecter.
+			let mut wpos = pos;
+			if pos_tamper == Some(gi) {
+				wpos[0] ^= 1;
+			}
+			bb.populate_positional(&mut seg, row, u, v, z, wpos)?;
+			gi += 1;
 		}
 	}
 	{
@@ -1553,17 +1588,24 @@ mod tests {
 		for &n in &[4usize, 8, 16] {
 			let mut rng = StdRng::seed_from_u64(0xBA7C ^ n as u64);
 			let x = rand_zq(&mut rng, n);
-			super::validate_ntt_network_batched(&x, n, None)
+			super::validate_ntt_network_batched(&x, n, None, None)
 				.unwrap_or_else(|e| panic!("n={n}: honest batched CT network must validate: {e}"));
 			let nbf = (n / 2) * (n.trailing_zeros() as usize);
 			for &b in &[0usize, nbf / 2, nbf - 1] {
+				// twiddle tamper: committed ζ ≠ the public schedule ζ ⇒ sched pin REJECTS.
 				assert!(
-					super::validate_ntt_network_batched(&x, n, Some(b)).is_err(),
+					super::validate_ntt_network_batched(&x, n, Some(b), None).is_err(),
 					"n={n}: a corrupted twiddle at butterfly {b} must be REJECTED (batched)"
+				);
+				// position tamper: committed position ≠ the public schedule position, boundary
+				// honest ⇒ the sched channel is the load-bearing rejecter (positions pinned).
+				assert!(
+					super::validate_ntt_network_batched(&x, n, None, Some(b)).is_err(),
+					"n={n}: a corrupted position at butterfly {b} must be REJECTED (schedule-pinned)"
 				);
 			}
 		}
-		println!("GATE ntt-network-batched: each stage is ONE tall-narrow positional table routed by a single (pos,value) channel; honest validates, any corrupted butterfly REJECTED");
+		println!("GATE ntt-network-batched: each stage is ONE tall-narrow positional table routed by a single (pos,value) channel, with positions+twiddle PINNED to the public schedule via boundary flushes; honest validates, any corrupted twiddle OR position REJECTED");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same

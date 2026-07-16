@@ -102,10 +102,15 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
    Honest validates over B256 (n = 4/8/16); a corrupted butterfly mismatches the position the next
    stage pulls ⇒ channel UNBALANCE ⇒ REJECT (`ntt_network_batched_composed_and_tamper_rejected`).
    This keeps the tall-narrow prove regime (n/2 rows per stage — the 15.6 s / 63 MiB curve) with
-   single-channel positional routing. **Final soundness step:** pin the per-row positions AND the
-   twiddle ζ to the public schedule in-circuit — a manual B256 lookup (M3's `LookupProducer` is
-   B128-only), or `add_structured(Incrementing)` + affine position arithmetic for the stage-0-style
-   mappings — so positions/ζ are not merely populated-from-schedule but constrained.
+   single-channel positional routing. **Schedule PINNING DONE** — each stage table PULLs its
+   `[pos_u, pos_v, pos_a, pos_s, ζ]` tuple from a per-stage `sched` channel, and the verifier's
+   Statement PUSHes the stage's n/2 public schedule tuples as **boundary flushes**
+   (`OurB256::from(B64::new(·))`). Channel balance forces every row's committed positions AND
+   twiddle to be a genuine public-schedule entry, each used exactly once (row order irrelevant —
+   positions pin the routing, ζ is bound to its slots). `ntt_network_batched_composed_and_tamper_rejected`
+   now rejects BOTH a corrupted twiddle AND a corrupted position (boundary honest ⇒ the `sched`
+   channel is the load-bearing rejecter). This sidesteps M3's `LookupProducer` (B128-only) by using
+   the public boundary-flush mechanism. The positional routed network is now fully sound.
 3. **Row-block sharding** with seam binding (mirror `gway_reconstruction`) — split a stage's
    positional table across fleet processors, seam the shared channel; measure per-shard RSS + fleet
    wall-time.
