@@ -1991,6 +1991,69 @@ mod tests {
 		println!("(combine joins the fleet: independent per-shard proofs; per-shard VERIFY is aggregation cost, folded into the succinct epoch proof.)");
 	}
 
+	/// END-TO-END: fleet-prove the NTT + combine shards (validity, low RSS, parallel), then
+	/// AGGREGATE their outputs into the epoch commitment (`fold_epoch`'s interleaved single
+	/// opening), and have the RESOLVER verify once.  Shows the pipeline the verify-time answer
+	/// rests on: fleet proves shards → aggregator folds → resolver verifies fast (ms), NOT the
+	/// seconds-per-shard verify.  Run ALONE (RSS process-global).
+	#[test]
+	#[ignore = "S1d fleet→epoch e2e (shard proves + fold + resolver verify); run ALONE with --ignored"]
+	fn s1d_fleet_to_epoch_e2e() {
+		use std::time::Instant;
+		use binius_field::BinaryField128b as F;
+		use crate::epoch_fold::{fold_epoch, open_record, verify_epoch, verify_record, EpochLeaf};
+
+		let n = 32usize;
+		let g = 4usize;
+		let mut rng = StdRng::seed_from_u64(0x5117);
+		let x = rand_zq(&mut rng, n);
+
+		// FLEET: prove NTT stage shards + one combine shard (validity, low RSS; parallel ⇒ wall = max).
+		let ntt_shards = super::stage_shards(&x, n, 1, g);
+		let mut max_rss = 0u64;
+		let mut fleet_wall_ms = 0f64;
+		let mut leaves: Vec<EpochLeaf> = Vec::new();
+		for shard in &ntt_shards {
+			let t = Instant::now();
+			let (_sz, rss) = super::run_stage_shard(shard, None, true).expect("ntt shard prove");
+			fleet_wall_ms = fleet_wall_ms.max(t.elapsed().as_secs_f64() * 1e3);
+			max_rss = max_rss.max(rss);
+			// this shard's output coefficients (o_add, o_sub per butterfly) become a record leaf.
+			let mut rec: Vec<F> = Vec::new();
+			for &(u, v, z, _pos) in shard {
+				let tt = ((z as u128 * v as u128) % Q as u128) as u64;
+				rec.push(F::new(((u + tt) % Q) as u128));
+				rec.push(F::new(((u + Q - tt) % Q) as u128));
+			}
+			while !rec.len().is_power_of_two() {
+				rec.push(F::new(0));
+			}
+			leaves.push(EpochLeaf { record: rec });
+		}
+		let combine = combine_specs(8, 0x5117C0);
+		let (_cz, crss) = super::run_combine_shard(&combine, None, true).expect("combine shard prove");
+		max_rss = max_rss.max(crss);
+
+		// AGGREGATE (once, by the aggregator): fold the shard outputs into the epoch commitment.
+		let ta = Instant::now();
+		let proof = fold_epoch(&leaves, "record", 1);
+		let agg_ms = ta.elapsed().as_secs_f64() * 1e3;
+
+		// RESOLVER: verify the ONE aggregated proof — the fast, network-cost check.
+		let tv = Instant::now();
+		verify_epoch(&proof, "record").expect("resolver verify_epoch");
+		let ve_ms = tv.elapsed().as_secs_f64() * 1e3;
+		let op = open_record(&leaves, 0);
+		let tr = Instant::now();
+		verify_record(&proof, &op).expect("resolver verify_record");
+		let vr_us = tr.elapsed().as_secs_f64() * 1e6;
+
+		println!("\n=== S1d fleet → epoch e2e (n={n} NTT stage + combine, {g}-way fleet) ===");
+		println!("FLEET (validity, parallel): {g} NTT shards + 1 combine, per-shard RSS ≤ {:.0} MiB, parallel wall ≈ {fleet_wall_ms:.0} ms", max_rss as f64 / 1048576.0);
+		println!("AGGREGATE (once/aggregator): epoch fold {agg_ms:.1} ms");
+		println!("RESOLVER (per epoch): verify_epoch {ve_ms:.2} ms, verify_record {vr_us:.1} µs  ← the fast resolver cost, NOT the seconds-per-shard verify");
+	}
+
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
 	/// n as `ntt_prove_scaling` — the direct comparison that shows row-per-butterfly is
 	/// IoT-viable where the wide-single-row `Ntt` is not.  Run ALONE (RSS is process-global).
