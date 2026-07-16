@@ -3508,17 +3508,162 @@ mod tests {
 		);
 	}
 
+	/// GATE prove-4c (Phase-3, S1d) — the ML-DSA hint-weight ≤ ω ACCEPT boundary over B256.
+	/// FIPS 204 Verify REJECTs unless the number of 1-bits in the hint h is ≤ ω (Alg 8 line 1,
+	/// `verify_ref` (1)).  HintBitPack encodes h by its 1-positions with k cumulative running
+	/// counts; the FINAL count is the total hint weight, and each count must be ≤ ω (the
+	/// `hint_wellformed_gadget` well-formedness).  This proves that bound in-circuit the S0 way:
+	/// `cnt < ω+1` ⟺ the carry-out of `cnt + (2⁸ − (ω+1))` is 0 — the same `< m` carry the
+	/// Decompose r1<44 and z-norm gadgets use.  An honest hint (weight up to exactly ω) PROVES +
+	/// VERIFIES; a hint of weight ω+1 is REJECTED, isolated to the `weight_le_omega` constraint.
+	/// This is the third of the three ACCEPT boundaries (with z-norm `prove-5` and the closing
+	/// c̃'==c̃ `prove-10`) that gate the assembled S1d verify.
+	#[test]
+	fn hint_weight_gadget_proves_and_tamper_rejected() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::{ripple_add, shl, two_pow_w_minus, write_bit, write_col};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_core::oracle::ShiftVariant;
+		use binius_field::Field;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+
+		let vp = verify_params(MlDsaParam::MlDsa44);
+		let omega = vp.omega; // 80 at L1
+		const W: usize = 64;
+		const WLOG: usize = 6;
+
+		fn bits64(x: u64) -> Vec<bool> {
+			(0..W).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		// Cumulative HintBitPack counts (monotone, ≤ ω); the FINAL count is the total hint
+		// weight.  The k=4 real counts [3, 40, ω, ω] include the boundary value ω (weight
+		// EXACTLY ω must ACCEPT); the table is padded with valid counts (0) to 64 rows so the
+		// committed trace clears the B256 FRI packing width (each row is an independent bound).
+		let om = omega as u64;
+		let counts: Vec<u64> = {
+			let mut c = vec![3u64, 40, om, om];
+			c.resize(64, 0);
+			c
+		};
+		let n = counts.len();
+		let c_om_bits = two_pow_w_minus(&bits64(om + 1)); // 2⁶⁴ − (ω+1)
+		let c_om_arr: [B1; W] =
+			std::array::from_fn(|k| if c_om_bits[k] { B1::ONE } else { B1::ZERO });
+
+		let run = |tamper: Option<(usize, u64)>, full: bool| -> (bool, String, bool) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("ML-DSA hint-weight ≤ ω boundary over B256");
+			let cnt = t.add_committed::<B1, W>("cnt");
+			// range cnt < ω+1 : carry-out of cnt + (2⁸ − (ω+1)) must be 0.
+			let c_om = t.add_constant("c_om", c_om_arr);
+			let cout = t.add_committed::<B1, W>("cout");
+			let cin = t.add_shifted("cin", cout, WLOG, 1, ShiftVariant::LogicalLeft);
+			t.assert_zero("weight_carry", (cnt + cin) * (c_om + cin) + cin - cout);
+			let fc = t.add_selected("fc", cout, W - 1);
+			t.assert_zero("weight_le_omega", fc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for row in 0..n {
+					let mut cv: u64 = counts[row];
+					if let Some((rr, ct)) = tamper {
+						if rr == row {
+							cv = ct;
+						}
+					}
+					write_col::<W>(&mut seg, cnt, row, &bits64(cv)).unwrap();
+					write_col::<W>(&mut seg, c_om, row, &c_om_bits).unwrap();
+					let (_s, co) = ripple_add(&bits64(cv), &c_om_bits);
+					write_col::<W>(&mut seg, cout, row, &co).unwrap();
+					write_col::<W>(&mut seg, cin, row, &shl(&co, 1)).unwrap();
+					write_bit(&mut seg, fc, row, co[W - 1]).unwrap();
+				}
+			}
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let v = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			);
+			let vok = v.is_ok();
+			let verr = v.err().map(|e| e.to_string()).unwrap_or_default();
+			if !full {
+				return (vok, verr, false);
+			}
+			let proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let verify_ok = match proof {
+				Err(_) => false,
+				Ok(pf) => binius_core::constraint_system::verify::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, pf)
+				.is_ok(),
+			};
+			(vok, verr, verify_ok)
+		};
+
+		// (a) Honest: weight up to exactly ω validates + PROVES/VERIFIES over B256.
+		let (vok, verr, verify_ok) = run(None, true);
+		assert!(vok, "honest hint-weight failed validate_witness: {verr}");
+		assert!(verify_ok, "honest hint-weight ≤ ω must PROVE+VERIFY over B256");
+
+		// (b) LOAD-BEARING: a hint whose count is ω+1 (weight over the cap) breaks the bound →
+		//     REJECT, isolated to weight_le_omega (the carry-out is 1).  Row 2 is the boundary
+		//     count ω; nudging it to ω+1 is the minimal over-weight.
+		let bad = run(Some((2, (omega + 1) as u64)), false);
+		assert!(!bad.0, "SOUNDNESS FAILURE: hint weight ω+1 was ACCEPTED");
+		assert!(
+			bad.1.contains("weight_le_omega"),
+			"over-weight not isolated to weight_le_omega (got: {})",
+			bad.1
+		);
+
+		println!(
+			"GATE prove-4c: ML-DSA hint-weight ≤ ω ACCEPT boundary PROVEN+VERIFIED over B256 @L1(128); {n} cumulative HintBitPack counts (final = total weight, ω={omega}), boundary weight=ω accepts; weight ω+1 REJECTED, isolated to weight_le_omega"
+		);
+	}
+
 	/// GATE prove-4 (PENDING, S1d) — the assembled ML-DSA verify proves over B256 for a
 	/// genuine (pk, M, σ) from the `fips204` crate, and each of {tampered z, c̃, h, M} is
 	/// REJECTED, isolated to a distinct ACCEPT constraint (norm / popcount / c̃-equality).
 	///
-	/// Requires: `fips204` in dev-deps + S1a/S1b/S1c prove paths wired.
+	/// State of the parts (all PROVEN in-circuit over B256, each with tamper rejection):
+	///   • the three ACCEPT boundaries — ‖z‖∞<γ1−β (`prove-5`), hint-weight≤ω (`prove-4c`),
+	///     c̃'==c̃ (`prove-10`, the load-bearing closing hash);
+	///   • the reduced dataflow pipeline — strand→combine (`prove-6/6b`)→Decompose (`prove-4a`)
+	///     →UseHint (`prove-4b`)→w1Encode (`prove-9`)→closing hash==c̃ (`prove-10`).
+	/// Remaining for this gate: wire the FRONT DAG (pkDecode→ExpandA(S1b)→NTT(S1a)→matrix-vector
+	/// →InvNTT to produce w'Approx feeding `combine`) into ONE ConstraintSystem and drive it with
+	/// a genuine `fips204` (pk,M,σ) so the four tamper cases each break a distinct proven
+	/// constraint.  Requires `fips204` in dev-deps + the S1a/S1b/S1c prove paths composed.
 	#[test]
-	#[ignore = "S1d assembly not wired yet — needs fips204 dev-dep + S1a/S1b/S1c prove paths"]
+	#[ignore = "S1d assembly not wired yet — front DAG (ExpandA→NTT→matvec) + fips204 drive; the 3 ACCEPT boundaries + reduced pipeline are proven"]
 	fn mldsa_verify_proves_and_tampered_sig_rejected() {
 		unimplemented!(
-			"assemble ExpandA+SampleInBall+NTT+UseHint+SHAKE over B256; \
-			 gate genuine fips204 (pk,M,σ) accept + 4 tamper rejects (distinct constraints)"
+			"wire front DAG (pkDecode→ExpandA→NTT→matvec→InvNTT→w'Approx) into the proven \
+			 combine→Decompose→UseHint→w1Encode→(hash==c̃) pipeline; drive with genuine fips204 \
+			 (pk,M,σ); gate accept + 4 tamper rejects isolated to norm / popcount / c̃-equality"
 		);
 	}
 }
