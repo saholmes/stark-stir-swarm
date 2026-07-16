@@ -49,8 +49,14 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
 1. **NTT strands** — the forward (z, c, t1·2ᵈ) and inverse (w′) transforms, each a tall-narrow
    butterfly table, sharded by row-block across the fleet. Dominant cost; the re-architecture
    above is the enabler.
-2. **Combine strands** — `verify_core_combine`: k×256 pointwise `ŵ = Â∘ẑ − ĉ∘t̂1·2ᵈ`
-   mod-q, already row-per-coefficient (narrow); shard by coefficient block.
+2. **Combine strands** — ✅ **DONE + MEASURED** (`CombineBatch` / `run_combine_shard`): the
+   NTT-domain `ŵ = Σ_j a_j·z_j − c·td` (Â∘ẑ − ĉ∘t̂1·2ᵈ), row-per-coefficient tall-narrow, every
+   input PULLED from `flow` at its position (z_j from the forward-NTT strand's output seam), ŵ
+   PUSHED downstream — so it wires into the fleet on the same seam the NTT feeds. Sharded standalone
+   proofs (`combine_strand_sharded_across_fleet`: honest validates, tampered coefficient REJECTED).
+   Per-shard prove (256 coeffs split G ways, `combine_shard_prove_scaling`): G=4 64c/28.1s/63 MiB;
+   G=8 32c/20.5s/71 MiB; G=16 16c/14.7s/73 MiB; G=32 8c/9.4s/**74 MiB** — under 500 MiB, joins the
+   fleet. (Slower than the butterfly: 5 var×var mults/row vs 1; RSS stays low, wall-time is per-shard.)
 3. **Digit strands** — Decompose → UseHint → w1Encode per coefficient group (proven gadgets,
    already narrow); shard by coefficient block.
 4. **Boundary strands** — ‖z‖∞ < γ1−β (prove-5), hint-weight ≤ ω (prove-4c).

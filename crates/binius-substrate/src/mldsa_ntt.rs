@@ -1431,6 +1431,194 @@ pub fn stage_shards(input: &[u64], n: usize, s: usize, g: usize) -> Vec<Vec<Butt
 	(0..g).map(|k| stage_bfs[k * per..(k + 1) * per].to_vec()).collect()
 }
 
+/// Combine arity for ML-DSA-44 (k = l = 4): ŵ_i = Σ_{j<4} Â_ij·ẑ_j − ĉ·(t̂1_i·2^d).
+pub const LC: usize = 4;
+
+/// Tall-narrow NTT-domain COMBINE batch (S1d prove-6): each ROW computes one coefficient's
+/// `ŵ = (Σ_j a_j·z_j − c·td) mod q` — the verify-core matrix-vector product Â∘ẑ − ĉ∘(t̂1·2^d).
+/// Row-per-coefficient ⇒ tall-narrow + fleet-shardable, exactly like the butterfly batch.  Every
+/// input (a_j, z_j, c, td) is PULLED from `flow` at its position (a_j from ExpandA, z_j from the
+/// forward-NTT strand's output seam, c/td from SampleInBall/t1 strands), and ŵ is PUSHED at its
+/// position — so the combine strand wires into the fleet on the same seam channel the NTT feeds.
+pub struct CombineBatch {
+	pub table_id: TableId,
+	c_col: Col<B1, W>,
+	a: [Col<B1, W>; LC],
+	z: [Col<B1, W>; LC],
+	cc: Col<B1, W>,
+	td: Col<B1, W>,
+	w: Col<B1, W>, // = ModSub output
+	lts: Vec<LtQ>,
+	az: Vec<ModMulVar>,
+	adders: Vec<ModAdd>,
+	ctd: ModMulVar,
+	wsub: ModSub,
+	pos: [Col<B1, W>; 2 * LC + 3], // [pa_0..,pz_0..,pc,ptd,pw]
+}
+
+impl CombineBatch {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, flow: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow COMBINE batch (Â∘ẑ − ĉ∘t̂1·2^d)");
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("c_q", c_arr);
+		let q_set = set_bits_of(Q);
+		let a: [Col<B1, W>; LC] = std::array::from_fn(|j| t.add_committed::<B1, W>(format!("a{j}")));
+		let z: [Col<B1, W>; LC] = std::array::from_fn(|j| t.add_committed::<B1, W>(format!("z{j}")));
+		let cc = t.add_committed::<B1, W>("c");
+		let td = t.add_committed::<B1, W>("td");
+		let mut lts = Vec::new();
+		for j in 0..LC {
+			lts.push(LtQ::build(&mut t, &format!("a{j}"), a[j], c_col));
+			lts.push(LtQ::build(&mut t, &format!("z{j}"), z[j], c_col));
+		}
+		lts.push(LtQ::build(&mut t, "c", cc, c_col));
+		lts.push(LtQ::build(&mut t, "td", td, c_col));
+		// p_j = a_j·z_j ; acc = Σ p_j mod q.
+		let az: Vec<ModMulVar> = (0..LC).map(|j| ModMulVar::build(&mut t, &format!("az{j}"), z[j], a[j], c_col, &q_set)).collect();
+		let mut adders = Vec::new();
+		let mut acc = az[0].out;
+		for j in 1..LC {
+			let add = ModAdd::build(&mut t, &format!("acc{j}"), acc, az[j].out, c_col, &q_set);
+			acc = add.out;
+			adders.push(add);
+		}
+		// ŵ = acc − c·td mod q.
+		let ctd = ModMulVar::build(&mut t, "ctd", td, cc, c_col, &q_set);
+		let wsub = ModSub::build(&mut t, "w", acc, ctd.out, c_col, &q_set);
+		let w = wsub.out;
+		// positions + seams on `flow`: pull every input, push ŵ.
+		let pos: [Col<B1, W>; 2 * LC + 3] = std::array::from_fn(|k| t.add_committed::<B1, W>(format!("pos{k}")));
+		let b64 = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, nm: &str| -> Col<B64, 1> { t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b"), col) };
+		let mut pi = 0usize;
+		for j in 0..LC {
+			let (pb, vb) = (b64(&mut t, pos[pi], &format!("pa{j}")), b64(&mut t, a[j], &format!("va{j}")));
+			t.pull(flow, [pb, vb]);
+			pi += 1;
+		}
+		for j in 0..LC {
+			let (pb, vb) = (b64(&mut t, pos[pi], &format!("pz{j}")), b64(&mut t, z[j], &format!("vz{j}")));
+			t.pull(flow, [pb, vb]);
+			pi += 1;
+		}
+		let (pb, vb) = (b64(&mut t, pos[pi], "pc"), b64(&mut t, cc, "vc"));
+		t.pull(flow, [pb, vb]);
+		pi += 1;
+		let (pb, vb) = (b64(&mut t, pos[pi], "ptd"), b64(&mut t, td, "vtd"));
+		t.pull(flow, [pb, vb]);
+		pi += 1;
+		let (pb, vb) = (b64(&mut t, pos[pi], "pw"), b64(&mut t, w, "vw"));
+		t.push(flow, [pb, vb]);
+		Self { table_id: t.id(), c_col, a, z, cc, td, w, lts, az, adders, ctd, wsub, pos }
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, a: [u64; LC], z: [u64; LC], cc: u64, td: u64, pos: [u64; 2 * LC + 3]) -> Result<u64> {
+		let c = c_q_bits();
+		write_col::<W>(seg, self.c_col, row, &c)?;
+		for j in 0..LC {
+			write_col::<W>(seg, self.a[j], row, &bits64(a[j]))?;
+			write_col::<W>(seg, self.z[j], row, &bits64(z[j]))?;
+		}
+		write_col::<W>(seg, self.cc, row, &bits64(cc))?;
+		write_col::<W>(seg, self.td, row, &bits64(td))?;
+		let mut li = 0;
+		for j in 0..LC {
+			self.lts[li].populate(seg, row, &bits64(a[j]), &c)?;
+			li += 1;
+			self.lts[li].populate(seg, row, &bits64(z[j]), &c)?;
+			li += 1;
+		}
+		self.lts[li].populate(seg, row, &bits64(cc), &c)?;
+		li += 1;
+		self.lts[li].populate(seg, row, &bits64(td), &c)?;
+		// p_j and accumulate.
+		let mut acc_bits = self.az[0].populate(seg, row, &bits64(z[0]), &bits64(a[0]), &c)?;
+		for j in 1..LC {
+			let pj = self.az[j].populate(seg, row, &bits64(z[j]), &bits64(a[j]), &c)?;
+			acc_bits = self.adders[j - 1].populate(seg, row, &acc_bits, &pj, &c)?;
+		}
+		let ctd_bits = self.ctd.populate(seg, row, &bits64(td), &bits64(cc), &c)?;
+		let w_bits = self.wsub.populate(seg, row, &acc_bits, &ctd_bits, &c)?;
+		for (k, &p) in pos.iter().enumerate() {
+			write_col::<W>(seg, self.pos[k], row, &bits64(p))?;
+		}
+		Ok(to_u64(&w_bits))
+	}
+}
+
+/// One combine coefficient's fleet-shard spec: inputs, output, and their seam positions.
+#[derive(Clone, Copy)]
+pub struct CombineSpec {
+	pub a: [u64; LC],
+	pub z: [u64; LC],
+	pub c: u64,
+	pub td: u64,
+	pub pos: [u64; 2 * LC + 3], // [pa_0.., pz_0.., pc, ptd, pw]
+}
+
+/// FLEET SHARD of the COMBINE strand: prove a row-block of combine coefficients as a standalone
+/// low-RSS proof, its input/output tokens as seam boundary flushes on `flow` (inputs boundary-
+/// PUSHed = upstream strand outputs; ŵ boundary-PULLed = InvNTT input).  So the combine wires
+/// into the fleet exactly like an NTT stage-shard.  `tamper` corrupts a coefficient's committed
+/// `c` (the boundary token stays honest ⇒ the seam pull unbalances ⇒ REJECT).
+pub fn run_combine_shard(specs: &[CombineSpec], tamper: Option<usize>, do_prove: bool) -> Result<(usize, u64)> {
+	assert!(specs.len().is_power_of_two(), "combine shard size must be a power of two");
+	let nrows = specs.len();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let flow = cs.add_channel("combine-flow");
+	let cb = CombineBatch::build(&mut cs, flow);
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for sp in specs {
+		let t = ((sp.c as u128 * sp.td as u128) % Q as u128) as u64;
+		let mut acc = 0u64;
+		for j in 0..LC {
+			acc = (acc + ((sp.a[j] as u128 * sp.z[j] as u128) % Q as u128) as u64) % Q;
+		}
+		let w = (acc + Q - t) % Q;
+		let mut pi = 0;
+		for j in 0..LC {
+			boundaries.push(Boundary { values: vec![bval(sp.pos[pi]), bval(sp.a[j])], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+			pi += 1;
+		}
+		for j in 0..LC {
+			boundaries.push(Boundary { values: vec![bval(sp.pos[pi]), bval(sp.z[j])], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+			pi += 1;
+		}
+		boundaries.push(Boundary { values: vec![bval(sp.pos[pi]), bval(sp.c)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		pi += 1;
+		boundaries.push(Boundary { values: vec![bval(sp.pos[pi]), bval(sp.td)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		pi += 1;
+		boundaries.push(Boundary { values: vec![bval(sp.pos[pi]), bval(w)], channel_id: flow, direction: FlushDirection::Pull, multiplicity: 1 });
+	}
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(cb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, sp) in specs.iter().enumerate() {
+			let c_use = if tamper == Some(row) { (sp.c + 1) % Q } else { sp.c };
+			cb.populate(&mut seg, row, sp.a, sp.z, c_use, sp.td, sp.pos)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	if !do_prove {
+		return Ok((0, 0));
+	}
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+	)?;
+	let proof_size = proof.get_proof_size();
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof,
+	)?;
+	Ok((proof_size, rss))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -1745,6 +1933,53 @@ mod tests {
 			println!("| {g} | {} | {ms:.0} | {bytes} | {:.0} |", shards[0].len(), rss as f64 / (1024.0 * 1024.0));
 		}
 		println!("(each shard is an independent proof ⇒ runs on its own fleet processor; peak RSS is per-shard, well under 500 MiB.)");
+	}
+
+	fn combine_specs(count: usize, seed: u64) -> Vec<super::CombineSpec> {
+		let mut rng = StdRng::seed_from_u64(seed);
+		(0..count)
+			.map(|i| {
+				let a = std::array::from_fn(|_| rng.next_u64() % Q);
+				let z = std::array::from_fn(|_| rng.next_u64() % Q);
+				// positions: a_j and z_j at the upstream NTT-output slots, ŵ at a post-combine slot.
+				let pos = std::array::from_fn(|k| (k * 4096 + i) as u64);
+				super::CombineSpec { a, z, c: rng.next_u64() % Q, td: rng.next_u64() % Q, pos }
+			})
+			.collect()
+	}
+
+	/// The COMBINE strand wired into the fleet: a row-block of ŵ = Σ a_j·z_j − c·td coefficients
+	/// proves as a standalone shard (inputs/output = seam boundary flushes on `flow`).  Honest
+	/// validates over B256; a tampered coefficient (committed c ≠ the boundary seam token) is
+	/// REJECTED.  Same shard shape as the NTT stage — so combine joins the fleet on `flow`.
+	#[test]
+	fn combine_strand_sharded_across_fleet() {
+		for &sz in &[4usize, 8, 16] {
+			let specs = combine_specs(sz, 0xC0FFEE ^ sz as u64);
+			super::run_combine_shard(&specs, None, false)
+				.unwrap_or_else(|e| panic!("combine shard sz={sz} must validate: {e}"));
+			assert!(super::run_combine_shard(&specs, Some(sz / 2), false).is_err(), "combine shard sz={sz}: a tampered ĉ must be REJECTED");
+		}
+		println!("GATE combine-fleet: the NTT-domain combine ŵ=Σa_j·z_j−c·td strand shards as standalone low-RSS proofs (I/O seams on `flow`); honest validates, tampered coefficient REJECTED");
+	}
+
+	/// MEASURE: the combine strand's per-shard FRI-prove time + peak RSS (256 coefficients split
+	/// G ways) — the same fleet regime as the NTT.  Run ALONE.
+	#[test]
+	#[ignore = "combine per-shard prove RSS/time; run ALONE with --ignored"]
+	fn combine_shard_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== fleet per-shard COMBINE prove over B256 @L1(128) — 256 coeffs split G ways ===");
+		println!("| G shards | coeffs/shard | prove_ms/shard | proof_bytes | peak_rss_MiB |");
+		for &g in &[4usize, 8, 16, 32] {
+			let per = 256 / g;
+			let specs = combine_specs(per, 0xC0FFEE ^ (g as u64) << 20);
+			let t = Instant::now();
+			let (bytes, rss) = super::run_combine_shard(&specs, None, true).expect("combine shard prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			println!("| {g} | {per} | {ms:.0} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
+		}
+		println!("(combine joins the fleet: independent per-shard proofs, per-shard RSS well under 500 MiB.)");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same
