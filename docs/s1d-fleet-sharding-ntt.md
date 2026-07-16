@@ -57,8 +57,14 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
    Per-shard prove (256 coeffs split G ways, `combine_shard_prove_scaling`): G=4 64c/28.1s/63 MiB;
    G=8 32c/20.5s/71 MiB; G=16 16c/14.7s/73 MiB; G=32 8c/9.4s/**74 MiB** — under 500 MiB, joins the
    fleet. (Slower than the butterfly: 5 var×var mults/row vs 1; RSS stays low, wall-time is per-shard.)
-3. **Digit strands** — Decompose → UseHint → w1Encode per coefficient group (proven gadgets,
-   already narrow); shard by coefficient block.
+3. **Digit strands** — ✅ **DONE + MEASURED** (`DigitBatch` / `run_digit_shard`): row-per-coefficient
+   `w1 = UseHint(h, Decompose(w′))` — the two load-bearing identities `r+γ2 = r1·α+v0+s·q`
+   (r1<m, v0∈[1,α]) and `w1+m+h = r1+2·hs+qp·m` (w1<m, qp∈{0,1,2}) in one row (no field mults, just
+   shift-sums by constants + carries). w′ PULLED from `flow` (InvNTT output seam), h pulled, w1
+   PUSHED downstream (→ w1Encode). Sharded standalone proofs (`digit_strand_sharded_across_fleet`:
+   native identities gated, honest validates, flipped hint REJECTED). Per-shard prove (256 coeffs
+   split G ways): G=4 64c/2.0s/16 MiB; G=32 8c/0.8s/**19 MiB** — the LIGHTEST strand (no var×var
+   mults), well under 500 MiB.
 4. **Boundary strands** — ‖z‖∞ < γ1−β (prove-5), hint-weight ≤ ω (prove-4c).
 5. **Closing-hash strand** — c̃′ = FIPS-202(μ ‖ w1Encode) == c̃ (prove-10; multi-block Keccak
    is its own scale-up — the callable `prove_verify_sha3_b256` is single-block today).
