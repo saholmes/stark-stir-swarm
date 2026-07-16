@@ -1876,6 +1876,120 @@ pub fn run_digit_shard(specs: &[DigitSpec], tamper: Option<usize>, do_prove: boo
 	Ok((proof_size, rss))
 }
 
+// ── BOUNDARY strand constants (ML-DSA-44 / NIST L1): z-norm ‖z‖∞ < γ1−β ──────
+const GAMMA1: u64 = 131072; // 2^17
+const BETA: u64 = 78;
+
+/// Tall-narrow BOUNDARY strand (S1d prove-5): the ‖z‖∞ < γ1−β ACCEPT check, row-per-coefficient.
+/// Each row pulls one response coefficient as `u = z + γ1` (non-negative) from `flow` and asserts
+/// the centered bound `|z| < γ1−β  ⇔  β < u < 2γ1−β` via two carries — the upper (u < 2γ1−β, final
+/// carry 0) and the lower (u ≥ β+1, final carry 1).  A "consumer" strand: it pulls z and checks,
+/// pushing nothing (the ACCEPT gate).  An out-of-range coefficient fails a carry ⇒ REJECT.
+pub struct BoundaryBatch {
+	pub table_id: TableId,
+	u: Col<B1, W>,
+	pos: Col<B1, W>,
+	hi_lt: LtQ,
+	lo_cout: Col<B1, W>,
+	lo_cin: Col<B1, W>,
+	lo_fc: Col<B1, 1>,
+	c_hi: Col<B1, W>,
+	c_lo: Col<B1, W>,
+}
+
+impl BoundaryBatch {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, flow: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow BOUNDARY batch (z-norm ‖z‖∞ < γ1−β)");
+		let cst = |t: &mut TableBuilder<OurB256>, nm: &str, x: u64| -> Col<B1, W> {
+			t.add_constant(nm, std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }))
+		};
+		let u = t.add_committed::<B1, W>("u"); // = z + γ1
+		// upper bound: u < 2γ1 − β  (final carry of u + (2^W − (2γ1−β)) == 0).
+		let c_hi = cst(&mut t, "c_hi", to_u64(&two_pow_w_minus(&bits64(2 * GAMMA1 - BETA))));
+		let hi_lt = LtQ::build(&mut t, "hi", u, c_hi);
+		// lower bound: u ≥ β + 1  (final carry of u + (2^W − (β+1)) == 1).
+		let c_lo = cst(&mut t, "c_lo", to_u64(&two_pow_w_minus(&bits64(BETA + 1))));
+		let lo_cout = t.add_committed::<B1, W>("lo_cout");
+		let lo_cin = t.add_shifted("lo_cin", lo_cout, WLOG, 1, ShiftVariant::LogicalLeft);
+		t.assert_zero("lo_carry", (u + lo_cin) * (c_lo + lo_cin) + lo_cin - lo_cout);
+		let lo_fc = t.add_selected("lo_fc", lo_cout, W - 1);
+		t.assert_zero("lo_ge", lo_fc + B1::ONE); // final carry == 1 ⇔ u ≥ β+1
+		// seam: pull the coefficient token.
+		let pos = t.add_committed::<B1, W>("pos");
+		let pb = t.add_packed::<B1, 64, B64, 1>("pos_b", pos);
+		let ub = t.add_packed::<B1, 64, B64, 1>("u_b", u);
+		t.pull(flow, [pb, ub]);
+		Self { table_id: t.id(), u, pos, hi_lt, lo_cout, lo_cin, lo_fc, c_hi, c_lo }
+	}
+
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, u: u64, pos: u64) -> Result<()> {
+		write_col::<W>(seg, self.u, row, &bits64(u))?;
+		write_col::<W>(seg, self.pos, row, &bits64(pos))?;
+		let chi = two_pow_w_minus(&bits64(2 * GAMMA1 - BETA));
+		let clo = two_pow_w_minus(&bits64(BETA + 1));
+		write_col::<W>(seg, self.c_hi, row, &chi)?;
+		write_col::<W>(seg, self.c_lo, row, &clo)?;
+		self.hi_lt.populate(seg, row, &bits64(u), &chi)?;
+		let (_s, co) = ripple_add(&bits64(u), &clo);
+		write_col::<W>(seg, self.lo_cout, row, &co)?;
+		write_col::<W>(seg, self.lo_cin, row, &shl(&co, 1))?;
+		write_bit(seg, self.lo_fc, row, co[W - 1])?;
+		Ok(())
+	}
+}
+
+/// One z-norm coefficient's fleet-shard spec: `(u = z + γ1, seam position)`.
+#[derive(Clone, Copy)]
+pub struct BoundarySpec {
+	pub u: u64,
+	pub pos: u64,
+}
+
+/// FLEET SHARD of the BOUNDARY (z-norm) strand: prove a row-block of coefficient bound checks as
+/// a standalone low-RSS proof, the coefficient tokens boundary-PUSHed on `flow` (= the z-decode
+/// strand's output).  `tamper` forces a coefficient out of range (u = 2γ1−β, the upper edge).
+pub fn run_boundary_shard(specs: &[BoundarySpec], tamper: Option<usize>, do_prove: bool) -> Result<(usize, u64)> {
+	assert!(specs.len().is_power_of_two(), "boundary shard size must be a power of two");
+	let nrows = specs.len();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let flow = cs.add_channel("boundary-flow");
+	let bb = BoundaryBatch::build(&mut cs, flow);
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for (i, sp) in specs.iter().enumerate() {
+		let u = if tamper == Some(i) { 2 * GAMMA1 - BETA } else { sp.u }; // out of range at the edge
+		boundaries.push(Boundary { values: vec![bval(sp.pos), bval(u)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+	}
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(bb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, sp) in specs.iter().enumerate() {
+			let u = if tamper == Some(row) { 2 * GAMMA1 - BETA } else { sp.u };
+			bb.populate(&mut seg, row, u, sp.pos)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	if !do_prove {
+		return Ok((0, 0));
+	}
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+	)?;
+	let proof_size = proof.get_proof_size();
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	let vt = std::time::Instant::now();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof,
+	)?;
+	VERIFY_US.store(vt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+	Ok((proof_size, rss))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -2288,6 +2402,49 @@ mod tests {
 			println!("| {g} | {per} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
 		}
 		println!("(digit joins the fleet: independent per-shard proofs, per-shard RSS well under 500 MiB.)");
+	}
+
+	fn boundary_specs(count: usize, seed: u64) -> Vec<super::BoundarySpec> {
+		let mut rng = StdRng::seed_from_u64(seed);
+		let m = super::GAMMA1 - super::BETA; // |z| < m
+		(0..count)
+			.map(|i| {
+				// z ∈ (−m, m) ⇒ u = z + γ1 ∈ (β, 2γ1−β).
+				let z = (rng.next_u64() % (2 * m - 1)) as i64 - (m as i64 - 1);
+				super::BoundarySpec { u: (z + super::GAMMA1 as i64) as u64, pos: (i as u64) }
+			})
+			.collect()
+	}
+
+	/// The BOUNDARY (z-norm) strand wired into the fleet: a row-block of ‖z‖∞ < γ1−β coefficient
+	/// checks proves as a standalone shard (coefficient tokens = seam boundary flushes on `flow`).
+	/// Honest (in-range) validates over B256; an out-of-range coefficient is REJECTED.
+	#[test]
+	fn boundary_strand_sharded_across_fleet() {
+		for &sz in &[4usize, 8, 16] {
+			let specs = boundary_specs(sz, 0xB0DE ^ sz as u64);
+			super::run_boundary_shard(&specs, None, false).unwrap_or_else(|e| panic!("boundary shard sz={sz} must validate: {e}"));
+			assert!(super::run_boundary_shard(&specs, Some(sz / 2), false).is_err(), "boundary shard sz={sz}: an out-of-range z coeff must be REJECTED");
+		}
+		println!("GATE boundary-fleet: the ‖z‖∞ < γ1−β z-norm strand shards as standalone low-RSS proofs (coeff seams on `flow`); honest validates, out-of-range REJECTED");
+	}
+
+	/// MEASURE: the boundary (z-norm) strand's per-shard prove time + peak RSS (256 coeffs G ways).
+	#[test]
+	#[ignore = "boundary per-shard prove RSS/time; run ALONE with --ignored"]
+	fn boundary_shard_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== fleet per-shard BOUNDARY (z-norm) prove over B256 @L1(128) — 256 coeffs split G ways ===");
+		println!("| G shards | coeffs/shard | prove_ms/shard | proof_bytes | peak_rss_MiB |");
+		for &g in &[4usize, 8, 16, 32] {
+			let per = 256 / g;
+			let specs = boundary_specs(per, 0xB0DE ^ (g as u64) << 20);
+			let t = Instant::now();
+			let (bytes, rss) = super::run_boundary_shard(&specs, None, true).expect("boundary shard prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			println!("| {g} | {per} | {ms:.0} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
+		}
+		println!("(boundary joins the fleet: the lightest ACCEPT-check strand, per-shard RSS well under 500 MiB.)");
 	}
 
 	/// END-TO-END: fleet-prove the NTT + combine shards (validity, low RSS, parallel), then

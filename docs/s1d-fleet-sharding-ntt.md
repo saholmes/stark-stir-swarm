@@ -65,7 +65,14 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
    native identities gated, honest validates, flipped hint REJECTED). Per-shard prove (256 coeffs
    split G ways): G=4 64c/2.0s/16 MiB; G=32 8c/0.8s/**19 MiB** — the LIGHTEST strand (no var×var
    mults), well under 500 MiB.
-4. **Boundary strands** — ‖z‖∞ < γ1−β (prove-5), hint-weight ≤ ω (prove-4c).
+4. **Boundary strands** — ✅ **z-norm DONE + MEASURED** (`BoundaryBatch` / `run_boundary_shard`):
+   ‖z‖∞ < γ1−β (prove-5) as a row-per-coefficient check — each row pulls `u = z+γ1` from `flow` and
+   asserts `β < u < 2γ1−β` via two carries (upper final-carry 0, lower final-carry 1). A "consumer"
+   strand (pulls z, checks, pushes nothing). Sharded standalone proofs
+   (`boundary_strand_sharded_across_fleet`: honest validates, out-of-range REJECTED). Per-shard
+   prove (256 coeffs split G ways): G=4 64c/229ms/12 MiB; G=32 8c/122ms/**14 MiB** — the LIGHTEST
+   strand (2 carries/row). hint-weight ≤ ω (prove-4c) is a single k-count check (already proven,
+   not per-coefficient ⇒ one small table, not sharded).
 5. **Closing-hash strand** — c̃′ = FIPS-202(μ ‖ w1Encode) == c̃ (prove-10; multi-block Keccak
    is its own scale-up — the callable `prove_verify_sha3_b256` is single-block today).
 
