@@ -29,6 +29,16 @@ use std::time::Instant;
 use deep_ali::binding_cells_commit::{commit_binding_cells, verify_ood_consistency};
 use deep_ali::fri::DeepFriParams;
 
+fn rss_mib() -> f64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0,
+        Err(_) => 0.0,
+    }
+}
+
 /// One low-degree LDE column: trace values from `pat`, ifft→coeffs→fft on the
 /// blown-up domain (so it passes the FRI low-degree test).
 fn make_col(pat: impl Fn(usize) -> u64, n_trace: usize, blowup: usize) -> Vec<F> {
@@ -66,30 +76,53 @@ fn main() {
     let blowup = 4usize;
     let pi = [0x42u8; 32];
     let cols: Vec<usize> = (0..k).collect();
+    // MODE=baseline | batched | both(default).  Separate processes give clean
+    // peak RSS per path under /usr/bin/time -l.
+    let mode = std::env::var("MODE").unwrap_or_else(|_| "both".into());
+    let run_base = mode == "baseline" || mode == "both";
+    let run_batch = mode == "batched" || mode == "both";
 
     // Honest seam: strand A and strand B agree on all K shared columns.
     let lde_a = seam_columns(k, n_trace, blowup, 0);
     let lde_b = lde_a.clone();
 
     // ── BASELINE: one single-column commit per side per column, K OOD verifies ──
-    let t = Instant::now();
-    let mut base_fri_verifies = 0usize;
-    for &c in &cols {
-        let (ca, _) = commit_binding_cells(&lde_a, &[c], n_trace, blowup, pi, b"seam", params);
-        let (cb, _) = commit_binding_cells(&lde_b, &[c], n_trace, blowup, pi, b"seam", params);
-        verify_ood_consistency(&ca, &cb, pi, params).expect("honest per-column seam must verify");
-        base_fri_verifies += 2; // one FRI verify per commit
+    let (mut base_ms, mut base_fri_verifies, mut base_rss) = (0.0f64, 0usize, 0.0f64);
+    if run_base {
+        let t = Instant::now();
+        for &c in &cols {
+            let (ca, _) = commit_binding_cells(&lde_a, &[c], n_trace, blowup, pi, b"seam", params);
+            let (cb, _) = commit_binding_cells(&lde_b, &[c], n_trace, blowup, pi, b"seam", params);
+            verify_ood_consistency(&ca, &cb, pi, params).expect("honest per-column seam must verify");
+            base_fri_verifies += 2; // one FRI verify per commit
+            base_rss = base_rss.max(rss_mib());
+        }
+        base_ms = t.elapsed().as_secs_f64() * 1000.0;
     }
-    let base_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // ── BATCHED: one packed commit per side over ALL K columns, ONE OOD verify ──
-    let t = Instant::now();
+    let (mut batch_ms, mut batch_rss) = (0.0f64, 0.0f64);
+    let batch_fri_verifies = 2usize;
+    if run_batch {
+        let t = Instant::now();
+        let (pa0, _) = commit_binding_cells(&lde_a, &cols, n_trace, blowup, pi, b"seam", params);
+        let (pb0, _) = commit_binding_cells(&lde_b, &cols, n_trace, blowup, pi, b"seam", params);
+        verify_ood_consistency(&pa0, &pb0, pi, params).expect("honest batched seam group must verify");
+        batch_ms = t.elapsed().as_secs_f64() * 1000.0;
+        batch_rss = rss_mib();
+        assert_eq!(pa0.num_cols, k as u32, "packed commit must carry all K columns");
+    }
+    if mode != "both" {
+        println!(
+            "MODE={mode} K={k} n_trace={n_trace} fri_verifies={} wall_ms={:.1} peak_rss_mib={:.0}",
+            if run_base { base_fri_verifies } else { batch_fri_verifies },
+            if run_base { base_ms } else { batch_ms },
+            if run_base { base_rss } else { batch_rss },
+        );
+        return;
+    }
     let (pa, _) = commit_binding_cells(&lde_a, &cols, n_trace, blowup, pi, b"seam", params);
     let (pb, _) = commit_binding_cells(&lde_b, &cols, n_trace, blowup, pi, b"seam", params);
-    verify_ood_consistency(&pa, &pb, pi, params).expect("honest batched seam group must verify");
-    let batch_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let batch_fri_verifies = 2usize;
-    assert_eq!(pa.num_cols, k as u32, "packed commit must carry all K columns");
 
     // ── ADVERSARIAL 1: one column of strand B differs (still low-degree) ──
     let mut lde_b_bad = lde_a.clone();
@@ -114,9 +147,9 @@ fn main() {
 
     let factor = base_fri_verifies as f64 / batch_fri_verifies as f64;
     println!("\n═══ deep_ali seam-batch bridge (K={k} columns / group, n_trace={n_trace}, L1/Fp6) ═══");
-    println!("  BASELINE  per-column : {base_fri_verifies} FRI verifies, {base_ms:.1} ms  (K commits ×2, K OOD checks)");
-    println!("  BATCHED   per-group  : {batch_fri_verifies} FRI verifies, {batch_ms:.1} ms  (1 packed commit ×2, 1 OOD check)");
-    println!("  reduction            : {factor:.0}× fewer FRI verifies, {:.1}× wall", base_ms / batch_ms);
+    println!("  BASELINE  per-column : {base_fri_verifies} FRI verifies, {base_ms:.1} ms, peak {base_rss:.0} MiB  (K commits ×2, K OOD checks)");
+    println!("  BATCHED   per-group  : {batch_fri_verifies} FRI verifies, {batch_ms:.1} ms, peak {batch_rss:.0} MiB  (1 packed commit ×2, 1 OOD check)");
+    println!("  reduction            : {factor:.0}× fewer FRI verifies, {:.1}× wall, but {:.1}× MORE RSS (packed poly is K× larger)", base_ms / batch_ms, batch_rss / base_rss.max(1.0));
     println!("  ----------------------------------------------------------------");
     println!("  honest group verifies         : true");
     println!("  tampered column rejected      : baseline={base_rej}, batched={batch_rej}");
