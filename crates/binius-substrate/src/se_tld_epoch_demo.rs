@@ -368,6 +368,80 @@ mod tests {
 		);
 	}
 
+	/// ★ TRUSTLESS END-TO-END (model C): fold a REAL `.se` zone into the trustless
+	/// C1/C2 epoch — each delegation's STATEMENT (pk, message) is committed via a
+	/// per-record FRI commitment bound to R* (no aggregator trust for commitment /
+	/// membership), with the ECDSA RRSIG validity in the NativeVerified slot (the
+	/// in-circuit sig-verify AIR = S1d, pending).  Measures the trustless resolver
+	/// cost on the real names.
+	#[test]
+	#[ignore = "real .se zone -> trustless C1/C2 epoch (per-record FRI); run with --ignored"]
+	fn se_zone_trustless_c2_e2e() {
+		use crate::epoch_c2::{fold_epoch_c2, open_statement_c2, verify_epoch_c2, verify_record_c2, Statement, ValidityAttestation};
+		use p256::elliptic_curve::sec1::ToEncodedPoint;
+		use std::time::Instant;
+
+		let level = Sha3Level::L1;
+		let d_seed: [u8; 32] = Sha256::digest(b"dot-se-ZSK-seed-v1").into();
+		let zsk = SigningKey::from_slice(&d_seed).expect("valid P-256 scalar");
+		let vk: VerifyingKey = *zsk.verifying_key();
+
+		// Real `.se` names, power-of-two count (C1 per-record FRI is O(N); keep N modest).
+		let loaded = load_se_names(256).expect("load real .se names");
+		let mut n = 1usize;
+		while n * 2 <= loaded.len() {
+			n *= 2;
+		}
+		let names = &loaded[..n];
+		let dels: Vec<SeDelegation> = names.iter().map(|nm| build_delegation(&zsk, level, nm)).collect();
+
+		// (1) AGGREGATOR: native ECDSA-P256 RRSIG verify (the hybrid validity slot).
+		let t = Instant::now();
+		let all_valid = dels.iter().all(|d| vk.verify(&d.signing_input, &d.sig).is_ok());
+		let rrsig_ms = t.elapsed().as_secs_f64() * 1e3;
+		assert!(all_valid, "all real `.se` RRSIGs must verify natively");
+
+		// STATEMENT_i = (pk_hash = SHA3(.se ZSK), msg_hash = SHA3-256(signing_input) = d.m32).
+		let pk_hash: [u8; 32] = {
+			let mut h = Sha3_256::new();
+			h.update(vk.to_encoded_point(false).as_bytes());
+			h.finalize().into()
+		};
+		let statements: Vec<Statement> =
+			dels.iter().map(|d| Statement { pk_hash, msg_hash: d.m32 }).collect();
+
+		// (2) AGGREGATOR: trustless C1/C2 commitment (per-record FRI) + validity slot.
+		let t = Instant::now();
+		let proof = fold_epoch_c2(statements.clone(), ValidityAttestation::NativeVerified, "se", 20_260_716);
+		let agg_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// (3) RESOLVER: trustless epoch verify (commitment/membership; validity native).
+		let t = Instant::now();
+		assert!(verify_epoch_c2(&proof, "se").is_ok(), "trustless `.se` epoch must verify");
+		let ve_ms = t.elapsed().as_secs_f64() * 1e3;
+
+		// (4) RESOLVER: trustless per-query membership for a REAL name; outsider rejected.
+		let idx = n / 3;
+		let op = open_statement_c2(&proof, idx);
+		let t = Instant::now();
+		assert!(verify_record_c2(&proof, &op, &statements[idx], "se").is_ok(), "real `.se` statement must open");
+		let vr_us = t.elapsed().as_secs_f64() * 1e6;
+		let outsider = Statement { pk_hash, msg_hash: [0x9Au8; 32] };
+		assert!(verify_record_c2(&proof, &op, &outsider, "se").is_err(), "a statement not under R* must be rejected");
+
+		println!("\n=== REAL `.se` zone → TRUSTLESS C1/C2 epoch (model C, NIST L1) ===");
+		println!("  real Tranco `.se` delegations         : {n}   (e.g. {}, {})", names[0].trim_end_matches('.'), names[1].trim_end_matches('.'));
+		println!("  AGGREGATOR (once/epoch):");
+		println!("    native ECDSA-P256 RRSIG verify      : {rrsig_ms:.1} ms  (validity: NativeVerified slot; in-circuit = S1d, pending)");
+		println!("    trustless C1 per-record FRI commit  : {agg_ms:.0} ms  (O(N), N per-record commitments bound to R*)");
+		println!("  RESOLVER:");
+		println!("    verify_epoch (once/epoch)           : {ve_ms:.1} ms  (TRUSTLESS: O(N) per-record openings, no aggregator trust)");
+		println!("    verify_record (per DNS query)       : {vr_us:.1} µs  (TRUSTLESS: statement byte-bound to its R*_i)");
+		println!("    outsider statement rejected         : ✓");
+		println!("  ⇒ commitment + membership are TRUSTLESS (no aggregator trust) on the real `.se` zone;");
+		println!("    validity is native ECDSA (hybrid) — the in-circuit sig-verify (S1d) is the trustless-validity upgrade.");
+	}
+
 	/// ★ END-TO-END: fold a REAL `.se` zone (Tranco delegations, native ECDSA-P256
 	/// RRSIGs) into ONE epoch proof via the interleaved single-opening, and measure
 	/// the resolver cost — verify_epoch once/epoch + µs membership per query — on
