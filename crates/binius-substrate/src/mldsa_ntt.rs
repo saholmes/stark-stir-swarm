@@ -1333,6 +1333,104 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 	Ok(())
 }
 
+/// One butterfly's fleet-shard spec: `(u, v, ζ, [pos_u, pos_v, pos_a, pos_s])`.
+pub type ButterflySpec = (u64, u64, u64, [u64; 4]);
+
+/// FLEET SHARD: prove ONE row-block of a stage's butterflies as a STANDALONE tall-narrow proof.
+/// The block's I/O and schedule are SEAM BOUNDARY FLUSHES on the shard's own `net`/`sched`
+/// channels: each butterfly's inputs are boundary-PUSHed and outputs boundary-PULLed on `net`
+/// (so the row's pull/push balance), and its `[pos,ζ]` schedule tuple is boundary-PUSHed on
+/// `sched` (pinning).  So a shard is a self-contained low-RSS proof of its block; the fleet runs
+/// G shards in parallel, and reconstruction checks the union of the boundary seam tokens is the
+/// stage's full I/O (positions are global, so the tokens across shards balance to the stage).
+/// `specs.len()` must be a power of two.  `do_prove` runs the full FRI PROVE+VERIFY and returns
+/// `(proof_bytes, peak_rss)`; otherwise `validate_witness` only.  `tamper` corrupts a butterfly's
+/// committed ζ (boundary schedule stays honest ⇒ the `sched` pin REJECTS).
+pub fn run_stage_shard(specs: &[ButterflySpec], tamper: Option<usize>, do_prove: bool) -> Result<(usize, u64)> {
+	assert!(specs.len().is_power_of_two(), "shard size must be a power of two");
+	let nrows = specs.len();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let net = cs.add_channel("shard-net");
+	let sched = cs.add_channel("shard-sched");
+	let bb = ButterflyBatch::build_seamed_positional(&mut cs, net, sched);
+
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for &(u, v, z, pos) in specs {
+		let t = ((z as u128 * v as u128) % Q as u128) as u64;
+		let oa = (u + t) % Q;
+		let os = (u + Q - t) % Q;
+		// net seam: PUSH the inputs (balancing the row's pulls), PULL the outputs (balancing pushes).
+		boundaries.push(Boundary { values: vec![bval(pos[0]), bval(u)], channel_id: net, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(pos[1]), bval(v)], channel_id: net, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(pos[2]), bval(oa)], channel_id: net, direction: FlushDirection::Pull, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(pos[3]), bval(os)], channel_id: net, direction: FlushDirection::Pull, multiplicity: 1 });
+		// sched seam: PUSH the public schedule tuple (pins this row's positions + ζ).
+		boundaries.push(Boundary { values: vec![bval(pos[0]), bval(pos[1]), bval(pos[2]), bval(pos[3]), bval(z)], channel_id: sched, direction: FlushDirection::Push, multiplicity: 1 });
+	}
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(bb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, &(u, v, z, pos)) in specs.iter().enumerate() {
+			let z_use = if tamper == Some(row) { (z + 1) % Q } else { z };
+			bb.populate_positional(&mut seg, row, u, v, z_use, pos)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	if !do_prove {
+		return Ok((0, 0));
+	}
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend())?;
+	let proof_size = proof.get_proof_size();
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof)?;
+	Ok((proof_size, rss))
+}
+
+/// Split a full forward `n`-NTT's stage `s` into `g` fleet-shard specs (row-blocks of its n/2
+/// butterflies).  Each returned Vec is one shard's butterflies, ready for `run_stage_shard`.
+pub fn stage_shards(input: &[u64], n: usize, s: usize, g: usize) -> Vec<Vec<ButterflySpec>> {
+	let mut a = input.to_vec();
+	let mut stage_bfs: Vec<ButterflySpec> = Vec::new();
+	for (start, len, zeta) in forward_groups(n) {
+		let st = (n.trailing_zeros() - len.trailing_zeros() - 1) as usize;
+		for j in start..start + len {
+			let (u, v) = (a[j], a[j + len]);
+			let t = ((zeta as u128 * v as u128) % Q as u128) as u64;
+			if st == s {
+				stage_bfs.push((u, v, zeta, [
+					(st * n + j) as u64,
+					(st * n + j + len) as u64,
+					((st + 1) * n + j) as u64,
+					((st + 1) * n + j + len) as u64,
+				]));
+			}
+			a[j] = (u + t) % Q;
+			a[j + len] = (u + Q - t) % Q;
+		}
+	}
+	let per = stage_bfs.len() / g;
+	(0..g).map(|k| stage_bfs[k * per..(k + 1) * per].to_vec()).collect()
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -1606,6 +1704,47 @@ mod tests {
 			}
 		}
 		println!("GATE ntt-network-batched: each stage is ONE tall-narrow positional table routed by a single (pos,value) channel, with positions+twiddle PINNED to the public schedule via boundary flushes; honest validates, any corrupted twiddle OR position REJECTED");
+	}
+
+	/// FLEET SHARDING: split a stage's butterflies into G independent shards, each a standalone
+	/// proof (its I/O + schedule as boundary seams).  Every honest shard validates; a tampered
+	/// shard is rejected; the union of shards is the whole stage (G·per = n/2 butterflies).
+	#[test]
+	fn stage_sharded_across_fleet() {
+		for &(n, g) in &[(16usize, 2usize), (16, 4), (32, 4)] {
+			let mut rng = StdRng::seed_from_u64(0x5A5A ^ (n as u64) ^ ((g as u64) << 8));
+			let x = rand_zq(&mut rng, n);
+			let s = 1; // an interior stage
+			let shards = super::stage_shards(&x, n, s, g);
+			assert_eq!(shards.iter().map(|sh| sh.len()).sum::<usize>(), n / 2, "shards must cover the stage");
+			for (k, shard) in shards.iter().enumerate() {
+				super::run_stage_shard(shard, None, false)
+					.unwrap_or_else(|e| panic!("n={n} g={g} shard {k} must validate: {e}"));
+				assert!(super::run_stage_shard(shard, Some(0), false).is_err(), "n={n} g={g} shard {k}: a tampered ζ must be REJECTED");
+			}
+		}
+		println!("GATE fleet-shard: a stage's butterflies split into G independent standalone shards (I/O + schedule as boundary seams); every shard validates over B256, tampered shard REJECTED, union = whole stage");
+	}
+
+	/// MEASURE: per-shard FRI-prove time + peak RSS as a stage is split G ways — the fleet
+	/// trade (more shards ⇒ smaller, lower-RSS, parallel proofs).  Run ALONE (RSS process-global).
+	#[test]
+	#[ignore = "fleet per-shard prove RSS/time; run ALONE with --ignored"]
+	fn stage_shard_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== fleet per-shard prove over B256 @L1(128) — stage of a 256-NTT, split G ways ===");
+		println!("| G shards | butterflies/shard | prove_ms/shard | proof_bytes | peak_rss_MiB |");
+		let n = 256usize;
+		let mut rng = StdRng::seed_from_u64(0xF1EE7);
+		let x = rand_zq(&mut rng, n);
+		for &g in &[2usize, 4, 8, 16] {
+			let shards = super::stage_shards(&x, n, 3, g);
+			let t = Instant::now();
+			let (bytes, rss) = super::run_stage_shard(&shards[0], None, true).expect("shard prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			println!("| {g} | {} | {ms:.0} | {bytes} | {:.0} |", shards[0].len(), rss as f64 / (1024.0 * 1024.0));
+		}
+		println!("(each shard is an independent proof ⇒ runs on its own fleet processor; peak RSS is per-shard, well under 500 MiB.)");
 	}
 
 	/// MEASURE: the TALL-NARROW butterfly batch FRI-prove time + peak RSS, swept over the same

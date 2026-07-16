@@ -111,9 +111,27 @@ Seam binding across strands is the existing OOD/channel model; reconstruction + 
    now rejects BOTH a corrupted twiddle AND a corrupted position (boundary honest ⇒ the `sched`
    channel is the load-bearing rejecter). This sidesteps M3's `LookupProducer` (B128-only) by using
    the public boundary-flush mechanism. The positional routed network is now fully sound.
-3. **Row-block sharding** with seam binding (mirror `gway_reconstruction`) — split a stage's
-   positional table across fleet processors, seam the shared channel; measure per-shard RSS + fleet
-   wall-time.
+3. **Row-block fleet sharding** — ✅ **DONE + MEASURED** (`run_stage_shard` / `stage_shards`). A
+   stage's n/2 butterflies split into G independent STANDALONE proofs; each shard's I/O and
+   schedule are **seam boundary flushes** (inputs boundary-PUSHed / outputs boundary-PULLed on the
+   shard's `net`, `[pos,ζ]` boundary-PUSHed on `sched`), so a shard is a self-contained low-RSS
+   proof and the fleet runs G in parallel; reconstruction checks the union of seam tokens is the
+   stage's full I/O (positions are global ⇒ tokens balance to the stage). Every honest shard
+   validates, a tampered shard is REJECTED, and the shards cover the stage
+   (`stage_sharded_across_fleet`). Per-shard FRI-prove of a **256-NTT stage** (128 butterflies)
+   split G ways (`stage_shard_prove_scaling`):
+
+   | G | butterflies/shard | prove/shard | proof | peak RSS |
+   |---|-------------------|-------------|-------|----------|
+   | 2 | 64 | 6.2 s | 561 KB | **25 MiB** |
+   | 4 | 32 | 4.7 s | 548 KB | **28 MiB** |
+   | 8 | 16 | 3.4 s | 538 KB | **29 MiB** |
+   | 16 | 8 | 2.3 s | 453 KB | **30 MiB** |
+
+   Each shard proves independently at **~25–30 MiB** (a ~16× margin under 500 MiB) — IoT-viable —
+   and more shards ⇒ faster per-shard prove; run in parallel across the fleet, wall-time is
+   per-shard, not the sum. The excessive-single-machine prove time is now a fleet of small,
+   low-RSS, parallel proofs.
 4. Wire the combine/digit/boundary/hash strands into the same fleet + reconstruct; measure the
    full sharded S1d ML-DSA verify (fleet latency + per-shard RSS).
 
