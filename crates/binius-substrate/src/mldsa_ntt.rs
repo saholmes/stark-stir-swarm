@@ -1626,6 +1626,117 @@ pub fn run_combine_shard(specs: &[CombineSpec], tamper: Option<usize>, do_prove:
 	Ok((proof_size, rss))
 }
 
+/// Tall-narrow single-MULTIPLY strand: each ROW proves one `p = a·z mod q` (var×var), the
+/// combine's inner multiply factored OUT so the combine shards FINER.  The combine ŵ = Σ_j
+/// a_j·z_j − c·td has 5 var×var mults/row (the width driver ⇒ the 14.7 s wall); running each
+/// multiply as its OWN row-per-coefficient strand (1 ModMulVar/row, ≈ the butterfly's ~2 s) in
+/// parallel across the fleet drops the combine's wall to ≈ one multiply, then a light accumulate
+/// strand sums the products.  Every input is pulled from `flow`, the product pushed.
+pub struct MultBatch {
+	pub table_id: TableId,
+	c_col: Col<B1, W>,
+	a: Col<B1, W>,
+	z: Col<B1, W>,
+	p: Col<B1, W>,
+	a_lt: LtQ,
+	z_lt: LtQ,
+	mul: ModMulVar,
+	pos: [Col<B1, W>; 3],
+}
+
+impl MultBatch {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, flow: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow single-MULTIPLY strand (p = a·z mod q)");
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("c_q", c_arr);
+		let q_set = set_bits_of(Q);
+		let a = t.add_committed::<B1, W>("a");
+		let z = t.add_committed::<B1, W>("z");
+		let a_lt = LtQ::build(&mut t, "a", a, c_col);
+		let z_lt = LtQ::build(&mut t, "z", z, c_col);
+		let mul = ModMulVar::build(&mut t, "mul", z, a, c_col, &q_set); // a·z
+		let p = mul.out;
+		let pos: [Col<B1, W>; 3] = std::array::from_fn(|k| t.add_committed::<B1, W>(format!("pos{k}")));
+		let b64 = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, nm: &str| -> Col<B64, 1> { t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b"), col) };
+		let (pa, va) = (b64(&mut t, pos[0], "pa"), b64(&mut t, a, "va"));
+		t.pull(flow, [pa, va]);
+		let (pz, vz) = (b64(&mut t, pos[1], "pz"), b64(&mut t, z, "vz"));
+		t.pull(flow, [pz, vz]);
+		let (pp, vp) = (b64(&mut t, pos[2], "pp"), b64(&mut t, p, "vp"));
+		t.push(flow, [pp, vp]);
+		Self { table_id: t.id(), c_col, a, z, p, a_lt, z_lt, mul, pos }
+	}
+
+	pub fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, a: u64, z: u64, pos: [u64; 3]) -> Result<u64> {
+		let c = c_q_bits();
+		write_col::<W>(seg, self.c_col, row, &c)?;
+		write_col::<W>(seg, self.a, row, &bits64(a))?;
+		write_col::<W>(seg, self.z, row, &bits64(z))?;
+		self.a_lt.populate(seg, row, &bits64(a), &c)?;
+		self.z_lt.populate(seg, row, &bits64(z), &c)?;
+		let pb = self.mul.populate(seg, row, &bits64(z), &bits64(a), &c)?;
+		let _ = self.p;
+		for (k, &pv) in pos.iter().enumerate() {
+			write_col::<W>(seg, self.pos[k], row, &bits64(pv))?;
+		}
+		Ok(to_u64(&pb))
+	}
+}
+
+/// One multiply coefficient's fleet-shard spec: `(a, z)` and seam positions `[pos_a, pos_z, pos_p]`.
+#[derive(Clone, Copy)]
+pub struct MultSpec {
+	pub a: u64,
+	pub z: u64,
+	pub pos: [u64; 3],
+}
+
+/// FLEET SHARD of a single-MULTIPLY strand: a row-block of `p = a·z mod q` as a standalone
+/// low-RSS proof (a/z pulled, p pushed on `flow`).  `tamper` corrupts a coefficient's `z`.
+pub fn run_mult_shard(specs: &[MultSpec], tamper: Option<usize>, do_prove: bool) -> Result<(usize, u64)> {
+	assert!(specs.len().is_power_of_two(), "mult shard size must be a power of two");
+	let nrows = specs.len();
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let flow = cs.add_channel("mult-flow");
+	let mb = MultBatch::build(&mut cs, flow);
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for sp in specs {
+		let p = ((sp.a as u128 * sp.z as u128) % Q as u128) as u64;
+		boundaries.push(Boundary { values: vec![bval(sp.pos[0]), bval(sp.a)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(sp.pos[1]), bval(sp.z)], channel_id: flow, direction: FlushDirection::Push, multiplicity: 1 });
+		boundaries.push(Boundary { values: vec![bval(sp.pos[2]), bval(p)], channel_id: flow, direction: FlushDirection::Pull, multiplicity: 1 });
+	}
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(mb.table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		for (row, sp) in specs.iter().enumerate() {
+			let z_use = if tamper == Some(row) { (sp.z + 1) % Q } else { sp.z };
+			mb.populate(&mut seg, row, sp.a, z_use, sp.pos)?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	if !do_prove {
+		return Ok((0, 0));
+	}
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, witness, &binius_hal::make_portable_backend(),
+	)?;
+	let proof_size = proof.get_proof_size();
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	let vt = std::time::Instant::now();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof,
+	)?;
+	VERIFY_US.store(vt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+	Ok((proof_size, rss))
+}
+
 // ── DIGIT strand constants (ML-DSA-44 / NIST L1) ────────────────────────────
 const GAMMA2: u64 = 95232;
 const ALPHA: u64 = 190464; // 2·γ2
@@ -2370,6 +2481,42 @@ mod tests {
 			println!("| {g} | {per} | {ms:.0} | {vms:.1} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
 		}
 		println!("(combine joins the fleet: independent per-shard proofs; per-shard VERIFY is aggregation cost, folded into the succinct epoch proof.)");
+	}
+
+	fn mult_specs(count: usize, seed: u64) -> Vec<super::MultSpec> {
+		let mut rng = StdRng::seed_from_u64(seed);
+		(0..count).map(|i| super::MultSpec { a: rng.next_u64() % Q, z: rng.next_u64() % Q, pos: std::array::from_fn(|k| (k * 4096 + i) as u64) }).collect()
+	}
+
+	/// The single-MULTIPLY strand (the combine, factored finer): a row-block of p = a·z mod q
+	/// proves as a standalone shard.  Honest validates; a tampered factor is REJECTED.
+	#[test]
+	fn mult_strand_sharded_across_fleet() {
+		for &sz in &[4usize, 8, 16] {
+			let specs = mult_specs(sz, 0x111 ^ sz as u64);
+			super::run_mult_shard(&specs, None, false).unwrap_or_else(|e| panic!("mult shard sz={sz} must validate: {e}"));
+			assert!(super::run_mult_shard(&specs, Some(sz / 2), false).is_err(), "mult shard sz={sz}: a tampered factor must be REJECTED");
+		}
+		println!("GATE mult-fleet: the single-multiply p=a·z strand shards as standalone low-RSS proofs; honest validates, tampered factor REJECTED");
+	}
+
+	/// MEASURE: the combine sharded FINER — one single-multiply strand vs the 5-mult combine.
+	/// The combine's 14.7 s wall was 5 var×var mults/row; one multiply/row is ~1/5 the width, so
+	/// the 5 mults run in parallel at ≈ butterfly speed ⇒ the combine wall drops to ≈ one multiply.
+	#[test]
+	#[ignore = "finer combine sharding (single-multiply strand) prove RSS/time; run ALONE"]
+	fn mult_shard_prove_scaling() {
+		use std::time::Instant;
+		println!("\n=== finer combine sharding — single-multiply p=a·z strand over B256 @L1(128) ===");
+		println!("| coeffs/shard | prove_ms/shard | proof_bytes | peak_rss_MiB | (vs 5-mult combine at same size) |");
+		for &per in &[64usize, 32, 16, 8] {
+			let specs = mult_specs(per, 0x222 ^ per as u64);
+			let t = Instant::now();
+			let (bytes, rss) = super::run_mult_shard(&specs, None, true).expect("mult shard prove");
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			println!("| {per} | {ms:.0} | {bytes} | {:.0} | |", rss as f64 / (1024.0 * 1024.0));
+		}
+		println!("(the combine's 5 var×var mults become 5 single-multiply strands run IN PARALLEL ⇒ combine wall ≈ one multiply strand (≈ butterfly), not 5×; a light accumulate strand then sums the products.)");
 	}
 
 	fn digit_specs(count: usize, seed: u64) -> Vec<super::DigitSpec> {

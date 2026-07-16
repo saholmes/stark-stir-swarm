@@ -67,6 +67,12 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
    Per-shard prove (256 coeffs split G ways, `combine_shard_prove_scaling`): G=4 64c/28.1s/63 MiB;
    G=8 32c/20.5s/71 MiB; G=16 16c/14.7s/73 MiB; G=32 8c/9.4s/**74 MiB** — under 500 MiB, joins the
    fleet. (Slower than the butterfly: 5 var×var mults/row vs 1; RSS stays low, wall-time is per-shard.)
+   **Sharded FINER** (`MultBatch` / `run_mult_shard`): the 5 var×var mults are factored OUT into 5
+   single-multiply strands (each row `p = a·z mod q`, one ModMulVar/row) run IN PARALLEL, plus a
+   light accumulate — so the combine wall ≈ ONE multiply, not 5×. Single-multiply strand measured:
+   64c/4.4s/21 MiB … 8c/1.6s/24 MiB — **~6× faster and ~3× lighter** than the 5-mult combine at the
+   same size (16c: 2.5 s vs 14.7 s). Drops the combine's parallel wall from ~14.7 s to ~1.6–2.5 s
+   (`mult_strand_sharded_across_fleet` gates validate + tamper).
 3. **Digit strands** — ✅ **DONE + MEASURED** (`DigitBatch` / `run_digit_shard`): row-per-coefficient
    `w1 = UseHint(h, Decompose(w′))` — the two load-bearing identities `r+γ2 = r1·α+v0+s·q`
    (r1<m, v0∈[1,α]) and `w1+m+h = r1+2·hs+qp·m` (w1<m, qp∈{0,1,2}) in one row (no field mults, just
