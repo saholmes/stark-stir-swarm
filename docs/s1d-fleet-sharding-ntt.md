@@ -73,7 +73,14 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
    prove (256 coeffs split G ways): G=4 64c/229ms/12 MiB; G=32 8c/122ms/**14 MiB** — the LIGHTEST
    strand (2 carries/row). hint-weight ≤ ω (prove-4c) is a single k-count check (already proven,
    not per-coefficient ⇒ one small table, not sharded).
-5. **Closing-hash strand** — c̃′ = FIPS-202(μ ‖ w1Encode) == c̃ (prove-10; multi-block Keccak
+5. **Closing-hash strand** — ✅ **DONE + MEASURED** (`run_closing_hash_shard`): the terminal
+   ACCEPT binding c̃′ = SHA3-256(μ ‖ w1Encode(w1′)) == c̃ (prove-10). Unlike the per-coefficient
+   strands this is ONE hash (the width driver); it consumes the digit strand's w1Encode output and
+   μ, proves the digest over B256, and binds it to the public c̃ — so a wrong w1′ (from any tampered
+   upstream shard) changes w1Encode ⇒ different digest ⇒ REJECT (`closing_hash_strand_in_fleet`:
+   binds on the genuine w1Encode, a flipped w1′ breaks it). 245 910 B / **19 MiB** at the
+   single-Keccak-block anchor (μ ‖ first w1Encode group; the callable b256 SHA3 gadget is
+   single-block — multi-block is the same gadget scaled). Original note: prove-10; multi-block Keccak
    is its own scale-up — the callable `prove_verify_sha3_b256` is single-block today).
 
 Seam binding across strands is the existing OOD/channel model; reconstruction + verify follow

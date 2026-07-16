@@ -1990,6 +1990,23 @@ pub fn run_boundary_shard(specs: &[BoundarySpec], tamper: Option<usize>, do_prov
 	Ok((proof_size, rss))
 }
 
+/// FLEET STRAND (terminal): the CLOSING-HASH binding (S1d prove-10).  Unlike the per-coefficient
+/// strands, this is ONE hash (the width driver): `c̃' = SHA3-256(μ ‖ w1Encode(w1'))` proven over
+/// B256, bound to the public challenge `c̃`.  It CONSUMES the digit strand's w1Encode output
+/// (`w1enc` = pack(w1') from the digit shards) and μ, and the ACCEPT gate is `c̃' == c̃` — so a
+/// wrong w1' (from a tampered digit/NTT/combine shard) yields a different digest ⇒ REJECT.
+/// Returns `(proof_bytes, peak_rss, c̃'==c̃)`.  Single-Keccak-block anchor (μ ‖ first w1Encode
+/// group ≤ 135 B); the multi-block message is the same gadget scaled (the callable b256 SHA3 path
+/// is single-block).
+pub fn run_closing_hash_shard(mu: &[u8], w1enc: &[u8], ctilde: &[u8]) -> Result<(usize, u64, bool)> {
+	let mut msg = mu.to_vec();
+	msg.extend_from_slice(w1enc);
+	assert!(msg.len() <= 135, "single-block anchor only (multi-block Keccak is the scale-up)");
+	let (sz, digs) = crate::b256_sha3::prove_verify_sha3_b256(crate::sha3_variants::Sha3Variant::Sha3_256, &[msg], 1, 128)?;
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	Ok((sz, rss, digs[0].as_slice() == ctilde))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -2445,6 +2462,34 @@ mod tests {
 			println!("| {g} | {per} | {ms:.0} | {bytes} | {:.0} |", rss as f64 / (1024.0 * 1024.0));
 		}
 		println!("(boundary joins the fleet: the lightest ACCEPT-check strand, per-shard RSS well under 500 MiB.)");
+	}
+
+	/// The CLOSING-HASH strand (terminal) wired into the fleet: it consumes the digit strand's
+	/// w1Encode output, proves c̃' = SHA3-256(μ ‖ w1Encode) over B256, and binds c̃' == c̃.  A
+	/// wrong w1' (from any tampered upstream shard) changes w1Encode ⇒ different digest ⇒ the
+	/// binding fails.  (Single-Keccak-block anchor; the callable b256 SHA3 gadget is single-block.)
+	#[test]
+	#[ignore = "closing-hash strand (B256 SHA3 prove); heavier (width driver), run with --ignored"]
+	fn closing_hash_strand_in_fleet() {
+		use sha3::{Digest, Sha3_256};
+		// digit strand outputs w1' (a UseHint group), packed by w1Encode (6 bits/coeff at L1).
+		let w1 = [5u64, 6, 0, 21]; // < m = 44
+		let pack = |w: &[u64; 4]| -> Vec<u8> { ((w[0] | (w[1] << 6) | (w[2] << 12) | (w[3] << 18)) as u32).to_le_bytes()[..3].to_vec() };
+		let mu = [0x5au8; 64];
+		let w1enc = pack(&w1);
+		let mut msg = mu.to_vec();
+		msg.extend_from_slice(&w1enc);
+		let ctilde: [u8; 32] = Sha3_256::digest(&msg).into();
+
+		let (sz, rss, ok) = super::run_closing_hash_shard(&mu, &w1enc, &ctilde).expect("closing-hash strand");
+		assert!(ok, "closing-hash strand must bind c̃' == c̃ over the genuine w1Encode");
+
+		// tamper: a wrong w1' coefficient ⇒ different w1Encode ⇒ c̃' ≠ c̃ (binding breaks).
+		let bad = pack(&[w1[0] + 1, w1[1], w1[2], w1[3]]);
+		let (_s, _r, bad_ok) = super::run_closing_hash_shard(&mu, &bad, &ctilde).expect("prove");
+		assert!(!bad_ok, "a tampered w1' must break the c̃' == c̃ binding");
+
+		println!("GATE closing-hash-fleet: c̃'=SHA3-256(μ‖w1Encode) PROVEN over B256 ({sz} B, {:.0} MiB), bound to c̃; a wrong w1' breaks it — the terminal ACCEPT strand.", rss as f64 / (1024.0 * 1024.0));
 	}
 
 	/// END-TO-END: fleet-prove the NTT + combine shards (validity, low RSS, parallel), then
