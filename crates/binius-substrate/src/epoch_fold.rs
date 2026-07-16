@@ -262,6 +262,38 @@ mod tests {
         );
     }
 
+    /// `.se`-SCALE SWEEP: the succinct resolver verify stays ~ms as the zone
+    /// grows (polylog), with a µs per-query membership check.  Ignored by
+    /// default (fold_epoch is O(N) aggregator work; run with --ignored).
+    #[test]
+    #[ignore = "epoch sweep (aggregator O(N) fold+decider prove); run with --ignored"]
+    fn se_scale_resolver_sweep() {
+        use std::time::Instant;
+        let inner_vars = 4usize; // small record witness (model A membership leaf)
+        println!("\n=== epoch-fold .se-scale resolver cost (inner_vars={inner_vars}, L1) ===");
+        println!("| N records | n_vars | aggregator fold+open ms | RESOLVER verify_epoch ms | proof KiB | verify_record µs |");
+        for &logn in &[8usize, 10, 12] {
+            let n = 1usize << logn;
+            let ls = leaves(n, inner_vars, 3);
+            let t = Instant::now();
+            let proof = fold_epoch(&ls, "se", EPOCH);
+            let agg_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            assert!(verify_epoch(&proof, "se").is_ok());
+            let ve = t.elapsed().as_secs_f64() * 1e3;
+            let op = open_record(&ls, n / 3);
+            let t = Instant::now();
+            assert!(verify_record(&proof, &op).is_ok());
+            let vr = t.elapsed().as_secs_f64() * 1e6;
+            println!(
+                "| {n} | {} | {agg_ms:.0} | {ve:.2} | {} | {vr:.1} |",
+                proof.acc_claim.point.len(),
+                proof.decider_proof.len() / 1024,
+            );
+        }
+        println!("(verify_epoch is once/epoch; verify_record is per DNS query.)");
+    }
+
     /// ADVERSARIAL: wrong zone ⇒ pi_hash differs ⇒ fold replay ≠ acc_claim ⇒ reject.
     #[test]
     fn wrong_zone_rejected() {
