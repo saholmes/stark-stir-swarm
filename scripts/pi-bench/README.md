@@ -101,10 +101,38 @@ sub-500 MB IoT claim holds on genuine low-end silicon, not just the M4/x86 proxy
 Per ML-DSA-44 verify: **641 shards, ~79665 s total shard-work, 34 MiB peak RSS.** Fleet latency:
 1 Pi → ~22 h, 64 → 1245 s, 256 → 311 s (~12 sigs/hr).
 
-**Shard size amortises fixed cost.** Same verify at `SHARD_COEFFS=8` needs 2561 tiny shards and
-**136474 s** total work; at `SHARD_COEFFS=32` it is 641 shards and **79665 s** — 1.71× less work for
-~1 MiB more RSS. (`closing-hash` stays ~67 s either way: it is per-signature SHA-3 of the full
+### Going further with the RAM headroom — 34 MiB of ~900 MiB is ~4%
+
+The peak footprint is tiny relative to the 1 GB, so the spare RAM is budget to spend. Two
+independent levers, both measured on this Pi 2, both far under 500 MiB, and they **compose**.
+
+**Lever 1 — bigger shards (`SHARD_COEFFS` ↑, zero code change).** Larger shards amortise the
+per-shard fixed cost (setup/commit), cutting total shard-work per ML-DSA-44 verify monotonically:
+
+| `SHARD_COEFFS` | shards/sig | total shard-work | peak RSS | vs sc=8 |
+|---:|---:|---:|---:|---:|
+| 8 | 2,561 | 136,474 s | 33 MiB | 1.0× |
+| 32 | 641 | 79,665 s | 34 MiB | 1.7× |
+| 64 | 321 | 52,564 s | 33 MiB | 2.6× |
+| 128 | 161 | 33,675 s | 37 MiB | 4.1× |
+| **256** | **81** | **21,101 s** | **43 MiB** | **6.5×** |
+
+`sc=256` (a whole polynomial per shard) does **6.5× less total work than `sc=8` for 43 MiB — 13% of
+the budget**. (`closing-hash` stays ~67 s at every size: it is per-signature SHA-3 of the full
 message, not coeff-sharded, so it is the critical-path floor.)
+
+**Lever 2 — intra-node concurrency (`concurrent_shards_throughput`).** A single shard's intra-parallel
+prove leaves ~⅔ of the 4 cores idle (Pi load ~1.9/4), so proving several independent shards *at once*
+recovers it. Measured (combine shards, `sc=32`):
+
+| CONC (shards at once) | sequential | concurrent | speedup | peak RSS |
+|---:|---:|---:|---:|---:|
+| 4 (= core count) | 518.5 s | 162.6 s | **3.19×** | 46 MiB |
+| 8 (oversubscribed) | 1036.4 s | 319.6 s | 3.24× | 64 MiB |
+
+**Rule: `CONC` = core count** — oversubscribing past 4 adds nothing (cores saturated) but more RAM.
+The two levers stack: `sc=256` (6.5× less work) × `CONC=4` (~3.2× faster wall) still fits in ~64 MiB,
+leaving ~850 MiB of the Pi's RAM untouched.
 
 **The Cortex-A7 is the worst-case throughput floor** (a 2015-era in-order core, ~40× the M4). The
 realistic fleet node is a Pi 4/5 (Cortex-A72/A76, 64-bit, 4–8× faster/core, runs the aarch64 static
