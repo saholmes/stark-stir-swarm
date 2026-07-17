@@ -400,6 +400,49 @@ pub fn trustless_combine_o1(records: &[Vec<OurB256>], inner_vars: usize, forge_a
 	Ok((holds, prove_ms, verify_ms, sz))
 }
 
+/// The combiner's report: which trust model ran, whether it accepted, and the resolver verify time.
+pub struct CombinerReport {
+	pub trust_model: &'static str,
+	pub accepted: bool,
+	pub verify_us: u128,
+}
+
+/// COMBINE the fleet's shard outputs into a record/epoch proof and VERIFY it — the combiner trust
+/// model chosen at COMPILE TIME by the `trusted-combiner` feature:
+///
+///   * default (feature OFF) → **TRUSTLESS**: `trustless_combine_o1` folds the shard-output claims
+///     and proves the whole fold tree; the resolver trusts nothing about the combiner (a forged
+///     shard output is REJECTED).  ~ms verify.
+///   * `--features trusted-combiner` → **TRUSTED aggregator** (model A): `epoch_fold` commits the
+///     interleaved shard outputs and opens once; the resolver checks only the data opening and
+///     trusts the combiner verified the shard proofs.  Sub-ms verify.
+///
+/// `records` are the fleet's shard-output blocks (each `2^inner_vars` coefficients, a power of two;
+/// the record count must be a power of two ≥ 2).  Same call site, trust model swapped by a flag.
+pub fn combine_and_verify(records: &[Vec<u64>], inner_vars: usize) -> Result<CombinerReport> {
+	use std::time::Instant;
+	assert!(records.len().is_power_of_two() && records.len() >= 2, "record count must be a power of two ≥ 2");
+	for rec in records {
+		assert_eq!(rec.len(), 1usize << inner_vars, "each record must have 2^inner_vars coefficients");
+	}
+	#[cfg(feature = "trusted-combiner")]
+	{
+		use crate::epoch_fold::{fold_epoch, verify_epoch, EpochLeaf};
+		use binius_field::BinaryField128b as F;
+		let leaves: Vec<EpochLeaf> = records.iter().map(|rec| EpochLeaf { record: rec.iter().map(|&x| F::new(x as u128)).collect() }).collect();
+		let proof = fold_epoch(&leaves, "record", 1);
+		let t = Instant::now();
+		let accepted = verify_epoch(&proof, "record").is_ok();
+		Ok(CombinerReport { trust_model: "trusted (epoch_fold / model A)", accepted, verify_us: t.elapsed().as_micros() })
+	}
+	#[cfg(not(feature = "trusted-combiner"))]
+	{
+		let recs: Vec<Vec<OurB256>> = records.iter().map(|rec| rec.iter().map(|&x| OurB256::from(binius_field::BinaryField128b::new(x as u128))).collect()).collect();
+		let (accepted, _prove_ms, verify_ms, _sz) = trustless_combine_o1(&recs, inner_vars, None)?;
+		Ok(CombinerReport { trust_model: "trustless (trustless_combine_o1)", accepted, verify_us: verify_ms.saturating_mul(1000) })
+	}
+}
+
 // --- B256 native multilinear machinery for the IVC driver -------------------------------
 fn node256(k: usize) -> OurB256 {
 	OurB256::from(binius_field::BinaryField64b::new(k as u64))
@@ -939,6 +982,25 @@ mod tests {
 			println!("| {n} | {} | {pm} | {vm} | {sz} | {} |", n - 1, if ok { "✓" } else { "✗" });
 		}
 		println!("(ALL N−1 folds proven in ONE narrow fold-verify table ⇒ the resolver verifies ONE proof, ~constant in N — the O(1) trustless-combiner verify. Forged shard output still REJECTED.)");
+	}
+
+	/// The combiner trust model is a COMPILE-TIME flag: `combine_and_verify` runs the trustless
+	/// fold-tree by default, or the trusted `epoch_fold` under `--features trusted-combiner`.
+	/// Same call site; the flag swaps the trust↔verify-cost tradeoff.
+	#[test]
+	fn combiner_trust_model_by_flag() {
+		use rand::{RngCore, SeedableRng};
+		let inner = 3usize;
+		let n = 4usize;
+		let mut rng = rand::rngs::StdRng::from_seed([0xab; 32]);
+		let records: Vec<Vec<u64>> = (0..n).map(|_| (0..(1usize << inner)).map(|_| rng.next_u64()).collect()).collect();
+		let rep = super::combine_and_verify(&records, inner).expect("combine_and_verify");
+		assert!(rep.accepted, "the combiner must accept honest shard outputs");
+		#[cfg(feature = "trusted-combiner")]
+		assert!(rep.trust_model.starts_with("trusted"), "feature ON ⇒ trusted combiner");
+		#[cfg(not(feature = "trusted-combiner"))]
+		assert!(rep.trust_model.starts_with("trustless"), "feature OFF (default) ⇒ trustless combiner");
+		println!("GATE combiner-flag: trust model = {} ; resolver verify {} µs  (swap with --features trusted-combiner)", rep.trust_model, rep.verify_us);
 	}
 
 	/// ★THE MEASUREMENT — is the fold-verify circuit NARROW? Sweep d (interleaved-poly vars);

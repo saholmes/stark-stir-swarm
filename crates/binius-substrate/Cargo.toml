@@ -26,6 +26,14 @@ publish = false
 # Used to measure the intra-strand (within one proof) rayon speedup vs the 1-core baseline.
 parallel = ["binius_maybe_rayon/rayon"]
 
+# Combiner trust model (compile-time). DEFAULT (feature OFF) = TRUSTLESS: the combiner folds the
+# fleet shard-output claims and PROVES the whole fold tree (accumulation_air::trustless_combine_o1),
+# so the resolver trusts nothing about the combiner (a forged shard output is rejected); ~ms verify.
+# `--features trusted-combiner` = TRUSTED aggregator (model A, epoch_fold): the combiner verifies
+# the shard proofs off-circuit and folds the outputs; the resolver checks only the data opening;
+# sub-ms verify, but trusts the combiner's validity check. See `combine_and_verify`.
+trusted-combiner = []
+
 [dependencies]
 # Binius (local checkout, path deps — see rust-toolchain.toml for the pinned nightly).
 binius_core     = { path = "../../../binius/crates/core" }
