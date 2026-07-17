@@ -2314,6 +2314,53 @@ mod tests {
 		println!("(unit costs MEASURED on this core; totals are the ML-DSA-44 shard counts; throughput scales ~linearly with Pi count until the closing-hash/critical path floors it. Run on the Pi for real Pi numbers; SHARD_COEFFS tunes shard size.)");
 	}
 
+	/// LEVER 2 — intra-node concurrency.  Each shard proves in ~34 MiB, so a 1 GB Pi has room to
+	/// prove MANY shards AT ONCE.  This measures the wall time to prove `CONC` independent combine
+	/// shards two ways — SEQUENTIALLY (each shard already uses `--features parallel` = all cores)
+	/// vs CONCURRENTLY (`CONC` OS threads at once) — and the peak process RSS of the concurrent
+	/// run.  It shows how much of the RAM headroom converts to per-NODE throughput on this core,
+	/// and how many concurrent shards still fit the 500 MiB budget.  `CONC` defaults to the core
+	/// count.  Run ALONE on the target.
+	#[test]
+	#[ignore = "lever-2 intra-node concurrency: sequential vs concurrent shard proving + peak RSS; run ALONE on the target"]
+	fn concurrent_shards_throughput() {
+		use std::time::Instant;
+		let sc = std::env::var("SHARD_COEFFS").ok().and_then(|s| s.parse().ok()).unwrap_or(32usize);
+		let conc: usize = std::env::var("CONC").ok().and_then(|s| s.parse().ok())
+			.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+		let mib = |b: u64| b as f64 / 1048576.0;
+		let rss = crate::b256_sha3::peak_rss_bytes;
+		println!("\n=== lever-2 concurrent shards — arch={} shard={sc} coeffs, CONC={conc} ===", std::env::consts::ARCH);
+
+		// one unit of work = prove a single combine (var×var multiply) shard — the heaviest strand.
+		let prove_one = |seed: u64| { super::run_mult_shard(&mult_specs(sc, seed), None, true).unwrap(); };
+
+		// (a) SEQUENTIAL — CONC shards one after another; each shard uses the rayon pool (all cores).
+		let t = Instant::now();
+		for i in 0..conc { prove_one(2 + i as u64); }
+		let seq_s = t.elapsed().as_secs_f64();
+
+		// (b) CONCURRENT — CONC shards at once, one OS thread each (RAM ≈ CONC × one shard).
+		let t = Instant::now();
+		std::thread::scope(|s| {
+			for i in 0..conc { s.spawn(move || prove_one(2 + i as u64)); }
+		});
+		let conc_s = t.elapsed().as_secs_f64();
+		let peak = rss();
+
+		let speedup = seq_s / conc_s.max(1e-9);
+		let per_shard_seq = seq_s / conc as f64;
+		let per_shard_conc = conc_s / conc as f64;
+		println!("  {conc} combine shards (sc={sc}):");
+		println!("    sequential (intra-shard parallel) : {seq_s:7.1} s   ({per_shard_seq:.1} s/shard)");
+		println!("    concurrent ({conc} threads)           : {conc_s:7.1} s   ({per_shard_conc:.1} s/shard effective)");
+		println!("    concurrency speedup                : {speedup:.2}×");
+		println!("    peak RSS (concurrent, {conc} at once) : {:.0} MiB", mib(peak));
+		let fit = (500.0 / (mib(peak) / conc as f64).max(1.0)) as usize;
+		println!("  ⇒ {conc} shards at once use {:.0} MiB (< 500 budget: {}); ~{fit} concurrent shards would fit 500 MiB",
+			mib(peak), if mib(peak) < 500.0 { "YES" } else { "NO" });
+	}
+
 	/// SINGLE-DEVICE RSS PIPELINE — the first Raspberry-Pi test.  Proves ONE shard of every strand
 	/// type SEQUENTIALLY on ONE device, sampling the PROCESS peak RSS (getrusage high-water) after
 	/// each.  The load-bearing property: peak RSS PLATEAUS at ≈ one strand (each shard's memory is
