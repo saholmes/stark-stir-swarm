@@ -2261,6 +2261,59 @@ mod tests {
 		println!("(full 256-pt NTT = 1024 butterflies; extrapolate prove-time, and shard so each fleet strand's RSS < 500 MiB.)");
 	}
 
+	/// FLEET THROUGHPUT + WALL model for a Raspberry-Pi (aarch64) fleet.  Measures each strand's
+	/// UNIT per-shard prove cost + RSS on THIS device's core, then reports the end-to-end model for
+	/// one ML-DSA-44 verify: shard counts, total shard-work, per-signature LATENCY (critical path)
+	/// and THROUGHPUT (signatures/sec) as the fleet size (number of Pis) grows.  Run ON the Pi.
+	#[test]
+	#[ignore = "Pi fleet throughput/wall model — measures unit shard costs + reports sigs/sec at fleet sizes; run ALONE on the target"]
+	fn fleet_throughput_model() {
+		use std::time::Instant;
+		let sc = std::env::var("SHARD_COEFFS").ok().and_then(|s| s.parse().ok()).unwrap_or(32usize);
+		let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+		println!("\n=== Pi fleet throughput model — arch={} cores={} shard={sc} coeffs ===", std::env::consts::ARCH, cores);
+
+		// unit per-shard prove cost (ms) + peak RSS (MiB) for each strand type on THIS core.
+		let unit = |label: &str, f: &dyn Fn() -> (u64, f64)| -> (f64, f64) {
+			let t = Instant::now();
+			let (_bytes, rss) = f();
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			println!("  strand {label:<10} : {ms:8.0} ms/shard, {:.0} MiB", rss);
+			(ms, rss)
+		};
+		let (ntt_ms, ntt_rss) = {
+			let x = rand_zq(&mut StdRng::seed_from_u64(1), 256);
+			let shards = super::stage_shards(&x, 256, 3, 256 / sc.max(1));
+			unit("NTT-bf", &|| { let (b, r) = super::run_stage_shard(&shards[0], None, true).unwrap(); (b as u64, r as f64 / 1048576.0) })
+		};
+		let (mult_ms, mult_rss) = unit("combine-×", &|| { let (b, r) = super::run_mult_shard(&mult_specs(sc, 2), None, true).unwrap(); (b as u64, r as f64 / 1048576.0) });
+		let (dig_ms, dig_rss) = unit("digit", &|| { let (b, r) = super::run_digit_shard(&digit_specs(sc, 3), None, true).unwrap(); (b as u64, r as f64 / 1048576.0) });
+		let (bnd_ms, bnd_rss) = unit("z-norm", &|| { let (b, r) = super::run_boundary_shard(&boundary_specs(sc, 4), None, true).unwrap(); (b as u64, r as f64 / 1048576.0) });
+		let (hash_ms, hash_rss) = unit("closing-H", &|| { let (b, r, _ok) = super::run_closing_hash_shard(&[0x5au8; 64], &[1u8, 2, 3], &[0u8; 32]).unwrap(); (b as u64, r as f64 / 1048576.0) });
+
+		// shard counts for ONE ML-DSA-44 verify (k=l=4, n=256), at `sc` coeffs/shard.
+		let per = sc.max(1);
+		let ntt_bf = 13 * 1024; // 4 fwd-z + 1 c + 4 fwd-t1 + 4 inv-w', each 1024 butterflies
+		let n_ntt = ntt_bf / per;
+		let n_mult = (4 * 5 * 256) / per; // k·(l+1) var×var mults × 256 coeffs
+		let n_dig = (4 * 256) / per;      // k polys × 256
+		let n_bnd = (4 * 256) / per;      // l polys × 256
+		let n_hash = 1usize;              // one closing hash (7 perms)
+		let total_shards = n_ntt + n_mult + n_dig + n_bnd + n_hash;
+		let total_work_ms = n_ntt as f64 * ntt_ms + n_mult as f64 * mult_ms + n_dig as f64 * dig_ms + n_bnd as f64 * bnd_ms + hash_ms;
+		let peak_rss = [ntt_rss, mult_rss, dig_rss, bnd_rss, hash_rss].iter().cloned().fold(0.0, f64::max);
+
+		println!("\n  per-signature: {total_shards} shards, total shard-work {:.1} s, peak per-shard RSS {peak_rss:.0} MiB (< 500 ⇒ IoT-viable)", total_work_ms / 1e3);
+		println!("\n| fleet size (Pis) | sig latency (wall) | throughput (sigs/hr) |");
+		for &g in &[1usize, 4, 16, 64, 256] {
+			// perfectly-parallel + pipelined model: wall ≈ total_work / G; throughput = G / total_work.
+			let wall_s = (total_work_ms / 1e3) / g as f64;
+			let sigs_per_hr = 3600.0 / wall_s;
+			println!("| {g:>3} | {wall_s:8.1} s | {sigs_per_hr:8.0} |");
+		}
+		println!("(unit costs MEASURED on this core; totals are the ML-DSA-44 shard counts; throughput scales ~linearly with Pi count until the closing-hash/critical path floors it. Run on the Pi for real Pi numbers; SHARD_COEFFS tunes shard size.)");
+	}
+
 	/// The TALL-NARROW butterfly batch's arithmetic == the reference forward NTT: every
 	/// butterfly row's `(o_add,o_sub)` matches the CT-schedule trace (asserted inside
 	/// `validate_butterflies`), the whole constraint system validates, and the trace's final
