@@ -905,6 +905,33 @@ mod tests {
 			 this fast O(1)-in-N verify = the cost-effective epoch DNS-STARK.");
 	}
 
+	/// PRIORITY-1 (paper §6.3) — the once-per-epoch EDGE peak RSS on real hardware.  Runs the
+	/// self-contained edge node's epoch work (prove the batched epoch Π + verify it) at a given
+	/// per-record width and zone size N, and samples the process high-water RSS.  The load-bearing
+	/// question: does the peak fit the Pi's 1 GB minus OS?  `getrusage` maxrss is a monotonic
+	/// high-water, so the reported peak is the max over the whole prove+verify (the
+	/// "width-dominated seconds" decider dominates).  Env: EPOCH_W (per-record width, default 64),
+	/// EPOCH_N (records, default 1024), EDGE_OS_MIB (OS reserve, default 150).  Run ALONE on the Pi.
+	#[test]
+	#[ignore = "Priority-1 edge epoch peak RSS (does the paper's ~741 MiB fit the Pi's 1 GB?); run ALONE on the target"]
+	fn edge_epoch_verify_rss() {
+		let w: usize = std::env::var("EPOCH_W").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+		let n: usize = std::env::var("EPOCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+		let os_mib: f64 = std::env::var("EDGE_OS_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(150.0);
+		let rss = crate::b256_sha3::peak_rss_bytes;
+		let mib = |b: u64| b as f64 / 1048576.0;
+		println!("\n=== edge epoch peak RSS — arch={} per-record-width={w} N={n} records ===", std::env::consts::ARCH);
+		println!("  baseline (pre-epoch)          : {:.0} MiB", mib(rss()));
+		let res = measure_epoch_verify(w, &[n]).expect("epoch prove+verify must run");
+		let peak = rss();
+		let (nn, prove_ms, verify_ms, sz) = res[0];
+		println!("  N={nn}: prove {prove_ms} ms, verify {verify_ms} ms, proof {} KiB", sz / 1024);
+		let usable = 1024.0 - os_mib;
+		println!("  PEAK RSS (self-contained edge node, prove+verify): {:.0} MiB", mib(peak));
+		println!("  ⇒ fits 1 GB Pi (− ~{os_mib:.0} MiB OS ⇒ {usable:.0} MiB usable): {}",
+			if mib(peak) < usable { "YES" } else { "NO — SPILLS" });
+	}
+
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
 	/// through N−1 narrow fold-verify STEPS (each a real proven circuit), and the final
 	/// accumulated claim HOLDS on the interleaved polynomial (end-to-end soundness). The
