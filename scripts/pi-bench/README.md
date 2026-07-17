@@ -86,6 +86,34 @@ The natural fleet controller: a coordinator hands each Pi a shard spec, collects
 and runs `combine_and_verify` once per epoch. The `fleet_throughput_model` numbers size the fleet
 (how many Pis for a target sigs/hr) directly from the measured per-Pi unit costs.
 
+## Cross-compile on a Mac (Apple Silicon) → deploy to the Pi ✅ recommended for 1 GB Pis
+
+Yes — build on the Mac mini, ship a ~20 MB binary to the Pi. The crate is **pure Rust** (no C
+build deps) and `peak_rss_bytes` already normalises Linux's kilobyte `ru_maxrss`, so it's a clean
+cross-compile. The only tool needed is a cross-linker, provided by **zig** via **cargo-zigbuild**.
+
+```bash
+# one-time, on the Mac:
+brew install zig
+cargo install cargo-zigbuild
+
+# build + get the deployable binary:
+cd scripts/pi-bench
+./cross-build.sh                                   # glibc for Pi OS Bullseye (2.31)
+# TARGET=aarch64-unknown-linux-gnu.2.36 ./cross-build.sh   # Pi OS Bookworm
+# TARGET=aarch64-unknown-linux-musl     ./cross-build.sh   # STATIC — runs on any Pi OS
+
+# deploy + run (no Rust toolchain on the Pi):
+scp deploy/pi-bench pi@raspberrypi:~/
+ssh pi@raspberrypi 'SHARD_COEFFS=16 ./pi-bench single_device_rss_pipeline --ignored --nocapture --test-threads=1'
+```
+
+The lib builds only under `cargo test`, so `cross-build.sh` cross-compiles the **test binary** —
+a standalone executable that carries the `single_device_rss_pipeline` / `fleet_throughput_model`
+benchmarks. Pick **musl** for a fully static binary (no glibc-version matching); pick **glibc** (pin
+the version to your Pi OS) for native-malloc benchmarking. Both are ~20 MB, need no toolchain on the
+Pi, and fit the 8 GB-SD provisioning above.
+
 ## Notes
 
 - Build **on the Pi** (native aarch64) is simplest; cross-compiling from x86 to
