@@ -63,8 +63,53 @@ them). `PIN_CORE=0` pins to one core for a per-core baseline.
 
 Per ML-DSA-44 verify: **641 shards, ~2050 s total shard-work single-core, 25 MiB peak RSS.**
 Throughput scales ~linearly with the fleet: 256 Pis ⇒ ~8 s/signature latency, ~449 sigs/hr
-(on M4-class cores; a Pi core is ~2–5× slower, so scale accordingly — run on the Pi for real
-numbers). RSS stays 25 MiB regardless, so the fleet runs on the cheapest Pis.
+(on M4-class cores). RSS stays 25 MiB regardless. For real low-end-Pi numbers see below — a
+Cortex-A7 turned out ~40× slower than the M4, so scale throughput by core speed, not a small factor.
+
+## Measured on a real Raspberry Pi 2 (2026-07-17) — the low-RSS claim on genuine 1 GB hardware
+
+Mythic Beasts hosted Pi 2: **ARMv7 Cortex-A7, 4 cores, ~944 MB RAM (≈1 GB), 32-bit**, Raspbian
+bookworm. Built with `TARGET=armv7-unknown-linux-musleabihf ./cross-build.sh` (static 16 MB ELF).
+The binius stack compiles for 32-bit with **zero code changes**.
+
+**STEP 1 — single-device RSS pipeline (`SHARD_COEFFS=8`):**
+
+```
+after NTT-butterfly shard : 29 MiB
+after combine-multiply    : 30 MiB
+after digit shard         : 30 MiB
+after z-norm shard        : 30 MiB
+after closing-hash shard  : 33 MiB  ← PEAK across all 5 strands
+PEAK RSS whole pipeline   : 33 MiB  ⇒ 1 GB headroom 31× ; < 500 MiB: YES
+combiner = trustless, verify 538 ms ; wall 227.7 s (sequential on one node)
+```
+
+The whole ML-DSA-44 verify pipeline runs at **33 MiB peak RSS on a real 1 GB device** — the
+sub-500 MB IoT claim holds on genuine low-end silicon, not just the M4/x86 proxy. (At the larger
+`SHARD_COEFFS=32` the peak is **35 MiB** — bigger shards, essentially the same footprint.)
+
+**STEP 2 — fleet throughput model (`SHARD_COEFFS=32`, 4 cores):**
+
+| strand | ms/shard | RSS |
+|---|---:|---:|
+| NTT butterfly | 136040 | 29 MiB |
+| combine (×) | 130156 | 32 MiB |
+| digit | 59894 | 32 MiB |
+| z-norm | 8233 | 32 MiB |
+| closing-hash | 67453 | 34 MiB |
+
+Per ML-DSA-44 verify: **641 shards, ~79665 s total shard-work, 34 MiB peak RSS.** Fleet latency:
+1 Pi → ~22 h, 64 → 1245 s, 256 → 311 s (~12 sigs/hr).
+
+**Shard size amortises fixed cost.** Same verify at `SHARD_COEFFS=8` needs 2561 tiny shards and
+**136474 s** total work; at `SHARD_COEFFS=32` it is 641 shards and **79665 s** — 1.71× less work for
+~1 MiB more RSS. (`closing-hash` stays ~67 s either way: it is per-signature SHA-3 of the full
+message, not coeff-sharded, so it is the critical-path floor.)
+
+**The Cortex-A7 is the worst-case throughput floor** (a 2015-era in-order core, ~40× the M4). The
+realistic fleet node is a Pi 4/5 (Cortex-A72/A76, 64-bit, 4–8× faster/core, runs the aarch64 static
+binary). **The Pi 2 proves low-RSS + 32-bit portability at the bottom of the market; throughput
+lives on faster nodes and scales ~linearly with core count and speed.**
 
 ## Running an actual distributed fleet
 
