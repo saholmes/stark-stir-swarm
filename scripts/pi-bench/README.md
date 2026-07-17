@@ -108,6 +108,22 @@ scp deploy/pi-bench pi@raspberrypi:~/
 ssh pi@raspberrypi 'SHARD_COEFFS=16 ./pi-bench single_device_rss_pipeline --ignored --nocapture --test-threads=1'
 ```
 
+### One command: build → deploy → run → collect
+
+`deploy.sh` does the whole Mac→Pi loop (cross-build, `scp` the binary, run both benchmarks on the
+Pi, pull results back to the Mac):
+
+```bash
+cd scripts/pi-bench
+PI_HOST=pi@raspberrypi.local ./deploy.sh
+# or:  ./deploy.sh pi@192.168.1.50
+# reuse a prior build:  SKIP_BUILD=1 ./deploy.sh pi@raspberrypi.local
+# static musl binary:   TARGET=aarch64-unknown-linux-musl ./deploy.sh pi@raspberrypi.local
+```
+
+Results land on the Mac under `results/deploy-<stamp>/` (`host.txt`, `rss-pipeline.txt`,
+`throughput.txt`). Needs SSH access to the Pi (key auth recommended); no toolchain on the Pi.
+
 The lib builds only under `cargo test`, so `cross-build.sh` cross-compiles the **test binary** —
 a standalone executable that carries the `single_device_rss_pipeline` / `fleet_throughput_model`
 benchmarks. Pick **musl** for a fully static binary (no glibc-version matching); pick **glibc** (pin
