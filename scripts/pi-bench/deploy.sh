@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-step Mac -> Raspberry Pi: cross-build the fleet benchmark, deploy the binary, run it on the
-# Pi, and collect results back on the Mac.  No Rust toolchain on the Pi — just the ~20 MB binary.
+# Pi, and collect results back on the Mac.  No Rust toolchain on the Pi — just the ~15 MB binary.
 #
 #   PI_HOST=pi@raspberrypi.local ./deploy.sh
 #   ./deploy.sh pi@192.168.1.50

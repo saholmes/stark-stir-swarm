@@ -88,25 +88,32 @@ and runs `combine_and_verify` once per epoch. The `fleet_throughput_model` numbe
 
 ## Cross-compile on a Mac (Apple Silicon) → deploy to the Pi ✅ recommended for 1 GB Pis
 
-Yes — build on the Mac mini, ship a ~20 MB binary to the Pi. The crate is **pure Rust** (no C
-build deps) and `peak_rss_bytes` already normalises Linux's kilobyte `ru_maxrss`, so it's a clean
-cross-compile. The only tool needed is a cross-linker, provided by **zig** via **cargo-zigbuild**.
+Yes — build on the Mac mini, ship a ~15 MB **fully static** binary to the Pi. `peak_rss_bytes`
+already normalises Linux's kilobyte `ru_maxrss`, so it's a clean cross-compile. The crate is Rust
+with one transitive C dep (`stackalloc`), so the only tool needed is **zig** (used as the cross
+compiler + linker); `python3` (already on macOS) runs a tiny target shim.
 
 ```bash
 # one-time, on the Mac:
-brew install zig
-cargo install cargo-zigbuild
+brew install zig            # provides `zig cc` (cross cc + linker) and `zig ar`
 
-# build + get the deployable binary:
+# build + get the deployable binary (default = STATIC musl → runs on any 64-bit Pi OS):
 cd scripts/pi-bench
-./cross-build.sh                                   # glibc for Pi OS Bullseye (2.31)
-# TARGET=aarch64-unknown-linux-gnu.2.36 ./cross-build.sh   # Pi OS Bookworm
-# TARGET=aarch64-unknown-linux-musl     ./cross-build.sh   # STATIC — runs on any Pi OS
+./cross-build.sh
+# TARGET=aarch64-unknown-linux-gnu.2.31 ./cross-build.sh   # Pi OS Bullseye glibc
+# TARGET=aarch64-unknown-linux-gnu.2.36 ./cross-build.sh   # Pi OS Bookworm glibc
 
 # deploy + run (no Rust toolchain on the Pi):
 scp deploy/pi-bench pi@raspberrypi:~/
 ssh pi@raspberrypi 'SHARD_COEFFS=16 ./pi-bench single_device_rss_pipeline --ignored --nocapture --test-threads=1'
 ```
+
+> **Why not `cargo-zigbuild`?** It has no `test` subcommand, and the deployable is the *test*
+> binary (the lib only builds under `cargo test`). So `cross-build.sh` drives `cargo test --no-run`
+> and points `CC`/`AR`/linker at a small `zig cc` shim it generates. The shim (a) forces zig's
+> `-target aarch64-linux-musl` and drops cc-rs's un-parseable rust-triple `--target=`, so C deps
+> compile as ELF not Mach-O, and (b) at link time drops rust's self-contained `crt*.o` +
+> `-nostartfiles` so only zig supplies the startup files (else `_start` is defined twice).
 
 ### One command: build → deploy → run → collect
 
