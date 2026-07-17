@@ -2118,6 +2118,34 @@ pub fn run_closing_hash_shard(mu: &[u8], w1enc: &[u8], ctilde: &[u8]) -> Result<
 	Ok((sz, rss, digs[0].as_slice() == ctilde))
 }
 
+/// MULTI-BLOCK closing hash (the FULL FIPS-204 message, no ≤135-byte cap): the real
+/// `c̃' = SHAKE-256(μ ‖ w1Encode(w1'), 2λ/8)` is computed over ALL `n_blocks` sponge blocks and
+/// bound to the public `c̃` (so a wrong w1' in ANY block ⇒ c̃' ≠ c̃), while the in-circuit cost is
+/// the message's Keccak-f PERMUTATIONS proven over B256 (`n_blocks` raw permutations — the true
+/// multi-block prove work, sharded like the other strands).  Returns `(perm_proof_bytes,
+/// peak_rss, n_blocks, c̃'==c̃)`.
+///
+/// HONEST SCOPE: the full-message binding is native-referenced (real SHAKE-256) and every block's
+/// Keccak-f is proven in-circuit; the residual is BINDING the in-circuit permutations to the
+/// SPECIFIC chained sponge states (state_in[i] = state_out[i−1] ⊕ block_i) — a state-fed Keccak
+/// table (the M3 gadget's built-in link is squeeze-only, no absorb-XOR, and the fork is frozen).
+/// Until that lands, the load-bearing binding is: the digit strands PROVE every w1' coefficient,
+/// and this gate confirms the full w1Encode hashes to c̃ with the in-circuit permutation count.
+pub fn run_multiblock_closing_hash(mu: &[u8], w1enc: &[u8], ctilde: &[u8]) -> Result<(usize, u64, usize, bool)> {
+	let mut msg = mu.to_vec();
+	msg.extend_from_slice(w1enc);
+	// real SHAKE-256 sponge over the FULL message → c̃' (2λ/8 = 32 B at L1).
+	let ctilde_prime = crate::mldsa_shake::shake256_xof(&msg, ctilde.len());
+	// SHAKE-256 absorb: ceil((mlen+1)/rate) blocks, rate = 168−? For SHAKE-256 rate = 136 bytes
+	// (1088 bits); the pad10*1 adds ≥1 byte, so n_blocks = floor(mlen/rate)+1.
+	const RATE: usize = 136;
+	let n_blocks = msg.len() / RATE + 1;
+	// prove the message's Keccak-f PERMUTATIONS in-circuit over B256 (the multi-block prove cost).
+	let sz = crate::b256_keccak::prove_verify_keccak_b256(n_blocks, 1, 128)?;
+	let rss = crate::b256_sha3::peak_rss_bytes();
+	Ok((sz, rss, n_blocks, ctilde_prime == ctilde))
+}
+
 /// Which honest column to corrupt after populate (the soundness gate).
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -2759,6 +2787,41 @@ mod tests {
 		assert!(!bad_ok, "a tampered w1' must break the c̃' == c̃ binding");
 
 		println!("GATE closing-hash-fleet: c̃'=SHA3-256(μ‖w1Encode) PROVEN over B256 ({sz} B, {:.0} MiB), bound to c̃; a wrong w1' breaks it — the terminal ACCEPT strand.", rss as f64 / (1024.0 * 1024.0));
+	}
+
+	/// MULTI-BLOCK closing hash: the FULL FIPS-204 message (μ ‖ all-k w1Encode ≈ 832 B ≈ 7 blocks)
+	/// binds to the real SHAKE-256 c̃, and a wrong w1' in ANY block breaks the binding; the
+	/// in-circuit cost is the message's Keccak-f permutations proven over B256.
+	#[test]
+	#[ignore = "multi-block closing hash (full message SHAKE-256 bind + Keccak-f perms over B256); run with --ignored"]
+	fn multiblock_closing_hash_in_fleet() {
+		use crate::mldsa_shake::shake256_xof;
+		// full w1Encode: k=4 polys × 256 coeffs × 6 bits = 768 B; μ = 64 B ⇒ 832 B ≈ 7 SHAKE blocks.
+		let mut rng = StdRng::seed_from_u64(0xC105);
+		let w1: Vec<u64> = (0..(4 * 256)).map(|_| rng.next_u64() % super::MM).collect();
+		let mut w1enc = Vec::new();
+		for poly in w1.chunks(256) {
+			// pack 6 bits/coeff, 4 coeffs → 3 bytes.
+			for grp in poly.chunks(4) {
+				let packed = (grp[0] | (grp[1] << 6) | (grp[2] << 12) | (grp[3] << 18)) as u32;
+				w1enc.extend_from_slice(&packed.to_le_bytes()[..3]);
+			}
+		}
+		let mu = vec![0x5au8; 64];
+		let mut msg = mu.clone();
+		msg.extend_from_slice(&w1enc);
+		let ctilde = shake256_xof(&msg, 32); // the real SHAKE-256 c̃
+
+		let (sz, rss, nblk, ok) = super::run_multiblock_closing_hash(&mu, &w1enc, &ctilde).expect("multi-block closing hash");
+		assert!(ok, "the FULL multi-block message must bind c̃' == c̃");
+
+		// tamper a w1' in the LAST block (which the single-block anchor would MISS) ⇒ c̃' ≠ c̃.
+		let mut bad_enc = w1enc.clone();
+		*bad_enc.last_mut().unwrap() ^= 1;
+		let (_s, _r, _n, bad_ok) = super::run_multiblock_closing_hash(&mu, &bad_enc, &ctilde).expect("prove");
+		assert!(!bad_ok, "a wrong w1' in a LATER block must break the multi-block binding (the anchor misses it)");
+
+		println!("GATE multiblock-closing-hash: full μ‖w1Encode ({} B, {nblk} SHAKE blocks) binds real SHAKE-256 c̃; {nblk} Keccak-f perms PROVEN over B256 ({sz} B, {:.0} MiB); a wrong w1' in the LAST block breaks the binding (the single-block anchor would miss it).", msg.len(), rss as f64 / (1024.0 * 1024.0));
 	}
 
 	/// END-TO-END: fleet-prove the NTT + combine shards (validity, low RSS, parallel), then

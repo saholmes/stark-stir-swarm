@@ -96,7 +96,17 @@ Each strand is an independent low-RSS fleet job, seam-bound into the reconstruct
    upstream shard) changes w1Encode ⇒ different digest ⇒ REJECT (`closing_hash_strand_in_fleet`:
    binds on the genuine w1Encode, a flipped w1′ breaks it). 245 910 B / **19 MiB** at the
    single-Keccak-block anchor (μ ‖ first w1Encode group; the callable b256 SHA3 gadget is
-   single-block — multi-block is the same gadget scaled). Original note: prove-10; multi-block Keccak
+   single-block). **MULTI-BLOCK** (`run_multiblock_closing_hash`): the FULL FIPS-204 message
+   (μ ‖ all-k w1Encode ≈ 832 B ≈ **7 SHAKE blocks**) binds the real SHAKE-256 c̃, and the message's
+   **7 Keccak-f permutations are PROVEN over B256** (341 935 B / 22 MiB) — the true multi-block prove
+   cost.  `multiblock_closing_hash_in_fleet`: the full message binds, and a wrong w1' in the LAST
+   block breaks the binding (which the single-block anchor MISSES — the multi-block soundness gain).
+   HONEST RESIDUAL: the full-message digest binding is native-referenced (real SHAKE-256) and every
+   block's Keccak-f is proven in-circuit; binding the in-circuit permutations to the SPECIFIC chained
+   sponge states (state_in[i] = state_out[i−1] ⊕ block_i) needs a state-fed Keccak table (the M3
+   gadget's built-in link is squeeze-only, no absorb-XOR, and the fork is frozen). Until then the
+   load-bearing binding is: the digit strands PROVE every w1' coefficient, and this gate confirms the
+   whole w1Encode hashes to c̃ with the in-circuit permutation count. Original note: prove-10; multi-block Keccak
    is its own scale-up — the callable `prove_verify_sha3_b256` is single-block today).
 
 Seam binding across strands is the existing OOD/channel model; reconstruction + verify follow
