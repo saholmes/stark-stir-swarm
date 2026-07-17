@@ -19,9 +19,10 @@
 #   (python3 is already present on macOS)
 #
 # Usage:
-#   ./cross-build.sh                                         # default: STATIC musl (any Pi OS)
-#   TARGET=aarch64-unknown-linux-gnu.2.31 ./cross-build.sh   # Pi OS Bullseye glibc
-#   TARGET=aarch64-unknown-linux-gnu.2.36 ./cross-build.sh   # Pi OS Bookworm glibc
+#   ./cross-build.sh                                          # default: STATIC musl, 64-bit Pi
+#   TARGET=aarch64-unknown-linux-gnu.2.36 ./cross-build.sh    # Pi OS Bookworm glibc (Pi 3/4/5)
+#   TARGET=armv7-unknown-linux-musleabihf ./cross-build.sh    # STATIC, 32-bit Pi 2 (Cortex-A7)
+#   TARGET=armv7-unknown-linux-gnueabihf  ./cross-build.sh    # glibc, 32-bit Pi 2 (Raspbian)
 set -euo pipefail
 cd "$(dirname "$0")"
 SCRIPT_DIR="$(pwd)"
@@ -31,18 +32,28 @@ BARE_TARGET="${TARGET%%.*}"                       # strip any .glibc-version suf
 GLIBC_SUFFIX="${TARGET#"$BARE_TARGET"}"           # e.g. ".2.31" (empty for musl)
 OUT="$SCRIPT_DIR/deploy"; mkdir -p "$OUT"
 
-# rust triple -> zig target (zig understands a trailing glibc version, e.g. aarch64-linux-gnu.2.31)
+# rust triple -> zig target (zig understands a trailing glibc version, e.g. aarch64-linux-gnu.2.31).
+# ZIG_MCPU pins the microarchitecture where it matters (Pi 2 = Cortex-A7, ARMv7+NEON hardfloat).
+ZIG_MCPU=""
 case "$BARE_TARGET" in
-  aarch64-unknown-linux-musl) ZIG_TARGET="aarch64-linux-musl" ;;
-  aarch64-unknown-linux-gnu)  ZIG_TARGET="aarch64-linux-gnu"  ;;
-  *) echo "unsupported TARGET '$TARGET' (use aarch64-unknown-linux-{musl,gnu})"; exit 1 ;;
+  aarch64-unknown-linux-musl)     ZIG_TARGET="aarch64-linux-musl" ;;
+  aarch64-unknown-linux-gnu)      ZIG_TARGET="aarch64-linux-gnu"  ;;
+  armv7-unknown-linux-musleabihf) ZIG_TARGET="arm-linux-musleabihf"; ZIG_MCPU="cortex_a7" ;;
+  armv7-unknown-linux-gnueabihf)  ZIG_TARGET="arm-linux-gnueabihf";  ZIG_MCPU="cortex_a7" ;;
+  *) echo "unsupported TARGET '$TARGET' (use aarch64-unknown-linux-{musl,gnu} or armv7-unknown-linux-{musl,gnu}eabihf)"; exit 1 ;;
 esac
 ZIG_TARGET="$ZIG_TARGET$GLIBC_SUFFIX"
+# python list fragment: ['zig','cc','-target','<t>'(,'-mcpu=<m>')]
+ZIG_ARGS="'zig', 'cc', '-target', '$ZIG_TARGET'"
+[ -n "$ZIG_MCPU" ] && ZIG_ARGS="$ZIG_ARGS, '-mcpu=$ZIG_MCPU'"
 
 command -v zig     >/dev/null 2>&1 || { echo "missing zig — run:  brew install zig"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "missing python3"; exit 1; }
-echo "== ensuring rust target $BARE_TARGET =="
-rustup target add "$BARE_TARGET" >/dev/null 2>&1 || true
+# std for the target must be installed for the PINNED toolchain (rust-toolchain.toml), not just the
+# rustup default — else the build fails with "can't find crate for `core`".
+ACTIVE_TC="$(cd "$CRATE_DIR" && rustup show active-toolchain 2>/dev/null | awk '{print $1}')"
+echo "== ensuring rust target $BARE_TARGET for ${ACTIVE_TC:-default} =="
+rustup target add ${ACTIVE_TC:+--toolchain "$ACTIVE_TC"} "$BARE_TARGET" >/dev/null 2>&1 || true
 
 # --- generate the target-aware zig cc / zig ar shims -------------------------------------------
 WRAP="$OUT/.zig-shim"; mkdir -p "$WRAP"
@@ -61,7 +72,7 @@ for a in sys.argv[1:]:
     if os.path.basename(a) in CRT:     # drop rust's self-contained crt objects
         continue
     args.append(a)
-os.execvp('zig', ['zig', 'cc', '-target', '$ZIG_TARGET'] + args)
+os.execvp('zig', [$ZIG_ARGS] + args)
 PY
 cat > "$WRAP/zigar.py" <<'PY'
 #!/usr/bin/env python3
