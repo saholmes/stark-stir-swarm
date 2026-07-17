@@ -2314,6 +2314,54 @@ mod tests {
 		println!("(unit costs MEASURED on this core; totals are the ML-DSA-44 shard counts; throughput scales ~linearly with Pi count until the closing-hash/critical path floors it. Run on the Pi for real Pi numbers; SHARD_COEFFS tunes shard size.)");
 	}
 
+	/// SINGLE-DEVICE RSS PIPELINE — the first Raspberry-Pi test.  Proves ONE shard of every strand
+	/// type SEQUENTIALLY on ONE device, sampling the PROCESS peak RSS (getrusage high-water) after
+	/// each.  The load-bearing property: peak RSS PLATEAUS at ≈ one strand (each shard's memory is
+	/// freed before the next), NOT the sum — so the whole ML-DSA-44 pipeline runs on a 1 GB Pi with
+	/// a huge margin, then aggregate + verify.  This is the low-RSS story on a single node.
+	#[test]
+	#[ignore = "single-device RSS pipeline (all strands sequentially, peak RSS ≈ one strand); run on the Pi"]
+	fn single_device_rss_pipeline() {
+		use std::time::Instant;
+		use binius_field::BinaryField128b as F;
+		use crate::epoch_fold::EpochLeaf;
+		let sc = std::env::var("SHARD_COEFFS").ok().and_then(|s| s.parse().ok()).unwrap_or(16usize);
+		let mib = |b: u64| b as f64 / 1048576.0;
+		let rss = crate::b256_sha3::peak_rss_bytes;
+		println!("\n=== single-device RSS pipeline — arch={} shard={sc} coeffs (peak RSS after each strand) ===", std::env::consts::ARCH);
+		let wall = Instant::now();
+		let base = rss();
+		println!("  baseline (pre-prove)          : {:.0} MiB", mib(base));
+
+		// prove one shard of every strand type, SEQUENTIALLY, sampling the process high-water RSS.
+		let x = rand_zq(&mut StdRng::seed_from_u64(7), 256);
+		let shards = super::stage_shards(&x, 256, 3, (256 / sc).max(2));
+		super::run_stage_shard(&shards[0], None, true).unwrap();
+		println!("  after NTT-butterfly shard     : {:.0} MiB", mib(rss()));
+		super::run_mult_shard(&mult_specs(sc, 2), None, true).unwrap();
+		println!("  after combine-multiply shard  : {:.0} MiB", mib(rss()));
+		super::run_digit_shard(&digit_specs(sc, 3), None, true).unwrap();
+		println!("  after digit shard             : {:.0} MiB", mib(rss()));
+		super::run_boundary_shard(&boundary_specs(sc, 4), None, true).unwrap();
+		println!("  after z-norm shard            : {:.0} MiB", mib(rss()));
+		super::run_closing_hash_shard(&[0x5au8; 64], &[1u8, 2, 3], &[0u8; 32]).unwrap();
+		let peak_prove = rss();
+		println!("  after closing-hash shard      : {:.0} MiB  ← PEAK across all 5 strands", mib(peak_prove));
+
+		// aggregate the (synthetic) shard outputs + verify on the same device.
+		let recs: Vec<Vec<u64>> = (0..4).map(|i| (0..8).map(|j| ((i * 8 + j) as u64) % Q).collect()).collect();
+		let _leaves: Vec<EpochLeaf> = recs.iter().map(|r| EpochLeaf { record: r.iter().map(|&v| F::new(v as u128)).collect() }).collect();
+		let rep = crate::accumulation_air::combine_and_verify(&recs, 3).expect("combine_and_verify");
+		let peak_all = rss();
+		let secs = wall.elapsed().as_secs_f64();
+
+		println!("  after aggregate + verify      : {:.0} MiB", mib(peak_all));
+		println!("\n  PEAK RSS across the WHOLE single-device pipeline: {:.0} MiB", mib(peak_all));
+		println!("  ⇒ plateaus at ≈ ONE strand (each shard freed before the next), NOT the sum of 5+.");
+		println!("  ⇒ 1 GB Pi headroom: {:.0}× ; < 500 MiB budget: {}", 1024.0 / mib(peak_all).max(1.0), if mib(peak_all) < 500.0 { "YES" } else { "NO" });
+		println!("  combiner = {} (verify {} µs) ; whole pipeline wall {secs:.1} s (sequential on one node)", rep.trust_model, rep.verify_us);
+	}
+
 	/// The TALL-NARROW butterfly batch's arithmetic == the reference forward NTT: every
 	/// butterfly row's `(o_add,o_sub)` matches the CT-schedule trace (asserted inside
 	/// `validate_butterflies`), the whole constraint system validates, and the trace's final

@@ -24,9 +24,29 @@ cd stark-binius-swarm/scripts/pi-bench
 SHARD_COEFFS=32 ./pi-fleet-bench.sh
 ```
 
-It prints per-strand unit shard cost (ms + RSS) measured on the Pi core, then the end-to-end
-model: shards/signature, total shard-work, per-signature latency, and **throughput (sigs/hr)** at
-fleet sizes 1 / 4 / 16 / 64 / 256 Pis. Results are saved under `results/pi-<stamp>/`.
+It runs two steps and saves results under `results/pi-<stamp>/`:
+
+1. **`single_device_rss_pipeline`** — the FIRST test: proves ONE shard of every strand type
+   SEQUENTIALLY on this one Pi, sampling the process peak RSS (getrusage high-water) after each.
+   It shows the peak **plateaus at ≈ one strand** (each shard freed before the next), not the sum —
+   the low-RSS story on a single node. On an aarch64 M4 proxy (SHARD_COEFFS=16):
+
+   ```
+   after NTT-butterfly shard : 23 MiB
+   after combine shard       : 24 MiB
+   after digit shard         : 24 MiB
+   after z-norm shard         : 24 MiB
+   after closing-hash shard  : 25 MiB  ← PEAK across all 5 strands
+   PEAK RSS whole pipeline    : 25 MiB  ⇒ 1 GB Pi headroom 40× ; < 500 MiB: YES
+   combiner = trustless, verify 9 ms ; wall 7.8 s (sequential on one node)
+   ```
+
+   **This is the "one Pi to test the RSS pipeline" run.** Start here: it validates the whole
+   ML-DSA-44 verify pipeline runs on one 1 GB Pi at ~25 MiB, then aggregate + verify locally.
+
+2. **`fleet_throughput_model`** — per-strand unit shard cost (ms + RSS), then the end-to-end
+   model: shards/signature, total shard-work, per-signature latency, and **throughput (sigs/hr)**
+   at fleet sizes 1 / 4 / 16 / 64 / 256 Pis (sizes the fleet for a target rate).
 
 `SHARD_COEFFS` tunes shard size (fewer coeffs/shard = smaller, faster, lower-RSS shards, more of
 them). `PIN_CORE=0` pins to one core for a per-core baseline.

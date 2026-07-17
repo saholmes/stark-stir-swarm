@@ -39,7 +39,15 @@ echo "== building test binary (release, parallel) ==" | tee -a "$RES/host.txt"
 cd "$CRATE_DIR"
 cargo test --release --lib --features parallel --no-run 2>&1 | tail -2 | tee -a "$RES/host.txt"
 
-echo "== fleet throughput model (SHARD_COEFFS=$SHARD_COEFFS) =="
+# STEP 1 — the RSS pipeline on ONE Pi: prove all strands sequentially, peak RSS ≈ one strand.
+echo "== [1/2] single-device RSS pipeline (SHARD_COEFFS=$SHARD_COEFFS) =="
+SHARD_COEFFS="$SHARD_COEFFS" $PIN cargo test --release --lib --features parallel \
+  single_device_rss_pipeline -- --ignored --test-threads=1 --nocapture 2>&1 \
+  | tee "$RES/rss-pipeline.txt" \
+  | grep -E "arch=|baseline|after |PEAK RSS|plateaus|headroom|combiner ="
+
+# STEP 2 — the fleet throughput/wall model (sizes the fleet for a target sigs/hr).
+echo "== [2/2] fleet throughput model (SHARD_COEFFS=$SHARD_COEFFS) =="
 SHARD_COEFFS="$SHARD_COEFFS" $PIN cargo test --release --lib --features parallel \
   fleet_throughput_model -- --ignored --test-threads=1 --nocapture 2>&1 \
   | tee "$RES/throughput.txt" \
