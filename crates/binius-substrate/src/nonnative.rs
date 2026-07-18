@@ -3281,4 +3281,94 @@ mod tests {
 			 round needs beyond the pure mul→mul chain: interleaving muls with fe_add/fe_sub does NOT grow RSS."
 		);
 	}
+
+	/// MEASUREMENT (paper LogUp reconciliation): what fraction of a real Binius `ModMul<1024>`'s
+	/// committed width is *range-check* evidence? That fraction is the CEILING on any LogUp
+	/// sub-limb-lookup speedup on Binius — LogUp only replaces range-check cells. On the prior
+	/// Goldilocks (prime-field) backend range checks were 90–98% of cells (bit-decomposition is
+	/// expensive there), giving a ~7.6× win. On Binius binary towers, bit ops are native and the
+	/// range check is a virtual `add_shifted`+`assert_zero` (`a_hi`/`b_hi`/`q_hi`, NOT committed);
+	/// only the `r<m` reduction check commits columns. This test prints the committed-column
+	/// breakdown so the paper can state the Binius LogUp ceiling from a real measurement.
+	#[test]
+	fn measure_modmul_logup_ceiling_over_binius() {
+		const W: usize = 1024; // W >= 2n+1; the EC double-and-add round uses ModMul<1024>
+		let n = 256usize; // P-256 field prime
+		// P-256 p (big-endian hex) → little-endian bit vector, padded to W.
+		let p_hex = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
+		let be: Vec<u8> = (0..p_hex.len())
+			.step_by(2)
+			.map(|i| u8::from_str_radix(&p_hex[i..i + 2], 16).unwrap())
+			.collect();
+		let mut m_bits = vec![false; W];
+		for j in 0..(be.len() * 8) {
+			let byte = be[be.len() - 1 - j / 8];
+			m_bits[j] = (byte >> (j % 8)) & 1 == 1;
+		}
+
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let modmul = ModMul::<W>::build(&mut cs, &m_bits, n);
+		let table = cs
+			.tables
+			.iter()
+			.find(|t| t.id() == modmul.table_id)
+			.expect("modmul table");
+
+		let categorize = |name: &str| -> &'static str {
+			if name.contains("rlt") || name.contains("_hi") || name.contains("range") {
+				"range-check"
+			} else if name.starts_with("bcast")
+				|| name.starts_with("pp")
+				|| name.starts_with("a_shl")
+				|| name.starts_with("mul")
+			{
+				"multiply"
+			} else if name.starts_with("qm") || name.starts_with("q_shl") {
+				"reduction"
+			} else if name == "a" || name == "b" || name == "q" || name == "r" {
+				"operand"
+			} else {
+				"other"
+			}
+		};
+
+		let mut total_bits = 0u64;
+		let mut total_cols = 0u64;
+		let mut cat_bits = std::collections::BTreeMap::<&str, u64>::new();
+		let mut cat_cols = std::collections::BTreeMap::<&str, u64>::new();
+		for col in &table.columns {
+			// Only COMMITTED columns cost prover commitment/width; shifted/computed are virtual.
+			if !matches!(col.col, binius_m3::builder::ColumnDef::Committed { .. }) {
+				continue;
+			}
+			let bits = 1u64 << col.shape.log_cell_size();
+			let cat = categorize(&col.name);
+			total_bits += bits;
+			total_cols += 1;
+			*cat_bits.entry(cat).or_default() += bits;
+			*cat_cols.entry(cat).or_default() += 1;
+		}
+
+		println!("\n=== MEASURED: ModMul<{W}> (P-256, n={n}) committed-column breakdown over B256 ===");
+		for (cat, bits) in &cat_bits {
+			println!(
+				"  {cat:12}: {:>4} committed cols, {:>7} committed bits/row  ({:5.2}%)",
+				cat_cols[cat],
+				bits,
+				100.0 * (*bits as f64) / (total_bits as f64)
+			);
+		}
+		println!("  {:12}: {total_cols:>4} committed cols, {total_bits:>7} committed bits/row", "TOTAL");
+		let rc = *cat_bits.get("range-check").unwrap_or(&0);
+		let ceil = 100.0 * (rc as f64) / (total_bits as f64);
+		println!(
+			"  ==> LogUp CEILING on Binius (range-check committed fraction): {ceil:.2}%  \
+			 (prior Goldilocks: 90–98% ⇒ ~7.6×; Binius bit-ops native ⇒ range checks are ~free/virtual)"
+		);
+		// Sanity: the multiply+reduction bulk must dominate committed width on Binius.
+		assert!(
+			ceil < 20.0,
+			"range-check fraction {ceil:.2}% — if this is high the Binius gadget is unexpectedly range-dominated"
+		);
+	}
 }
