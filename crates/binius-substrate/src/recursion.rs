@@ -330,6 +330,47 @@ mod tests {
 		[byte; 32]
 	}
 
+	/// PRIORITY-3 (paper §6.3) — per-query Merkle-path VERIFY timing on the target device, to
+	/// complement the M-series ~1 µs figure.  Times ONLY `merkle_path_verify` (SHA3-256 up the
+	/// auth path); the auth paths are pre-generated OUTSIDE the timed loop, so this is the pure
+	/// verifier per-query cost (no prover-side path extraction).  Reports µs/path and the implied
+	/// per-SHA3 hash cost at a few tree depths.  Run on the Pi.
+	#[test]
+	#[ignore = "Priority-3 per-query Merkle-path verify timing (complements M-series ~1 µs); run on the target"]
+	fn merkle_path_verify_timing() {
+		use sha3::{Digest, Sha3_256};
+		use std::time::Instant;
+		println!("\n=== per-query Merkle-path VERIFY timing — arch={} ===", std::env::consts::ARCH);
+		println!("| tree leaves | path depth | verifies | µs/path | ns/SHA3-hash |");
+		println!("|--:|--:|--:|--:|--:|");
+		for &log_leaves in &[10usize, 13, 16, 20] {
+			let n = 1usize << log_leaves;
+			let leaves: Vec<[u8; 32]> = (0..n)
+				.map(|i| { let mut h = Sha3_256::new(); h.update((i as u64).to_le_bytes()); h.finalize().into() })
+				.collect();
+			let tree = merkle_tree_sha3(&leaves);
+			let root = tree.last().unwrap()[0];
+			// pre-generate the auth paths OUTSIDE the timed region (prover-side work).
+			let sample = 64usize.min(n);
+			let paths: Vec<(usize, Vec<[u8; 32]>)> =
+				(0..sample).map(|k| { let idx = (k * (n / sample)) % n; (idx, merkle_auth_path(&tree, idx)) }).collect();
+			let iters = 20_000usize;
+			let t = Instant::now();
+			let mut ok = true;
+			for k in 0..iters {
+				let (idx, path) = &paths[k % sample];
+				ok &= merkle_path_verify(leaves[*idx], *idx, path, root);
+			}
+			let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+			assert!(ok, "all Merkle-path verifies must pass");
+			let ns_per_hash = us * 1000.0 / log_leaves as f64; // depth = log_leaves SHA3s per path
+			println!("| {n} | {log_leaves} | {iters} | {us:.3} | {ns_per_hash:.0} |");
+		}
+		println!("# Per-query Merkle-path verify = depth × SHA3-256(64 B). Pure verifier cost (paths \
+			 pre-generated). On the Pi this complements the M-series ~1 µs/path figure; the per-SHA3 \
+			 cost is the portable primitive (verify scales linearly in tree depth).");
+	}
+
 	/// GATE zone-hash-leveled — the zone-tree hash ladders SHA3-256/384/512 with the NIST
 	/// level: (a) L1-leveled == the existing hardcoded SHA3-256 root bit-for-bit; (b) L3/L5
 	/// give 48/64-byte roots with 192/256-bit collision resistance; (c) auth-path verify
