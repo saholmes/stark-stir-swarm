@@ -541,6 +541,33 @@ pub fn mldsa_batch_root(statements: &[[u8; 32]]) -> [u8; 32] {
 mod tests {
 	use super::*;
 
+	/// PRIORITY-1 FOOTNOTE (paper §6.3) — the wall-clock cost of Step 1 of edge verification,
+	/// the native ML-DSA-44 signature check (canonical FIPS-204 `fips204` crate), on the target
+	/// device.  Keygen+sign are setup (outside the timed loop); we time only `pk.verify` over many
+	/// iterations.  This is a fixed-size operation independent of zone size N; the point is to show
+	/// it is negligible beside the multi-second epoch decider.  Run on the Pi.
+	#[test]
+	#[ignore = "Priority-1 footnote: native ML-DSA-44 verify time (FIPS-204 edge Step 1); run on the target"]
+	fn mldsa44_native_verify_timing() {
+		use fips204::ml_dsa_44;
+		use fips204::traits::{Signer, Verifier};
+		use std::time::Instant;
+		let (pk, sk) = ml_dsa_44::try_keygen().expect("fips204 keygen");
+		let msg: &[u8] = b"STARK-DNS epoch root (ML-DSA-44 edge Step 1)";
+		let sig = sk.try_sign(msg, b"").expect("fips204 sign");
+		assert!(pk.verify(msg, &sig, b""), "fips204 self-verify sanity");
+		let iters = 5000usize;
+		let t = Instant::now();
+		let mut ok = true;
+		for _ in 0..iters {
+			ok &= pk.verify(msg, &sig, b"");
+		}
+		let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+		assert!(ok, "all native ML-DSA-44 verifies must pass");
+		println!("\n=== native ML-DSA-44 verify (FIPS-204, edge Step 1) — arch={} ===", std::env::consts::ARCH);
+		println!("  {us:.1} µs / verify  ({iters} iters, fixed-size, independent of zone N)");
+	}
+
 	/// GATE ref-6 (S1d) — Decompose is a faithful base-α split: r ≡ r1·α + r0 (mod q),
 	/// r0 ∈ (−α/2, α/2], r1 ∈ [0, m); checked exhaustively on a stride across [0,q) for
 	/// both γ2 values.
