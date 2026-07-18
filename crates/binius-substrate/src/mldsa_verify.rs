@@ -568,6 +568,58 @@ mod tests {
 		println!("  {us:.1} µs / verify  ({iters} iters, fixed-size, independent of zone N)");
 	}
 
+	/// PRIORITY-1 FOOTNOTE (companion to `mldsa44_native_verify_timing`) — the same edge Step-1
+	/// native signature-verify cost for the CLASSICAL DNSSEC algorithms the zone may use:
+	/// ECDSA-P256 (alg 13), Ed25519 (alg 15), RSA-2048/SHA-256 (alg 8), via the canonical
+	/// RustCrypto crates.  Keygen+sign are setup (outside the timed loop); we time only `verify`.
+	/// Run on the Pi to characterise Step 1 across every algorithm on the weakest device.
+	#[test]
+	#[ignore = "Priority-1 footnote: native classical-sig verify times (ECDSA-P256/Ed25519/RSA-2048, edge Step 1); run on the target"]
+	fn classical_sig_verify_timing() {
+		use rand::SeedableRng;
+		use std::time::Instant;
+		let iters = 5000usize;
+		let bench = |label: &str, verify: &dyn Fn() -> bool| {
+			assert!(verify(), "{label} self-verify sanity");
+			let t = Instant::now();
+			let mut ok = true;
+			for _ in 0..iters {
+				ok &= verify();
+			}
+			assert!(ok, "{label}: all verifies must pass");
+			println!("  {label:<12}: {:8.1} µs / verify", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+		};
+		println!("\n=== native signature verify (edge Step 1) — arch={}, {iters} iters ===", std::env::consts::ARCH);
+		{
+			use p256::ecdsa::signature::{Signer, Verifier};
+			use p256::ecdsa::{Signature, SigningKey};
+			let sk = SigningKey::random(&mut rand::rngs::StdRng::seed_from_u64(13));
+			let vk = *sk.verifying_key();
+			let msg = b"STARK-DNS edge Step 1";
+			let sig: Signature = sk.sign(msg);
+			bench("ECDSA-P256", &|| vk.verify(msg, &sig).is_ok());
+		}
+		{
+			use ed25519_dalek::{Signer, SigningKey, Verifier};
+			let mut seed = [0u8; 32];
+			seed[0] = 15;
+			let sk = SigningKey::from_bytes(&seed);
+			let vk = sk.verifying_key();
+			let msg = b"STARK-DNS edge Step 1";
+			let sig = sk.sign(msg);
+			bench("Ed25519", &|| vk.verify(msg, &sig).is_ok());
+		}
+		{
+			use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+			use sha2::{Digest, Sha256};
+			let sk = RsaPrivateKey::new(&mut rand::rngs::StdRng::seed_from_u64(8), 2048).expect("rsa keygen");
+			let pk = RsaPublicKey::from(&sk);
+			let digest = Sha256::digest(b"STARK-DNS edge Step 1").to_vec();
+			let sig = sk.sign(Pkcs1v15Sign::new::<Sha256>(), &digest).expect("rsa sign");
+			bench("RSA-2048", &|| pk.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &sig).is_ok());
+		}
+	}
+
 	/// GATE ref-6 (S1d) — Decompose is a faithful base-α split: r ≡ r1·α + r0 (mod q),
 	/// r0 ∈ (−α/2, α/2], r1 ∈ [0, m); checked exhaustively on a stride across [0,q) for
 	/// both γ2 values.
