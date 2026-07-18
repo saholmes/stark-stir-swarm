@@ -708,6 +708,78 @@ where
 	Ok(out)
 }
 
+// --- EDGE VERIFY-ONLY split (paper §6.3) -------------------------------------------------------
+// In deployment the fleet/owner PROVES the epoch Π and the resolver only VERIFIES a received
+// proof. `epoch_prove_to_bytes` builds the CS+witness and returns the proof transcript;
+// `epoch_verify_from_bytes` rebuilds ONLY the CS (no witness — the verifier never sees it) and
+// checks the bytes. Splitting them lets the edge verify run in a SEPARATE process from the prover,
+// so its `getrusage` peak RSS is the true edge footprint (no prover witness), not the prove+verify
+// high-water. Both build the identical CS (same column/constraint order) so the compiled CCS
+// matches. L1 (SHA-256 @ 128).
+
+/// Build CS + witness, prove, and return the proof transcript bytes (the fleet/owner side).
+pub fn epoch_prove_to_bytes(per_record_muls: usize, n: usize, security_bits: usize) -> Result<Vec<u8>> {
+	use rand::SeedableRng;
+	let n = n.next_power_of_two();
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut tb = cs.add_table("epoch: N records batched");
+	let beta_col = tb.add_committed::<B64, 1>("beta");
+	let mut ops = Vec::with_capacity(per_record_muls);
+	let mut muls = Vec::with_capacity(per_record_muls);
+	for i in 0..per_record_muls {
+		let a = col4(&mut tb, &format!("a{i}"));
+		let b = col4(&mut tb, &format!("b{i}"));
+		muls.push(build_b256_mul(&mut tb, beta_col, a, b, &format!("m{i}_")));
+		ops.push((a, b));
+	}
+	let table_id = tb.id();
+	let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	let mut rng = rand::rngs::StdRng::from_seed([0xe0; 32]);
+	{
+		let tw = witness.init_table(table_id, n)?;
+		let mut seg = tw.full_segment();
+		for row in 0..n {
+			wc64(&mut seg, beta_col, row, beta())?;
+			for i in 0..per_record_muls {
+				let (av, bv) = (<OurB256 as Field>::random(&mut rng), <OurB256 as Field>::random(&mut rng));
+				let (asp, bsp) = (split256(av), split256(bv));
+				for j in 0..4 {
+					wc64(&mut seg, ops[i].0[j], row, asp[j])?;
+					wc64(&mut seg, ops[i].1[j], row, bsp[j])?;
+				}
+				pop_b256_mul(&muls[i], &mut seg, row, asp, bsp)?;
+			}
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, 1, security_bits, &statement.boundaries, witness, &make_portable_backend(),
+	)?;
+	Ok(proof.transcript)
+}
+
+/// Rebuild ONLY the CS (no witness) and verify the received transcript bytes (the resolver/edge).
+pub fn epoch_verify_from_bytes(per_record_muls: usize, n: usize, security_bits: usize, transcript: Vec<u8>) -> Result<()> {
+	let n = n.next_power_of_two();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let mut tb = cs.add_table("epoch: N records batched");
+	let beta_col = tb.add_committed::<B64, 1>("beta");
+	for i in 0..per_record_muls {
+		let a = col4(&mut tb, &format!("a{i}"));
+		let b = col4(&mut tb, &format!("b{i}"));
+		let _ = build_b256_mul(&mut tb, beta_col, a, b, &format!("m{i}_"));
+	}
+	let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+	let ccs = cs.compile(&statement).unwrap();
+	binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, 1, security_bits, &statement.boundaries, binius_core::constraint_system::Proof { transcript },
+	)?;
+	Ok(())
+}
+
 /// The epoch-Π prover over the **B512 tower** — the full-L5 variant that lifts `κ_IT` from 192
 /// (B256) to **256**. Same shape as `measure_epoch_verify_hash` but each per-record constraint is
 /// an in-circuit GF(2^512) multiply (`gf512_air::build_b512_mul`) over `ConstraintSystem<OurB512>`,
@@ -930,6 +1002,43 @@ mod tests {
 		println!("  PEAK RSS (self-contained edge node, prove+verify): {:.0} MiB", mib(peak));
 		println!("  ⇒ fits 1 GB Pi (− ~{os_mib:.0} MiB OS ⇒ {usable:.0} MiB usable): {}",
 			if mib(peak) < usable { "YES" } else { "NO — SPILLS" });
+	}
+
+	/// PRIORITY-1 (paper §6.3, TRUE edge model) — the resolver VERIFIES a proof the fleet/owner
+	/// produced; it never proves and never sees the witness.  Two modes (env EDGE_MODE):
+	///   prove : build CS+witness, prove, write the proof transcript to EDGE_PROOF (run on a big box)
+	///   verify: read EDGE_PROOF, rebuild ONLY the CS, verify, and sample this process's peak RSS
+	/// Because prove and verify are separate processes, the verify-mode `getrusage` peak is the TRUE
+	/// edge footprint (no prover witness) — expected to be far below the prove+verify high-water of
+	/// `edge_epoch_verify_rss`.  Env: EPOCH_W (64), EPOCH_N (4096), EDGE_PROOF (/tmp/epoch.proof).
+	#[test]
+	#[ignore = "Priority-1 TRUE edge: verify-only epoch RSS/time (prove on a big box, verify on the Pi); EDGE_MODE=prove|verify"]
+	fn edge_epoch_verify_only_rss() {
+		use std::time::Instant;
+		let w: usize = std::env::var("EPOCH_W").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+		let n: usize = std::env::var("EPOCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+		let path = std::env::var("EDGE_PROOF").unwrap_or_else(|_| "/tmp/epoch.proof".to_string());
+		let mode = std::env::var("EDGE_MODE").unwrap_or_else(|_| "verify".to_string());
+		let rss = crate::b256_sha3::peak_rss_bytes;
+		let mib = |b: u64| b as f64 / 1048576.0;
+		if mode == "prove" {
+			let bytes = super::epoch_prove_to_bytes(w, n, 128).expect("epoch prove");
+			std::fs::write(&path, &bytes).expect("write proof");
+			println!("\n=== edge epoch PROVE (owner side) — w={w} N={n} ===");
+			println!("  proof {} KiB → {path}", bytes.len() / 1024);
+		} else {
+			let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("read {path} — run EDGE_MODE=prove first (on a big box) and copy it here"));
+			let sz = bytes.len();
+			println!("\n=== edge epoch VERIFY-ONLY (resolver side) — arch={} w={w} N={n} ===", std::env::consts::ARCH);
+			println!("  baseline (pre-verify)     : {:.0} MiB", mib(rss()));
+			let t = Instant::now();
+			super::epoch_verify_from_bytes(w, n, 128, bytes).expect("epoch verify");
+			let ms = t.elapsed().as_millis();
+			let peak = rss();
+			println!("  proof {} KiB, verify {ms} ms", sz / 1024);
+			println!("  PEAK RSS (verify-only, TRUE edge): {:.0} MiB", mib(peak));
+			println!("  ⇒ fits 1 GB Pi with room to spare: {}", if mib(peak) < 500.0 { "YES (< 500 MiB)" } else if mib(peak) < 874.0 { "yes (tight)" } else { "NO" });
+		}
 	}
 
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
