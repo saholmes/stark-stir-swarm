@@ -154,6 +154,27 @@ pub struct SeEpochReport {
 
 /// Run the complete `.se` TLD epoch on `n_real` real delegations at NIST `level`.
 pub fn run_se_tld_epoch_demo(n_real: usize, level: Sha3Level) -> Result<SeEpochReport> {
+	let names = load_se_names(n_real)?;
+	run_se_epoch_from_names(&names, level)
+}
+
+/// Deterministic DISTINCT synthetic `.se` names — scale-test the full pipeline without the
+/// finite Tranco list; each yields a distinct signed delegation (no clone-padding).
+pub fn synth_se_names(n: usize) -> Vec<String> {
+	(0..n).map(|i| format!("synth-{i:08x}.se")).collect()
+}
+
+/// Run the full Binius `.se` epoch pipeline on `n` DISTINCT synthetic delegations: per-record
+/// in-circuit FIPS commitment + SHA-3 Merkle tree + in-circuit recursive-STARK epoch verify ---
+/// a synthetic-data end-to-end recursive-STARK + Merkle test at arbitrary scale.
+pub fn run_synthetic_se_epoch(n: usize, level: Sha3Level) -> Result<SeEpochReport> {
+	run_se_epoch_from_names(&synth_se_names(n), level)
+}
+
+/// Run the full `.se` epoch pipeline on an explicit name list (real Tranco or synthetic).
+/// Identical Binius path for both: per-record in-circuit FIPS commitment, the SHA-3 Merkle
+/// lookup tree, and the in-circuit recursive-STARK epoch verify.
+pub fn run_se_epoch_from_names(names: &[String], level: Sha3Level) -> Result<SeEpochReport> {
 	let (variant, field_name, variant_name, security_bits) = match level {
 		Sha3Level::L1 => (Sha3Variant::Sha3_256, "B256", "SHA3-256", 128),
 		Sha3Level::L3 => (Sha3Variant::Sha3_384, "B256", "SHA3-384", 192),
@@ -165,8 +186,7 @@ pub fn run_se_tld_epoch_demo(n_real: usize, level: Sha3Level) -> Result<SeEpochR
 	let zsk = SigningKey::from_slice(&d_seed).expect("valid P-256 scalar");
 	let vk: VerifyingKey = *zsk.verifying_key();
 
-	// (2) build N real signed delegations.
-	let names = load_se_names(n_real)?;
+	// (2) build N distinct signed delegations (real Tranco or synthetic names).
 	let n_real = names.len();
 	let delegations: Vec<SeDelegation> =
 		names.iter().map(|nm| build_delegation(&zsk, level, nm)).collect();
@@ -294,6 +314,39 @@ mod tests {
 
 	fn hex8(s: &[u8]) -> String {
 		s[..4.min(s.len())].iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	/// SYNTHETIC-DATA END-TO-END (Binius, in-circuit recursion): `n` DISTINCT synthetic `.se`
+	/// delegations (no clone-padding) drive the FULL pipeline --- native ECDSA-P256 verify
+	/// (gated reference), in-circuit FIPS commitments proven == the SHA-3 Merkle leaves,
+	/// Merkle membership + tamper, and the aggregated in-circuit recursive-STARK epoch verify.
+	/// This exercises the recursive STARK + Merkle tree end to end on synthetic data at
+	/// arbitrary scale, with no dependency on the finite Tranco list.
+	#[test]
+	fn synthetic_se_full_recursive_stark_and_merkle() {
+		let n = 512usize; // the in-circuit floor: at N>=512 every record is DISTINCT (no cloning)
+		let r = run_synthetic_se_epoch(n, Sha3Level::L1).expect("synthetic .se epoch runs");
+
+		assert_eq!(r.n_real, n, "all {n} synthetic delegations are distinct (no clone-padding)");
+		assert_eq!(r.n_incircuit, n, "the in-circuit batch is exactly the N distinct records");
+		assert!(r.all_rrsigs_valid, "every synthetic ECDSA-P256 RRSIG verifies natively");
+		assert!(r.tampered_rrsig_rejected, "a tampered signing input is rejected natively");
+		assert!(r.incircuit_gated, "every in-circuit FIPS digest equals its native Merkle leaf");
+		assert!(!r.sample_lookups.is_empty() && r.sample_lookups.iter().all(|(_, ok)| *ok),
+			"sampled Merkle membership paths verify against the root");
+		assert!(r.tampered_leaf_rejected, "a record NOT in the epoch fails its membership proof");
+		assert!(!r.merkle_root.is_empty(), "Merkle root committed");
+		assert!(r.epoch_proof_bytes > 0, "the in-circuit recursive-STARK epoch proof was produced");
+		assert!(r.tree_depth >= 9, "Merkle tree over >=512 leaves has depth >= 9");
+
+		println!(
+			"SYNTHETIC .se epoch (Binius, in-circuit recursion): N={n} DISTINCT delegations \
+			 | in-circuit-gated={} | merkle depth {} root {} | epoch: prove {} ms, verify {} ms, \
+			 proof {} B | steady-state {:.2} us/lookup --- full recursive STARK + Merkle on \
+			 synthetic data, no Tranco dependency.",
+			r.incircuit_gated, r.tree_depth, hex8(&r.merkle_root),
+			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes, r.steady_state_us
+		);
 	}
 
 	/// LEDGER ITEM #5 (MEASURED): the per-record RRSIG *signature* cost that the `.se` prove
