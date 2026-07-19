@@ -1177,4 +1177,355 @@ mod tests {
 			 → epoch R* boundary; tampered-zone rejects (mixed RSA/ECDSA/Ed25519/ML-DSA)"
 		);
 	}
+
+	/// GATE prove-D-nsec3-forward (in-circuit, Binius/B256) — the NSEC3 chain-completeness
+	/// FORWARD/sortedness core over a MULTI-ROW table: for N committed
+	/// `(owner_hash, next_hash)` records, prove `owner[i] < next[i]` for EVERY record (each
+	/// interval is non-degenerate and forward). Reuses the proven strict-less-than gadget
+	/// (`(owner+1)+d == next`, top carry-out forced to 0) applied per row over N rows. A
+	/// record whose interval is reversed/out-of-order (`owner >= next`) has no valid witness
+	/// and is REJECTED. This is the per-row half of the C1--C4 tiling AIR; the cross-row
+	/// ordered link (`next[i] == owner[i+1]`, via a position-tagged channel) composes on top
+	/// to give the full gap-free cyclic cover.
+	#[test]
+	fn nsec3_chain_forward_sortedness_over_b256() {
+		use crate::b256_field::B256 as OurB256;
+		use crate::nonnative::{ripple_add, write_bit, write_col, Adder};
+		use binius_field::Field;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+
+		const W: usize = 256; // 160-bit NSEC3 hashes fit with room for the (+1) carry
+		let to_bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|i| x.bit(i)).collect() };
+
+		// Synthetic SORTED NSEC3 chain: N distinct owner hashes spread over the hash space,
+		// each next[i] = owner[i+1] (an open sorted chain — forward on every row).
+		let n: usize = 8;
+		let step = BigUint::from(1u32) << 150; // large gaps → hashes spread across 160 bits
+		let base = BigUint::from(0x51E3u32);
+		let owners: Vec<BigUint> = (0..=n).map(|i| &base + BigUint::from(i as u32) * &step).collect();
+		let chain: Vec<(BigUint, BigUint)> =
+			(0..n).map(|i| (owners[i].clone(), owners[i + 1].clone())).collect();
+
+		let run = |tamper_row: Option<usize>| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mut t = cs.add_table("NSEC3 chain forward: owner[i] < next[i] over B256 (N rows)");
+			let one_arr: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
+			let one_col = t.add_constant("one", one_arr);
+			let owner = t.add_committed::<B1, W>("owner");
+			let next = t.add_committed::<B1, W>("next");
+			// strict-less-than: (owner+1)+d == next with no overflow ⇒ owner < next.
+			let a1 = Adder::<W>::build(&mut t, owner, one_col, "a1");
+			let d = t.add_committed::<B1, W>("d");
+			let s2 = Adder::<W>::build(&mut t, a1.sum, d, "s2");
+			t.assert_zero("eq", s2.sum - next);
+			let fc = t.add_selected("fc", s2.cout, W - 1);
+			t.assert_zero("no_ovf", fc * B1::ONE);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				let one_bits = to_bits(&BigUint::from(1u32));
+				for i in 0..n {
+					let (mut o, mut x) = (chain[i].0.clone(), chain[i].1.clone());
+					if tamper_row == Some(i) {
+						std::mem::swap(&mut o, &mut x); // reversed record ⇒ owner > next
+					}
+					write_col::<W>(&mut seg, one_col, i, &one_bits).unwrap();
+					write_col::<W>(&mut seg, owner, i, &to_bits(&o)).unwrap();
+					write_col::<W>(&mut seg, next, i, &to_bits(&x)).unwrap();
+					let a1v = &o + 1u32;
+					let a1_bits = to_bits(&a1v);
+					a1.populate(&mut seg, i, &to_bits(&o), &one_bits).unwrap();
+					// d = next − (owner+1); if owner ≥ next this underflows (wraps), forcing the
+					// top carry-out the `no_ovf` constraint rejects.
+					let d_val = if x >= a1v { &x - &a1v } else { (BigUint::from(1u32) << W) + &x - &a1v };
+					let d_bits = to_bits(&d_val);
+					write_col::<W>(&mut seg, d, i, &d_bits).unwrap();
+					s2.populate(&mut seg, i, &a1_bits, &d_bits).unwrap();
+					let (_s, cout) = ripple_add(&a1_bits, &d_bits);
+					write_bit(&mut seg, fc, i, cout[W - 1]).unwrap();
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)
+				.is_ok()
+		};
+
+		assert!(run(None), "a sorted forward NSEC3 chain (every owner < next) must VALIDATE");
+		assert!(!run(Some(3)), "a reversed record (owner > next) must be REJECTED (no valid witness)");
+		println!(
+			"GATE prove-D-nsec3-forward: N={n} NSEC3 records proven owner<next per row over \
+			 B256 @L1(128); a reversed/out-of-order record REJECTED. Forward/sortedness core of \
+			 the chain-completeness (C1--C4) tiling AIR — the cross-row ordered link composes on top."
+		);
+	}
+
+	/// GATE prove-D-nsec3-link (in-circuit, Binius/B256) — the cross-row ORDERED-LINK half of the
+	/// NSEC3 chain-completeness tiling AIR. For a closed cyclic chain, `next[i] = owner[(i+1) mod N]`,
+	/// so `next[]` is a cyclic-shift PERMUTATION of `owner[]`. A hash channel enforces exactly that:
+	/// each row PUSHES its `owner_hash` (as four B64 lanes of the 256-bit column) and PULLS its
+	/// `next_hash`, so the channel balances iff `multiset(owner) == multiset(next)`. Omitting or
+	/// altering any record breaks the multiset equality ⇒ channel imbalance ⇒ REJECTED — the
+	/// censorship-by-omission surface, caught in-circuit. Composed with `prove-D-nsec3-forward`
+	/// (per-row `owner<next`, single wrap), this pins `next[i] = value-successor(owner[i])`, the
+	/// gap-free cyclic cover of the hash space (C1--C4).
+	#[test]
+	fn nsec3_chain_permutation_link_over_b256() {
+		use crate::b256_field::B256 as OurB256;
+		use crate::nonnative::write_col;
+		use binius_m3::builder::{Col, ConstraintSystem, Statement, WitnessIndex, B1, B64};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+
+		const W: usize = 256;
+		const LANES: usize = W / 64; // 4 B64 lanes cover the full 256-bit hash (collision-free key)
+		let to_bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|i| x.bit(i)).collect() };
+
+		// Closed cyclic sorted NSEC3 chain: next[i] = owner[(i+1) mod N] ⇒ a cyclic-shift permutation.
+		let n: usize = 8;
+		let step = BigUint::from(1u32) << 150;
+		let base = BigUint::from(0x51E3u32);
+		let owners: Vec<BigUint> = (0..n).map(|i| &base + BigUint::from(i as u32) * &step).collect();
+		let nexts: Vec<BigUint> = (0..n).map(|i| owners[(i + 1) % n].clone()).collect();
+
+		let run = |tamper: Option<usize>| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("nsec3_hashes");
+			let mut t = cs.add_table("NSEC3 chain link: next[] is a permutation of owner[] over B256");
+			let owner = t.add_committed::<B1, W>("owner");
+			let next = t.add_committed::<B1, W>("next");
+			// project each 256-bit hash column to four B64 lanes and flush on the channel:
+			// PUSH owner, PULL next ⇒ multiset(owner) == multiset(next). The projected
+			// selected-block oracles must be filled by hand (validate does not auto-materialize).
+			let owner_sel: Vec<Col<B1, 64>> =
+				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
+			let owner_b64: Vec<Col<B64, 1>> =
+				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
+			t.push(chan, owner_b64);
+			let next_sel: Vec<Col<B1, 64>> =
+				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
+			let next_b64: Vec<Col<B64, 1>> =
+				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
+			t.pull(chan, next_b64);
+			let t_id = t.id();
+
+			let statement = Statement { boundaries: vec![], table_sizes: vec![n] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				for i in 0..n {
+					let obits = to_bits(&owners[i]);
+					write_col::<W>(&mut seg, owner, i, &obits).unwrap();
+					let nx = if tamper == Some(i) { &nexts[i] + BigUint::from(1u32) } else { nexts[i].clone() };
+					let nbits = to_bits(&nx);
+					write_col::<W>(&mut seg, next, i, &nbits).unwrap();
+					// fill the four 64-bit lane projections by hand (validate needs them).
+					for l in 0..LANES {
+						write_col::<64>(&mut seg, owner_sel[l], i, &obits[l * 64..(l + 1) * 64]).unwrap();
+						write_col::<64>(&mut seg, next_sel[l], i, &nbits[l * 64..(l + 1) * 64]).unwrap();
+					}
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)
+				.is_ok()
+		};
+
+		assert!(run(None), "a closed cyclic chain (next = permutation of owner) must VALIDATE");
+		assert!(!run(Some(4)), "altering/omitting a record breaks the permutation ⇒ REJECTED");
+		println!(
+			"GATE prove-D-nsec3-link: N={n} NSEC3 chain next[] proven a PERMUTATION of owner[] over \
+			 B256 @L1(128) via a hash channel; an omitted/altered record breaks channel balance and \
+			 is REJECTED. Cross-row ordered-link half of the C1--C4 tiling — composes with \
+			 prove-D-nsec3-forward for the full gap-free cyclic cover."
+		);
+	}
+
+	/// GATE prove-D-nsec3-tiling (in-circuit, Binius/B256) — the COMPLETE C1--C4 NSEC3
+	/// chain-completeness tiling AIR in ONE table. For N committed `(owner, next)` records with a
+	/// per-row `wrap` flag, three constraint families compose to the gap-free cyclic cover:
+	///   (L) hash channel: push `owner`, pull `next` ⇒ `next[]` is a permutation of `owner[]`;
+	///   (F) `min < max` with `wrap` selecting orientation (`lo = wrap?next:owner`,
+	///       `hi = wrap?owner:next`, proven `lo < next`... i.e. `lo < hi` via the a<b gadget),
+	///       which FORCES `wrap[i] = (owner[i] > next[i])` — a forward interval unless the wrap row;
+	///   (1) a selector-flushed count channel: each row pushes a token iff `wrap[i]=1`, and a
+	///       boundary pulls it exactly once ⇒ `sum(wrap) = 1` (exactly one wrap row).
+	/// Permutation + exactly-one-descent uniquely pins `next[i] = value-successor(owner[i])` — the
+	/// gap-free cyclic tiling of the hash space. Omission (breaks L), a reversed non-wrap interval
+	/// (breaks F), or a second wrap (breaks 1) are each REJECTED. This is more complete than the
+	/// prior Goldilocks `Nsec3Chain` AIR, which coded only link+closure (no sortedness/wrap).
+	#[test]
+	fn nsec3_chain_tiling_complete_over_b256() {
+		use crate::b256_field::B256 as OurB256;
+		use crate::nonnative::{ripple_add, write_bit, write_col, Adder};
+		use binius_field::Field;
+		use binius_m3::builder::{
+			Boundary, Col, ConstraintSystem, FlushDirection, FlushOpts, Statement, WitnessIndex, B1, B64,
+		};
+		use bumpalo::Bump;
+		use num_bigint::BigUint;
+
+		const W: usize = 256;
+		const LANES: usize = W / 64;
+		let to_bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|i| x.bit(i)).collect() };
+
+		// Closed cyclic sorted chain: owner[0..n) ascending, next[i] = owner[(i+1) mod n].
+		// Exactly one wrap row (i = n-1: owner[n-1] > next[n-1] = owner[0]).
+		let n: usize = 8;
+		let step = BigUint::from(1u32) << 150;
+		let base = BigUint::from(0x51E3u32);
+		let owners: Vec<BigUint> = (0..n).map(|i| &base + BigUint::from(i as u32) * &step).collect();
+		let nexts: Vec<BigUint> = (0..n).map(|i| owners[(i + 1) % n].clone()).collect();
+
+		// tamper: 0 = honest; 1 = omit/alter a record (breaks perm); 2 = reverse a non-wrap
+		// interval without flagging wrap (breaks F); 3 = add a second wrap flag (breaks count).
+		let run = |tamper: u8| -> bool {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let hchan = cs.add_channel("nsec3_hashes");
+			let wchan = cs.add_channel("nsec3_wrap_count");
+			let mut t = cs.add_table("NSEC3 tiling C1-C4 over B256");
+			t.require_power_of_two_size(); // selector-flushed wrap count needs a po2 table
+
+			let one_w: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
+			let one_col = t.add_constant("one", one_w);
+			let tok = t.add_committed::<B64, 1>("tok"); // committed constant-1 token (filled below)
+			let owner = t.add_committed::<B1, W>("owner");
+			let next = t.add_committed::<B1, W>("next");
+			let wrap = t.add_committed::<B1, 1>("wrap");
+			// broadcast wrap to all W lanes (all-lanes-equal + lane0 == wrap).
+			let bc = t.add_committed::<B1, W>("bc");
+			let bcr = t.add_shifted("bcr", bc, W.trailing_zeros() as usize, 1, binius_core::oracle::ShiftVariant::CircularLeft);
+			t.assert_zero("bc_eq", bc - bcr);
+			let bc0 = t.add_selected("bc0", bc, 0);
+			t.assert_zero("bc_bind", bc0 - wrap);
+			// mux: lo = owner + bc*(owner+next); hi = next + bc*(owner+next)  (GF(2): + is XOR).
+			let diff = t.add_committed::<B1, W>("diff");
+			t.assert_zero("diff_def", diff - (owner + next));
+			let masked = t.add_committed::<B1, W>("masked");
+			t.assert_zero("masked_def", masked - bc * diff);
+			let lo = t.add_committed::<B1, W>("lo");
+			t.assert_zero("lo_def", lo - (owner + masked));
+			let hi = t.add_committed::<B1, W>("hi");
+			t.assert_zero("hi_def", hi - (next + masked));
+			// a<b: (lo+1)+d == hi, top carry 0  ⇒  lo < hi.
+			let a1 = Adder::<W>::build(&mut t, lo, one_col, "a1");
+			let dcol = t.add_committed::<B1, W>("d");
+			let s2 = Adder::<W>::build(&mut t, a1.sum, dcol, "s2");
+			t.assert_zero("lt_eq", s2.sum - hi);
+			let fc = t.add_selected("fc", s2.cout, W - 1);
+			t.assert_zero("lt_no_ovf", fc * B1::ONE);
+			// (L) permutation channel: push owner lanes, pull next lanes.
+			let owner_sel: Vec<Col<B1, 64>> =
+				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
+			let owner_b64: Vec<Col<B64, 1>> =
+				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
+			t.push(hchan, owner_b64);
+			let next_sel: Vec<Col<B1, 64>> =
+				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
+			let next_b64: Vec<Col<B64, 1>> =
+				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
+			t.pull(hchan, next_b64);
+			// (1) exactly-one-wrap: push token iff wrap[i]=1; a boundary pulls it once.
+			t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
+			let t_id = t.id();
+
+			let statement = Statement {
+				boundaries: vec![Boundary {
+					values: vec![OurB256::from(B64::new(1))],
+					channel_id: wchan,
+					direction: FlushDirection::Pull,
+					multiplicity: 1,
+				}],
+				table_sizes: vec![n],
+			};
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(t_id, n).unwrap();
+				let mut seg = tw.full_segment();
+				{
+					// fill the committed count-token = 1 in every row.
+					let mut tc = seg.get_scalars_mut(tok).unwrap();
+					for v in tc.iter_mut() { *v = B64::new(1); }
+				}
+				let one_bits = to_bits(&BigUint::from(1u32));
+				let modw = BigUint::from(1u32) << W;
+				for i in 0..n {
+					let (mut o, mut x) = (owners[i].clone(), nexts[i].clone());
+					if tamper == 1 && i == 4 { x = &x + BigUint::from(1u32); } // break perm
+					if tamper == 2 && i == 2 { std::mem::swap(&mut o, &mut x); } // reversed, wrap NOT flagged
+					let obits = to_bits(&o);
+					let xbits = to_bits(&x);
+					write_col::<W>(&mut seg, owner, i, &obits).unwrap();
+					write_col::<W>(&mut seg, next, i, &xbits).unwrap();
+					write_col::<W>(&mut seg, one_col, i, &one_bits).unwrap();
+					for l in 0..LANES {
+						write_col::<64>(&mut seg, owner_sel[l], i, &obits[l * 64..(l + 1) * 64]).unwrap();
+						write_col::<64>(&mut seg, next_sel[l], i, &xbits[l * 64..(l + 1) * 64]).unwrap();
+					}
+					// wrap = (o > x); plus an injected extra wrap flag for tamper 3.
+					let mut wv = o > x;
+					if tamper == 3 && i == 1 { wv = true; } // second wrap flag with no real descent
+					write_bit(&mut seg, wrap, i, wv).unwrap();
+					let wb: Vec<bool> = (0..W).map(|_| wv).collect();
+					write_col::<W>(&mut seg, bc, i, &wb).unwrap();
+					write_col::<W>(&mut seg, bcr, i, &wb).unwrap(); // all-equal ⇒ rotate == self
+					write_bit(&mut seg, bc0, i, wv).unwrap(); // selected lane-0 of the broadcast
+					let dbits: Vec<bool> = (0..W).map(|k| obits[k] ^ xbits[k]).collect();
+					write_col::<W>(&mut seg, diff, i, &dbits).unwrap();
+					let mbits: Vec<bool> = (0..W).map(|k| wv && dbits[k]).collect();
+					write_col::<W>(&mut seg, masked, i, &mbits).unwrap();
+					let lobits: Vec<bool> = (0..W).map(|k| obits[k] ^ mbits[k]).collect();
+					let hibits: Vec<bool> = (0..W).map(|k| xbits[k] ^ mbits[k]).collect();
+					write_col::<W>(&mut seg, lo, i, &lobits).unwrap();
+					write_col::<W>(&mut seg, hi, i, &hibits).unwrap();
+					// a<b witness on (lo, hi)
+					let lo_v = BigUint::from_bytes_le(&{
+						let mut b = vec![0u8; W / 8];
+						for (k, &bit) in lobits.iter().enumerate() { if bit { b[k / 8] |= 1 << (k % 8); } }
+						b
+					});
+					let hi_v = BigUint::from_bytes_le(&{
+						let mut b = vec![0u8; W / 8];
+						for (k, &bit) in hibits.iter().enumerate() { if bit { b[k / 8] |= 1 << (k % 8); } }
+						b
+					});
+					let a1v = &lo_v + 1u32;
+					let a1_bits = to_bits(&a1v);
+					a1.populate(&mut seg, i, &lobits, &one_bits).unwrap();
+					let d_val = if hi_v >= a1v { &hi_v - &a1v } else { &modw + &hi_v - &a1v };
+					let d_bits = to_bits(&d_val);
+					write_col::<W>(&mut seg, dcol, i, &d_bits).unwrap();
+					s2.populate(&mut seg, i, &a1_bits, &d_bits).unwrap();
+					let (_s, cout) = ripple_add(&a1_bits, &d_bits);
+					write_bit(&mut seg, fc, i, cout[W - 1]).unwrap();
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)
+				.is_ok()
+		};
+
+		assert!(run(0), "the honest gap-free cyclic NSEC3 chain must VALIDATE (C1--C4 tiling)");
+		assert!(!run(1), "omitting/altering a record breaks the permutation ⇒ REJECTED");
+		assert!(!run(2), "a reversed non-wrap interval breaks forward (a<b) ⇒ REJECTED");
+		assert!(!run(3), "a second wrap flag breaks sum(wrap)=1 ⇒ REJECTED");
+		println!(
+			"GATE prove-D-nsec3-tiling: N={n} NSEC3 records proven a GAP-FREE CYCLIC COVER over \
+			 B256 @L1(128) — permutation link + forward-with-wrap + exactly-one-wrap composed in \
+			 one AIR. Omission, a reversed interval, and a second wrap are each REJECTED. Full \
+			 C1--C4 chain-completeness in-circuit on Binius."
+		);
+	}
 }
