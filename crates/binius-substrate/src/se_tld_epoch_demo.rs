@@ -339,14 +339,21 @@ mod tests {
 		assert!(r.epoch_proof_bytes > 0, "the in-circuit recursive-STARK epoch proof was produced");
 		assert!(r.tree_depth >= 9, "Merkle tree over >=512 leaves has depth >= 9");
 
+		// IoT prover-RSS budget: peak process high-water (getrusage) during the in-circuit
+		// record-commitment prove. Target <500 MiB (ideal IoT) / <900 MiB (Raspberry Pi 1 GB).
+		let peak_mib = r.peak_rss_bytes as f64 / (1024.0 * 1024.0);
+		let iot_ideal = peak_mib < 500.0;
+		let pi_ok = peak_mib < 900.0;
 		println!(
 			"SYNTHETIC .se epoch (Binius, in-circuit recursion): N={n} DISTINCT delegations \
 			 | in-circuit-gated={} | merkle depth {} root {} | epoch: prove {} ms, verify {} ms, \
-			 proof {} B | steady-state {:.2} us/lookup --- full recursive STARK + Merkle on \
-			 synthetic data, no Tranco dependency.",
+			 proof {} B | steady-state {:.2} us/lookup | PROVER PEAK RSS {:.0} MiB \
+			 [IoT<500={} Pi<900={}] --- full recursive STARK + Merkle on synthetic data.",
 			r.incircuit_gated, r.tree_depth, hex8(&r.merkle_root),
-			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes, r.steady_state_us
+			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes, r.steady_state_us,
+			peak_mib, iot_ideal, pi_ok
 		);
+		assert!(pi_ok, "prover peak RSS {peak_mib:.0} MiB exceeds the 900 MiB Raspberry Pi budget");
 	}
 
 	/// LEDGER ITEM #5 (MEASURED): the per-record RRSIG *signature* cost that the `.se` prove
