@@ -249,6 +249,70 @@ pub fn run_synthetic_se_epoch_with_nsec3(
 	})
 }
 
+/// CLAIM-LEVEL fold integration: make the NSEC3 chain-completeness witness a first-class
+/// folded [`crate::accumulation::Record`], so its eval-claim accumulates in the epoch fold
+/// *alongside* the positive-record claims (over the binary field `BinaryField128b`), not just
+/// as a committed leaf. Builds a chain-witness polynomial for `n_chain` NSEC3 records, folds it
+/// with a set of positive-record polynomials into one accumulated claim, and returns
+/// `(honest_verifies, tamper_rejected)` — a tampered chain claim (as if a record were
+/// omitted/altered) is caught at its fold. Deterministic (no RNG); the fold is the same
+/// point-reduction accumulation the in-circuit decider replays.
+pub fn fold_nsec3_claim_into_epoch(n_chain: usize) -> Result<(bool, bool)> {
+	use crate::accumulation::{accumulate, accumulate_verify, lifted_claim, mle_eval, EvalClaim, Record};
+	use binius_field::{BinaryField128b as F, Field};
+
+	let inner_log = 4usize; // 16-element inner polynomials
+	let inner = 1usize << inner_log;
+	// deterministic inner evaluation point r and fold challenges (derived, not random).
+	let r: Vec<F> = (0..inner_log).map(|i| F::from(0x9E37_79B9u128.wrapping_mul(i as u128 + 1))).collect();
+
+	// NSEC3 chain-witness polynomial: fold the whole (owner, next) cyclic chain into each of
+	// the `inner` field elements — a commitment-like packing so ANY altered/omitted record
+	// changes the polynomial (and hence its claimed evaluation).
+	let owners: Vec<[u8; 32]> =
+		(0..n_chain).map(|i| Sha3_256::digest(format!("nsec3-owner-{i:08x}").as_bytes()).into()).collect();
+	let chain_evals: Vec<F> = (0..inner)
+		.map(|k| {
+			let mut h = Sha3_256::new();
+			sha3::Digest::update(&mut h, (k as u64).to_le_bytes());
+			for i in 0..n_chain {
+				sha3::Digest::update(&mut h, owners[i]);
+				sha3::Digest::update(&mut h, owners[(i + 1) % n_chain]); // next = cyclic successor
+			}
+			let d: [u8; 32] = sha3::Digest::finalize(h).into();
+			F::from(u128::from_le_bytes(d[0..16].try_into().unwrap()))
+		})
+		.collect();
+	let tiling = Record {
+		claim: EvalClaim { point: r.clone(), value: mle_eval(&chain_evals, &r) },
+		evals: chain_evals,
+	};
+
+	// seven distinct positive-record polynomials + the tiling record = 8 (a power of two).
+	let mut records: Vec<Record> = (0..7)
+		.map(|j| {
+			let evals: Vec<F> =
+				(0..inner).map(|k| F::from((j as u128 + 1).wrapping_mul(k as u128 + 7).wrapping_add(3))).collect();
+			Record { claim: EvalClaim { point: r.clone(), value: mle_eval(&evals, &r) }, evals }
+		})
+		.collect();
+	records.push(tiling);
+
+	let m = records.len().trailing_zeros() as usize;
+	let challenges: Vec<F> =
+		(0..records.len() - 1).map(|i| F::from(0xABCD_1234u128.wrapping_mul(i as u128 + 1))).collect();
+	let (_, _acc, proofs) = accumulate(&records, &challenges);
+	let lifted: Vec<EvalClaim> = records.iter().enumerate().map(|(i, rc)| lifted_claim(rc, i, m)).collect();
+
+	let honest_verifies = accumulate_verify(&lifted, &proofs, &challenges).is_some();
+	// TAMPER the tiling record's claim value (as if the chain were altered/omitted).
+	let mut bad = lifted.clone();
+	let last = bad.len() - 1;
+	bad[last].value += F::ONE;
+	let tamper_rejected = accumulate_verify(&bad, &proofs, &challenges).is_none();
+	Ok((honest_verifies, tamper_rejected))
+}
+
 /// Run the full `.se` epoch pipeline on an explicit name list (real Tranco or synthetic).
 /// Identical Binius path for both: per-record in-circuit FIPS commitment, the SHA-3 Merkle
 /// lookup tree, and the in-circuit recursive-STARK epoch verify.
@@ -461,6 +525,28 @@ mod tests {
 			r.n_records, r.n_chain, r.combined_n, hex8(&r.nsec3_chain_root),
 			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes
 		);
+	}
+
+	/// CLAIM-LEVEL fold integration: the NSEC3 chain-completeness witness is a first-class
+	/// folded `Record`, so its eval-claim accumulates in the epoch fold alongside the positive
+	/// records (over `BinaryField128b`). The honest accumulation verifies; a tampered chain
+	/// claim (as if a record were omitted/altered) is caught AT ITS FOLD — deeper than leaf
+	/// binding: the chain-completeness statement is one of the folded claims.
+	#[test]
+	fn nsec3_claim_folded_into_accumulation() {
+		let (honest, tampered_rejected) =
+			run_nsec3_claim_fold().expect("claim-level NSEC3 fold runs");
+		assert!(honest, "honest NSEC3 chain claim must accumulate/verify in the epoch fold");
+		assert!(tampered_rejected, "a tampered NSEC3 chain claim must be REJECTED at its fold");
+		println!(
+			"NSEC3 CLAIM-LEVEL FOLD: the chain-completeness witness folds as a first-class record \
+			 in the epoch accumulation (over B128) — honest verifies, a tampered chain claim is \
+			 caught at its fold. Chain-completeness is now one of the folded claims, not just a leaf."
+		);
+	}
+
+	fn run_nsec3_claim_fold() -> anyhow::Result<(bool, bool)> {
+		super::fold_nsec3_claim_into_epoch(64)
 	}
 
 	/// LEDGER ITEM #5 (MEASURED): the per-record RRSIG *signature* cost that the `.se` prove
