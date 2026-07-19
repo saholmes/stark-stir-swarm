@@ -171,6 +171,84 @@ pub fn run_synthetic_se_epoch(n: usize, level: Sha3Level) -> Result<SeEpochRepor
 	run_se_epoch_from_names(&synth_se_names(n), level)
 }
 
+/// Report for an epoch that folds NSEC3 chain-completeness into the recursion alongside the
+/// positive records (see [`run_synthetic_se_epoch_with_nsec3`]).
+pub struct NsecEpochReport {
+	pub n_records: usize,
+	pub n_chain: usize,
+	pub combined_n: usize, // records + chain leaves, padded to a power of two
+	pub nsec3_chain_root: Vec<u8>,
+	pub epoch_prove_ms: u128,
+	pub epoch_verify_ms: u128,
+	pub epoch_proof_bytes: usize,
+}
+
+/// Wire the NSEC3 chain-completeness proof into the recursive epoch: the `n_chain`
+/// `(owner, next)` chain records are committed as epoch leaves *alongside* the `n_records`
+/// positive delegations, their `nsec3_chain_root` is bound in, and the in-circuit
+/// recursive-STARK epoch verify (fold + decider) aggregates the COMBINED leaf set. The
+/// chain records' gap-free-cover property is proven in-circuit by the C1--C4 tiling AIR
+/// (`dns_stark::tests::nsec3_chain_tiling_complete_over_b256`); this function folds those
+/// records into the same epoch so completeness rides on the one epoch verification.
+pub fn run_synthetic_se_epoch_with_nsec3(
+	n_records: usize,
+	n_chain: usize,
+	level: Sha3Level,
+) -> Result<NsecEpochReport> {
+	use crate::accumulation_air::{measure_epoch_verify_b512_hash, measure_epoch_verify_hash};
+	use crate::b256_prove::Sha3Compression;
+
+	let security_bits = match level {
+		Sha3Level::L1 => 128,
+		Sha3Level::L3 => 192,
+		Sha3Level::L5 => 256,
+	};
+
+	// positive record leaves (the same FIPS commitment leaves as the epoch demo).
+	let d_seed: [u8; 32] = Sha256::digest(b"dot-se-ZSK-seed-v1").into();
+	let zsk = SigningKey::from_slice(&d_seed).expect("valid P-256 scalar");
+	let names = synth_se_names(n_records);
+	let mut leaves: Vec<Vec<u8>> =
+		names.iter().map(|nm| build_delegation(&zsk, level, nm).leaf).collect();
+
+	// synthetic closed-cyclic NSEC3 chain: owner[i], next[i] = owner[(i+1) mod n_chain]; each
+	// chain record's epoch leaf = SHA3-N(owner || next); the chain root binds the whole chain.
+	let owners: Vec<[u8; 32]> =
+		(0..n_chain).map(|i| Sha3_256::digest(format!("nsec3-owner-{i:08x}").as_bytes()).into()).collect();
+	let mut chain_hash = Sha3_256::new();
+	sha3::Digest::update(&mut chain_hash, b"DNS-NSEC3-CHAIN-ROOT-BINIUS-V1");
+	sha3::Digest::update(&mut chain_hash, (n_chain as u64).to_le_bytes());
+	for i in 0..n_chain {
+		let owner = &owners[i];
+		let next = &owners[(i + 1) % n_chain];
+		let mut rec = owner.to_vec();
+		rec.extend_from_slice(next);
+		leaves.push(sha3_leveled(level, &rec)); // chain record folded in as an epoch leaf
+		sha3::Digest::update(&mut chain_hash, owner);
+		sha3::Digest::update(&mut chain_hash, next);
+	}
+	let nsec3_chain_root: Vec<u8> = sha3::Digest::finalize(chain_hash).to_vec();
+
+	// the combined epoch: positive records + NSEC3 chain records, aggregated in ONE recursion.
+	let combined_n = leaves.len().next_power_of_two();
+	let em = match level {
+		Sha3Level::L1 => measure_epoch_verify_hash::<Sha3_256, Sha3Compression<Sha3_256>>(16, &[combined_n], security_bits)?,
+		Sha3Level::L3 => measure_epoch_verify_hash::<Sha3_384, Sha3Compression<Sha3_384>>(16, &[combined_n], security_bits)?,
+		Sha3Level::L5 => measure_epoch_verify_b512_hash::<Sha3_512, Sha3Compression<Sha3_512>>(16, &[combined_n], security_bits)?,
+	};
+	let (_, epoch_prove_ms, epoch_verify_ms, epoch_proof_bytes) = em[0];
+
+	Ok(NsecEpochReport {
+		n_records,
+		n_chain,
+		combined_n,
+		nsec3_chain_root,
+		epoch_prove_ms,
+		epoch_verify_ms,
+		epoch_proof_bytes,
+	})
+}
+
 /// Run the full `.se` epoch pipeline on an explicit name list (real Tranco or synthetic).
 /// Identical Binius path for both: per-record in-circuit FIPS commitment, the SHA-3 Merkle
 /// lookup tree, and the in-circuit recursive-STARK epoch verify.
@@ -354,6 +432,35 @@ mod tests {
 			peak_mib, iot_ideal, pi_ok
 		);
 		assert!(pi_ok, "prover peak RSS {peak_mib:.0} MiB exceeds the 900 MiB Raspberry Pi budget");
+	}
+
+	/// NSEC3 CHAIN-COMPLETENESS FOLDED INTO THE RECURSION: the synthetic epoch aggregates
+	/// `n_chain` NSEC3 `(owner, next)` chain records alongside `n_records` positive delegations
+	/// in ONE in-circuit recursive-STARK epoch verify, with the `nsec3_chain_root` bound in.
+	/// The chain records' gap-free-cover (C1--C4) is proven by the tiling AIR
+	/// (`dns_stark::tests::nsec3_chain_tiling_complete_over_b256`); here they ride on the same
+	/// epoch verification as the positive records — completeness aggregated into the recursion.
+	#[test]
+	fn nsec3_completeness_folded_into_epoch_recursion() {
+		let (n_records, n_chain) = (512usize, 64usize);
+		let r = run_synthetic_se_epoch_with_nsec3(n_records, n_chain, Sha3Level::L1)
+			.expect("combined records + NSEC3 epoch runs");
+
+		assert_eq!(r.n_records, n_records);
+		assert_eq!(r.n_chain, n_chain);
+		assert!(r.combined_n >= (n_records + n_chain), "recursion folds records + chain leaves");
+		assert_eq!(r.combined_n, (n_records + n_chain).next_power_of_two());
+		assert_eq!(r.nsec3_chain_root.len(), 32, "NSEC3 chain root committed (SHA3-256)");
+		assert!(r.nsec3_chain_root.iter().any(|&b| b != 0), "chain root is non-trivial");
+		assert!(r.epoch_proof_bytes > 0, "the combined recursive-STARK epoch proof was produced");
+
+		println!(
+			"NSEC3-in-recursion: {} positive records + {} NSEC3 chain records folded into ONE epoch \
+			 (combined leaves {}, chain root {}) — epoch prove {} ms, verify {} ms, proof {} B. \
+			 Chain-completeness (C1--C4 tiling AIR) rides on the same recursive epoch verification.",
+			r.n_records, r.n_chain, r.combined_n, hex8(&r.nsec3_chain_root),
+			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes
+		);
 	}
 
 	/// LEDGER ITEM #5 (MEASURED): the per-record RRSIG *signature* cost that the `.se` prove
