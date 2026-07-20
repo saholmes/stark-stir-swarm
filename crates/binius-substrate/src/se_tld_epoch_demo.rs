@@ -255,7 +255,6 @@ pub fn run_synthetic_se_epoch_with_nsec3(
 /// as `ceil(total/shard)` FIXED-size shards instead keeps peak RSS at ~ONE shard's footprint
 /// regardless of zone size — each shard's witness is dropped before the next is proved — and the
 /// shard claims fold into the one epoch (the recursion already aggregates them).
-/// Returns `(n_shards, peak_rss_bytes, total_prove_ms)`.
 /// Returns `(n_shards, peak_rss_bytes, cumulative_prove_ms, slowest_shard_prove_ms)`.
 ///
 /// The two timings are NOT interchangeable, and only the second is comparable with a
@@ -281,6 +280,47 @@ pub fn run_sharded_epoch(
 		peak = peak.max(r.peak_rss_bytes); // process high-water across the sequential shards
 	}
 	Ok((n_shards, peak, cumulative_prove_ms, slowest_shard_prove_ms))
+}
+
+/// TRUE-PARALLEL fixed-shard proving: proves the shards CONCURRENTLY, one OS thread each, and
+/// returns the measured wall-clock — the figure [`run_sharded_epoch`]'s `slowest_shard_prove_ms`
+/// only *projects*. Use this to confirm (or refute) that projection rather than assuming shard
+/// independence translates into parallel speedup.
+///
+/// Fidelity note (MEASURED, do not assume otherwise): the prover is already multi-threaded even
+/// with the `parallel` feature off — binius pulls rayon in through Cargo feature unification, and
+/// a single monolithic prove measures 3.4x CPU utilisation (183.9s user / 53.7s real). So N
+/// concurrent shards demand N x ~3.4 cores. Unless the caller pins each prover to one thread
+/// (`RAYON_NUM_THREADS=1`), N concurrent shards on a smaller box measure OVERSUBSCRIPTION on
+/// that box, not the N-separate-devices deployment. Measured unpinned on 10 cores, 4 shards each
+/// took 3.4x their isolated time and the sharded wall-clock was 2.4x WORSE than monolithic.
+///
+/// Returns `(n_shards, aggregate_peak_rss_bytes, wall_clock_ms, slowest_shard_prove_ms)`.
+/// The RSS is the whole process's high-water while ALL shards are resident at once, i.e. the
+/// aggregate across concurrent shards — NOT the per-device figure (that is one shard's
+/// footprint, which [`run_sharded_epoch`] approximates).
+pub fn run_sharded_epoch_parallel(
+	total_records: usize,
+	shard_size: usize,
+	level: Sha3Level,
+) -> Result<(usize, u64, u128, u128)> {
+	use std::time::Instant;
+
+	let n_shards = total_records.div_ceil(shard_size);
+	let t0 = Instant::now();
+	let per_shard_ms: Vec<u128> = std::thread::scope(|s| {
+		let handles: Vec<_> = (0..n_shards)
+			.map(|_| s.spawn(|| run_synthetic_se_epoch(shard_size, level).map(|r| r.prove_ms)))
+			.collect();
+		handles
+			.into_iter()
+			.map(|h| h.join().expect("shard thread panicked"))
+			.collect::<Result<Vec<_>>>()
+	})?;
+	let wall_clock_ms = t0.elapsed().as_millis();
+	let slowest_shard_prove_ms = per_shard_ms.iter().copied().max().unwrap_or(0);
+
+	Ok((n_shards, crate::b256_sha3::peak_rss_bytes(), wall_clock_ms, slowest_shard_prove_ms))
 }
 
 /// CLAIM-LEVEL fold integration: make the NSEC3 chain-completeness witness a first-class
@@ -666,6 +706,114 @@ mod tests {
 		assert!(sharded_mib < mono_mib, "sharding must cut peak RSS at the same total N");
 		assert!(sharded_mib < 500.0, "sharded proving must stay inside the IoT budget");
 		assert!(n_shards == TOTAL / SHARD, "shard count");
+	}
+
+	/// Shard parallelism (ignored; ~4 min at RAYON_NUM_THREADS=1). Attempts to CONFIRM the fleet
+	/// speedup that `sharded_vs_monolithic_rss` projects from the slowest shard — and records the
+	/// NEGATIVE result that a single machine cannot confirm it.
+	///
+	/// MEASURED @ 2048/512/L1, single-threaded provers, 10 cores: isolated shard 13684 ms,
+	/// monolithic 52865 ms (=3.86x, so cost is ~linear in N), but 4 CONCURRENT shards took
+	/// 54098 ms each — a 3.95x inflation with only 4 threads on 10 cores. That is not CPU
+	/// oversubscription; the provers are memory-bound and share one memory subsystem. Separate
+	/// devices do not, so no single-box emulation reproduces the fleet case, and the ~3.9x fleet
+	/// speedup stays a PROJECTION until measured on real devices.
+	///
+	/// Consequently this test asserts only what one box CAN establish — linearity of per-shard
+	/// cost and the per-device RSS budget — and deliberately does NOT assert a speedup.
+	/// Run: `RAYON_NUM_THREADS=1 cargo test --release --lib sharded_parallel_wall_clock -- --ignored --nocapture`
+	#[test]
+	#[ignore = "parallel wall-clock: ~1 min (proves 2048 records as 4 concurrent shards, then monolithic)"]
+	fn sharded_parallel_wall_clock() {
+		const TOTAL: usize = 2048;
+		const SHARD: usize = 512;
+		let n_expected = TOTAL / SHARD;
+		let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+
+		// The prover is ALREADY multi-threaded (binius pulls in rayon via feature unification:
+		// measured 3.4x CPU utilisation on a single monolithic prove even with `parallel` off).
+		// So N concurrent shards demand N x threads_per_prover cores, NOT N cores. Unless each
+		// prover is pinned to one thread, the shards oversubscribe and the wall-clock measures
+		// contention on THIS box rather than the multi-device deployment it is meant to model.
+		let rayon_threads = std::env::var("RAYON_NUM_THREADS").ok();
+		assert_eq!(
+			rayon_threads.as_deref(),
+			Some("1"),
+			"run with RAYON_NUM_THREADS=1 so each shard's prover is single-threaded; only then do \
+			 {n_expected} concurrent shards on {cores} cores emulate {n_expected} separate devices. \
+			 Unpinned, each prover takes ~3.4 cores, so {n_expected} shards need ~{} cores and this \
+			 box has {cores} -- the result would be an oversubscription artefact, not a fleet figure.",
+			(n_expected as f64 * 3.4).ceil()
+		);
+		assert!(
+			cores >= n_expected,
+			"need >= {n_expected} cores for {n_expected} single-threaded shards; box has {cores}"
+		);
+
+		// (1) ISOLATED single shard — the true per-device cost, nothing else running.
+		let iso = run_synthetic_se_epoch(SHARD, Sha3Level::L1).expect("isolated shard");
+
+		// (2) PARALLEL sharded on THIS box — all shards concurrent, one thread each.
+		let (n_shards, par_peak, wall_ms, slowest_ms) =
+			run_sharded_epoch_parallel(TOTAL, SHARD, Sha3Level::L1).expect("parallel sharded epoch");
+
+		// (3) MONOLITHIC same total.
+		let mono = run_synthetic_se_epoch(TOTAL, Sha3Level::L1).expect("monolithic epoch");
+
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+		let projected_fleet_speedup = mono.prove_ms as f64 / (iso.prove_ms.max(1) as f64);
+		let measured_onebox_speedup = mono.prove_ms as f64 / (wall_ms.max(1) as f64);
+		let contention = slowest_ms as f64 / (iso.prove_ms.max(1) as f64);
+
+		println!(
+			"\n  SHARD PARALLELISM @ {TOTAL} records (L1, {cores} cores, RAYON_NUM_THREADS=1):\n\
+			 \x20   isolated 1 x {SHARD}        {} ms   <- TRUE per-device cost (MEASURED)\n\
+			 \x20   monolith 1 x {TOTAL}       {} ms\n\
+			 \x20   concurrent {n_shards} x {SHARD}    wall-clock {wall_ms} ms  (slowest shard {slowest_ms} ms)\n\
+			 \n\
+			 \x20   PROJECTED fleet speedup (separate devices) = {projected_fleet_speedup:.2}x\n\
+			 \x20   MEASURED  one-box  speedup                 = {measured_onebox_speedup:.2}x\n\
+			 \n\
+			 \x20   ★ THE FLEET SPEEDUP IS NOT CONFIRMED BY THIS TEST, AND CANNOT BE.\n\
+			 \x20   Each concurrent shard took {contention:.2}x its ISOLATED time despite being\n\
+			 \x20   single-threaded with {cores} cores for {n_shards} threads — so this is NOT CPU\n\
+			 \x20   oversubscription. The provers are MEMORY-BOUND and contend for one shared\n\
+			 \x20   memory subsystem and last-level cache. Separate devices each have their own,\n\
+			 \x20   so no single-box emulation can reproduce the fleet case: pinning cores does not\n\
+			 \x20   partition memory bandwidth. On one box, sharding is a latency LOSS.\n\
+			 \x20   The {projected_fleet_speedup:.2}x therefore stays a PROJECTION (evidence class E/P),\n\
+			 \x20   resting on the measured facts that per-shard cost is ~linear in N and that shards\n\
+			 \x20   are logically independent. Confirming it needs {n_shards} real devices.\n\
+			 \n\
+			 \x20   RSS {:.0} MiB is the AGGREGATE high-water with all {n_shards} shards resident in ONE\n\
+			 \x20   process — NOT the per-device figure, which is the isolated shard's {:.0} MiB.\n\
+			 \x20   Excludes the fold over shard claims (polylog in shard count) and all network I/O.\n",
+			iso.prove_ms,
+			mono.prove_ms,
+			mib(par_peak),
+			mib(iso.peak_rss_bytes),
+		);
+
+		assert_eq!(n_shards, n_expected, "shard count");
+		// Defensible on one box: per-shard cost is ~linear in N (so sharding adds no large fixed
+		// per-proof cost), and the per-device footprint is well inside the IoT budget. The fleet
+		// speedup itself is deliberately NOT asserted — this harness cannot measure it.
+		let linearity = mono.prove_ms as f64 / (iso.prove_ms.max(1) as f64);
+		let ratio = (TOTAL / SHARD) as f64;
+		assert!(
+			linearity > ratio * 0.7 && linearity < ratio * 1.3,
+			"per-shard cost should be ~linear in N: monolithic/{SHARD}-shard = {linearity:.2}x, \
+			 expected ~{ratio:.0}x. A large deviation means a fixed per-proof cost that would \
+			 change the sharding trade-off."
+		);
+		assert!(
+			mib(iso.peak_rss_bytes) < 500.0,
+			"per-device (isolated shard) RSS must stay inside the IoT budget"
+		);
+		assert!(
+			wall_ms >= slowest_ms,
+			"wall-clock ({wall_ms} ms) cannot be below the slowest shard ({slowest_ms} ms)"
+		);
 	}
 
 	/// CLAIM-LEVEL fold integration over the REAL chain witness: the NSEC3 `(owner, next)`
