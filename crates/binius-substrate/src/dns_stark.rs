@@ -1364,8 +1364,7 @@ mod tests {
 	/// gap-free cyclic tiling of the hash space. Omission (breaks L), a reversed non-wrap interval
 	/// (breaks F), or a second wrap (breaks 1) are each REJECTED. This is more complete than the
 	/// prior Goldilocks `Nsec3Chain` AIR, which coded only link+closure (no sortedness/wrap).
-	#[test]
-	fn nsec3_chain_tiling_complete_over_b256() {
+	fn nsec3_tiling_at_width<const W: usize>() {
 		use crate::b256_field::B256 as OurB256;
 		use crate::nonnative::{ripple_add, write_bit, write_col, Adder};
 		use binius_field::Field;
@@ -1375,8 +1374,12 @@ mod tests {
 		use bumpalo::Bump;
 		use num_bigint::BigUint;
 
-		const W: usize = 256;
-		const LANES: usize = W / 64;
+		// W = the nonnative comparison width in bits; must be a multiple of the 64-bit lane size.
+		// NSEC3 owner hashes are SHA-1 (RFC 5155 defines only algorithm 1), i.e. 160 bits, so
+		// W=256 carries ~96 dead bits per wide column. W is swept to test whether verifier
+		// latency tracks AIR WIDTH — the only driver the n-sweep and rate-sweep did not rule out.
+		assert!(W % 64 == 0, "W must be a multiple of the 64-bit lane size (got {W})");
+		let lanes: usize = W / 64;
 		let to_bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|i| x.bit(i)).collect() };
 
 		// Closed cyclic sorted chain: owner[0..n) ascending, next[i] = owner[(i+1) mod n].
@@ -1384,9 +1387,11 @@ mod tests {
 		// NSEC3_N scales the chain (default 8, must be a power of two: the selector-flushed wrap
 		// count needs a po2 table). NSEC3_PROVE=1 additionally runs the REAL prove+verify on the
 		// honest chain — without it this test only validates the witness, which is NOT a proving
-		// cost measurement. `step = 2^150` keeps owners inside B256 for any n up to 2^106.
+		// cost measurement. `step = 2^(W-16)` keeps the whole ascending chain inside W bits for
+		// any n up to 2^15 (n*step = 2^(W-1) at n=32768), so the sweep is valid at every width.
 		let n: usize = std::env::var("NSEC3_N").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
 		assert!(n.is_power_of_two(), "NSEC3_N must be a power of two (got {n})");
+		assert!(n <= 1 << 15, "chain must fit W bits: n<=2^15 for step=2^(W-16) (got {n})");
 		let do_prove = std::env::var("NSEC3_PROVE").is_ok_and(|v| v == "1");
 		// NSEC3_LOG_INV_RATE = FRI blowup exponent (rate 2^-r). SECURITY_BITS stays 128 in BOTH
 		// prove and verify, so binius derives the query count from (rate, 128): the soundness
@@ -1396,7 +1401,7 @@ mod tests {
 			std::env::var("NSEC3_LOG_INV_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 		// (prove_ms, proof_bytes, peak_rss_bytes, verify_ms) — filled only when do_prove.
 		let stats = std::cell::Cell::new((0u128, 0usize, 0u64, 0u128));
-		let step = BigUint::from(1u32) << 150;
+		let step = BigUint::from(1u32) << (W - 16);
 		let base = BigUint::from(0x51E3u32);
 		let owners: Vec<BigUint> = (0..n).map(|i| &base + BigUint::from(i as u32) * &step).collect();
 		let nexts: Vec<BigUint> = (0..n).map(|i| owners[(i + 1) % n].clone()).collect();
@@ -1441,14 +1446,14 @@ mod tests {
 			t.assert_zero("lt_no_ovf", fc * B1::ONE);
 			// (L) permutation channel: push owner lanes, pull next lanes.
 			let owner_sel: Vec<Col<B1, 64>> =
-				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
+				(0..lanes).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
 			let owner_b64: Vec<Col<B64, 1>> =
-				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
+				(0..lanes).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
 			t.push(hchan, owner_b64);
 			let next_sel: Vec<Col<B1, 64>> =
-				(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
+				(0..lanes).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
 			let next_b64: Vec<Col<B64, 1>> =
-				(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
+				(0..lanes).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
 			t.pull(hchan, next_b64);
 			// (1) exactly-one-wrap: push token iff wrap[i]=1; a boundary pulls it once.
 			t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
@@ -1483,7 +1488,7 @@ mod tests {
 					write_col::<W>(&mut seg, owner, i, &obits).unwrap();
 					write_col::<W>(&mut seg, next, i, &xbits).unwrap();
 					write_col::<W>(&mut seg, one_col, i, &one_bits).unwrap();
-					for l in 0..LANES {
+					for l in 0..lanes {
 						write_col::<64>(&mut seg, owner_sel[l], i, &obits[l * 64..(l + 1) * 64]).unwrap();
 						write_col::<64>(&mut seg, next_sel[l], i, &xbits[l * 64..(l + 1) * 64]).unwrap();
 					}
@@ -1587,6 +1592,20 @@ mod tests {
 				lir,
 				rss as f64 / (1024.0 * 1024.0),
 			);
+		}
+	}
+
+	/// GATE prove-D-nsec3-tiling — the C1--C4 chain-completeness AIR at the deployed width.
+	/// `NSEC3_W` selects the comparison width (256 default; 192 is the natural fit for NSEC3's
+	/// 160-bit SHA-1 owner hashes once rounded to whole 64-bit lanes). W must be a multiple of 64
+	/// and is a COMPILE-TIME const generic, so the sweep dispatches rather than parameterising.
+	#[test]
+	fn nsec3_chain_tiling_complete_over_b256() {
+		match std::env::var("NSEC3_W").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) {
+			128 => nsec3_tiling_at_width::<128>(),
+			192 => nsec3_tiling_at_width::<192>(),
+			256 => nsec3_tiling_at_width::<256>(),
+			w => panic!("NSEC3_W must be 128, 192 or 256 (got {w})"),
 		}
 	}
 }
