@@ -37,11 +37,23 @@
 //! the AUDITABLE mode — an auditor holding the zone can check the chain against it — and not the
 //! succinct mode a resolver wants.
 //!
-//! **W4 (not done)** — epoch aggregation is still the random-witness cost model
-//! (`measure_epoch_verify_hash`), which binds none of this, and it is also where succinct binding
-//! must come from: an evaluation-claim fold gives the resolver a short pin where a hash root
-//! cannot. Until W4 lands, chain completeness is load-bearing for an AUDITOR but not for a
-//! resolver holding only a short commitment.
+//! **W4(a) (done)** — [`prove_bound_chain`] proves and verifies the composed system over the
+//! ACTUAL leaves, replacing the random-witness cost model for this artifact.
+//!
+//! **W4(b) (mechanism only)** — [`fold_verifies_against_pin`] carries a zone pin through the
+//! native accumulation fold, but its instantiation is NOT binding: [`fs_point`] derives the point
+//! as `H(leaves)`, which a grinding prover can anticipate. Superseded in practice by W5.
+//!
+//! **W5 (done)** — [`verify_bound_chain_against_pin`] gives the RESOLVER-facing property: holding
+//! a 32-byte commitment and no leaf data, it accepts its own zone's proof and rejects a valid
+//! gap-free chain proved for another zone. Verification is a composition of two checks the
+//! resolver performs itself — commitment == pin, then the stock `constraint_system::verify` — so
+//! nothing rests on transcript-layout assumptions or a vendored verifier.
+//!
+//! **W5.4 (open, design)** — the pin covers the WHOLE witness, tiling columns included, so a
+//! prover-side circuit revision invalidates it even for an unchanged zone. The pin is
+//! per-circuit-version and a deployment must publish a version with it. A leaf-only commitment
+//! would need binius's commit path changed (all committed oracles go through one `commit_meta`).
 //!
 //! ## Known hazard
 //!
@@ -204,11 +216,51 @@ fn validate_bound_chain_inner(n: usize, tamper: BindTamper, binding: RootBinding
 	build_bound_chain(n, tamper, binding, false).map(|(ok, _)| ok)
 }
 
+/// W5.2 — RESOLVER-SIDE verification against a pinned commitment.
+///
+/// Two checks, both performed by the verifier itself, which is what makes the composition sound:
+///   1. the proof's polynomial commitment equals `expected_commitment` (the resolver's pin), and
+///   2. the proof verifies against the constraint system.
+///
+/// The verifier rebuilds the constraint system from `(n, binding)` alone — it never sees a
+/// witness, a leaf, or a chain — and reuses the SAME builder the prover used, so the two cannot
+/// drift apart. Passing check 1 without check 2 would prove nothing about completeness; passing
+/// check 2 without check 1 is exactly the prove-A-serve-B hole W2/W3 left open for a resolver.
+///
+/// ★ The pin is PER-CIRCUIT-VERSION: the commitment covers the whole witness, tiling columns
+/// included, so any prover-side circuit revision changes it even for an unchanged zone. A
+/// deployment must publish a circuit version alongside the pin (W5.4).
+pub fn verify_bound_chain_against_pin(
+	n: usize,
+	binding: RootBinding,
+	proof_transcript: &[u8],
+	expected_commitment: &[u8],
+) -> Result<bool> {
+	build_bound_chain_inner(
+		n,
+		BindTamper::None,
+		binding,
+		false,
+		Some((proof_transcript, expected_commitment)),
+	)
+	.map(|(ok, _)| ok)
+}
+
 fn build_bound_chain(
 	n: usize,
 	tamper: BindTamper,
 	binding: RootBinding,
 	do_prove: bool,
+) -> Result<(bool, Option<BoundChainCost>)> {
+	build_bound_chain_inner(n, tamper, binding, do_prove, None)
+}
+
+fn build_bound_chain_inner(
+	n: usize,
+	tamper: BindTamper,
+	binding: RootBinding,
+	do_prove: bool,
+	verify_against: Option<(&[u8], &[u8])>,
 ) -> Result<(bool, Option<BoundChainCost>)> {
 	assert!(n.is_power_of_two(), "n must be a power of two (selector-flushed wrap count)");
 	assert!(n <= 1 << 15, "chain must fit W bits: n <= 2^15 for step = 2^(W-16)");
@@ -318,6 +370,37 @@ fn build_bound_chain(
 	}
 
 	let statement = binius_m3::builder::Statement { boundaries, table_sizes: vec![n, n] };
+
+	// W5.2 RESOLVER PATH — no witness is built at all: the verifier holds only the proof and its
+	// pin. Both checks below are its own, so their conjunction is what the resolver relies on.
+	if let Some((proof_transcript, expected_commitment)) = verify_against {
+		let ccs = cs.compile(&statement)?;
+		// (1) the pin: does this proof commit the zone the resolver asked about?
+		let got = read_proof_commitment(proof_transcript, &statement.boundaries)?;
+		if got != expected_commitment {
+			return Ok((false, None));
+		}
+		// (2) the proof: is the committed data actually a gap-free cover, bound to those leaves?
+		use crate::b256_field::{B256TowerFamily, U256};
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use sha2::Sha256;
+		let ok = binius_core::constraint_system::verify::<
+			U256,
+			B256TowerFamily,
+			Sha256,
+			Sha256Compression,
+			HasherChallenger<Sha256>,
+		>(
+			&ccs,
+			2,
+			128,
+			&statement.boundaries,
+			binius_core::constraint_system::Proof { transcript: proof_transcript.to_vec() },
+		)
+		.is_ok();
+		return Ok((ok, None));
+	}
 
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 
@@ -947,6 +1030,76 @@ mod tests {
 			 \x20   REMAINING COUPLING (W5.4): the commitment covers the WHOLE witness, tiling \
 			 columns included, so a prover-side circuit revision invalidates a resolver's pin even \
 			 for an unchanged zone. The pin is per-circuit-version and must be published with one."
+		);
+	}
+
+	/// W5.3 GATE — the RESOLVER-facing property, for real.
+	///
+	/// A resolver holding a 32-byte pin and nothing else accepts its own zone's proof and rejects
+	/// a proof of a different, perfectly valid, gap-free chain. This is the case W2 and W3 could
+	/// not serve: W2 proves "some valid chain", W3 pins the zone but costs O(n) leaf data.
+	///
+	/// The three assertions are deliberately paired so neither check can be silently doing all the
+	/// work: the wrong-zone proof VERIFIES on its own terms (it is a real proof of a real chain)
+	/// and is rejected only by the pin; the honest proof is rejected once the pin is corrupted.
+	#[test]
+	fn w5_3_resolver_verifies_against_pin() {
+		const N: usize = 64;
+		let binding = RootBinding::None; // resolver holds ONLY the 32-byte pin, no leaf data
+
+		let mine = prove_bound_chain_of(N, BindTamper::None, binding).expect("my zone");
+		let other =
+			prove_bound_chain_of(N, BindTamper::NoneAlternateChain, binding).expect("other zone");
+		let my_pin = mine.commitment_prefix.clone();
+
+		// (1) my zone's proof, against my pin → ACCEPT
+		assert!(
+			verify_bound_chain_against_pin(N, binding, &mine.transcript, &my_pin)
+				.expect("verify mine"),
+			"a resolver must accept its own zone's proof against its pin"
+		);
+
+		// (2) ★ a DIFFERENT zone's proof, against my pin → REJECT.
+		//     The proof itself is perfectly valid — assertion (3) below confirms it verifies
+		//     against its OWN pin — so the rejection is the pin doing the work, not a bad proof.
+		assert!(
+			!verify_bound_chain_against_pin(N, binding, &other.transcript, &my_pin)
+				.expect("verify other"),
+			"★ prove-A-serve-B: a valid gap-free chain for ANOTHER zone must be REJECTED against \
+			 my pin — this is the resolver-facing property W2/W3 could not deliver"
+		);
+
+		// (3) control: that same proof IS valid against its own pin, so (2) rejected on identity
+		//     rather than on validity.
+		assert!(
+			verify_bound_chain_against_pin(N, binding, &other.transcript, &other.commitment_prefix)
+				.expect("verify other vs own pin"),
+			"control: the other zone's proof must verify against ITS OWN pin — otherwise (2) \
+			 proves nothing about the pin"
+		);
+
+		// (4) control the other way: a corrupted pin rejects an otherwise-good proof, so the
+		//     commitment check is actually consulted rather than incidental.
+		let mut bad_pin = my_pin.clone();
+		bad_pin[0] ^= 0x01;
+		assert!(
+			!verify_bound_chain_against_pin(N, binding, &mine.transcript, &bad_pin)
+				.expect("verify vs bad pin"),
+			"a corrupted pin must reject an otherwise-valid proof"
+		);
+
+		println!(
+			"\n  W5.3 GATE resolver-pin: a resolver holding a {}-byte pin and NO leaf data\n\
+			 \x20   accepts its own zone's proof, REJECTS a valid gap-free chain proved for another\n\
+			 \x20   zone, and rejects its own zone under a corrupted pin. Both controls hold, so\n\
+			 \x20   neither the pin check nor the proof check is carrying the result alone.\n\
+			 \x20   Verification is a composition of two checks the RESOLVER performs: commitment\n\
+			 \x20   == pin, then the stock constraint_system::verify. No witness, no leaf list, no\n\
+			 \x20   vendored verifier.\n\
+			 \x20   ★ CAVEAT (W5.4): the pin covers the WHOLE witness including tiling columns, so\n\
+			 \x20   a prover-side circuit revision invalidates it even for an unchanged zone. The\n\
+			 \x20   pin is per-circuit-version and must be published with a version.",
+			my_pin.len()
 		);
 	}
 
