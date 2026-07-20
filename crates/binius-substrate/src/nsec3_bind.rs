@@ -84,6 +84,194 @@ const LEAF_LANES: usize = 2 * LANES;
 /// while serving chain B.
 const ALT_SALT: u32 = 7;
 
+// =====================================================================================
+// THE C1--C4 TILING AIR — the single definition, shared by every caller.
+//
+// This used to exist twice: once in `dns_stark`'s gate test and once here. Two copies of a
+// soundness-critical circuit drift, and once this module became load-bearing that stopped being
+// acceptable. Both callers now build from `build_tiling_table` / `fill_tiling_row`, so a change
+// to the constraints reaches the gate test and the binding path together or not at all.
+// =====================================================================================
+
+/// Every column of the tiling table, so a caller can fill the witness without rebuilding it.
+#[allow(dead_code)]
+pub(crate) struct TilingCols<const W: usize> {
+	pub tok: Col<B64, 1>,
+	pub one_col: Col<B1, W>,
+	pub owner: Col<B1, W>,
+	pub next: Col<B1, W>,
+	pub wrap: Col<B1, 1>,
+	pub bc: Col<B1, W>,
+	pub bcr: Col<B1, W>,
+	pub bc0: Col<B1, 1>,
+	pub diff: Col<B1, W>,
+	pub masked: Col<B1, W>,
+	pub lo: Col<B1, W>,
+	pub hi: Col<B1, W>,
+	pub a1: Adder<W>,
+	pub dcol: Col<B1, W>,
+	pub s2: Adder<W>,
+	pub fc: Col<B1, 1>,
+	pub owner_sel: Vec<Col<B1, 64>>,
+	pub next_sel: Vec<Col<B1, 64>>,
+}
+
+/// Build the C1--C4 tiling constraints on `t`.
+///
+/// * `hchan` carries the permutation link (push owner lanes, pull next lanes) — C1/C4.
+/// * `wchan` carries the exactly-one-wrap count token, selector-flushed on `wrap`.
+/// * `leafchan`, when given, additionally pushes the whole `(owner ‖ next)` row so a leaf table
+///   can pull it — this is the W2 binding, and is absent for the standalone gate.
+///
+/// The caller must have called `t.require_power_of_two_size()` (the selector flush needs it) and
+/// must supply the boundary that pulls the wrap token exactly once.
+pub(crate) fn build_tiling_table<const W: usize>(
+	t: &mut binius_m3::builder::TableBuilder<OurB256>,
+	hchan: binius_core::constraint_system::channel::ChannelId,
+	wchan: binius_core::constraint_system::channel::ChannelId,
+	leafchan: Option<binius_core::constraint_system::channel::ChannelId>,
+) -> TilingCols<W> {
+	assert!(W % 64 == 0, "W must be a multiple of the 64-bit lane size (got {W})");
+	let lanes = W / 64;
+
+	let one_w: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
+	let one_col = t.add_constant("one", one_w);
+	let tok = t.add_committed::<B64, 1>("tok");
+	let owner = t.add_committed::<B1, W>("owner");
+	let next = t.add_committed::<B1, W>("next");
+	let wrap = t.add_committed::<B1, 1>("wrap");
+	// broadcast wrap to all W lanes (all-lanes-equal + lane0 == wrap)
+	let bc = t.add_committed::<B1, W>("bc");
+	let bcr =
+		t.add_shifted("bcr", bc, W.trailing_zeros() as usize, 1, ShiftVariant::CircularLeft);
+	t.assert_zero("bc_eq", bc - bcr);
+	let bc0 = t.add_selected("bc0", bc, 0);
+	t.assert_zero("bc_bind", bc0 - wrap);
+	// mux: lo = owner + bc*(owner+next); hi = next + bc*(owner+next)  (GF(2): + is XOR)
+	let diff = t.add_committed::<B1, W>("diff");
+	t.assert_zero("diff_def", diff - (owner + next));
+	let masked = t.add_committed::<B1, W>("masked");
+	t.assert_zero("masked_def", masked - bc * diff);
+	let lo = t.add_committed::<B1, W>("lo");
+	t.assert_zero("lo_def", lo - (owner + masked));
+	let hi = t.add_committed::<B1, W>("hi");
+	t.assert_zero("hi_def", hi - (next + masked));
+	// a<b: (lo+1)+d == hi with top carry 0  ⇒  lo < hi
+	let a1 = Adder::<W>::build(t, lo, one_col, "a1");
+	let dcol = t.add_committed::<B1, W>("d");
+	let s2 = Adder::<W>::build(t, a1.sum, dcol, "s2");
+	t.assert_zero("lt_eq", s2.sum - hi);
+	let fc = t.add_selected("fc", s2.cout, W - 1);
+	t.assert_zero("lt_no_ovf", fc * B1::ONE);
+
+	let owner_sel: Vec<Col<B1, 64>> = (0..lanes)
+		.map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i))
+		.collect();
+	let owner_b64: Vec<Col<B64, 1>> = (0..lanes)
+		.map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i]))
+		.collect();
+	t.push(hchan, owner_b64.clone());
+	let next_sel: Vec<Col<B1, 64>> = (0..lanes)
+		.map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i))
+		.collect();
+	let next_b64: Vec<Col<B64, 1>> = (0..lanes)
+		.map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i]))
+		.collect();
+	t.pull(hchan, next_b64.clone());
+	t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
+
+	if let Some(lc) = leafchan {
+		let leaf_out: Vec<Col<B64, 1>> =
+			owner_b64.iter().chain(next_b64.iter()).copied().collect();
+		t.push(lc, leaf_out);
+	}
+
+	TilingCols {
+		tok,
+		one_col,
+		owner,
+		next,
+		wrap,
+		bc,
+		bcr,
+		bc0,
+		diff,
+		masked,
+		lo,
+		hi,
+		a1,
+		dcol,
+		s2,
+		fc,
+		owner_sel,
+		next_sel,
+	}
+}
+
+/// Fill one tiling row from its `(owner, next)` values.
+///
+/// `force_wrap` overrides the derived `wrap = owner > next` flag. It exists only so a test can
+/// inject a SECOND wrap with no real descent — a corruption that cannot be expressed by changing
+/// the values, since `wrap` is witness data the constraints tie to the mux rather than derive.
+pub(crate) fn fill_tiling_row<const W: usize>(
+	seg: &mut TableWitnessSegment<OurB256>,
+	c: &TilingCols<W>,
+	i: usize,
+	owner_v: &BigUint,
+	next_v: &BigUint,
+	force_wrap: Option<bool>,
+) -> Result<()> {
+	let lanes = W / 64;
+	let bits = |x: &BigUint| -> Vec<bool> { (0..W as u64).map(|k| x.bit(k)).collect() };
+	let one_bits = bits(&BigUint::from(1u32));
+	let modw = BigUint::from(1u32) << W;
+
+	let obits = bits(owner_v);
+	let xbits = bits(next_v);
+	write_col::<W>(seg, c.owner, i, &obits)?;
+	write_col::<W>(seg, c.next, i, &xbits)?;
+	write_col::<W>(seg, c.one_col, i, &one_bits)?;
+	for l in 0..lanes {
+		write_col::<64>(seg, c.owner_sel[l], i, &obits[l * 64..(l + 1) * 64])?;
+		write_col::<64>(seg, c.next_sel[l], i, &xbits[l * 64..(l + 1) * 64])?;
+	}
+	let wv = force_wrap.unwrap_or(owner_v > next_v);
+	write_bit(seg, c.wrap, i, wv)?;
+	let wb: Vec<bool> = (0..W).map(|_| wv).collect();
+	write_col::<W>(seg, c.bc, i, &wb)?;
+	write_col::<W>(seg, c.bcr, i, &wb)?; // all-equal ⇒ rotate == self
+	write_bit(seg, c.bc0, i, wv)?;
+	let dbits: Vec<bool> = (0..W).map(|k| obits[k] ^ xbits[k]).collect();
+	write_col::<W>(seg, c.diff, i, &dbits)?;
+	let mbits: Vec<bool> = (0..W).map(|k| wv && dbits[k]).collect();
+	write_col::<W>(seg, c.masked, i, &mbits)?;
+	let lobits: Vec<bool> = (0..W).map(|k| obits[k] ^ mbits[k]).collect();
+	let hibits: Vec<bool> = (0..W).map(|k| xbits[k] ^ mbits[k]).collect();
+	write_col::<W>(seg, c.lo, i, &lobits)?;
+	write_col::<W>(seg, c.hi, i, &hibits)?;
+	let to_uint = |b: &[bool]| -> BigUint {
+		let mut v = vec![0u8; W / 8];
+		for (k, &bit) in b.iter().enumerate() {
+			if bit {
+				v[k / 8] |= 1 << (k % 8);
+			}
+		}
+		BigUint::from_bytes_le(&v)
+	};
+	let lo_v = to_uint(&lobits);
+	let hi_v = to_uint(&hibits);
+	let a1v = &lo_v + 1u32;
+	let a1_bits = (0..W as u64).map(|k| a1v.bit(k)).collect::<Vec<bool>>();
+	c.a1.populate(seg, i, &lobits, &one_bits)?;
+	let d_val = if hi_v >= a1v { &hi_v - &a1v } else { &modw + &hi_v - &a1v };
+	let d_bits = (0..W as u64).map(|k| d_val.bit(k)).collect::<Vec<bool>>();
+	write_col::<W>(seg, c.dcol, i, &d_bits)?;
+	c.s2.populate(seg, i, &a1_bits, &d_bits)?;
+	let (_s, cout) = ripple_add(&a1_bits, &d_bits);
+	write_bit(seg, c.fc, i, cout[W - 1])?;
+	Ok(())
+}
+
 /// What to corrupt, so each guarantee has a test that fails without it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BindTamper {
@@ -283,48 +471,7 @@ fn build_bound_chain_inner(
 	// ---- table A: the C1--C4 tiling AIR, plus a push of each row onto `leafchan` -------------
 	let mut t = cs.add_table("NSEC3 tiling C1-C4 over B256");
 	t.require_power_of_two_size();
-	let one_w: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
-	let one_col = t.add_constant("one", one_w);
-	let tok = t.add_committed::<B64, 1>("tok");
-	let owner = t.add_committed::<B1, W>("owner");
-	let next = t.add_committed::<B1, W>("next");
-	let wrap = t.add_committed::<B1, 1>("wrap");
-	let bc = t.add_committed::<B1, W>("bc");
-	let bcr = t.add_shifted("bcr", bc, W.trailing_zeros() as usize, 1, ShiftVariant::CircularLeft);
-	t.assert_zero("bc_eq", bc - bcr);
-	let bc0 = t.add_selected("bc0", bc, 0);
-	t.assert_zero("bc_bind", bc0 - wrap);
-	let diff = t.add_committed::<B1, W>("diff");
-	t.assert_zero("diff_def", diff - (owner + next));
-	let masked = t.add_committed::<B1, W>("masked");
-	t.assert_zero("masked_def", masked - bc * diff);
-	let lo = t.add_committed::<B1, W>("lo");
-	t.assert_zero("lo_def", lo - (owner + masked));
-	let hi = t.add_committed::<B1, W>("hi");
-	t.assert_zero("hi_def", hi - (next + masked));
-	let a1 = Adder::<W>::build(&mut t, lo, one_col, "a1");
-	let dcol = t.add_committed::<B1, W>("d");
-	let s2 = Adder::<W>::build(&mut t, a1.sum, dcol, "s2");
-	t.assert_zero("lt_eq", s2.sum - hi);
-	let fc = t.add_selected("fc", s2.cout, W - 1);
-	t.assert_zero("lt_no_ovf", fc * B1::ONE);
-
-	let owner_sel: Vec<Col<B1, 64>> =
-		(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
-	let owner_b64: Vec<Col<B64, 1>> =
-		(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
-	t.push(hchan, owner_b64.clone());
-	let next_sel: Vec<Col<B1, 64>> =
-		(0..LANES).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
-	let next_b64: Vec<Col<B64, 1>> =
-		(0..LANES).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
-	t.pull(hchan, next_b64.clone());
-	t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
-
-	// the binding push: the WHOLE row (owner ‖ next) as one 8-lane flush.
-	let leaf_out: Vec<Col<B64, 1>> =
-		owner_b64.iter().chain(next_b64.iter()).copied().collect();
-	t.push(leafchan, leaf_out);
+	let tc = build_tiling_table::<W>(&mut t, hchan, wchan, Some(leafchan));
 	let tiling_id = t.id();
 
 	// ---- table B: the epoch's raw chain leaves, PULLED from the same channel -----------------
@@ -409,58 +556,13 @@ fn build_bound_chain_inner(
 		let tw = witness.init_table(tiling_id, n)?;
 		let mut seg = tw.full_segment();
 		{
-			let mut tc = seg.get_scalars_mut(tok)?;
-			for v in tc.iter_mut() {
+			let mut tv = seg.get_scalars_mut(tc.tok)?;
+			for v in tv.iter_mut() {
 				*v = B64::new(1);
 			}
 		}
-		let one_bits = to_bits(&BigUint::from(1u32));
-		let modw = BigUint::from(1u32) << W;
 		for i in 0..n {
-			let (o, x) = (owners[i].clone(), nexts[i].clone());
-			let obits = to_bits(&o);
-			let xbits = to_bits(&x);
-			write_col::<W>(&mut seg, owner, i, &obits)?;
-			write_col::<W>(&mut seg, next, i, &xbits)?;
-			write_col::<W>(&mut seg, one_col, i, &one_bits)?;
-			for l in 0..LANES {
-				write_col::<64>(&mut seg, owner_sel[l], i, &obits[l * 64..(l + 1) * 64])?;
-				write_col::<64>(&mut seg, next_sel[l], i, &xbits[l * 64..(l + 1) * 64])?;
-			}
-			let wv = o > x;
-			write_bit(&mut seg, wrap, i, wv)?;
-			let wb: Vec<bool> = (0..W).map(|_| wv).collect();
-			write_col::<W>(&mut seg, bc, i, &wb)?;
-			write_col::<W>(&mut seg, bcr, i, &wb)?;
-			write_bit(&mut seg, bc0, i, wv)?;
-			let dbits: Vec<bool> = (0..W).map(|k| obits[k] ^ xbits[k]).collect();
-			write_col::<W>(&mut seg, diff, i, &dbits)?;
-			let mbits: Vec<bool> = (0..W).map(|k| wv && dbits[k]).collect();
-			write_col::<W>(&mut seg, masked, i, &mbits)?;
-			let lobits: Vec<bool> = (0..W).map(|k| obits[k] ^ mbits[k]).collect();
-			let hibits: Vec<bool> = (0..W).map(|k| xbits[k] ^ mbits[k]).collect();
-			write_col::<W>(&mut seg, lo, i, &lobits)?;
-			write_col::<W>(&mut seg, hi, i, &hibits)?;
-			let bits_to_uint = |bits: &[bool]| -> BigUint {
-				let mut b = vec![0u8; W / 8];
-				for (k, &bit) in bits.iter().enumerate() {
-					if bit {
-						b[k / 8] |= 1 << (k % 8);
-					}
-				}
-				BigUint::from_bytes_le(&b)
-			};
-			let lo_v = bits_to_uint(&lobits);
-			let hi_v = bits_to_uint(&hibits);
-			let a1v = &lo_v + 1u32;
-			let a1_bits = to_bits(&a1v);
-			a1.populate(&mut seg, i, &lobits, &one_bits)?;
-			let d_val = if hi_v >= a1v { &hi_v - &a1v } else { &modw + &hi_v - &a1v };
-			let d_bits = to_bits(&d_val);
-			write_col::<W>(&mut seg, dcol, i, &d_bits)?;
-			s2.populate(&mut seg, i, &a1_bits, &d_bits)?;
-			let (_s, cout) = ripple_add(&a1_bits, &d_bits);
-			write_bit(&mut seg, fc, i, cout[W - 1])?;
+			fill_tiling_row::<W>(&mut seg, &tc, i, &owners[i], &nexts[i], None)?;
 		}
 	}
 

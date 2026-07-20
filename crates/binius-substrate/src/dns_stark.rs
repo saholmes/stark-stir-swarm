@@ -1415,48 +1415,11 @@ mod tests {
 			let wchan = cs.add_channel("nsec3_wrap_count");
 			let mut t = cs.add_table("NSEC3 tiling C1-C4 over B256");
 			t.require_power_of_two_size(); // selector-flushed wrap count needs a po2 table
-
-			let one_w: [B1; W] = std::array::from_fn(|i| if i == 0 { B1::ONE } else { B1::ZERO });
-			let one_col = t.add_constant("one", one_w);
-			let tok = t.add_committed::<B64, 1>("tok"); // committed constant-1 token (filled below)
-			let owner = t.add_committed::<B1, W>("owner");
-			let next = t.add_committed::<B1, W>("next");
-			let wrap = t.add_committed::<B1, 1>("wrap");
-			// broadcast wrap to all W lanes (all-lanes-equal + lane0 == wrap).
-			let bc = t.add_committed::<B1, W>("bc");
-			let bcr = t.add_shifted("bcr", bc, W.trailing_zeros() as usize, 1, binius_core::oracle::ShiftVariant::CircularLeft);
-			t.assert_zero("bc_eq", bc - bcr);
-			let bc0 = t.add_selected("bc0", bc, 0);
-			t.assert_zero("bc_bind", bc0 - wrap);
-			// mux: lo = owner + bc*(owner+next); hi = next + bc*(owner+next)  (GF(2): + is XOR).
-			let diff = t.add_committed::<B1, W>("diff");
-			t.assert_zero("diff_def", diff - (owner + next));
-			let masked = t.add_committed::<B1, W>("masked");
-			t.assert_zero("masked_def", masked - bc * diff);
-			let lo = t.add_committed::<B1, W>("lo");
-			t.assert_zero("lo_def", lo - (owner + masked));
-			let hi = t.add_committed::<B1, W>("hi");
-			t.assert_zero("hi_def", hi - (next + masked));
-			// a<b: (lo+1)+d == hi, top carry 0  ⇒  lo < hi.
-			let a1 = Adder::<W>::build(&mut t, lo, one_col, "a1");
-			let dcol = t.add_committed::<B1, W>("d");
-			let s2 = Adder::<W>::build(&mut t, a1.sum, dcol, "s2");
-			t.assert_zero("lt_eq", s2.sum - hi);
-			let fc = t.add_selected("fc", s2.cout, W - 1);
-			t.assert_zero("lt_no_ovf", fc * B1::ONE);
-			// (L) permutation channel: push owner lanes, pull next lanes.
-			let owner_sel: Vec<Col<B1, 64>> =
-				(0..lanes).map(|i| t.add_selected_block::<B1, W, 64>(format!("o_sel{i}"), owner, i)).collect();
-			let owner_b64: Vec<Col<B64, 1>> =
-				(0..lanes).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i])).collect();
-			t.push(hchan, owner_b64);
-			let next_sel: Vec<Col<B1, 64>> =
-				(0..lanes).map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i)).collect();
-			let next_b64: Vec<Col<B64, 1>> =
-				(0..lanes).map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i])).collect();
-			t.pull(hchan, next_b64);
-			// (1) exactly-one-wrap: push token iff wrap[i]=1; a boundary pulls it once.
-			t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
+			// THE SINGLE DEFINITION of the C1--C4 constraints, shared with `nsec3_bind`'s binding
+			// path. This gate used to carry its own copy; two copies of a soundness-critical circuit
+			// drift, so both now build from the same function. `None` = no leaf channel: this gate
+			// proves completeness alone, without the leaf-set binding.
+			let tc = crate::nsec3_bind::build_tiling_table::<W>(&mut t, hchan, wchan, None);
 			let t_id = t.id();
 
 			let statement = Statement {
@@ -1474,60 +1437,17 @@ mod tests {
 				let mut seg = tw.full_segment();
 				{
 					// fill the committed count-token = 1 in every row.
-					let mut tc = seg.get_scalars_mut(tok).unwrap();
-					for v in tc.iter_mut() { *v = B64::new(1); }
+					let mut tv = seg.get_scalars_mut(tc.tok).unwrap();
+					for v in tv.iter_mut() { *v = B64::new(1); }
 				}
-				let one_bits = to_bits(&BigUint::from(1u32));
-				let modw = BigUint::from(1u32) << W;
 				for i in 0..n {
 					let (mut o, mut x) = (owners[i].clone(), nexts[i].clone());
 					if tamper == 1 && i == 4 { x = &x + BigUint::from(1u32); } // break perm
 					if tamper == 2 && i == 2 { std::mem::swap(&mut o, &mut x); } // reversed, wrap NOT flagged
-					let obits = to_bits(&o);
-					let xbits = to_bits(&x);
-					write_col::<W>(&mut seg, owner, i, &obits).unwrap();
-					write_col::<W>(&mut seg, next, i, &xbits).unwrap();
-					write_col::<W>(&mut seg, one_col, i, &one_bits).unwrap();
-					for l in 0..lanes {
-						write_col::<64>(&mut seg, owner_sel[l], i, &obits[l * 64..(l + 1) * 64]).unwrap();
-						write_col::<64>(&mut seg, next_sel[l], i, &xbits[l * 64..(l + 1) * 64]).unwrap();
-					}
-					// wrap = (o > x); plus an injected extra wrap flag for tamper 3.
-					let mut wv = o > x;
-					if tamper == 3 && i == 1 { wv = true; } // second wrap flag with no real descent
-					write_bit(&mut seg, wrap, i, wv).unwrap();
-					let wb: Vec<bool> = (0..W).map(|_| wv).collect();
-					write_col::<W>(&mut seg, bc, i, &wb).unwrap();
-					write_col::<W>(&mut seg, bcr, i, &wb).unwrap(); // all-equal ⇒ rotate == self
-					write_bit(&mut seg, bc0, i, wv).unwrap(); // selected lane-0 of the broadcast
-					let dbits: Vec<bool> = (0..W).map(|k| obits[k] ^ xbits[k]).collect();
-					write_col::<W>(&mut seg, diff, i, &dbits).unwrap();
-					let mbits: Vec<bool> = (0..W).map(|k| wv && dbits[k]).collect();
-					write_col::<W>(&mut seg, masked, i, &mbits).unwrap();
-					let lobits: Vec<bool> = (0..W).map(|k| obits[k] ^ mbits[k]).collect();
-					let hibits: Vec<bool> = (0..W).map(|k| xbits[k] ^ mbits[k]).collect();
-					write_col::<W>(&mut seg, lo, i, &lobits).unwrap();
-					write_col::<W>(&mut seg, hi, i, &hibits).unwrap();
-					// a<b witness on (lo, hi)
-					let lo_v = BigUint::from_bytes_le(&{
-						let mut b = vec![0u8; W / 8];
-						for (k, &bit) in lobits.iter().enumerate() { if bit { b[k / 8] |= 1 << (k % 8); } }
-						b
-					});
-					let hi_v = BigUint::from_bytes_le(&{
-						let mut b = vec![0u8; W / 8];
-						for (k, &bit) in hibits.iter().enumerate() { if bit { b[k / 8] |= 1 << (k % 8); } }
-						b
-					});
-					let a1v = &lo_v + 1u32;
-					let a1_bits = to_bits(&a1v);
-					a1.populate(&mut seg, i, &lobits, &one_bits).unwrap();
-					let d_val = if hi_v >= a1v { &hi_v - &a1v } else { &modw + &hi_v - &a1v };
-					let d_bits = to_bits(&d_val);
-					write_col::<W>(&mut seg, dcol, i, &d_bits).unwrap();
-					s2.populate(&mut seg, i, &a1_bits, &d_bits).unwrap();
-					let (_s, cout) = ripple_add(&a1_bits, &d_bits);
-					write_bit(&mut seg, fc, i, cout[W - 1]).unwrap();
+					// tamper 3 injects a SECOND wrap flag with no real descent — witness-level, so it
+					// cannot be expressed by changing values and needs the explicit override.
+					let fw = if tamper == 3 && i == 1 { Some(true) } else { None };
+					crate::nsec3_bind::fill_tiling_row::<W>(&mut seg, &tc, i, &o, &x, fw).unwrap();
 				}
 			}
 			let ccs = cs.compile(&statement).unwrap();
