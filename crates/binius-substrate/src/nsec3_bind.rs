@@ -174,6 +174,9 @@ pub struct BoundChainCost {
 	/// offset is an assumption about transcript layout, not a documented API, and nothing in
 	/// `constraint_system::verify` checks it — see [`transcript_commitment_probe`].
 	pub commitment_prefix: Vec<u8>,
+	/// Full proof transcript, so [`read_proof_commitment`] can recover the commitment through the
+	/// transcript API rather than the byte-offset assumption `commitment_prefix` encodes.
+	pub transcript: Vec<u8>,
 }
 
 /// W4(a) — PROVE and VERIFY the composed system over the ACTUAL leaves.
@@ -451,6 +454,7 @@ fn build_bound_chain(
 	let proof_bytes = proof.get_proof_size();
 	// W4(b) probe: prove.rs writes the polynomial commitment as the FIRST transcript message.
 	let commitment_prefix: Vec<u8> = proof.transcript.iter().copied().take(32).collect();
+	let transcript_bytes = proof.transcript.clone();
 	let peak_rss_bytes = crate::b256_sha3::peak_rss_bytes();
 	let t1 = std::time::Instant::now();
 	binius_core::constraint_system::verify::<
@@ -471,6 +475,7 @@ fn build_bound_chain(
 			peak_rss_bytes,
 			n_boundaries,
 			commitment_prefix,
+			transcript: transcript_bytes,
 		}),
 	))
 }
@@ -604,6 +609,34 @@ pub fn fold_verifies_against_pin(n: usize, served_salt: u32, pinned_salt: u32) -
 	};
 
 	accumulate_verify(&verifier_claims, &proofs, &challenges).is_some()
+}
+
+/// W5.1 — read the polynomial commitment out of a proof through the PROPER transcript API.
+///
+/// `constraint_system::verify` does exactly this (`verify.rs`: `observe().write_slice(boundaries)`
+/// then `reader.read::<Output<Hash>>()`), and `piop::verify` takes the commitment as an explicit
+/// parameter — so the commitment is a first-class value, not something that must be recovered by
+/// guessing a byte offset. If this works, a resolver can check "commitment == my pinned value AND
+/// the proof verifies", which is a sound composition of two checks it performs itself.
+///
+/// `proof_transcript` is `Proof::transcript`; `boundaries` must be the SAME boundaries the proof
+/// was produced against, because they are observed into the challenger before the first message.
+pub fn read_proof_commitment(
+	proof_transcript: &[u8],
+	boundaries: &[binius_m3::builder::Boundary<OurB256>],
+) -> Result<Vec<u8>> {
+	use binius_core::fiat_shamir::HasherChallenger;
+	use binius_core::transcript::VerifierTranscript;
+	use sha2::Sha256;
+
+	let mut transcript =
+		VerifierTranscript::<HasherChallenger<Sha256>>::new(proof_transcript.to_vec());
+	transcript.observe().write_slice(boundaries);
+	let mut reader = transcript.message();
+	let commitment = reader
+		.read::<sha2::digest::Output<Sha256>>()
+		.map_err(|e| anyhow::anyhow!("could not read commitment from transcript: {e}"))?;
+	Ok(commitment.to_vec())
 }
 
 #[cfg(test)]
@@ -859,6 +892,61 @@ mod tests {
 			w3_bytes as f64 / pin_bytes as f64,
 			(1_400_000f64 * 4.0).log2().ceil() as usize * 16 + 16,
 			(1_400_000usize * LEAF_LANES * 8) / 1_000_000,
+		);
+	}
+
+	/// W5.1 EXPERIMENT — can the commitment be recovered through the transcript API?
+	///
+	/// The whole W5 scope rests on this. If it works, a resolver can perform two checks it owns —
+	/// "the commitment equals my pinned value" AND "the proof verifies" — which is a sound
+	/// composition, and no byte-offset assumption or vendored verifier is needed.
+	#[test]
+	fn w5_1_read_commitment_via_transcript() {
+		use binius_m3::builder::{Boundary, FlushDirection};
+		const N: usize = 64;
+		let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+		// Unpinned proofs, so the boundary set is the single wrap-count boundary and can be
+		// reconstructed here exactly as `build_bound_chain` builds it.
+		let a = prove_bound_chain_of(N, BindTamper::None, RootBinding::None).expect("a");
+		let b = prove_bound_chain_of(N, BindTamper::NoneAlternateChain, RootBinding::None)
+			.expect("b");
+		let rebuild_boundaries = || {
+			// channel_id 1 == wchan: channels are added in order hchan(0), wchan(1), leafchan(2).
+			vec![Boundary::<OurB256> {
+				values: vec![OurB256::from(B64::new(1))],
+				channel_id: 1,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			}]
+		};
+
+		let ca = read_proof_commitment(&a.transcript, &rebuild_boundaries())
+			.expect("commitment must be readable through the transcript API");
+		let cb = read_proof_commitment(&b.transcript, &rebuild_boundaries()).expect("b commitment");
+
+		println!("\n  W5.1 — commitment via VerifierTranscript (n={N})");
+		println!("    chain A  transcript-API  {}", hex(&ca));
+		println!("    chain A  byte-offset     {}", hex(&a.commitment_prefix));
+		println!("    chain B  transcript-API  {}", hex(&cb));
+
+		// (1) The API read agrees with the byte-offset probe, confirming BOTH readings and
+		// retiring the offset assumption in favour of the supported path.
+		assert_eq!(
+			ca,
+			a.commitment_prefix,
+			"transcript-API read must agree with the leading 32 bytes"
+		);
+		// (2) Still zone-separating, which is what makes it usable as a pin.
+		assert_ne!(ca, cb, "different zones must give different commitments");
+
+		println!(
+			"    ✓ transcript-API read == byte-offset read, and zones still separate.\n\
+			 \x20   ⇒ W5.2 is a pure composition: check commitment == pinned, then call the stock \
+			 constraint_system::verify. No vendored verifier, no offset assumption.\n\
+			 \x20   REMAINING COUPLING (W5.4): the commitment covers the WHOLE witness, tiling \
+			 columns included, so a prover-side circuit revision invalidates a resolver's pin even \
+			 for an unchanged zone. The pin is per-circuit-version and must be published with one."
 		);
 	}
 
