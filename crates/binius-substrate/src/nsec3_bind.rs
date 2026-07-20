@@ -1,9 +1,10 @@
-//! W2 — BINDING the NSEC3 chain-completeness proof to the epoch's committed leaf set.
+//! BINDING the NSEC3 chain-completeness proof to the epoch's committed leaf set, and to the zone
+//! a verifier actually asked about. Home of the C1--C4 tiling constraints themselves.
 //!
 //! ## Why this exists (the attack it closes)
 //!
-//! The C1--C4 tiling AIR (`dns_stark::tests::nsec3_chain_tiling_complete_over_b256`) proves that
-//! *some* chain is a gap-free cyclic cover. On its own that is unfalsifiable evidence about an
+//! The C1--C4 tiling AIR (built here, gated by `dns_stark::tests::nsec3_chain_tiling_complete_over_b256`)
+//! proves that *some* chain is a gap-free cyclic cover. On its own that is unfalsifiable evidence about an
 //! unspecified chain: an operator can prove completeness of chain A — genuinely complete, perhaps
 //! from an old or synthetic zone — while serving zone B with records omitted. Both proofs verify.
 //! Nothing ties the completeness proof to the root resolvers actually query against.
@@ -55,12 +56,16 @@
 //! per-circuit-version and a deployment must publish a version with it. A leaf-only commitment
 //! would need binius's commit path changed (all committed oracles go through one `commit_meta`).
 //!
-//! ## Known hazard
+//! ## Where the tiling constraints live
 //!
-//! The tiling constraints below DUPLICATE the construction in `dns_stark`'s gate test. Two copies
-//! of a soundness-critical circuit can drift. The intended convergence is for the `dns_stark` gate
-//! to call [`build_tiling_table`] rather than rebuild it; that is deliberately left as a separate
-//! change so this module can be reviewed against the already-committed original.
+//! [`build_tiling_table`] / [`fill_tiling_row`] below are the SINGLE definition of the C1--C4
+//! constraints. `dns_stark`'s gate test builds from them too, so a change reaches the gate and
+//! this binding path together or not at all. They were briefly duplicated; the copies were
+//! converged in commit 327c894 once this module became load-bearing, because a constraint fixed
+//! in one copy and missed in the other would leave a gate passing while the deployed path was
+//! wrong. Keep it that way — if a caller needs a variant, add a parameter here rather than a
+//! second copy. The only structural difference between the two current callers is the optional
+//! leaf channel: `Some(leafchan)` adds the W2 row push, `None` gives the standalone gate.
 
 use crate::b256_field::B256 as OurB256;
 use crate::nonnative::{ripple_add, write_bit, write_col, Adder};
