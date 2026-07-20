@@ -1388,6 +1388,12 @@ mod tests {
 		let n: usize = std::env::var("NSEC3_N").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
 		assert!(n.is_power_of_two(), "NSEC3_N must be a power of two (got {n})");
 		let do_prove = std::env::var("NSEC3_PROVE").is_ok_and(|v| v == "1");
+		// NSEC3_LOG_INV_RATE = FRI blowup exponent (rate 2^-r). SECURITY_BITS stays 128 in BOTH
+		// prove and verify, so binius derives the query count from (rate, 128): the soundness
+		// target is INVARIANT across a rate sweep. The rate trades prover LDE work against
+		// verifier query count at CONSTANT kappa — it does NOT buy speed by weakening the proof.
+		let lir: usize =
+			std::env::var("NSEC3_LOG_INV_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 		// (prove_ms, proof_bytes, peak_rss_bytes, verify_ms) — filled only when do_prove.
 		let stats = std::cell::Cell::new((0u128, 0usize, 0u64, 0u128));
 		let step = BigUint::from(1u32) << 150;
@@ -1538,7 +1544,7 @@ mod tests {
 				let pt = std::time::Instant::now();
 				let proof = binius_core::constraint_system::prove::<
 					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
-				>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())
+				>(&ccs, lir, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())
 				.expect("NSEC3 tiling prove must succeed on the honest chain");
 				let prove_ms = pt.elapsed().as_millis();
 				let bytes = proof.get_proof_size();
@@ -1546,7 +1552,7 @@ mod tests {
 				let vt = std::time::Instant::now();
 				binius_core::constraint_system::verify::<
 					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
-				>(&ccs, 1, 128, &statement.boundaries, proof)
+				>(&ccs, lir, 128, &statement.boundaries, proof)
 				.expect("NSEC3 tiling proof must VERIFY");
 				stats.set((prove_ms, bytes, rss, vt.elapsed().as_millis()));
 			}
@@ -1566,7 +1572,9 @@ mod tests {
 		if do_prove {
 			let (prove_ms, bytes, rss, verify_ms) = stats.get();
 			println!(
-				"  NSEC3 TILING REAL PROVE  n={n}  B256@L1(128)  rows={n}\n\
+				"  NSEC3 TILING REAL PROVE  n={n}  B256@L1(128)  rows={n}  \
+				 log_inv_rate={}  (kappa target 128 bits, INVARIANT across rates)\n\
+				 \x20   ---\n\
 				 \x20   prove   {prove_ms} ms\n\
 				 \x20   verify  {verify_ms} ms\n\
 				 \x20   proof   {bytes} bytes\n\
@@ -1576,6 +1584,7 @@ mod tests {
 				 \x20   is unbalanced by its two endpoints, so sharding needs an open-path variant\n\
 				 \x20   plus in-circuit endpoint chaining and cross-shard wrap-count aggregation.\n\
 				 \x20   None of that is built, so these numbers bound a WHOLE-CHAIN prove only.",
+				lir,
 				rss as f64 / (1024.0 * 1024.0),
 			);
 		}
