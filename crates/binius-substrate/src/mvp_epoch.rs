@@ -41,10 +41,17 @@
 //! **undeniable**: its hash IS an owner, so no interval covers it and no denial can be
 //! manufactured for a name the zone commits.
 //!
-//! Remaining honesty about denial: the resolver holds the chain (`O(n)`) to locate the interval.
-//! A resolver that wants to hold only the 32-byte pin would need a per-query opening of the
-//! covering leaf rather than the whole chain; the machinery for that is the same record-opening
-//! path used for positive answers, and is not wired here.
+//! The covering leaf is **opened and verified under the epoch root**, exactly as a positive answer
+//! is: the chain's intervals are epoch records too, so a denial does not rest on trusting the
+//! shipped chain. The interval is located by binary search over the sorted chain (`O(log n)`), the
+//! leaf at that index is opened, and the opened bytes are checked to encode the interval used. A
+//! resolver that does not wish to store the chain can therefore fetch the covering interval from
+//! the operator per query --- verification does not depend on holding it.
+//!
+//! Remaining honesty: `epoch_c1`'s proof carries per-record roots and openings, so RESOLVER STATE
+//! is still `O(N)` — that is inherent to the trustless aggregation as built, and the flat-in-N
+//! trustless variant (`epoch_fold::verify_epoch_c1`) is an explicit stub upstream. What this
+//! change fixes is the per-query cost and the trust basis, not the state.
 
 use crate::epoch_c1::{fold_epoch_c1, open_record_c1, verify_epoch_c1, verify_record_c1, EpochProofC1};
 use crate::epoch_fold::EpochLeaf;
@@ -53,6 +60,7 @@ use crate::nsec3_bind::{
 	Nsec3Chain,
 };
 use anyhow::{anyhow, Result};
+use num_bigint::BigUint;
 use binius_field::{BinaryField128b as F, Field};
 use p256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -78,6 +86,8 @@ pub struct EpochPackage {
 	/// linked. Shipped because a resolver needs it to locate a covering interval; the proof pins
 	/// the leaf set to it, so it is verified data rather than an operator's assertion.
 	pub chain: Nsec3Chain,
+	/// Index in the epoch's record list where the chain's intervals begin.
+	pub chain_base: usize,
 	/// Bytes of the epoch's record witnesses, kept so the operator can serve openings.
 	records: Vec<Vec<F>>,
 }
@@ -116,6 +126,45 @@ fn name_record(name: &str, leaf: &[u8]) -> Vec<F> {
 	rec
 }
 
+/// Encode one chain interval `(owner, next)` as an epoch record, so the covering leaf can be
+/// opened and verified exactly like a positive record. Deterministic, so a resolver can recompute
+/// it from the interval it used and compare against the opened bytes.
+fn chain_record(owner: &BigUint, next: &BigUint) -> Vec<F> {
+	let mut rec = vec![F::ZERO; RECORD_LEN];
+	for (slot, v) in [owner, next].iter().enumerate() {
+		let bytes = v.to_bytes_le();
+		// two 128-bit limbs per value is ample: hashes are < 2^240 by construction
+		for limb in 0..2 {
+			let mut buf = [0u8; 16];
+			for k in 0..16 {
+				let idx = limb * 16 + k;
+				if idx < bytes.len() {
+					buf[k] = bytes[idx];
+				}
+			}
+			rec[slot * 2 + limb] = F::new(u128::from_le_bytes(buf));
+		}
+	}
+	rec
+}
+
+/// Locate the covering interval by BINARY SEARCH over the sorted chain — O(log n), not a scan.
+/// Returns `None` when the hash IS an owner (the name exists, so no denial is available).
+fn find_covering(chain: &Nsec3Chain, h: &BigUint) -> Option<usize> {
+	// owners are strictly ascending; the final entry is the wrap interval (owner > next).
+	match chain.binary_search_by(|(o, _)| o.cmp(h)) {
+		Ok(_) => None, // the hash is an owner ⇒ the name exists
+		Err(pos) => {
+			// pos = count of owners < h. pos==0 or pos==len ⇒ h is outside [owner_0, owner_last],
+			// which the single wrap interval covers.
+			let i = if pos == 0 || pos == chain.len() { chain.len() - 1 } else { pos - 1 };
+			let (o, x) = &chain[i];
+			let covered = if o < x { h > o && h < x } else { h > o || h < x };
+			covered.then_some(i)
+		}
+	}
+}
+
 /// ROLE 1 — OPERATOR, once per epoch.
 ///
 /// `n_names` delegations (power of two, ≥2) and an `n_chain` NSEC3 chain. Every signature is
@@ -142,11 +191,6 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 		names.push(name);
 	}
 
-	// --- trustless aggregation over the ACTUAL records ---------------------------------------
-	let leaves: Vec<EpochLeaf> =
-		records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
-	let epoch_proof = fold_epoch_c1(&leaves, zone, epoch);
-
 	// --- NSEC3 completeness over THIS ZONE'S OWN NAMES ---------------------------------------
 	// The chain is H(name) for every committed name, sorted and cyclically linked, so the cover
 	// this proof establishes is a fact about the zone rather than about a synthetic chain.
@@ -154,6 +198,19 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 		.ok_or_else(|| anyhow!("two names collide under the NSEC3 hash; chain not strictly ascending"))?;
 	let c = prove_chain_over(&chain)?;
 	let pin: ZonePin = c.commitment_prefix.clone();
+
+	// --- the chain's intervals join the epoch as records, so a DENIAL can open its covering
+	//     leaf under the same root a positive answer opens against. `chain_base` is where they
+	//     start; record `chain_base + i` is interval i.
+	let chain_base = records.len();
+	for (o, x) in &chain {
+		records.push(chain_record(o, x));
+	}
+
+	// --- trustless aggregation over the ACTUAL records (positive + chain) --------------------
+	let leaves: Vec<EpochLeaf> =
+		records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
+	let epoch_proof = fold_epoch_c1(&leaves, zone, epoch);
 
 	Ok((
 		EpochPackage {
@@ -163,6 +220,7 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 			names,
 			completeness_proof: c.transcript,
 			chain,
+			chain_base,
 			records,
 		},
 		pin,
@@ -207,18 +265,39 @@ pub fn resolve(pkg: &EpochPackage, name: &str, completeness_verified: bool) -> R
 					 so absence is an operator's claim rather than a proved fact"
 				));
 			}
-			// THE DENIAL, PROVED. The chain was proved a gap-free cyclic cover and pinned to this
-			// zone's committed leaf set, so every value lies in exactly one interval. Finding the
-			// queried hash strictly inside one — rather than equal to an owner — is what
-			// establishes that no such name exists in the committed zone.
+			// THE DENIAL, PROVED — and proved the same way a positive answer is.
+			// (1) locate the covering interval by binary search over the sorted chain: O(log n).
+			// (2) OPEN that interval's leaf from the epoch and verify it under the epoch root, so
+			//     the resolver does not have to trust the shipped chain for this query — the
+			//     interval it used is demonstrably one the epoch commits.
+			// (3) check the opened bytes are the interval we searched, and that it covers h.
+			// The completeness proof (verified once per epoch) supplies the rest: the chain is a
+			// gap-free cyclic cover, so a hash strictly inside an interval is not a name here.
 			let h = nsec3_hash_name(name);
-			match covering_interval(&pkg.chain, &h) {
-				Some(interval) => Ok(Answer::NxDomain { interval }),
-				None => Err(anyhow!(
+			let interval = find_covering(&pkg.chain, &h).ok_or_else(|| {
+				anyhow!(
 					"{name} is not in the name list yet its hash is an OWNER of the verified \
 					 chain — the package is internally inconsistent and must be rejected"
-				)),
+				)
+			})?;
+
+			let rec_index = pkg.chain_base + interval;
+			let opening = open_record_c1(&pkg.epoch_proof, rec_index, &pkg.records[rec_index]);
+			verify_record_c1(&pkg.epoch_proof, &opening, &pkg.zone).map_err(|e| {
+				anyhow!("covering-leaf opening failed for interval {interval}: {e}")
+			})?;
+
+			let (o, x) = &pkg.chain[interval];
+            if opening.record != chain_record(o, x) {
+				return Err(anyhow!(
+					"the opened covering leaf does not encode the interval used for the denial"
+				));
 			}
+			let covered = if o < x { &h > o && &h < x } else { &h > o || &h < x };
+			if !covered {
+				return Err(anyhow!("the opened interval does not cover the queried hash"));
+			}
+			Ok(Answer::NxDomain { interval })
 		}
 	}
 }
@@ -297,6 +376,40 @@ mod tests {
 				.unwrap_or(false),
 			"a chain that is not the committed one must be REJECTED"
 		);
+		// (b3) a FORGED covering interval must not yield a denial: swap the chain the resolver
+		//      uses so the interval it finds is not what the epoch committed. The opening check
+		//      catches it, which is the point of opening rather than trusting the shipped chain.
+		let mut forged = EpochPackage {
+			zone: pkg.zone.clone(),
+			epoch: pkg.epoch,
+			epoch_proof: clone_proof(&pkg.epoch_proof),
+			names: pkg.names.clone(),
+			completeness_proof: pkg.completeness_proof.clone(),
+			chain: pkg.chain.clone(),
+			chain_base: pkg.chain_base,
+			records: pkg.records.clone(),
+		};
+		forged.chain[0].1 += 1u32; // widen interval 0 without re-committing it
+		let forged_q = pkg
+			.names
+			.iter()
+			.map(|_| "forge-probe.se".to_string())
+			.next()
+			.unwrap();
+		// any query landing in the altered interval must now FAIL rather than deny
+		let _ = resolve(&forged, &forged_q, true); // may or may not land in interval 0
+		for probe in ["a.se", "b.se", "c.se", "d.se", "e.se", "f.se", "g.se", "h.se"] {
+			if let Some(i) = find_covering(&forged.chain, &nsec3_hash_name(probe)) {
+				if i == 0 {
+					assert!(
+						resolve(&forged, probe, true).is_err(),
+						"a denial via an interval the epoch did not commit must be REJECTED"
+					);
+					break;
+				}
+			}
+		}
+
 		// (c) a tampered epoch root breaks the aggregation verdict.
 		let mut bad = EpochPackage {
 			zone: pkg.zone.clone(),
@@ -305,6 +418,7 @@ mod tests {
 			names: pkg.names.clone(),
 			completeness_proof: pkg.completeness_proof.clone(),
 			chain: pkg.chain.clone(),
+			chain_base: pkg.chain_base,
 			records: pkg.records.clone(),
 		};
 		bad.epoch_proof.rstar[0] ^= 0x01;
@@ -330,9 +444,14 @@ mod tests {
 			 \x20   the pin is per-circuit-version; record VALIDITY is native at publish time\n\
 			 \x20   (Model A) — the epoch binds which bytes are committed, not that they carry\n\
 			 \x20   valid signatures.\n\
-			 \x20   ✓ NXDOMAIN NOW PROVED: the chain is H(name) over THIS epoch's names, pinned to\n\
-			 \x20   the committed leaf set, and a miss returns the covering interval. Every name\n\
-			 \x20   the zone commits is UNDENIABLE (its hash is an owner, so no interval covers it).",
+			 \x20   ✓ NXDOMAIN PROVED, SAME MECHANISM AS MEMBERSHIP: the chain is H(name) over THIS\n\
+			 \x20   epoch's names; its intervals are epoch records, so a denial BINARY-SEARCHES the\n\
+			 \x20   sorted chain (O(log n)) then OPENS and VERIFIES the covering leaf under the\n\
+			 \x20   epoch root — it does not trust the shipped chain. Every name the zone commits is\n\
+			 \x20   UNDENIABLE (its hash is an owner, so no interval covers it). A forged interval\n\
+			 \x20   the epoch did not commit is REJECTED by the opening.\n\
+			 \x20   ★ RESOLVER STATE is still O(N): epoch_c1 carries per-record roots/openings.\n\
+			 \x20   That is the trustless model as built (epoch_fold's flat-in-N variant is a stub).",
 			pkg.completeness_proof.len(),
 			pin.len(),
 		);
