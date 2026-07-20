@@ -156,7 +156,39 @@ pub fn validate_bound_chain(n: usize, tamper: BindTamper) -> Result<bool> {
 	validate_bound_chain_inner(n, tamper, RootBinding::None)
 }
 
+/// Cost of a REAL proof over the composed system — not a model.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundChainCost {
+	pub prove_ms: u128,
+	pub verify_ms: u128,
+	pub proof_bytes: usize,
+	pub peak_rss_bytes: u64,
+	/// Boundary values the verifier must hold. 1 under [`RootBinding::None`]; grows with the
+	/// chain under [`RootBinding::PinLeafSet`], which is the O(n)-public-data cost of W3.
+	pub n_boundaries: usize,
+}
+
+/// W4(a) — PROVE and VERIFY the composed system over the ACTUAL leaves.
+///
+/// This is what replaces `measure_epoch_verify_hash` for the chain: that function builds a
+/// synthetic table of B256 multiplications, fills it with RANDOM field elements, and proves that
+/// — it never sees a leaf, a root, or a chain, so its timings are a cost model rather than a
+/// verification of anything. Here the witness IS the constrained chain and its committed leaves,
+/// so the numbers describe the real artifact.
+pub fn prove_bound_chain(n: usize, binding: RootBinding) -> Result<BoundChainCost> {
+	build_bound_chain(n, BindTamper::None, binding, true).map(|(_, c)| c.expect("prove requested"))
+}
+
 fn validate_bound_chain_inner(n: usize, tamper: BindTamper, binding: RootBinding) -> Result<bool> {
+	build_bound_chain(n, tamper, binding, false).map(|(ok, _)| ok)
+}
+
+fn build_bound_chain(
+	n: usize,
+	tamper: BindTamper,
+	binding: RootBinding,
+	do_prove: bool,
+) -> Result<(bool, Option<BoundChainCost>)> {
 	assert!(n.is_power_of_two(), "n must be a power of two (selector-flushed wrap count)");
 	assert!(n <= 1 << 15, "chain must fit W bits: n <= 2^15 for step = 2^(W-16)");
 
@@ -360,16 +392,60 @@ fn validate_bound_chain_inner(n: usize, tamper: BindTamper, binding: RootBinding
 		}
 	}
 
+	let n_boundaries = statement.boundaries.len();
 	let ccs = cs.compile(&statement)?;
 	let witness = witness.into_multilinear_extension_index();
-	Ok(
-		binius_core::constraint_system::validate::validate_witness(
-			&ccs,
-			&statement.boundaries,
-			&witness,
-		)
-		.is_ok(),
+	let ok = binius_core::constraint_system::validate::validate_witness(
+		&ccs,
+		&statement.boundaries,
+		&witness,
 	)
+	.is_ok();
+	if !ok || !do_prove {
+		return Ok((ok, None));
+	}
+
+	use crate::b256_field::{B256TowerFamily, U256};
+	use binius_core::fiat_shamir::HasherChallenger;
+	use binius_hash::sha2::Sha256Compression;
+	use sha2::Sha256;
+	// rate 2^-2: measured in 7e7c3ce as the knee — 28% smaller proof and ~9% lower peak RSS than
+	// 2^-1 for ~9% more prove time, at the SAME 128-bit soundness target.
+	const LOG_INV_RATE: usize = 2;
+	const SECURITY_BITS: usize = 128;
+	let t0 = std::time::Instant::now();
+	let proof = binius_core::constraint_system::prove::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+		_,
+	>(
+		&ccs,
+		LOG_INV_RATE,
+		SECURITY_BITS,
+		&statement.boundaries,
+		witness,
+		&binius_hal::make_portable_backend(),
+	)?;
+	let prove_ms = t0.elapsed().as_millis();
+	let proof_bytes = proof.get_proof_size();
+	let peak_rss_bytes = crate::b256_sha3::peak_rss_bytes();
+	let t1 = std::time::Instant::now();
+	binius_core::constraint_system::verify::<
+		U256,
+		B256TowerFamily,
+		Sha256,
+		Sha256Compression,
+		HasherChallenger<Sha256>,
+	>(&ccs, LOG_INV_RATE, SECURITY_BITS, &statement.boundaries, proof)?;
+	let verify_ms = t1.elapsed().as_millis();
+
+	Ok((
+		true,
+		Some(BoundChainCost { prove_ms, verify_ms, proof_bytes, peak_rss_bytes, n_boundaries }),
+	))
 }
 
 #[cfg(test)]
@@ -470,6 +546,44 @@ mod tests {
 			 ~165 GB at 1.4M records), so it is infeasible by the same measurement that ruled out \
 			 hash leaf-binding. This is the AUDITABLE mode (an auditor holding the zone can check \
 			 it); SUCCINCT binding for a resolver needs the evaluation-claim fold of W4."
+		);
+	}
+
+	/// W4(a) — REAL prove+verify over the actual leaves, replacing the modelled epoch numbers.
+	///
+	/// `measure_epoch_verify_hash` proves a synthetic table of B256 multiplications filled with
+	/// RANDOM field elements: it never sees a leaf, a root, or a chain, so its timings model a
+	/// cost rather than verify anything. These numbers are over the real constrained chain and
+	/// its committed leaves, in both binding modes, so the O(n)-public-data cost of W3 is visible.
+	/// Run: `cargo test --release --lib bound_chain_real_cost -- --ignored --nocapture`
+	#[test]
+	#[ignore = "real prove+verify of the composed system: ~1-3 min"]
+	fn bound_chain_real_cost() {
+		let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset (all cores)".into());
+		println!(
+			"\n  REAL PROVE of the BOUND chain (tiling ⊗ leaves), B256@L1(128), rate 2^-2, \
+			 threads={threads}"
+		);
+		println!("    n     mode        prove ms   verify ms   proof KiB   RSS MiB   boundaries");
+		for &n in &[64usize, 512, 4096] {
+			for (label, binding) in
+				[("unpinned", RootBinding::None), ("pinned  ", RootBinding::PinLeafSet { salt: 0 })]
+			{
+				let c = prove_bound_chain(n, binding).expect("real prove");
+				println!(
+					"  {n:>5}   {label}   {:>8}   {:>9}   {:>9.0}   {:>7.0}   {:>10}",
+					c.prove_ms,
+					c.verify_ms,
+					c.proof_bytes as f64 / 1024.0,
+					c.peak_rss_bytes as f64 / (1024.0 * 1024.0),
+					c.n_boundaries,
+				);
+			}
+		}
+		println!(
+			"  The `pinned` rows carry n+1 boundaries — the verifier holds the whole leaf set. \
+			 That is the AUDITABLE mode. A resolver wanting a SHORT pin is still unserved: a hash \
+			 root would need n-1 in-circuit SHA-3 compressions (~165 GB at 1.4M records, b997882).\n"
 		);
 	}
 
