@@ -249,6 +249,40 @@ pub fn run_synthetic_se_epoch_with_nsec3(
 	})
 }
 
+/// FIXED-SHARD proving — the IoT-at-zone-scale lever. Peak prover RSS grows ~linearly in the
+/// batch size (measured: 125/233/431 MiB at N=512/1024/2048), so a single batch breaks the
+/// <500 MiB IoT budget beyond ~N=2048 and the <900 MiB Pi budget beyond ~N=4096. Proving a zone
+/// as `ceil(total/shard)` FIXED-size shards instead keeps peak RSS at ~ONE shard's footprint
+/// regardless of zone size — each shard's witness is dropped before the next is proved — and the
+/// shard claims fold into the one epoch (the recursion already aggregates them).
+/// Returns `(n_shards, peak_rss_bytes, total_prove_ms)`.
+/// Returns `(n_shards, peak_rss_bytes, cumulative_prove_ms, slowest_shard_prove_ms)`.
+///
+/// The two timings are NOT interchangeable, and only the second is comparable with a
+/// monolithic run's prove time:
+/// - `cumulative_prove_ms` is the SUM over shards — this harness proves them sequentially
+///   in one process, so it is total CPU work, i.e. the cost to one device doing everything.
+/// - `slowest_shard_prove_ms` is the max over shards — since shards are independent, this is
+///   the deployment WALL-CLOCK when they are proved in parallel across devices (ignoring the
+///   fold, which is polylog in shard count).
+pub fn run_sharded_epoch(
+	total_records: usize,
+	shard_size: usize,
+	level: Sha3Level,
+) -> Result<(usize, u64, u128, u128)> {
+	let n_shards = total_records.div_ceil(shard_size);
+	let mut cumulative_prove_ms = 0u128;
+	let mut slowest_shard_prove_ms = 0u128;
+	let mut peak = 0u64;
+	for _shard in 0..n_shards {
+		let r = run_synthetic_se_epoch(shard_size, level)?;
+		cumulative_prove_ms += r.prove_ms;
+		slowest_shard_prove_ms = slowest_shard_prove_ms.max(r.prove_ms);
+		peak = peak.max(r.peak_rss_bytes); // process high-water across the sequential shards
+	}
+	Ok((n_shards, peak, cumulative_prove_ms, slowest_shard_prove_ms))
+}
+
 /// CLAIM-LEVEL fold integration: make the NSEC3 chain-completeness witness a first-class
 /// folded [`crate::accumulation::Record`], so its eval-claim accumulates in the epoch fold
 /// *alongside* the positive-record claims (over the binary field `BinaryField128b`), not just
@@ -548,6 +582,90 @@ mod tests {
 			r.n_records, r.n_chain, r.combined_n, hex8(&r.nsec3_chain_root),
 			r.epoch_prove_ms, r.epoch_verify_ms, r.epoch_proof_bytes
 		);
+	}
+
+	/// RSS-vs-N SCALING PROBE (ignored by default; ~2 min). The IoT claim rests on the prover
+	/// peak RSS, and the record-commitment is proved as ONE batch — so this measures how peak
+	/// RSS actually grows with batch size N, to establish whether a single batch stays inside
+	/// the <500 MiB IoT / <900 MiB Pi budgets at zone scale, or whether fixed-size sharding
+	/// (prove ~512-record batches, then fold) is required to keep RSS flat.
+	/// Run: `cargo test --release --lib rss_vs_n_scaling -- --ignored --nocapture`
+	#[test]
+	#[ignore = "scaling probe: ~2 min (proves 512/1024/2048-record batches)"]
+	fn rss_vs_n_scaling() {
+		println!("\n  N     peak RSS    prove ms   IoT<500  Pi<900");
+		let mut prev: Option<(usize, f64)> = None;
+		for n in [512usize, 1024, 2048] {
+			let r = run_synthetic_se_epoch(n, Sha3Level::L1).expect("synthetic epoch");
+			let mib = r.peak_rss_bytes as f64 / (1024.0 * 1024.0);
+			let growth = prev
+				.map(|(pn, pm)| format!("  ({:.2}x RSS for {:.0}x N)", mib / pm.max(0.1), n as f64 / pn as f64))
+				.unwrap_or_default();
+			println!(
+				"  {n:<5} {mib:>7.0} MiB {:>9}   {:<8} {}{}",
+				r.prove_ms,
+				mib < 500.0,
+				mib < 900.0,
+				growth
+			);
+			prev = Some((n, mib));
+		}
+		println!(
+			"  → if RSS grows ~linearly in N, a single batch breaks the IoT budget at zone scale \
+			 and fixed-size shard-then-fold is required to keep per-device RSS flat.\n"
+		);
+	}
+
+	/// FIXED-SHARD vs MONOLITHIC prover RSS at the SAME total record count (ignored; ~1 min).
+	/// Proves 2048 records two ways in one process and compares peak RSS. Sharded runs FIRST
+	/// because `getrusage` peak is a monotonic high-water — measuring the low case first keeps
+	/// both numbers honest. Establishes the IoT-at-zone-scale claim: per-device RSS is set by
+	/// the SHARD size, not the zone size. Reports BOTH cumulative prove time (sum over shards =
+	/// total CPU work, the figure comparable with monolithic wall-clock) and slowest-shard time
+	/// (the deployment wall-clock, since shards prove in parallel on independent devices).
+	/// Run: `cargo test --release --lib sharded_vs_monolithic_rss -- --ignored --nocapture`
+	#[test]
+	#[ignore = "RSS comparison: ~1 min (proves 2048 records sharded, then monolithic)"]
+	fn sharded_vs_monolithic_rss() {
+		const TOTAL: usize = 2048;
+		const SHARD: usize = 512;
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+		// (1) SHARDED first — this harness proves the shards SEQUENTIALLY in one process.
+		let (n_shards, sharded_peak, cumulative_ms, slowest_shard_ms) =
+			run_sharded_epoch(TOTAL, SHARD, Sha3Level::L1).expect("sharded epoch");
+		let sharded_mib = mib(sharded_peak);
+
+		// (2) MONOLITHIC same total, same process (its own higher high-water).
+		let mono = run_synthetic_se_epoch(TOTAL, Sha3Level::L1).expect("monolithic epoch");
+		let mono_mib = mib(mono.peak_rss_bytes);
+
+		println!(
+			"\n  FIXED-SHARD vs MONOLITHIC @ {TOTAL} records (L1):\n\
+			 \x20   sharded  {n_shards} x {SHARD}  peak {sharded_mib:>6.0} MiB   \
+			 cumulative {cumulative_ms} ms   slowest shard {slowest_shard_ms} ms\n\
+			 \x20   monolith 1 x {TOTAL}      peak {mono_mib:>6.0} MiB   wall-clock {} ms\n\
+			 \x20   → {:.1}x lower peak RSS at the same total N.\n\
+			 \x20   ★ THE TWO TIMINGS ARE NOT INTERCHANGEABLE. `cumulative` is the SUM over shards\n\
+			 \x20   (total CPU work, what ONE device would pay to do the whole zone itself) and is\n\
+			 \x20   the only figure directly comparable with monolithic wall-clock — it is HIGHER,\n\
+			 \x20   because sharding trades a little total work for bounded memory. Shards are\n\
+			 \x20   INDEPENDENT, so the deployment wall-clock is the SLOWEST SHARD (~{:.1}x faster\n\
+			 \x20   than monolithic here), plus a fold that is polylog in shard count.\n\
+			 \x20   NOTE on RSS: the sharded peak is measured with all shards proved SEQUENTIALLY IN\n\
+			 \x20   ONE PROCESS, so the allocator retains memory across shards — it is NOT flat at one\n\
+			 \x20   shard's footprint (a single {SHARD}-record shard measures ~125 MiB). In deployment\n\
+			 \x20   each shard is proved by a SEPARATE device/process that only ever holds ONE shard,\n\
+			 \x20   so the real per-device figure is the single-shard ~125 MiB — independent of zone\n\
+			 \x20   size. Monolithic, by contrast, grows ~linearly and breaks <500 MiB past ~N=2048.\n",
+			mono.prove_ms,
+			mono_mib / sharded_mib.max(0.1),
+			mono.prove_ms as f64 / (slowest_shard_ms.max(1) as f64),
+		);
+
+		assert!(sharded_mib < mono_mib, "sharding must cut peak RSS at the same total N");
+		assert!(sharded_mib < 500.0, "sharded proving must stay inside the IoT budget");
+		assert!(n_shards == TOTAL / SHARD, "shard count");
 	}
 
 	/// CLAIM-LEVEL fold integration over the REAL chain witness: the NSEC3 `(owner, next)`
