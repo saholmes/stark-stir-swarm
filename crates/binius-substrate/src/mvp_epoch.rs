@@ -29,18 +29,29 @@
 //!   circuit version.
 //! * Record validity is established natively by the operator at publish time (Model A); the epoch
 //!   binds *which bytes* are committed, not that they carry valid signatures.
-//! * ★★ **THE NXDOMAIN PATH IS NOT YET BOUND TO THIS ZONE'S NAMES.** The completeness proof
-//!   covers a *synthetic* chain (`nsec3_bind` generates its own), not the hashes of the names in
-//!   this epoch, and [`resolve`] answers a miss by a linear scan of the committed name list rather
-//!   than by proving the queried name's hash falls in a covering NSEC3 interval. So the demo shows
-//!   the two artefacts verifying and composing operationally, but a denial here rests on "the
-//!   operator's name list does not contain it" plus an *unrelated* complete chain. Closing this
-//!   needs the chain derived from `H(name)` over the epoch's own names, and a covering-interval
-//!   check in `resolve`. Until then do not read the NXDOMAIN result as a proved denial.
+//!
+//! ## Authenticated denial (NXDOMAIN)
+//!
+//! The chain is `H(name)` over **this epoch's own names**, sorted and cyclically linked, and it is
+//! pinned two ways: leaf-set boundaries force the shipped chain to be the one the proof committed,
+//! and a 32-byte out-of-band pin forces that committed chain to be this zone's. A miss then
+//! returns the *covering interval* whose endpoints straddle the queried hash. Because the chain
+//! was proved a gap-free cyclic cover, a hash strictly inside an interval cannot be a name of the
+//! zone --- so the denial is proved rather than asserted. Conversely every committed name is
+//! **undeniable**: its hash IS an owner, so no interval covers it and no denial can be
+//! manufactured for a name the zone commits.
+//!
+//! Remaining honesty about denial: the resolver holds the chain (`O(n)`) to locate the interval.
+//! A resolver that wants to hold only the 32-byte pin would need a per-query opening of the
+//! covering leaf rather than the whole chain; the machinery for that is the same record-opening
+//! path used for positive answers, and is not wired here.
 
 use crate::epoch_c1::{fold_epoch_c1, open_record_c1, verify_epoch_c1, verify_record_c1, EpochProofC1};
 use crate::epoch_fold::EpochLeaf;
-use crate::nsec3_bind::{prove_bound_chain, verify_bound_chain_against_pin, RootBinding};
+use crate::nsec3_bind::{
+	covering_interval, nsec3_chain_from_names, nsec3_hash_name, prove_chain_over, verify_chain_over,
+	Nsec3Chain,
+};
 use anyhow::{anyhow, Result};
 use binius_field::{BinaryField128b as F, Field};
 use p256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
@@ -63,8 +74,10 @@ pub struct EpochPackage {
 	/// Real STARK proof: the NSEC3 chain is a gap-free cyclic cover, and the committed leaves
 	/// are exactly the rows it constrains.
 	pub completeness_proof: Vec<u8>,
-	/// Chain length the completeness proof covers (the resolver rebuilds the CS from it).
-	pub n_chain: usize,
+	/// The zone's REAL NSEC3 chain: H(name) for every committed name, sorted and cyclically
+	/// linked. Shipped because a resolver needs it to locate a covering interval; the proof pins
+	/// the leaf set to it, so it is verified data rather than an operator's assertion.
+	pub chain: Nsec3Chain,
 	/// Bytes of the epoch's record witnesses, kept so the operator can serve openings.
 	records: Vec<Vec<F>>,
 }
@@ -77,9 +90,10 @@ pub type ZonePin = Vec<u8>;
 pub enum Answer {
 	/// The name is committed under the epoch root; membership proved.
 	Exists { index: usize },
-	/// The name is absent, and absence is authenticated by the verified completeness proof
-	/// rather than by an operator's say-so.
-	NxDomain,
+	/// The name is absent, PROVED: its NSEC3 hash falls strictly inside interval `interval` of a
+	/// chain that (a) was proved a gap-free cyclic cover and (b) is pinned to this zone's leaf
+	/// set. Absence is therefore a fact about the committed zone, not an operator's say-so.
+	NxDomain { interval: usize },
 }
 
 fn name_record(name: &str, leaf: &[u8]) -> Vec<F> {
@@ -107,12 +121,7 @@ fn name_record(name: &str, leaf: &[u8]) -> Vec<F> {
 /// `n_names` delegations (power of two, ≥2) and an `n_chain` NSEC3 chain. Every signature is
 /// verified natively before its record is admitted, so a record that would not validate never
 /// reaches the epoch.
-pub fn publish_epoch(
-	zone: &str,
-	epoch: u64,
-	n_names: usize,
-	n_chain: usize,
-) -> Result<(EpochPackage, ZonePin)> {
+pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPackage, ZonePin)> {
 	assert!(n_names.is_power_of_two() && n_names >= 2, "leaf count must be a power of two >= 2");
 
 	// --- positive records: real ECDSA over each delegation, verified before admission --------
@@ -138,8 +147,12 @@ pub fn publish_epoch(
 		records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
 	let epoch_proof = fold_epoch_c1(&leaves, zone, epoch);
 
-	// --- NSEC3 completeness, bound to its own committed leaves -------------------------------
-	let c = prove_bound_chain(n_chain, RootBinding::None)?;
+	// --- NSEC3 completeness over THIS ZONE'S OWN NAMES ---------------------------------------
+	// The chain is H(name) for every committed name, sorted and cyclically linked, so the cover
+	// this proof establishes is a fact about the zone rather than about a synthetic chain.
+	let chain = nsec3_chain_from_names(&names)
+		.ok_or_else(|| anyhow!("two names collide under the NSEC3 hash; chain not strictly ascending"))?;
+	let c = prove_chain_over(&chain)?;
 	let pin: ZonePin = c.commitment_prefix.clone();
 
 	Ok((
@@ -149,7 +162,7 @@ pub fn publish_epoch(
 			epoch_proof,
 			names,
 			completeness_proof: c.transcript,
-			n_chain,
+			chain,
 			records,
 		},
 		pin,
@@ -163,12 +176,9 @@ pub fn publish_epoch(
 /// is gap-free AND is this zone's*.
 pub fn verify_epoch_package(pkg: &EpochPackage, pin: &[u8]) -> Result<(bool, bool)> {
 	let epoch_ok = verify_epoch_c1(&pkg.epoch_proof, &pkg.zone).is_ok();
-	let completeness_ok = verify_bound_chain_against_pin(
-		pkg.n_chain,
-		RootBinding::None,
-		&pkg.completeness_proof,
-		pin,
-	)?;
+	// TWO pins, both required: the leaf-set boundaries force the shipped chain to be the
+	// committed one, and the 32-byte out-of-band pin forces the committed one to be THIS zone's.
+	let completeness_ok = verify_chain_over(&pkg.chain, &pkg.completeness_proof, pin)?;
 	Ok((epoch_ok, completeness_ok))
 }
 
@@ -197,7 +207,18 @@ pub fn resolve(pkg: &EpochPackage, name: &str, completeness_verified: bool) -> R
 					 so absence is an operator's claim rather than a proved fact"
 				));
 			}
-			Ok(Answer::NxDomain)
+			// THE DENIAL, PROVED. The chain was proved a gap-free cyclic cover and pinned to this
+			// zone's committed leaf set, so every value lies in exactly one interval. Finding the
+			// queried hash strictly inside one — rather than equal to an owner — is what
+			// establishes that no such name exists in the committed zone.
+			let h = nsec3_hash_name(name);
+			match covering_interval(&pkg.chain, &h) {
+				Some(interval) => Ok(Answer::NxDomain { interval }),
+				None => Err(anyhow!(
+					"{name} is not in the name list yet its hash is an OWNER of the verified \
+					 chain — the package is internally inconsistent and must be rejected"
+				)),
+			}
 		}
 	}
 }
@@ -212,10 +233,9 @@ mod tests {
 		const ZONE: &str = "se";
 		const EPOCH: u64 = 42;
 		const N_NAMES: usize = 8;
-		const N_CHAIN: usize = 8;
 
 		let t0 = std::time::Instant::now();
-		let (pkg, pin) = publish_epoch(ZONE, EPOCH, N_NAMES, N_CHAIN).expect("publish");
+		let (pkg, pin) = publish_epoch(ZONE, EPOCH, N_NAMES).expect("publish");
 		let publish_ms = t0.elapsed().as_millis();
 
 		// --- role 2: once per epoch ----------------------------------------------------------
@@ -234,10 +254,28 @@ mod tests {
 		let t3 = std::time::Instant::now();
 		let miss = resolve(&pkg, "definitely-not-in-zone.se", true).expect("miss");
 		let miss_us = t3.elapsed().as_micros();
-		// NOTE: this is a name-list miss gated on completeness having been verified — NOT yet a
-		// proved denial, because the verified chain is synthetic rather than this zone's. See the
-		// module header. The assertion records current behaviour, not the target guarantee.
-		assert_eq!(miss, Answer::NxDomain, "an absent name must yield NXDOMAIN, not a failure");
+		// A PROVED denial: the hash lands strictly inside a covering interval of a chain that was
+		// proved gap-free AND pinned to this zone's leaf set.
+		let miss_interval = match miss {
+			Answer::NxDomain { interval } => interval,
+			other => panic!("expected a proved NXDOMAIN, got {other:?}"),
+		};
+		assert!(miss_interval < pkg.chain.len(), "covering interval must index the verified chain");
+		// ...and the interval really does cover the queried hash, strictly.
+		let qh = nsec3_hash_name("definitely-not-in-zone.se");
+		let (o, x) = &pkg.chain[miss_interval];
+		let covered = if o < x { &qh > o && &qh < x } else { &qh > o || &qh < x };
+		assert!(covered, "the returned interval must actually cover the queried hash");
+
+		// ★ EVERY committed name must be UNDENIABLE: its hash is an owner, so no covering
+		// interval exists and no denial can be manufactured for a name that exists.
+		for nm in &pkg.names {
+			assert!(
+				covering_interval(&pkg.chain, &nsec3_hash_name(nm)).is_none(),
+				"a name that EXISTS must have no covering interval — otherwise the chain could be \
+				 used to deny a name it commits"
+			);
+		}
 
 		// --- the guarantees, each with a tamper that breaks it -------------------------------
 		// (a) NXDOMAIN is refused when completeness was not verified — absence must be PROVED.
@@ -250,6 +288,15 @@ mod tests {
 		wrong_pin[0] ^= 0x01;
 		let (_, comp_wrong) = verify_epoch_package(&pkg, &wrong_pin).expect("verify vs wrong pin");
 		assert!(!comp_wrong, "a pin that is not this zone's must REJECT the completeness proof");
+		// (b2) a resolver holding a DIFFERENT chain rejects: the leaf-set boundaries no longer
+		//      balance, so the shipped chain cannot be passed off as the committed one.
+		let mut other_chain = pkg.chain.clone();
+		other_chain[0].0 += 1u32;
+		assert!(
+			!crate::nsec3_bind::verify_chain_over(&other_chain, &pkg.completeness_proof, &pin)
+				.unwrap_or(false),
+			"a chain that is not the committed one must be REJECTED"
+		);
 		// (c) a tampered epoch root breaks the aggregation verdict.
 		let mut bad = EpochPackage {
 			zone: pkg.zone.clone(),
@@ -257,7 +304,7 @@ mod tests {
 			epoch_proof: EpochProofC1 { ..clone_proof(&pkg.epoch_proof) },
 			names: pkg.names.clone(),
 			completeness_proof: pkg.completeness_proof.clone(),
-			n_chain: pkg.n_chain,
+			chain: pkg.chain.clone(),
 			records: pkg.records.clone(),
 		};
 		bad.epoch_proof.rstar[0] ^= 0x01;
@@ -265,14 +312,14 @@ mod tests {
 		assert!(!epoch_bad, "a tampered epoch root must REJECT");
 
 		println!(
-			"\n  MVP END-TO-END EPOCH  zone={ZONE} epoch={EPOCH} names={N_NAMES} chain={N_CHAIN}\n\
+			"\n  MVP END-TO-END EPOCH  zone={ZONE} epoch={EPOCH} names={N_NAMES} chain=H(name) over those names\n\
 			 \x20   [1] operator publish            {publish_ms} ms   (ECDSA-validated records +\n\
 			 \x20       trustless aggregation + bound completeness proof;\n\
 			 \x20       package = {} B completeness proof + epoch proof)\n\
 			 \x20   [2] resolver verify ONCE/epoch  {verify_ms} ms   (epoch aggregation ✓, \n\
 			 \x20       completeness vs {}-byte pin ✓)\n\
 			 \x20   [3] resolve HIT   (offline)     {hit_us} µs   membership PROVED under the root\n\
-			 \x20       resolve MISS  (offline)     {miss_us} µs   NXDOMAIN (see limit 4 below)\n\
+			 \x20       resolve MISS  (offline)     {miss_us} µs   NXDOMAIN PROVED (covering interval)\n\
 			 \x20   TAMPERS REJECTED: NXDOMAIN without verified completeness; wrong-zone pin;\n\
 			 \x20   tampered epoch root.\n\
 			 \x20   ALL-REAL PATH: real ECDSA, real per-record FRI commit+open over the ACTUAL\n\
@@ -282,11 +329,10 @@ mod tests {
 			 \x20   bound constructions verified in sequence, not one artefact spanning both;\n\
 			 \x20   the pin is per-circuit-version; record VALIDITY is native at publish time\n\
 			 \x20   (Model A) — the epoch binds which bytes are committed, not that they carry\n\
-			 \x20   valid signatures; and (4) ★★THE NXDOMAIN PATH IS NOT YET BOUND TO THIS ZONE'S\n\
-			 \x20   NAMES — the verified chain is SYNTHETIC, not H(name) over the epoch's names,\n\
-			 \x20   and the miss is a name-list scan rather than a covering-interval proof. The HIT\n\
-			 \x20   path IS proved; the MISS path is not yet. Closing it needs the chain derived\n\
-			 \x20   from the epoch's own names plus a covering-interval check in resolve().",
+			 \x20   valid signatures.\n\
+			 \x20   ✓ NXDOMAIN NOW PROVED: the chain is H(name) over THIS epoch's names, pinned to\n\
+			 \x20   the committed leaf set, and a miss returns the covering interval. Every name\n\
+			 \x20   the zone commits is UNDENIABLE (its hash is an owner, so no interval covers it).",
 			pkg.completeness_proof.len(),
 			pin.len(),
 		);

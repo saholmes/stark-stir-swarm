@@ -277,6 +277,107 @@ pub(crate) fn fill_tiling_row<const W: usize>(
 	Ok(())
 }
 
+/// A closed cyclic NSEC3 chain: `(owner, next)` per record, `owner` strictly ascending and
+/// `next[i] = owner[(i+1) mod n]`, so there is exactly one wrap.
+pub type Nsec3Chain = Vec<(BigUint, BigUint)>;
+
+/// Hash a name to its NSEC3 owner value, in the width the tiling AIR compares over.
+///
+/// Real NSEC3 uses iterated SHA-1 over `salt ‖ name` (RFC 5155); this uses SHA3-256 truncated to
+/// the comparison width, because the completeness argument depends only on the hashes being
+/// fixed-width, ordered values — not on which hash produced them. A deployment must substitute the
+/// zone's actual parameterised hash, and the cover verdict is then meaningful only against those
+/// exact NSEC3 parameters.
+pub fn nsec3_hash_name(name: &str) -> BigUint {
+	use sha3::{Digest, Sha3_256};
+	let mut h = Sha3_256::new();
+	h.update(b"NSEC3-OWNER-V1");
+	h.update(name.as_bytes());
+	let d: [u8; 32] = h.finalize().into();
+	// keep it inside W bits with headroom, so `owner + 1` in the a<b gadget cannot overflow
+	BigUint::from_bytes_le(&d[0..(W / 8 - 2)])
+}
+
+/// Build the zone's real closed cyclic chain from its names: hash, sort, link cyclically.
+///
+/// Returns `None` if two names collide under [`nsec3_hash_name`] — the chain would not be strictly
+/// ascending and the tiling AIR would (correctly) reject it, so this fails loudly rather than
+/// silently producing an unprovable chain.
+pub fn nsec3_chain_from_names(names: &[String]) -> Option<Nsec3Chain> {
+	let mut owners: Vec<BigUint> = names.iter().map(|n| nsec3_hash_name(n)).collect();
+	owners.sort();
+	if owners.windows(2).any(|w| w[0] == w[1]) {
+		return None; // hash collision within the zone
+	}
+	let n = owners.len();
+	Some((0..n).map(|i| (owners[i].clone(), owners[(i + 1) % n].clone())).collect())
+}
+
+/// The interval of a verified chain that covers `h`, if `h` is strictly inside one.
+///
+/// A gap-free cyclic cover means every value lies in exactly one interval `(owner_i, next_i)`.
+/// Returning `Some(i)` for a hash that is not itself an owner is what makes a denial PROVED: the
+/// chain is complete (so nothing is missing between the endpoints) and `h` is strictly between two
+/// adjacent owners, therefore `h` is not a name of this zone.
+///
+/// Returns `None` when `h` IS an owner — the name exists, and no denial is available.
+pub fn covering_interval(chain: &Nsec3Chain, h: &BigUint) -> Option<usize> {
+	for (i, (o, x)) in chain.iter().enumerate() {
+		if h == o {
+			return None; // the name exists; this is not a denial
+		}
+		if o < x {
+			if h > o && h < x {
+				return Some(i);
+			}
+		} else {
+			// the single wrap interval: covers (o, MAX] ∪ [0, x)
+			if h > o || h < x {
+				return Some(i);
+			}
+		}
+	}
+	None
+}
+
+/// Prove completeness of a caller-supplied chain, pinning the leaf set so a verifier holding the
+/// chain can check its own covering intervals against exactly what was committed.
+pub fn prove_chain_over(chain: &Nsec3Chain) -> Result<BoundChainCost> {
+	build_bound_chain_over(
+		chain.len(),
+		BindTamper::None,
+		RootBinding::PinLeafSet { salt: 0 },
+		true,
+		None,
+		Some(chain),
+	)
+	.map(|(_, c)| c.expect("prove requested"))
+}
+
+/// Verify a completeness proof against the verifier's OWN copy of the chain.
+///
+/// Because the leaf set is pinned by boundaries built from `chain`, success means the committed
+/// leaves are exactly this chain — so a covering interval found in `chain` is a fact about the
+/// proved cover, not about data the operator merely asserted.
+/// `expected_commitment` may be empty to rely on the leaf-set boundaries alone; supplying the
+/// zone's 32-byte pin adds the out-of-band zone identity on top, so BOTH hold: the shipped chain
+/// is the committed one (boundaries), and the committed one is the zone the resolver trusts (pin).
+pub fn verify_chain_over(
+	chain: &Nsec3Chain,
+	proof_transcript: &[u8],
+	expected_commitment: &[u8],
+) -> Result<bool> {
+	build_bound_chain_over(
+		chain.len(),
+		BindTamper::None,
+		RootBinding::PinLeafSet { salt: 0 },
+		false,
+		Some((proof_transcript, expected_commitment)),
+		Some(chain),
+	)
+	.map(|(ok, _)| ok)
+}
+
 /// What to corrupt, so each guarantee has a test that fails without it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BindTamper {
@@ -455,6 +556,27 @@ fn build_bound_chain_inner(
 	do_prove: bool,
 	verify_against: Option<(&[u8], &[u8])>,
 ) -> Result<(bool, Option<BoundChainCost>)> {
+	build_bound_chain_over(n, tamper, binding, do_prove, verify_against, None)
+}
+
+/// As [`build_bound_chain_inner`], but over a CALLER-SUPPLIED chain.
+///
+/// This is what lets a zone prove completeness of *its own* NSEC3 chain — the hashes of the names
+/// it actually commits — rather than a synthetic one. When `chain` is `Some`, it replaces the
+/// synthetic chain in the tiling table, the leaf table, and (under
+/// [`RootBinding::PinLeafSet`]) the verifier's boundaries.
+///
+/// The chain must be a closed cyclic cover: `owner` strictly ascending with `next[i] =
+/// owner[(i+1) mod n]`, i.e. exactly one wrap. [`nsec3_chain_from_names`] produces one.
+#[allow(clippy::too_many_arguments)]
+fn build_bound_chain_over(
+	n: usize,
+	tamper: BindTamper,
+	binding: RootBinding,
+	do_prove: bool,
+	verify_against: Option<(&[u8], &[u8])>,
+	chain: Option<&[(BigUint, BigUint)]>,
+) -> Result<(bool, Option<BoundChainCost>)> {
 	assert!(n.is_power_of_two(), "n must be a power of two (selector-flushed wrap count)");
 	assert!(n <= 1 << 15, "chain must fit W bits: n <= 2^15 for step = 2^(W-16)");
 
@@ -471,7 +593,13 @@ fn build_bound_chain_inner(
 	// The tiling table is built over the alternate chain ONLY for the negative control; every
 	// other case constrains chain 0, so a rejection can be attributed to the leaf side alone.
 	let tiling_salt = if tamper == BindTamper::NoneAlternateChain { ALT_SALT } else { 0 };
-	let (owners, nexts) = synth_chain(n, tiling_salt);
+	let (owners, nexts) = match chain {
+		Some(c) => (
+			c.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>(),
+			c.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(),
+		),
+		None => synth_chain(n, tiling_salt),
+	};
 
 	// ---- table A: the C1--C4 tiling AIR, plus a push of each row onto `leafchan` -------------
 	let mut t = cs.add_table("NSEC3 tiling C1-C4 over B256");
@@ -503,7 +631,13 @@ fn build_bound_chain_inner(
 	// leaves are any other set — including a different but perfectly valid chain — the rootchan
 	// cannot balance and the statement is rejected.
 	if let RootBinding::PinLeafSet { salt } = binding {
-		let (po, px) = synth_chain(n, salt);
+		let (po, px) = match chain {
+			Some(c) => (
+				c.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>(),
+				c.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(),
+			),
+			None => synth_chain(n, salt),
+		};
 		for i in 0..n {
 			let mut values: Vec<OurB256> = Vec::with_capacity(LEAF_LANES);
 			for l in lanes_of(&po[i]) {
@@ -528,9 +662,15 @@ fn build_bound_chain_inner(
 	if let Some((proof_transcript, expected_commitment)) = verify_against {
 		let ccs = cs.compile(&statement)?;
 		// (1) the pin: does this proof commit the zone the resolver asked about?
-		let got = read_proof_commitment(proof_transcript, &statement.boundaries)?;
-		if got != expected_commitment {
-			return Ok((false, None));
+		//     An EMPTY expected commitment means the caller is pinning by leaf-set boundaries
+		//     instead (RootBinding::PinLeafSet), which already forces committed == the verifier's
+		//     own chain — so there is nothing for a 32-byte pin to add. Any non-empty value is
+		//     checked, and a mismatch rejects before the proof is even considered.
+		if !expected_commitment.is_empty() {
+			let got = read_proof_commitment(proof_transcript, &statement.boundaries)?;
+			if got != expected_commitment {
+				return Ok((false, None));
+			}
 		}
 		// (2) the proof: is the committed data actually a gap-free cover, bound to those leaves?
 		use crate::b256_field::{B256TowerFamily, U256};
@@ -578,7 +718,8 @@ fn build_bound_chain_inner(
 		let (lo_owners, lo_nexts) = match tamper {
 			// SwapWholeChain: tiling constrains chain 0, leaves carry the alternate chain.
 			// NoneAlternateChain: BOTH are the alternate chain, so this must validate.
-			BindTamper::SwapWholeChain | BindTamper::NoneAlternateChain => synth_chain(n, ALT_SALT),
+			BindTamper::SwapWholeChain => synth_chain(n, ALT_SALT),
+			BindTamper::NoneAlternateChain if chain.is_none() => synth_chain(n, ALT_SALT),
 			_ => (owners.clone(), nexts.clone()),
 		};
 		let tw = witness.init_table(leaf_id, n)?;
