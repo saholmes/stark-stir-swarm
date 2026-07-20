@@ -28,12 +28,20 @@
 //!
 //! ## Scope and honest status
 //!
-//! This is W2 of the binding scope. It establishes leaf-set == constrained-chain INSIDE one
-//! constraint system. It does NOT yet:
-//!   * bind `nsec3_chain_root` as a public `Statement` boundary (W3), so a verifier still cannot
-//!     check the proof against a root it received out of band;
-//!   * replace the epoch aggregation cost model with real aggregation over these leaves (W4).
-//! Until W3 and W4 land, chain completeness is NOT yet load-bearing end to end.
+//! **W2 (done)** — leaf-set == constrained-chain, inside one constraint system.
+//!
+//! **W3 (done, but NOT as originally scoped)** — [`RootBinding::PinLeafSet`] lets the verifier pin
+//! the leaf set from outside the proof, so a complete chain for the WRONG zone is rejected. It
+//! pins **O(n) public leaf data, not a 32-byte root**: an in-circuit Merkle root would need `n-1`
+//! SHA-3 compressions, which the b997882 measurement puts at ~165 GB for a 1.4M chain. So this is
+//! the AUDITABLE mode — an auditor holding the zone can check the chain against it — and not the
+//! succinct mode a resolver wants.
+//!
+//! **W4 (not done)** — epoch aggregation is still the random-witness cost model
+//! (`measure_epoch_verify_hash`), which binds none of this, and it is also where succinct binding
+//! must come from: an evaluation-claim fold gives the resolver a short pin where a hash root
+//! cannot. Until W4 lands, chain completeness is load-bearing for an AUDITOR but not for a
+//! resolver holding only a short commitment.
 //!
 //! ## Known hazard
 //!
@@ -109,11 +117,46 @@ fn synth_chain(n: usize, salt: u32) -> (Vec<BigUint>, Vec<BigUint>) {
 	(owners, nexts)
 }
 
+/// W3 — what the VERIFIER pins from outside the proof.
+///
+/// A succinct hash root is NOT available here. Binding `nsec3_chain_root` would mean proving
+/// `root == MerkleRoot(leaves)` in-circuit, i.e. `n-1` SHA-3 compressions over 64-byte inputs —
+/// exactly the shape measured in commit b997882 at ~4.04 ms and ~121 KB peak RSS PER record, so
+/// ~1.6 h and ~165 GB for a 1.4M chain. The same measurement that ruled out hash-based leaf
+/// binding rules out an in-circuit hash root.
+///
+/// What IS available at ~zero circuit cost is to make the leaf set itself the public statement:
+/// the leaf table pushes every leaf onto a channel that the verifier's boundaries pull. Channel
+/// balance then forces `committed leaves == the leaf list the verifier holds`. The cost is O(n)
+/// public data instead of a 32-byte root, so this is the AUDITABLE mode (an auditor who holds the
+/// zone can check the chain against it), not the succinct mode a resolver wants. Succinct binding
+/// needs the evaluation-claim fold of W4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootBinding {
+	/// No external pin: proves only "the leaves are SOME valid chain" (W2).
+	None,
+	/// The verifier pins the leaf set to the chain at `salt`, as O(n) boundary data.
+	PinLeafSet { salt: u32 },
+}
+
 /// Compose the tiling table and the raw-leaf table in ONE constraint system and validate.
 ///
 /// Returns `Ok(true)` iff the composed witness validates. The honest case must validate; every
 /// [`BindTamper`] must not.
+pub fn validate_bound_chain_pinned(
+	n: usize,
+	tamper: BindTamper,
+	binding: RootBinding,
+) -> Result<bool> {
+	validate_bound_chain_inner(n, tamper, binding)
+}
+
+/// W2-only entry point: no external pin. Kept so the W2 gate reads unchanged.
 pub fn validate_bound_chain(n: usize, tamper: BindTamper) -> Result<bool> {
+	validate_bound_chain_inner(n, tamper, RootBinding::None)
+}
+
+fn validate_bound_chain_inner(n: usize, tamper: BindTamper, binding: RootBinding) -> Result<bool> {
 	assert!(n.is_power_of_two(), "n must be a power of two (selector-flushed wrap count)");
 	assert!(n <= 1 << 15, "chain must fit W bits: n <= 2^15 for step = 2^(W-16)");
 
@@ -123,6 +166,9 @@ pub fn validate_bound_chain(n: usize, tamper: BindTamper) -> Result<bool> {
 	let wchan = cs.add_channel("nsec3_wrap_count");
 	// THE BINDING CHANNEL: chain rows out of the tiling table, into the committed leaf set.
 	let leafchan = cs.add_channel("nsec3_chain_leaves");
+	// W3: carries every committed leaf out to the verifier's boundaries (declared here because
+	// channels must be added before any table borrows the constraint system).
+	let rootchan = cs.add_channel("nsec3_public_leaf_set");
 
 	// The tiling table is built over the alternate chain ONLY for the negative control; every
 	// other case constrains chain 0, so a rejection can be attributed to the leaf side alone.
@@ -184,17 +230,41 @@ pub fn validate_bound_chain(n: usize, tamper: BindTamper) -> Result<bool> {
 	let leaf_cols: Vec<Col<B64, 1>> =
 		(0..LEAF_LANES).map(|i| lt.add_committed::<B64, 1>(format!("leaf{i}"))).collect();
 	lt.pull(leafchan, leaf_cols.clone());
+	// W3: re-export every committed leaf so the verifier's boundaries can pin the whole set.
+	if binding != RootBinding::None {
+		lt.push(rootchan, leaf_cols.clone());
+	}
 	let leaf_id = lt.id();
 
-	let statement = binius_m3::builder::Statement {
-		boundaries: vec![binius_m3::builder::Boundary {
-			values: vec![OurB256::from(B64::new(1))],
-			channel_id: wchan,
-			direction: binius_m3::builder::FlushDirection::Pull,
-			multiplicity: 1,
-		}],
-		table_sizes: vec![n, n],
-	};
+	let mut boundaries = vec![binius_m3::builder::Boundary {
+		values: vec![OurB256::from(B64::new(1))],
+		channel_id: wchan,
+		direction: binius_m3::builder::FlushDirection::Pull,
+		multiplicity: 1,
+	}];
+	// The verifier's own view of the zone, supplied from OUTSIDE the proof. If the committed
+	// leaves are any other set — including a different but perfectly valid chain — the rootchan
+	// cannot balance and the statement is rejected.
+	if let RootBinding::PinLeafSet { salt } = binding {
+		let (po, px) = synth_chain(n, salt);
+		for i in 0..n {
+			let mut values: Vec<OurB256> = Vec::with_capacity(LEAF_LANES);
+			for l in lanes_of(&po[i]) {
+				values.push(OurB256::from(B64::new(l)));
+			}
+			for l in lanes_of(&px[i]) {
+				values.push(OurB256::from(B64::new(l)));
+			}
+			boundaries.push(binius_m3::builder::Boundary {
+				values,
+				channel_id: rootchan,
+				direction: binius_m3::builder::FlushDirection::Pull,
+				multiplicity: 1,
+			});
+		}
+	}
+
+	let statement = binius_m3::builder::Statement { boundaries, table_sizes: vec![n, n] };
 
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 
@@ -347,6 +417,59 @@ mod tests {
 			 leaf, and omitted leaf are each REJECTED. No in-circuit hashing (raw leaves). \
 			 NOT YET load-bearing end to end: chain root is not a public boundary (W3) and epoch \
 			 aggregation is still modelled (W4)."
+		);
+	}
+
+	/// W3 GATE — the verifier pins the leaf set from OUTSIDE the proof.
+	///
+	/// W2 alone proves "the leaves are SOME valid chain". That is not enough: an operator can
+	/// prove a genuinely complete chain A while serving zone B. The `honest_proof_wrong_zone`
+	/// case below is exactly that attack — every constraint inside the proof is satisfied, the
+	/// chain really is a gap-free cover, and it is still REJECTED because it is not the zone the
+	/// verifier asked about. That case is what makes completeness load-bearing rather than
+	/// unfalsifiable evidence about an unspecified chain.
+	#[test]
+	fn nsec3_leaf_set_pinned_by_verifier() {
+		const N: usize = 8;
+		let pin0 = RootBinding::PinLeafSet { salt: 0 };
+
+		assert!(
+			validate_bound_chain_pinned(N, BindTamper::None, pin0).expect("honest pinned"),
+			"honest: committed leaves == the verifier's leaf set must VALIDATE"
+		);
+
+		// ★ THE W3 CASE. Internally flawless proof over the ALTERNATE chain — it validates
+		// unpinned (the W2 control proves it is a real gap-free cover) — but the verifier is
+		// asking about chain 0. Rejected on the binding alone.
+		assert!(
+			validate_bound_chain(N, BindTamper::NoneAlternateChain).expect("alt unpinned"),
+			"control: the alternate chain validates when NOT pinned"
+		);
+		assert!(
+			!validate_bound_chain_pinned(N, BindTamper::NoneAlternateChain, pin0)
+				.expect("alt pinned"),
+			"★ a COMPLETE, internally-valid chain for the WRONG ZONE must be REJECTED once the \
+			 verifier pins its own leaf set — this is prove-A-serve-B, and W2 alone cannot catch it"
+		);
+
+		// And pinning to the alternate chain accepts it again: the pin is what selects the zone.
+		assert!(
+			validate_bound_chain_pinned(N, BindTamper::NoneAlternateChain, RootBinding::PinLeafSet {
+				salt: ALT_SALT
+			})
+			.expect("alt pinned to itself"),
+			"pinning to the alternate chain must ACCEPT it — the pin selects the zone, nothing else"
+		);
+
+		println!(
+			"W3 GATE nsec3-leaf-set-pin: N={N} the verifier pins the leaf set from outside the \
+			 proof via {LEAF_LANES}-lane channel boundaries. A complete chain for the WRONG zone \
+			 is REJECTED; the same chain pinned to itself is ACCEPTED. \
+			 ★ LIMITATION: this pins O(n) public leaf data, NOT a 32-byte root — an in-circuit \
+			 Merkle root would cost n-1 SHA-3 compressions (~4.04 ms and ~121 KB RSS per record, \
+			 ~165 GB at 1.4M records), so it is infeasible by the same measurement that ruled out \
+			 hash leaf-binding. This is the AUDITABLE mode (an auditor holding the zone can check \
+			 it); SUCCINCT binding for a resolver needs the evaluation-claim fold of W4."
 		);
 	}
 
