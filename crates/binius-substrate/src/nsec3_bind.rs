@@ -157,7 +157,7 @@ pub fn validate_bound_chain(n: usize, tamper: BindTamper) -> Result<bool> {
 }
 
 /// Cost of a REAL proof over the composed system — not a model.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BoundChainCost {
 	pub prove_ms: u128,
 	pub verify_ms: u128,
@@ -166,6 +166,13 @@ pub struct BoundChainCost {
 	/// Boundary values the verifier must hold. 1 under [`RootBinding::None`]; grows with the
 	/// chain under [`RootBinding::PinLeafSet`], which is the O(n)-public-data cost of W3.
 	pub n_boundaries: usize,
+	/// W4(b) probe — the first 32 transcript bytes, which `prove.rs` writes as the polynomial
+	/// commitment (`writer.write(&commitment)` is the FIRST message written, before exp evals,
+	/// non-zero products or flush products). If this is a stable, leaf-set-dependent value then a
+	/// resolver could in principle pin it as a short root. THIS IS A PROBE, NOT A MECHANISM: the
+	/// offset is an assumption about transcript layout, not a documented API, and nothing in
+	/// `constraint_system::verify` checks it — see [`transcript_commitment_probe`].
+	pub commitment_prefix: Vec<u8>,
 }
 
 /// W4(a) — PROVE and VERIFY the composed system over the ACTUAL leaves.
@@ -176,7 +183,17 @@ pub struct BoundChainCost {
 /// verification of anything. Here the witness IS the constrained chain and its committed leaves,
 /// so the numbers describe the real artifact.
 pub fn prove_bound_chain(n: usize, binding: RootBinding) -> Result<BoundChainCost> {
-	build_bound_chain(n, BindTamper::None, binding, true).map(|(_, c)| c.expect("prove requested"))
+	prove_bound_chain_of(n, BindTamper::None, binding)
+}
+
+/// Prove a specific (honest) chain — `BindTamper::NoneAlternateChain` selects the alternate one,
+/// so two different zones can be proved and their commitments compared.
+pub fn prove_bound_chain_of(
+	n: usize,
+	tamper: BindTamper,
+	binding: RootBinding,
+) -> Result<BoundChainCost> {
+	build_bound_chain(n, tamper, binding, true).map(|(_, c)| c.expect("prove requested"))
 }
 
 fn validate_bound_chain_inner(n: usize, tamper: BindTamper, binding: RootBinding) -> Result<bool> {
@@ -431,6 +448,8 @@ fn build_bound_chain(
 	)?;
 	let prove_ms = t0.elapsed().as_millis();
 	let proof_bytes = proof.get_proof_size();
+	// W4(b) probe: prove.rs writes the polynomial commitment as the FIRST transcript message.
+	let commitment_prefix: Vec<u8> = proof.transcript.iter().copied().take(32).collect();
 	let peak_rss_bytes = crate::b256_sha3::peak_rss_bytes();
 	let t1 = std::time::Instant::now();
 	binius_core::constraint_system::verify::<
@@ -444,7 +463,14 @@ fn build_bound_chain(
 
 	Ok((
 		true,
-		Some(BoundChainCost { prove_ms, verify_ms, proof_bytes, peak_rss_bytes, n_boundaries }),
+		Some(BoundChainCost {
+			prove_ms,
+			verify_ms,
+			proof_bytes,
+			peak_rss_bytes,
+			n_boundaries,
+			commitment_prefix,
+		}),
 	))
 }
 
@@ -584,6 +610,71 @@ mod tests {
 			"  The `pinned` rows carry n+1 boundaries — the verifier holds the whole leaf set. \
 			 That is the AUDITABLE mode. A resolver wanting a SHORT pin is still unserved: a hash \
 			 root would need n-1 in-circuit SHA-3 compressions (~165 GB at 1.4M records, b997882).\n"
+		);
+	}
+
+	/// W4(b) OPTION-1 PROBE — is the transcript's leading commitment usable as a resolver's short
+	/// pin? Checks the three properties that would have to hold before option 3 (the fold) is
+	/// worth building, and records exactly which of them the probe can and cannot establish.
+	///
+	/// This does NOT implement succinct binding. `constraint_system::verify` never checks this
+	/// value, so anything here is an out-of-band comparison layered on top of verification, and
+	/// the 32-byte offset is an assumption about transcript layout rather than a documented API.
+	#[test]
+	fn transcript_commitment_probe() {
+		const N: usize = 64;
+		let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+		let a1 = prove_bound_chain_of(N, BindTamper::None, RootBinding::None).expect("a1");
+		let a2 = prove_bound_chain_of(N, BindTamper::None, RootBinding::None).expect("a2");
+		let b1 = prove_bound_chain_of(N, BindTamper::NoneAlternateChain, RootBinding::None)
+			.expect("b1");
+		let a_pinned =
+			prove_bound_chain_of(N, BindTamper::None, RootBinding::PinLeafSet { salt: 0 })
+				.expect("a_pinned");
+
+		println!("\n  W4(b) OPTION-1 PROBE — transcript[0..32] as a candidate short pin (n={N})");
+		println!("    chain A, run 1        {}", hex(&a1.commitment_prefix));
+		println!("    chain A, run 2        {}", hex(&a2.commitment_prefix));
+		println!("    chain B (alternate)   {}", hex(&b1.commitment_prefix));
+		println!("    chain A, pinned mode  {}", hex(&a_pinned.commitment_prefix));
+
+		// (P1) DETERMINISTIC: same zone, same commitment. Without this a resolver could never
+		// hold a stable pin at all.
+		let deterministic = a1.commitment_prefix == a2.commitment_prefix;
+		// (P2) ZONE-SEPARATING: a different zone gives a different commitment. Without this the
+		// pin cannot distinguish the zone it is supposed to identify.
+		let separating = a1.commitment_prefix != b1.commitment_prefix;
+		// (P3) BINDING-MODE-INVARIANT: the commitment covers the witness, which is identical in
+		// both modes, so pinning should not disturb it. If this fails the value depends on the
+		// statement as well as the data, and is not a property of the zone.
+		let mode_invariant = a1.commitment_prefix == a_pinned.commitment_prefix;
+
+		println!(
+			"    P1 deterministic (A run1 == A run2)      : {deterministic}\n\
+			 \x20   P2 zone-separating (A != B)              : {separating}\n\
+			 \x20   P3 mode-invariant (unpinned == pinned)   : {mode_invariant}"
+		);
+
+		assert!(deterministic, "P1: the same zone must yield the same commitment");
+		assert!(separating, "P2: a different zone must yield a different commitment");
+
+		println!(
+			"  VERDICT: P1 and P2 hold, so a leading-32-byte commitment IS a stable, \
+			 zone-separating value — the shape a short pin needs. What the probe CANNOT establish, \
+			 and what keeps this from being a mechanism:\n\
+			 \x20   (a) constraint_system::verify NEVER checks it. Comparing it is an out-of-band \
+			 step bolted onto verification, so soundness would rest on that comparison rather than \
+			 on the verifier.\n\
+			 \x20   (b) the 32-byte offset is inferred from prove.rs writing the commitment as its \
+			 first message; it is not a documented API and would break silently on a binius change \
+			 or a different hash/compression choice.\n\
+			 \x20   (c) it commits the WHOLE witness, not the leaf set — every tiling column too — \
+			 so it changes whenever the circuit changes, even for an identical zone. A resolver's \
+			 pin would be invalidated by a prover-side circuit revision.\n\
+			 \x20  So option 1 CONFIRMS the approach is viable in principle and is NOT a shippable \
+			 mechanism. Option 3 (evaluation-claim fold) is the one that puts the pin inside what \
+			 the verifier checks and scopes it to the leaves."
 		);
 	}
 
