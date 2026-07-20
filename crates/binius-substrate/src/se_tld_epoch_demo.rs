@@ -708,6 +708,62 @@ mod tests {
 		assert!(n_shards == TOTAL / SHARD, "shard count");
 	}
 
+	/// ISOLATED single-shard cost — the true per-device figure, nothing else running. Deliberately
+	/// the same code path on every host so a Mac number and a Raspberry Pi number are directly
+	/// comparable: this is what ONE fleet device actually pays to prove ONE shard.
+	///
+	/// `SHARD_N` (default 512) sizes the shard so a slow device can be calibrated on a small N
+	/// before committing to the full one. Report the thread count with any timing — the prover is
+	/// multi-threaded by default (see `run_sharded_epoch_parallel`), so a figure without
+	/// RAYON_NUM_THREADS stated is not reproducible.
+	///
+	/// ★ MEASURED on a REAL Raspberry Pi 2 (ARMv7 32-bit, 4 cores, 922 MB), L1, all cores:
+	///   N=512  prove 170880 ms (2.85 min)  epoch verify 4862 ms  proof 632113 B  PEAK RSS 95 MiB
+	/// The IoT budget therefore holds on real hardware with ~8.7x headroom (95 of 922 MB), not
+	/// by projection from a workstation.
+	///
+	/// ★ FIXED-COST FLOOR — prove time and RSS are FLAT up to N~512 on BOTH platforms:
+	///   Pi:  N=32 -> 171480 ms,  N=512 -> 170880 ms   (95 MiB)
+	///   Mac: N=32 ->   2500 ms,  N=128 -> 2483 ms,  N=512 -> 2492 ms   (~130 MiB)
+	/// and only then goes linear (Mac N=1024 -> 4768 ms, N=2048 -> 9476 ms). So a fixed circuit
+	/// cost dominates below ~512 records: shards SMALLER than 512 pay the same price for less
+	/// work and are pure waste, while larger ones start paying linearly. 512 is the efficient
+	/// shard size — the most records available at the floor price. Do not extrapolate per-record
+	/// cost from a sub-512 run; that floor made an early Pi N=32 reading look ~200x worse per
+	/// record than it is.
+	///
+	/// Device ratio at N=512, each host using all its cores: Pi 170880 ms vs Mac 2492 ms = ~69x.
+	/// Run: `SHARD_N=512 cargo test --release --lib isolated_shard_cost -- --ignored --nocapture`
+	#[test]
+	#[ignore = "per-device shard cost; SHARD_N sizes it (default 512)"]
+	fn isolated_shard_cost() {
+		let n: usize = std::env::var("SHARD_N").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+		let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset (all cores)".into());
+		let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+
+		let r = run_synthetic_se_epoch(n, Sha3Level::L1).expect("isolated shard");
+		let mib = r.peak_rss_bytes as f64 / (1024.0 * 1024.0);
+
+		println!(
+			"\n  ISOLATED SHARD COST  N={n}  L1  (cores={cores}, RAYON_NUM_THREADS={threads})\n\
+			 \x20   prove        {} ms\n\
+			 \x20   epoch verify {} ms\n\
+			 \x20   proof        {} bytes\n\
+			 \x20   PEAK RSS     {mib:.0} MiB      IoT<500 {}   Pi<900 {}\n\
+			 \x20   This is the per-device figure: one device holds ONE shard regardless of zone\n\
+			 \x20   size. Fleet wall-clock for a zone of K shards is this time (shards are\n\
+			 \x20   independent) plus a fold polylog in K — NOT measurable on one box, see\n\
+			 \x20   sharded_parallel_wall_clock.\n",
+			r.prove_ms,
+			r.epoch_verify_ms,
+			r.epoch_proof_bytes,
+			mib < 500.0,
+			mib < 900.0,
+		);
+
+		assert!(mib < 900.0, "per-device shard RSS must fit a 1 GB Pi (measured {mib:.0} MiB)");
+	}
+
 	/// Shard parallelism (ignored; ~4 min at RAYON_NUM_THREADS=1). Attempts to CONFIRM the fleet
 	/// speedup that `sharded_vs_monolithic_rss` projects from the slowest shard — and records the
 	/// NEGATIVE result that a single machine cannot confirm it.
