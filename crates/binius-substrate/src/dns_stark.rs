@@ -1381,7 +1381,15 @@ mod tests {
 
 		// Closed cyclic sorted chain: owner[0..n) ascending, next[i] = owner[(i+1) mod n].
 		// Exactly one wrap row (i = n-1: owner[n-1] > next[n-1] = owner[0]).
-		let n: usize = 8;
+		// NSEC3_N scales the chain (default 8, must be a power of two: the selector-flushed wrap
+		// count needs a po2 table). NSEC3_PROVE=1 additionally runs the REAL prove+verify on the
+		// honest chain — without it this test only validates the witness, which is NOT a proving
+		// cost measurement. `step = 2^150` keeps owners inside B256 for any n up to 2^106.
+		let n: usize = std::env::var("NSEC3_N").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+		assert!(n.is_power_of_two(), "NSEC3_N must be a power of two (got {n})");
+		let do_prove = std::env::var("NSEC3_PROVE").is_ok_and(|v| v == "1");
+		// (prove_ms, proof_bytes, peak_rss_bytes, verify_ms) — filled only when do_prove.
+		let stats = std::cell::Cell::new((0u128, 0usize, 0u64, 0u128));
 		let step = BigUint::from(1u32) << 150;
 		let base = BigUint::from(0x51E3u32);
 		let owners: Vec<BigUint> = (0..n).map(|i| &base + BigUint::from(i as u32) * &step).collect();
@@ -1513,8 +1521,36 @@ mod tests {
 			}
 			let ccs = cs.compile(&statement).unwrap();
 			let witness = witness.into_multilinear_extension_index();
-			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)
-				.is_ok()
+			let vok = binius_core::constraint_system::validate::validate_witness(
+				&ccs,
+				&statement.boundaries,
+				&witness,
+			)
+			.is_ok();
+			// A REAL prove+verify, on the honest chain only. validate_witness above merely checks
+			// the constraints are satisfied — it runs no polynomial IOP, commitment or FRI, so it
+			// says nothing about proving cost. Only this branch does.
+			if vok && do_prove && tamper == 0 {
+				use crate::b256_field::{B256TowerFamily, U256};
+				use binius_core::fiat_shamir::HasherChallenger;
+				use binius_hash::sha2::Sha256Compression;
+				use sha2::Sha256;
+				let pt = std::time::Instant::now();
+				let proof = binius_core::constraint_system::prove::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+				>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())
+				.expect("NSEC3 tiling prove must succeed on the honest chain");
+				let prove_ms = pt.elapsed().as_millis();
+				let bytes = proof.get_proof_size();
+				let rss = crate::b256_sha3::peak_rss_bytes();
+				let vt = std::time::Instant::now();
+				binius_core::constraint_system::verify::<
+					U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+				>(&ccs, 1, 128, &statement.boundaries, proof)
+				.expect("NSEC3 tiling proof must VERIFY");
+				stats.set((prove_ms, bytes, rss, vt.elapsed().as_millis()));
+			}
+			vok
 		};
 
 		assert!(run(0), "the honest gap-free cyclic NSEC3 chain must VALIDATE (C1--C4 tiling)");
@@ -1527,5 +1563,21 @@ mod tests {
 			 one AIR. Omission, a reversed interval, and a second wrap are each REJECTED. Full \
 			 C1--C4 chain-completeness in-circuit on Binius."
 		);
+		if do_prove {
+			let (prove_ms, bytes, rss, verify_ms) = stats.get();
+			println!(
+				"  NSEC3 TILING REAL PROVE  n={n}  B256@L1(128)  rows={n}\n\
+				 \x20   prove   {prove_ms} ms\n\
+				 \x20   verify  {verify_ms} ms\n\
+				 \x20   proof   {bytes} bytes\n\
+				 \x20   RSS     {:.0} MiB (process high-water, monotonic — run one n per process)\n\
+				 \x20   NOTE: this is ONE closed cyclic chain in ONE table. It is NOT a shard of a\n\
+				 \x20   larger chain: a contiguous segment is an open PATH whose permutation channel\n\
+				 \x20   is unbalanced by its two endpoints, so sharding needs an open-path variant\n\
+				 \x20   plus in-circuit endpoint chaining and cross-shard wrap-count aggregation.\n\
+				 \x20   None of that is built, so these numbers bound a WHOLE-CHAIN prove only.",
+				rss as f64 / (1024.0 * 1024.0),
+			);
+		}
 	}
 }
