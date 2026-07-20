@@ -708,6 +708,59 @@ mod tests {
 		assert!(n_shards == TOTAL / SHARD, "shard count");
 	}
 
+	/// IN-CIRCUIT SHA-3 COST PER RECORD — the number the NSEC3 leaf-binding scope hinges on.
+	///
+	/// To make chain-completeness load-bearing, the epoch's chain leaves must provably be the SAME
+	/// (owner, next) rows the C1--C4 tiling AIR constrains; otherwise an operator proves a complete
+	/// chain A while serving a zone B with omissions. One way to bind is to hash each record
+	/// IN-CIRCUIT (leaf_i = SHA3(owner_i || next_i)) inside the same constraint system, so this
+	/// measures what that costs per record. Messages are 64 B = owner||next, the real shape.
+	///
+	/// The alternative binding makes the epoch leaf the RAW 64-byte pair, so the link is a pure
+	/// channel equality and needs NO in-circuit hashing (cost: 64 B instead of 32 B leaves in the
+	/// Merkle tree). This sweep decides between them: cheap per-record hashing keeps both options
+	/// open, expensive hashing makes the raw-leaf design mandatory.
+	/// Run: `cargo test --release --lib incircuit_sha3_cost_per_record -- --ignored --nocapture`
+	#[test]
+	#[ignore = "in-circuit SHA3 cost sweep: ~2-5 min"]
+	fn incircuit_sha3_cost_per_record() {
+		use crate::b256_sha3::prove_verify_sha3_b256_timed;
+		let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset (all cores)".into());
+		println!("\n  IN-CIRCUIT SHA3-256 over 64 B (owner||next) records, L1(128), threads={threads}");
+		println!("     n      prove ms   ms/record   verify ms   proof KiB   RSS MiB");
+		for &n in &[512usize, 4096, 32768] {
+			// distinct 64-byte records so nothing is deduplicated or specialised away.
+			let msgs: Vec<Vec<u8>> = (0..n)
+				.map(|i| {
+					let o: [u8; 32] = Sha3_256::digest(format!("nsec3-owner-{i:08x}").as_bytes()).into();
+					let x: [u8; 32] = Sha3_256::digest(format!("nsec3-owner-{:08x}", i + 1).as_bytes()).into();
+					let mut v = o.to_vec();
+					v.extend_from_slice(&x);
+					v
+				})
+				.collect();
+			let (digests, m) =
+				prove_verify_sha3_b256_timed(Sha3Variant::Sha3_256, &msgs, 1, 128).expect("in-circuit sha3");
+			assert_eq!(digests.len(), n, "one digest per record");
+			// the in-circuit digest must equal the native hash — otherwise the cost is meaningless.
+			let native: [u8; 32] = Sha3_256::digest(&msgs[0]).into();
+			assert_eq!(digests[0], native.to_vec(), "in-circuit digest must equal native SHA3-256");
+			println!(
+				"  {n:>6}   {:>8}   {:>9.3}   {:>9}   {:>9.0}   {:>7.0}",
+				m.prove_ms,
+				m.prove_ms as f64 / n as f64,
+				m.verify_ms,
+				m.proof_bytes as f64 / 1024.0,
+				m.peak_rss_bytes as f64 / (1024.0 * 1024.0),
+			);
+		}
+		println!(
+			"  Extrapolate to a zone chain ONLY along a verified-linear stretch — per-record cost\n\
+			 \x20  here is flat below the circuit's padding floor (the batch pads to >=512), so a\n\
+			 \x20  small-n reading is not a rate. Compare against the raw-leaf option, which is 0.\n"
+		);
+	}
+
 	/// ISOLATED single-shard cost — the true per-device figure, nothing else running. Deliberately
 	/// the same code path on every host so a Mac number and a Raspberry Pi number are directly
 	/// comparable: this is what ONE fleet device actually pays to prove ONE shard.
