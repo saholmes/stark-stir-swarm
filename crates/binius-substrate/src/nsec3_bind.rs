@@ -58,6 +58,7 @@ use binius_m3::builder::{
 	Col, ConstraintSystem, FlushOpts, TableWitnessSegment, WitnessIndex, B1, B64,
 };
 use binius_core::oracle::ShiftVariant;
+use binius_field::BinaryField128b as AccF;
 use num_bigint::BigUint;
 
 /// Comparison width. NSEC3 owner hashes are SHA-1 (RFC 5155 defines only algorithm 1) = 160 bits;
@@ -474,6 +475,137 @@ fn build_bound_chain(
 	))
 }
 
+// =====================================================================================
+// W4(b) option 3 — the SUCCINCT pin, carried as an evaluation claim through the fold.
+// =====================================================================================
+
+/// The leaf set as a multilinear polynomial over `BinaryField128b` — the SAME bytes the leaf
+/// table commits (`LEAF_LANES` u64 lanes per leaf, packed two lanes to a 128-bit element), so a
+/// claim about this polynomial is a claim about the committed leaves.
+pub fn leaf_polynomial(n: usize, salt: u32) -> Vec<AccF> {
+	use binius_field::BinaryField128b;
+	let (owners, nexts) = synth_chain(n, salt);
+	let pack = |a: u64, b: u64| BinaryField128b::new(((b as u128) << 64) | a as u128);
+	let mut out = Vec::with_capacity(2 * LANES * n);
+	for i in 0..n {
+		let ol = lanes_of(&owners[i]);
+		let xl = lanes_of(&nexts[i]);
+		for l in (0..LANES).step_by(2) {
+			out.push(pack(ol[l], ol[l + 1]));
+		}
+		for l in (0..LANES).step_by(2) {
+			out.push(pack(xl[l], xl[l + 1]));
+		}
+	}
+	let padded = out.len().next_power_of_two();
+	out.resize(padded, <AccF as binius_field::Field>::ZERO);
+	out
+}
+
+/// Derive the evaluation point the way Fiat–Shamir must: from a digest of the committed data.
+///
+/// ★★ THIS HELPER IS NOT SOUND AS A PROTOCOL, and the gap is specific, not hypothetical.
+///
+/// The point here is `H(leaves)`, so a prover can DERIVE the resolver's point before choosing what
+/// to serve. `fold_verify` checks a single field equation, `g(0) == pinned_value`. A prover wanting
+/// to serve chain B against a pin for chain A needs only `mle_eval(B, point_A) == value_A` — one
+/// equation, with the whole of B free to vary, so it can be ground out. The wrong-zone rejection
+/// demonstrated by [`fold_verifies_against_pin`] shows the MECHANISM works against an honest-ish
+/// prover; it does NOT show the pin is binding against a grinding adversary.
+///
+/// The fix is structural, not a parameter change. In a real accumulation protocol the resolver
+/// holds a short COMMITMENT, not a precomputed `(point, value)`; the point is derived by the
+/// transcript challenger AFTER the prover commits, so it cannot be anticipated, and the PCS proves
+/// the committed polynomial's evaluation there. That requires wiring this into binius's PIOP —
+/// `accumulation.rs` is explicitly a native model with no circuit — which is NOT done here.
+pub fn fs_point(poly: &[AccF], n_vars: usize) -> Vec<AccF> {
+	use binius_field::BinaryField128b;
+	use sha3::{Digest, Sha3_256};
+	let mut h = Sha3_256::new();
+	h.update(b"NSEC3-LEAFSET-EVAL-POINT-V1");
+	for e in poly {
+		h.update(binius_field::underlier::WithUnderlier::to_underlier(*e).to_le_bytes());
+	}
+	let seed: [u8; 32] = h.finalize().into();
+	(0..n_vars)
+		.map(|j| {
+			let mut hj = Sha3_256::new();
+			hj.update(seed);
+			hj.update((j as u64).to_le_bytes());
+			let d: [u8; 32] = hj.finalize().into();
+			BinaryField128b::new(u128::from_le_bytes(d[0..16].try_into().unwrap()))
+		})
+		.collect()
+}
+
+/// The resolver's SHORT PIN for a zone: `log2(leafset size) + 1` field elements, versus the
+/// O(n) leaf list that [`RootBinding::PinLeafSet`] requires.
+pub fn zone_pin(n: usize, salt: u32) -> crate::accumulation::EvalClaim {
+	use crate::accumulation::{mle_eval, EvalClaim};
+	let poly = leaf_polynomial(n, salt);
+	let n_vars = poly.len().trailing_zeros() as usize;
+	let point = fs_point(&poly, n_vars);
+	let value = mle_eval(&poly, &point);
+	EvalClaim { point, value }
+}
+
+/// W4(b) — fold the chain's leaf-set record into an epoch alongside other records, and have a
+/// verifier that holds ONLY short claims replay the fold.
+///
+/// `served_salt` is the chain the operator actually commits and folds; `pinned_salt` is the zone
+/// the resolver holds a pin for. When they differ this is prove-A-serve-B, and it must be
+/// rejected even though the served chain is itself a perfectly valid gap-free cover.
+///
+/// Returns `true` iff the verifier accepts.
+pub fn fold_verifies_against_pin(n: usize, served_salt: u32, pinned_salt: u32) -> bool {
+	use crate::accumulation::{accumulate, accumulate_verify, lifted_claim, mle_eval, Record};
+	use binius_field::{BinaryField128b, Field};
+
+	// The operator's real leaf set, and three companion epoch records standing in for the rest
+	// of the epoch (positive delegations etc.) — 4 records so the fold chain is non-trivial.
+	let served = leaf_polynomial(n, served_salt);
+	let n_vars = served.len().trailing_zeros() as usize;
+	// One shared inner point, as `accumulate` requires. Derived from the SERVED data: a prover
+	// cannot gain by shifting it, because the resolver's pinned value was computed at the point
+	// derived from ITS zone, and a mismatch in either the point or the value fails the fold.
+	let point = fs_point(&served, n_vars);
+
+	let mut records: Vec<Record> = Vec::with_capacity(4);
+	records.push(Record {
+		claim: crate::accumulation::EvalClaim { point: point.clone(), value: mle_eval(&served, &point) },
+		evals: served.clone(),
+	});
+	for k in 1..4u64 {
+		let filler: Vec<AccF> = (0..served.len())
+			.map(|i| BinaryField128b::new(((k as u128) << 96) ^ (i as u128).wrapping_mul(0x9E37)))
+			.collect();
+		records.push(Record {
+			claim: crate::accumulation::EvalClaim { point: point.clone(), value: mle_eval(&filler, &point) },
+			evals: filler,
+		});
+	}
+
+	let challenges: Vec<AccF> = (0..records.len() - 1)
+		.map(|k| BinaryField128b::new(0xA5A5_0000_0000_0001u128 + k as u128))
+		.collect();
+	let (_interleaved, _acc, proofs) = accumulate(&records, &challenges);
+
+	// The VERIFIER holds only claims — never the leaves. For record 0 it substitutes the claim
+	// for the zone it actually cares about; the rest it takes from the epoch package.
+	let m = records.len().trailing_zeros() as usize;
+	let pin = zone_pin(n, pinned_salt);
+	let mut verifier_claims: Vec<crate::accumulation::EvalClaim> =
+		records.iter().enumerate().map(|(i, r)| lifted_claim(r, i, m)).collect();
+	verifier_claims[0] = {
+		// lift the pin to record index 0: append m zero bits, exactly as `lifted_claim` does.
+		let mut c = pin.clone();
+		c.point.extend(std::iter::repeat(AccF::ZERO).take(m));
+		c
+	};
+
+	accumulate_verify(&verifier_claims, &proofs, &challenges).is_some()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -675,6 +807,58 @@ mod tests {
 			 \x20  So option 1 CONFIRMS the approach is viable in principle and is NOT a shippable \
 			 mechanism. Option 3 (evaluation-claim fold) is the one that puts the pin inside what \
 			 the verifier checks and scopes it to the leaves."
+		);
+	}
+
+	/// W4(b) OPTION 3 — the SUCCINCT pin. A resolver holding only an evaluation claim, never the
+	/// leaf list, rejects a complete chain served for the wrong zone.
+	///
+	/// This is the resolver-facing half that W2+W3 could not deliver: W3 works but costs O(n)
+	/// public leaf data, so it serves an auditor rather than a resolver.
+	#[test]
+	fn succinct_pin_rejects_wrong_zone() {
+		for &n in &[8usize, 64, 256] {
+			assert!(
+				fold_verifies_against_pin(n, 0, 0),
+				"n={n}: serving the pinned zone must VERIFY"
+			);
+			assert!(
+				!fold_verifies_against_pin(n, ALT_SALT, 0),
+				"★ n={n}: serving a DIFFERENT (but perfectly valid, gap-free) chain while the \
+				 resolver pins zone 0 must be REJECTED — caught at the fold, with the verifier \
+				 holding only a short claim"
+			);
+			assert!(
+				fold_verifies_against_pin(n, ALT_SALT, ALT_SALT),
+				"n={n}: pinning the alternate zone accepts it — the pin selects the zone"
+			);
+		}
+
+		// The whole point: how short IS the pin, against the O(n) leaf list W3 needs?
+		let n = 256usize;
+		let pin = zone_pin(n, 0);
+		let pin_elems = pin.point.len() + 1;
+		let pin_bytes = pin_elems * 16;
+		let w3_bytes = n * LEAF_LANES * 8;
+		println!(
+			"\n  W4(b) OPTION-3 GATE succinct-pin: a resolver holding ONE EvalClaim rejects a \
+			 valid chain served for the wrong zone, at every n tested.\n\
+			 \x20   pin size  @ n={n}: {pin_elems} field elements = {pin_bytes} B \
+			 (log2(leafset)+1)\n\
+			 \x20   W3 O(n)   @ n={n}: {w3_bytes} B of leaf data — {:.0}x larger\n\
+			 \x20   At a 1.4M-record chain the pin is ~{} B while the leaf list is ~{} MB.\n\
+			 \x20   ★★ WHAT THIS DOES AND DOES NOT SHOW. It shows the fold MECHANISM carries a \
+			 zone pin: a verifier holding one short claim, never the leaves, rejects a valid chain \
+			 served for another zone. It does NOT show the pin is BINDING against a grinding \
+			 adversary. fs_point derives the point as H(leaves), so a prover can compute the \
+			 resolver's point before choosing what to serve, and fold_verify checks a single field \
+			 equation g(0)==pinned_value — one equation with all of chain B free to vary, so it can \
+			 be ground out. The fix is structural: the resolver must hold a COMMITMENT, with the \
+			 point derived by the transcript challenger AFTER the prover commits. That needs \
+			 binius PIOP integration; accumulation.rs is a native model with no circuit.",
+			w3_bytes as f64 / pin_bytes as f64,
+			(1_400_000f64 * 4.0).log2().ceil() as usize * 16 + 16,
+			(1_400_000usize * LEAF_LANES * 8) / 1_000_000,
 		);
 	}
 
