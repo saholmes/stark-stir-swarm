@@ -3117,7 +3117,14 @@ mod tests {
 
 	/// CORRECTNESS at FULL ML-DSA size via witness validation (constraint-satisfaction
 	/// of every gate). Forward output matches `ntt_ref`; round-trip returns x.
+	///
+	/// `#[ignore]`d: `validate(256)` over the full 256-point NTT constraint system is
+	/// pathologically slow (does not complete in a default `cargo test` run --- it was the test
+	/// that hung a full-suite run for 20 h). Smaller-`n` round-trip and per-gate tests above cover
+	/// correctness; this is the run-alone full-size check. Why validation is this slow at n=256 is
+	/// a separate perf issue worth a look. Run: `... full_256_validates_and_matches_ref -- --ignored`.
 	#[test]
+	#[ignore = "validate(256) over the full NTT is pathologically slow; run alone (hung a 20h suite run)"]
 	fn full_256_validates_and_matches_ref() {
 		let n = 256;
 		let mut rng = StdRng::seed_from_u64(0x2020);

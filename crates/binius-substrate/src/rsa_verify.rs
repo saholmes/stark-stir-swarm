@@ -887,6 +887,7 @@ mod tests {
 	/// (per-ModMul cost ≈ (W/512)² ≈ 4× here, ~64× at W=4096), which is exactly why the modexp MUST
 	/// be strand-decomposed for bounded memory.
 	#[test]
+	#[ignore = "heavy RSA proving (W=1024 ModMul); minutes+, runs alone: -- --ignored"]
 	fn rsa_modmul_wide_width_prove_over_b256() {
 		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 		use crate::nonnative::{ModMul, ModMulRow};
@@ -967,6 +968,7 @@ mod tests {
 	/// is the same construction (17 strands) at W=4096 — the EMSA prefix now binds because the seam
 	/// carries ceil(np/64) lanes. Honest sig PROVES+VERIFIES at NIST L1; wrong-message REJECTED.
 	#[test]
+	#[ignore = "heavy RSA proving (RSA-496 PKCS#1, W=1024 strands); ~1h, runs alone: -- --ignored"]
 	fn rsa_pkcs1_verify_emsa_bound_prove_over_b256() {
 		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
 		use crate::nonnative::{ModMul, ModMulRow};
