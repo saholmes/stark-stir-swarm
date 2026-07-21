@@ -710,6 +710,90 @@ mod tests {
 		}
 	}
 
+	/// W2 PROBE — the decisive unknown for Phase 1 (trustless flat-in-N binding).
+	///
+	/// Can the interleaved polynomial P be opened at a RECORD-SELECTING point `(a, bin(i))` as a
+	/// SINGLE FRI opening that (1) verifies against one commitment and (2) yields exactly
+	/// `P_i(a)`? If yes, per-record membership is O(1) trustless against R* = the FRI root, and the
+	/// decider crux is tractable. If it needs N openings, Phase 1 collapses to O(N) and is not
+	/// worth building. This probes it directly before any scope is committed.
+	#[test]
+	fn w2_probe_record_selecting_opening() {
+		use crate::accumulation::mle_eval;
+		use crate::decider::{decider_open_at_ext_l1, decider_verify_rooted_ext_l1, lift_b128_to_b256};
+		use binius_field::BinaryField128b as B128;
+
+		const N: usize = 4; // records
+		const INNER: usize = 3; // log2(record length) => 8 values/record
+		let n_vars = INNER + 2; // + log2(N)=2 select bits; |P| = 32 = 2^5
+
+		// deterministic distinct records (no rng): value depends on (record, position)
+		let records: Vec<Vec<B128>> = (0..N)
+			.map(|i| {
+				(0..(1 << INNER))
+					.map(|j| B128::new(((i as u128) << 96) ^ (j as u128).wrapping_mul(0x9E3779B1) ^ 0xABCD))
+					.collect()
+			})
+			.collect();
+		// P = block concatenation (matches epoch_fold::interleave_records): low INNER bits = inner
+		// index, high 2 bits = record index.
+		let p: Vec<B128> = records.iter().flatten().copied().collect();
+		assert_eq!(p.len(), 1 << n_vars);
+
+		// inner challenge point a (INNER B128 coords), lifted to B256 for the decider.
+		let a_b128: Vec<B128> = (0..INNER).map(|k| B128::new(0x1234_5678u128 + k as u128 * 7 + 1)).collect();
+
+		// helper: full opening point for record i = [lift(a), lift(bit0(i)), lift(bit1(i))].
+		let point_for = |i: usize| -> Vec<crate::b256_field::B256> {
+			let mut pt: Vec<_> = a_b128.iter().map(|&x| lift_b128_to_b256(x)).collect();
+			for b in 0..2 {
+				let bit = (i >> b) & 1;
+				pt.push(lift_b128_to_b256(if bit == 1 { B128::ONE } else { B128::ZERO }));
+			}
+			pt
+		};
+
+		let mut roots = Vec::new();
+		for i in 0..N {
+			let pt = point_for(i);
+			let (root, proof, value, nv) = decider_open_at_ext_l1(&p, &pt, 128);
+			// (1) the opening verifies against the single commitment
+			assert!(
+				decider_verify_rooted_ext_l1(root, proof, &pt, value, nv, 128),
+				"record {i}: single opening at (a, bin(i)) must verify against the FRI root"
+			);
+			// (2) the opened value is EXACTLY P_i(a) — the record-selecting point isolates record i
+			let expected = lift_b128_to_b256(mle_eval(&records[i], &a_b128));
+			assert_eq!(
+				value, expected,
+				"record {i}: opened value must equal P_i(a); the select bits must isolate record i"
+			);
+			roots.push(root);
+		}
+
+		// (3) the FRI root commits P and is INDEPENDENT of which point we opened — so R* = this
+		// root can be published once and every per-record opening checks against it.
+		assert!(roots.windows(2).all(|w| w[0] == w[1]), "the commitment root must be point-independent");
+
+		// (4) a forged value at a record-selecting point is REJECTED (soundness of the opening).
+		let pt = point_for(1);
+		let (root, proof, value, nv) = decider_open_at_ext_l1(&p, &pt, 128);
+		let forged = value + lift_b128_to_b256(B128::ONE);
+		assert!(
+			!decider_verify_rooted_ext_l1(root, proof, &pt, forged, nv, 128),
+			"a forged opened value must be rejected"
+		);
+
+		println!(
+			"\n  W2 PROBE — RECORD-SELECTING SINGLE OPENING: FEASIBLE.\n\
+			 \x20   Opening the interleaved P at (a, bin(i)) is ONE FRI opening that verifies\n\
+			 \x20   against a single, point-independent root and yields exactly P_i(a) for every\n\
+			 \x20   record i; a forged value is rejected. ⇒ per-record membership is O(1) and\n\
+			 \x20   trustless against R* = the FRI root, so Phase 1's decider crux (verify_epoch_c1)\n\
+			 \x20   does NOT require N openings. The trustless flat-in-N epoch is buildable."
+		);
+	}
+
 	/// `EpochProof` has no `Clone`; rebuild it field-by-field for the tamper case.
 	fn clone_proof(p: &EpochProof) -> EpochProof {
 		EpochProof {
