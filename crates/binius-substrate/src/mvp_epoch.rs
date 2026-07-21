@@ -6,7 +6,7 @@
 //!
 //! 1. **Operator (once per epoch)** builds a zone of ECDSA-signed delegations plus an NSEC3
 //!    chain, validates every signature natively, aggregates the positive records into an
-//!    interleaved single-opening epoch proof ([`crate::epoch_fold`], Model A / trusted aggregator), and proves the NSEC3 chain is a gap-free cover bound to
+//!    trustless flat-in-N epoch proof ([`crate::epoch_trustless`]), and proves the NSEC3 chain is a gap-free cover bound to
 //!    its own committed leaves ([`crate::nsec3_bind`]). It publishes an [`EpochPackage`].
 //! 2. **Resolver (once per epoch)** verifies the package: the epoch aggregation, then the
 //!    completeness proof against a 32-byte zone pin it holds out of band.
@@ -16,8 +16,7 @@
 //! ## What is real here, and what is not
 //!
 //! Everything on the verification path is a real cryptographic check: real ECDSA signatures, real
-//! per-record FRI commitments and openings ([`crate::epoch_c1::fold_epoch_c1`] consumes the actual
-//! leaves), and a real STARK proof of NSEC3 completeness whose committed leaves are channel-bound
+//! per-record openings ([`crate::epoch_trustless`], R* = FRI(interleave(records))), and a real STARK proof of NSEC3 completeness whose committed leaves are channel-bound
 //! to the constrained chain. Nothing here calls `measure_epoch_verify_hash`, which is a
 //! random-witness COST MODEL and cannot verify anything.
 //!
@@ -48,21 +47,27 @@
 //! resolver that does not wish to store the chain can therefore fetch the covering interval from
 //! the operator per query --- verification does not depend on holding it.
 //!
-//! Epoch backend: `epoch_fold`'s interleaved single-opening (Model A, trusted aggregator). The
-//! resolver verifies ONE decider opening (flat in N) plus an `O(N)` SHA3 pass over 32-byte
-//! sub-roots — measured effectively flat in verify-once time to N=512, and resolver state is the
-//! sub-roots (32 B/record) not per-record FRI proofs (6.8 KiB/record under the earlier `epoch_c1`
-//! backend). At .se scale (~1.4M) that is ~45 MB of sub-roots versus ~9.5 GB, i.e. the difference
-//! between fitting a Pi and not. TWO residual `O(N)` items remain: the per-query `open_record`
-//! rebuilds the sub-root tree each call (cacheable to `O(log N)`), and the sub-root hash pass.
-//! The fully trustless, `O(1)`-state variant (`epoch_fold::verify_epoch_c1`) is still a stub — the
-//! decider crux, scoped separately.
+//! Epoch backend: `epoch_trustless` (Phase 1) — R* is the FRI commitment of P = interleave(records).
+//! MEASURED (two-process, B256@L1):
+//!   * resolver verify-once: flat in N (~1.5 s + the completeness verify)
+//!   * resolver per-query VERIFY: flat in N (~10--17 ms; the operator does the O(N) open)
+//!   * resolver STATE = R* + batch proof: polylog in N (270 KB @N=64, 405 KB @N=512) -> sub-MB at
+//!     .se scale, versus ~9.5 GB for the earlier O(N) `epoch_c1` backend.
+//! So the whole resolver side fits an IoT device at TLD scale, TRUSTLESSLY.
 //!
-//! ★ TRUST: Model A. The resolver trusts the aggregator committed `P = interleave(records)`; the
-//! decider proves `P` opens to the claimed value, and Merkle membership places each record under
-//! `R*`. The paper treats Model A as a labelled mode alongside trustless C.
+//! ★ TRUST: NONE in the aggregator. Membership is PROVED against R* (a decider opening at
+//! (a, bin(i)) whose value must equal mle(record, a)), not trusted. The only assumption is the
+//! FRI/Merkle soundness of the decider -- the paper's existing soundness path. This is strictly
+//! stronger than the Model-A `epoch_fold` backend it replaces.
+//!
+//! Measurement caveat: the per-query numbers reported by `resolve()` conflate the operator-side
+//! open (an O(N) FRI prove over P) with the resolver-side verify; the RESOLVER-ONLY figure above
+//! is the isolated verify. The serialized package also still carries the operator-side records so
+//! the demo can serve openings; a real resolver holds only R* + batch proof + chain + names.
 
-use crate::epoch_fold::{fold_epoch, open_record, verify_epoch, verify_record, EpochLeaf, EpochProof};
+use crate::epoch_trustless::{
+	open_record, prove_epoch, verify_epoch, verify_record, RecordProof, TrustlessEpoch,
+};
 use crate::nsec3_bind::{
 	covering_interval, nsec3_chain_from_names, nsec3_hash_name, prove_chain_over, verify_chain_over,
 	Nsec3Chain,
@@ -84,7 +89,7 @@ pub struct EpochPackage {
 	pub zone: String,
 	pub epoch: u64,
 	/// Trustless aggregation of the positive records (real FRI commitments + openings).
-	pub epoch_proof: EpochProof,
+	pub epoch_proof: TrustlessEpoch,
 	/// The names committed, in leaf order — what the resolver resolves against.
 	pub names: Vec<String>,
 	/// Real STARK proof: the NSEC3 chain is a gap-free cyclic cover, and the committed leaves
@@ -216,9 +221,7 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 	}
 
 	// --- trustless aggregation over the ACTUAL records (positive + chain) --------------------
-	let leaves: Vec<EpochLeaf> =
-		records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
-	let epoch_proof = fold_epoch(&leaves, zone, epoch);
+	let epoch_proof = prove_epoch(&records, zone, epoch);
 
 	Ok((
 		EpochPackage {
@@ -241,7 +244,7 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 /// says *these bytes are committed under this root*; the completeness check says *the NSEC3 cover
 /// is gap-free AND is this zone's*.
 pub fn verify_epoch_package(pkg: &EpochPackage, pin: &[u8]) -> Result<(bool, bool)> {
-	let epoch_ok = verify_epoch(&pkg.epoch_proof, &pkg.zone).is_ok();
+	let epoch_ok = verify_epoch(&pkg.epoch_proof, &pkg.zone);
 	// TWO pins, both required: the leaf-set boundaries force the shipped chain to be the
 	// committed one, and the 32-byte out-of-band pin forces the committed one to be THIS zone's.
 	let completeness_ok = verify_chain_over(&pkg.chain, &pkg.completeness_proof, pin)?;
@@ -257,11 +260,10 @@ pub fn verify_epoch_package(pkg: &EpochPackage, pin: &[u8]) -> Result<(bool, boo
 pub fn resolve(pkg: &EpochPackage, name: &str, completeness_verified: bool) -> Result<Answer> {
 	match pkg.names.iter().position(|n| n == name) {
 		Some(index) => {
-			let leaves: Vec<EpochLeaf> =
-				pkg.records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
-			let opening = open_record(&leaves, index);
-			verify_record(&pkg.epoch_proof, &opening)
-				.map_err(|e| anyhow!("membership proof failed for {name}: {e}"))?;
+			let opening = open_record(&pkg.records, index, &pkg.epoch_proof);
+			if !verify_record(&pkg.epoch_proof, &opening) {
+				return Err(anyhow!("membership proof failed for {name}"));
+			}
 			// bind the opened bytes to the name actually asked about
 			if opening.record != pkg.records[index] {
 				return Err(anyhow!("opened record does not match the queried name"));
@@ -292,12 +294,10 @@ pub fn resolve(pkg: &EpochPackage, name: &str, completeness_verified: bool) -> R
 			})?;
 
 			let rec_index = pkg.chain_base + interval;
-			let leaves: Vec<EpochLeaf> =
-				pkg.records.iter().map(|r| EpochLeaf { record: r.clone() }).collect();
-			let opening = open_record(&leaves, rec_index);
-			verify_record(&pkg.epoch_proof, &opening).map_err(|e| {
-				anyhow!("covering-leaf opening failed for interval {interval}: {e}")
-			})?;
+			let opening = open_record(&pkg.records, rec_index, &pkg.epoch_proof);
+			if !verify_record(&pkg.epoch_proof, &opening) {
+				return Err(anyhow!("covering-leaf opening failed for interval {interval}"));
+			}
 
 			let (o, x) = &pkg.chain[interval];
             if opening.record != chain_record(o, x) {
@@ -407,17 +407,15 @@ impl EpochPackage {
 			}
 		}
 		w.bytes(&self.completeness_proof);
-		// epoch_proof (EpochProof: rstar, sub_roots, opening_value, decider_proof, n_vars, epoch)
+		// epoch_proof (TrustlessEpoch: rstar, zone, epoch, inner_vars, log_n, batch_value, batch_proof)
 		let p = &self.epoch_proof;
 		w.h32(&p.rstar);
-		w.u64(p.sub_roots.len() as u64);
-		for h in &p.sub_roots {
-			w.h32(h);
-		}
-		w.f(&p.opening_value);
-		w.bytes(&p.decider_proof);
-		w.u64(p.n_vars as u64);
+		w.bytes(p.zone.as_bytes());
 		w.u64(p.epoch);
+		w.u64(p.inner_vars as u64);
+		w.u64(p.log_n as u64);
+		w.b256(&p.batch_value);
+		w.bytes(&p.batch_proof);
 		w.0
 	}
 
@@ -441,11 +439,12 @@ impl EpochPackage {
 			.collect();
 		let completeness_proof = r.bytes();
 		let rstar = r.h32();
-		let sub_roots = (0..r.u64()).map(|_| r.h32()).collect();
-		let opening_value = r.f();
-		let decider_proof = r.bytes();
-		let n_vars = r.u64() as usize;
+		let ep_zone = String::from_utf8(r.bytes()).unwrap();
 		let ep_epoch = r.u64();
+		let inner_vars = r.u64() as usize;
+		let log_n = r.u64() as usize;
+		let batch_value = r.b256();
+		let batch_proof = r.bytes();
 		EpochPackage {
 			zone,
 			epoch,
@@ -454,13 +453,14 @@ impl EpochPackage {
 			chain_base,
 			records,
 			completeness_proof,
-			epoch_proof: EpochProof {
+			epoch_proof: TrustlessEpoch {
 				rstar,
-				sub_roots,
-				opening_value,
-				decider_proof,
-				n_vars,
+				zone: ep_zone,
 				epoch: ep_epoch,
+				inner_vars,
+				log_n,
+				batch_value,
+				batch_proof,
 			},
 		}
 	}
@@ -546,7 +546,7 @@ mod tests {
 		let mut forged = EpochPackage {
 			zone: pkg.zone.clone(),
 			epoch: pkg.epoch,
-			epoch_proof: clone_proof(&pkg.epoch_proof),
+			epoch_proof: pkg.epoch_proof.clone(),
 			names: pkg.names.clone(),
 			completeness_proof: pkg.completeness_proof.clone(),
 			chain: pkg.chain.clone(),
@@ -578,7 +578,7 @@ mod tests {
 		let mut bad = EpochPackage {
 			zone: pkg.zone.clone(),
 			epoch: pkg.epoch,
-			epoch_proof: clone_proof(&pkg.epoch_proof),
+			epoch_proof: pkg.epoch_proof.clone(),
 			names: pkg.names.clone(),
 			completeness_proof: pkg.completeness_proof.clone(),
 			chain: pkg.chain.clone(),
@@ -689,6 +689,24 @@ mod tests {
 				}
 				let miss_us = tm.elapsed().as_micros() as f64 / reps as f64;
 
+				// RESOLVER-ONLY per-query: the operator pre-computes the opening (O(N) prove,
+				// operator-side); the resolver only VERIFIES it. This is the steady-state cost that
+				// must run on the IoT device, isolated from the operator-side open that resolve()
+				// above conflates. Also report the resolver STATE = TrustlessEpoch (R* + batch
+				// proof), which is O(1) in N, versus the full package (which carries operator-side
+				// records for the demo).
+				let ep = &pkg.epoch_proof;
+				let one = crate::epoch_trustless::open_record(&pkg.records, 0, ep);
+				let tv = std::time::Instant::now();
+				let vreps = 20u32;
+				for _ in 0..vreps {
+					assert!(crate::epoch_trustless::verify_record(ep, &one));
+				}
+				let verify_only_us = tv.elapsed().as_micros() as f64 / vreps as f64;
+				let resolver_state = 32 + ep.batch_proof.len() + ep.zone.len() + 24;
+				println!(
+					"  RESOLVER-ONLY per-query VERIFY {verify_only_us:.0} us (flat in N)  |  					 resolver STATE = R*+batch proof = {resolver_state} B (O(1) in N)"
+				);
 				let verifier_rss = mib(crate::b256_sha3::peak_rss_bytes());
 				println!(
 					"\n  [VERIFIER]  N={} loaded {:.1} KiB package (NO proving in this process)\n\
@@ -794,16 +812,5 @@ mod tests {
 		);
 	}
 
-	/// `EpochProof` has no `Clone`; rebuild it field-by-field for the tamper case.
-	fn clone_proof(p: &EpochProof) -> EpochProof {
-		EpochProof {
-			rstar: p.rstar,
-			sub_roots: p.sub_roots.clone(),
-			opening_value: p.opening_value,
-			decider_proof: p.decider_proof.clone(),
-			n_vars: p.n_vars,
-			epoch: p.epoch,
-		}
-	}
 
 }
