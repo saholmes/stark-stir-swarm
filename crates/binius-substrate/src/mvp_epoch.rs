@@ -302,6 +302,173 @@ pub fn resolve(pkg: &EpochPackage, name: &str, completeness_verified: bool) -> R
 	}
 }
 
+// =====================================================================================
+// Serialization — so the package can cross a PROCESS boundary. This is what makes an honest
+// verifier-RSS measurement possible: prove in one process, verify in a SEPARATE one, so the
+// verifier's getrusage peak is its own footprint and not the prover's witness high-water.
+// Compact length-prefixed binary; the proofs are already bytes, only the field elements need
+// encoding. Not intended as a wire format — a deployment would use a versioned codec.
+// =====================================================================================
+mod codec {
+	use super::*;
+	use binius_field::underlier::WithUnderlier;
+	use num_bigint::BigUint;
+
+	pub struct W(pub Vec<u8>);
+	impl W {
+		pub fn u64(&mut self, v: u64) {
+			self.0.extend_from_slice(&v.to_le_bytes());
+		}
+		pub fn bytes(&mut self, b: &[u8]) {
+			self.u64(b.len() as u64);
+			self.0.extend_from_slice(b);
+		}
+		pub fn h32(&mut self, h: &[u8; 32]) {
+			self.0.extend_from_slice(h);
+		}
+		pub fn f(&mut self, x: &F) {
+			self.0.extend_from_slice(&WithUnderlier::to_underlier(*x).to_le_bytes());
+		}
+		pub fn b256(&mut self, x: &crate::b256_field::B256) {
+			let u = WithUnderlier::to_underlier(*x).0;
+			self.0.extend_from_slice(&u[0].to_le_bytes());
+			self.0.extend_from_slice(&u[1].to_le_bytes());
+		}
+		pub fn big(&mut self, x: &BigUint) {
+			self.bytes(&x.to_bytes_le());
+		}
+	}
+
+	pub struct R<'a>(pub &'a [u8], pub usize);
+	impl R<'_> {
+		fn take(&mut self, n: usize) -> &[u8] {
+			let s = &self.0[self.1..self.1 + n];
+			self.1 += n;
+			s
+		}
+		pub fn u64(&mut self) -> u64 {
+			u64::from_le_bytes(self.take(8).try_into().unwrap())
+		}
+		pub fn bytes(&mut self) -> Vec<u8> {
+			let n = self.u64() as usize;
+			self.take(n).to_vec()
+		}
+		pub fn h32(&mut self) -> [u8; 32] {
+			self.take(32).try_into().unwrap()
+		}
+		pub fn f(&mut self) -> F {
+			F::new(u128::from_le_bytes(self.take(16).try_into().unwrap()))
+		}
+		pub fn b256(&mut self) -> crate::b256_field::B256 {
+			let lo = u128::from_le_bytes(self.take(16).try_into().unwrap());
+			let hi = u128::from_le_bytes(self.take(16).try_into().unwrap());
+			crate::b256_field::B256::from_underlier(crate::b256_field::U256([lo, hi]))
+		}
+		pub fn big(&mut self) -> BigUint {
+			BigUint::from_bytes_le(&self.bytes())
+		}
+	}
+}
+
+impl EpochPackage {
+	/// Serialize the whole package to bytes so a verifier in another process can load it.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		use codec::W;
+		let mut w = W(Vec::new());
+		w.bytes(self.zone.as_bytes());
+		w.u64(self.epoch);
+		w.u64(self.names.len() as u64);
+		for n in &self.names {
+			w.bytes(n.as_bytes());
+		}
+		w.u64(self.chain.len() as u64);
+		for (o, x) in &self.chain {
+			w.big(o);
+			w.big(x);
+		}
+		w.u64(self.chain_base as u64);
+		w.u64(self.records.len() as u64);
+		for r in &self.records {
+			w.u64(r.len() as u64);
+			for v in r {
+				w.f(v);
+			}
+		}
+		w.bytes(&self.completeness_proof);
+		// epoch_proof
+		let p = &self.epoch_proof;
+		w.h32(&p.rstar);
+		w.u64(p.sub_roots.len() as u64);
+		for h in &p.sub_roots {
+			w.h32(h);
+		}
+		w.u64(p.roots.len() as u64);
+		for h in &p.roots {
+			w.h32(h);
+		}
+		w.u64(p.proofs.len() as u64);
+		for pr in &p.proofs {
+			w.bytes(pr);
+		}
+		w.u64(p.values.len() as u64);
+		for v in &p.values {
+			w.b256(v);
+		}
+		w.u64(p.inner_vars as u64);
+		w.u64(p.epoch);
+		w.u64(p.security_bits as u64);
+		w.0
+	}
+
+	/// Inverse of [`to_bytes`], for the verifier process.
+	pub fn from_bytes(buf: &[u8]) -> Self {
+		use codec::R;
+		let mut r = R(buf, 0);
+		let zone = String::from_utf8(r.bytes()).unwrap();
+		let epoch = r.u64();
+		let n_names = r.u64() as usize;
+		let names = (0..n_names).map(|_| String::from_utf8(r.bytes()).unwrap()).collect();
+		let n_chain = r.u64() as usize;
+		let chain = (0..n_chain).map(|_| (r.big(), r.big())).collect();
+		let chain_base = r.u64() as usize;
+		let n_rec = r.u64() as usize;
+		let records = (0..n_rec)
+			.map(|_| {
+				let l = r.u64() as usize;
+				(0..l).map(|_| r.f()).collect()
+			})
+			.collect();
+		let completeness_proof = r.bytes();
+		let rstar = r.h32();
+		let sub_roots = (0..r.u64()).map(|_| r.h32()).collect();
+		let roots = (0..r.u64()).map(|_| r.h32()).collect();
+		let proofs = (0..r.u64()).map(|_| r.bytes()).collect();
+		let values = (0..r.u64()).map(|_| r.b256()).collect();
+		let inner_vars = r.u64() as usize;
+		let ep_epoch = r.u64();
+		let security_bits = r.u64() as usize;
+		EpochPackage {
+			zone,
+			epoch,
+			names,
+			chain,
+			chain_base,
+			records,
+			completeness_proof,
+			epoch_proof: EpochProofC1 {
+				rstar,
+				sub_roots,
+				roots,
+				proofs,
+				values,
+				inner_vars,
+				epoch: ep_epoch,
+				security_bits,
+			},
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -455,6 +622,82 @@ mod tests {
 			pkg.completeness_proof.len(),
 			pin.len(),
 		);
+	}
+
+	/// FEASIBILITY — the deployment asymmetry: prover anywhere, verifier on ONE IoT device.
+	///
+	/// The prover's footprint is deliberately not asserted (it runs on a large box or a fleet).
+	/// The VERIFIER's footprint is the load-bearing number, and it must be measured in a process
+	/// that never proved — otherwise `getrusage`'s monotonic peak reports the prover's witness
+	/// high-water, not the verifier's. So this runs in two modes across two processes:
+	///
+	///   MVP_ROLE=prove  N=<names>  publish, serialize the package to $MVP_PKG, print prover RSS
+	///   MVP_ROLE=verify            load $MVP_PKG, verify-once + one HIT + one MISS, print VERIFIER
+	///                              peak RSS — the number that must fit an IoT budget
+	///
+	/// Run (same machine, or prove on a big box / verify on the Pi):
+	///   MVP_ROLE=prove  MVP_PKG=/tmp/mvp.pkg N=8 cargo test --release --lib mvp_feasibility -- --ignored --nocapture
+	///   MVP_ROLE=verify MVP_PKG=/tmp/mvp.pkg      cargo test --release --lib mvp_feasibility -- --ignored --nocapture
+	#[test]
+	#[ignore = "two-process feasibility: MVP_ROLE=prove|verify, MVP_PKG=<path>; measures verifier RSS in a witness-free process"]
+	fn mvp_feasibility() {
+		let role = std::env::var("MVP_ROLE").unwrap_or_default();
+		let path = std::env::var("MVP_PKG").unwrap_or_else(|_| "/tmp/mvp.pkg".into());
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+		match role.as_str() {
+			"prove" => {
+				let n: usize =
+					std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+				let t0 = std::time::Instant::now();
+				let (pkg, pin) = publish_epoch("se", 42, n).expect("publish");
+				let prove_ms = t0.elapsed().as_millis();
+				let bytes = pkg.to_bytes();
+				// round-trip check: the verifier must load exactly what was proved
+				let rt = EpochPackage::from_bytes(&bytes);
+				assert_eq!(rt.epoch_proof.rstar, pkg.epoch_proof.rstar, "serialization round-trip");
+				std::fs::write(&path, &bytes).expect("write package");
+				std::fs::write(format!("{path}.pin"), &pin).expect("write pin");
+				println!(
+					"\n  [PROVER]  N={n}  publish {prove_ms} ms  PROVER PEAK RSS {:.0} MiB  \
+					 package {:.1} KiB -> {path}\n\
+					 \x20   (prover footprint is unconstrained: large box or fleet. The number that \
+					 matters is the VERIFIER's, measured next in a separate process.)",
+					mib(crate::b256_sha3::peak_rss_bytes()),
+					bytes.len() as f64 / 1024.0,
+				);
+			}
+			"verify" => {
+				let bytes = std::fs::read(&path).expect("read package (run MVP_ROLE=prove first)");
+				let pin = std::fs::read(format!("{path}.pin")).expect("read pin");
+				let pkg = EpochPackage::from_bytes(&bytes);
+
+				let t1 = std::time::Instant::now();
+				let (epoch_ok, comp_ok) = verify_epoch_package(&pkg, &pin).expect("verify");
+				let verify_ms = t1.elapsed().as_millis();
+				assert!(epoch_ok && comp_ok, "loaded package must verify");
+
+				let hit = resolve(&pkg, &pkg.names[0].clone(), true).expect("hit");
+				let miss = resolve(&pkg, "absent-name.se", true).expect("miss");
+				assert!(matches!(hit, Answer::Exists { .. }));
+				assert!(matches!(miss, Answer::NxDomain { .. }));
+
+				let verifier_rss = mib(crate::b256_sha3::peak_rss_bytes());
+				println!(
+					"\n  [VERIFIER]  loaded {:.1} KiB package (NO proving in this process)\n\
+					 \x20   verify-once  {verify_ms} ms   (epoch aggregation + completeness+pin)\n\
+					 \x20   VERIFIER PEAK RSS  {verifier_rss:.0} MiB   IoT<500 {}   Pi<900 {}\n\
+					 \x20   ★ THIS is the asymmetry number: the resolver holds no witness, so its\n\
+					 \x20   footprint is bounded by the proof + package, not by the trace. It must\n\
+					 \x20   fit ONE IoT device; the prover's does not.",
+					bytes.len() as f64 / 1024.0,
+					verifier_rss < 500.0,
+					verifier_rss < 900.0,
+				);
+				assert!(verifier_rss < 900.0, "verifier must fit a 1 GB Pi (measured {verifier_rss:.0} MiB)");
+			}
+			_ => panic!("set MVP_ROLE=prove or MVP_ROLE=verify"),
+		}
 	}
 
 	/// `EpochProofC1` has no `Clone`; rebuild it field-by-field for the tamper case.
