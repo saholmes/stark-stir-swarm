@@ -147,6 +147,7 @@ pub mod mldsa_shake; // S1b ExpandA / S1c SampleInBall (SHAKE)
 pub mod mldsa_verify; // S1d/e ML-DSA verify assembly + decode
 pub mod ec_verify; // S2 EdDSA / ECDSA verify (7 curves)
 pub mod rsa_verify; // S3 RSA verify (PKCS#1-v1.5 + PSS, 1024–8192)
+pub mod epoch_trustless; // Phase 1 trustless flat-in-N epoch (R* = FRI root; record-selecting openings)
 pub mod mvp_epoch; // MVP end-to-end epoch package (publish / verify-once / resolve offline)
 pub mod nsec3_bind; // W2 NSEC3 chain-completeness ↔ epoch leaf-set binding (channel-linked)
 pub mod recursion; // R Tier-A aggregation + Tier-B verifier design
