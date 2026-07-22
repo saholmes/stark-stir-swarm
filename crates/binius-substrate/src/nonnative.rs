@@ -3350,25 +3350,34 @@ mod tests {
 			(ms, rss)
 		}
 
-		let (t1024, r1024) = prove_one::<1024>(504, 0x4A5A);
-		let (t512, r512) = prove_one::<512>(252, 0x4A5B);
-		let three_half = 3 * t512;
-		let ratio = three_half as f64 / t1024 as f64;
+		// Sweep W ∈ {512,1024,2048,4096} to read the FRI-prove exponent per doubling and whether
+		// it STEEPENS toward W=4096 (which would re-open Karatsuba: it wins iff exponent > 1.58).
+		// np ≈ W/2 − 4 keeps 2·np ≤ W. Single process, so RSS is a cumulative high-water — the
+		// load-bearing numbers are the TIMES and their per-doubling ratios.
+		let (t512, _) = prove_one::<512>(252, 0x4A5B);
+		let (t1024, _) = prove_one::<1024>(504, 0x4A5A);
+		let (t2048, _) = prove_one::<2048>(1020, 0x4A5C);
+		let (t4096, r4096) = prove_one::<4096>(2044, 0x4A5D);
+		let exp = |lo: u128, hi: u128| (hi as f64 / lo as f64).log2(); // exponent for a 2× width step
 		println!(
-			"\n  KARATSUBA PROBE (ModMul FRI-prove, L1):\n\
-			 \x20   full  W=1024 k=504: {t1024} ms   ({r1024:.0} MiB)\n\
-			 \x20   half  W=512  k=252: {t512} ms   ({r512:.0} MiB)\n\
-			 \x20   half/full width scaling: {:.2}x (expect ~4x if O(W^2))\n\
-			 \x20   3× half = {three_half} ms   vs   1× full = {t1024} ms   →  {ratio:.2}x\n\
-			 \x20   VERDICT: {} — one Karatsuba level replaces 1 full mult with 3 half mults +\n\
-			 \x20   an O(W) combination (small vs O(W^2) mults). 3×half is a CONSERVATIVE upper\n\
-			 \x20   bound (each half here includes its reduction; raw sub-mults are cheaper).",
-			t1024 as f64 / t512 as f64,
-			if ratio < 0.95 {
-				"WIN — 3×half < full, so Karatsuba reduces prove cost; the win compounds toward W=4096"
+			"\n  FRI-PROVE EXPONENT SWEEP (ModMul, L1):\n\
+			 \x20    W     np   prove ms   ratio vs prev   exponent (log2 ratio)\n\
+			 \x20   512   252   {t512:>8}        --              --\n\
+			 \x20  1024   504   {t1024:>8}      {:.2}x           {:.2}\n\
+			 \x20  2048  1020   {t2048:>8}      {:.2}x           {:.2}\n\
+			 \x20  4096  2044   {t4096:>8}      {:.2}x           {:.2}   ({r4096:.0} MiB cum)\n\
+			 \x20   Karatsuba (1 full → 3 half) wins iff the exponent > log2(3) = 1.58.\n\
+			 \x20   VERDICT: {}\n\
+			 \x20   Real RSA-2048 ModMul IS the W=4096 row above: prove ≈ {} s.",
+			t1024 as f64 / t512 as f64, exp(t512, t1024),
+			t2048 as f64 / t1024 as f64, exp(t1024, t2048),
+			t4096 as f64 / t2048 as f64, exp(t2048, t4096),
+			if exp(t2048, t4096) > 1.58 {
+				"exponent CROSSES 1.58 by W=4096 — Karatsuba would win at RSA-2048 width; worth revisiting"
 			} else {
-				"NO WIN at this width — combination/constant factors dominate; revisit nearer W=4096"
-			}
+				"exponent stays BELOW 1.58 through W=4096 — Karatsuba never wins; do not build it"
+			},
+			t4096 / 1000,
 		);
 	}
 
