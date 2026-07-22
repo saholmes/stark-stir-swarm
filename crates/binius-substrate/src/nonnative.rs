@@ -515,6 +515,281 @@ impl<const W: usize> KaratsubaMul<W> {
 	}
 }
 
+// ---------------------------------------------------------------------------------
+// W2b: the CROSS-WIDTH Karatsuba split. This is where the area win actually lives.
+//
+// W2a proved the logic but kept every column `W` bits wide, so three half-length
+// sub-multiplies cost ~1.5x one full multiply — a loss. FRI-prove cost tracks trace AREA
+// = rows x column-width, so the win requires the sub-multiplies to live in a table whose
+// columns are only `WH = W/2` bits wide:
+//
+//   schoolbook  1 row x ~7n columns  x W  bits   (n = W/2 - eps)
+//   Karatsuba   1 row x ~21(n/2) cols x W/2 bits   ==>  0.75 x the area
+//
+// Both stay at ONE row per instance (all three sub-products sit side by side in the same
+// narrow row), so there is no power-of-two row-padding penalty — the 3-rows-per-instance
+// alternative would pad 3N up to 4N and hand the whole 25% straight back.
+//
+// SEAM. The narrow table PUSHES `(a, b, z0, z1, z2)` as `B64` lane projections and the
+// wide assembly table PULLS the same tuple, reusing the projection recipe `ModMul`'s
+// chaining seam already uses. Carrying `a` and `b` in the tuple (not just the three
+// sub-products) is what pins wide row i to narrow row i: the channel is a MULTISET, so a
+// bare `(z0,z1,z2)` tuple would let instance i's reduction consume instance j's product.
+// Each pulled value is range-checked `< 2^WH` on the wide side, so the WH projected bits
+// carry the WHOLE value across and nothing hides above the seam.
+// ---------------------------------------------------------------------------------
+
+/// Narrow (`WH`-wide) half of the cross-width Karatsuba multiply: splits `a`/`b`, forms the
+/// three sub-products, recovers `z1` by the additive identity, and pushes `(a,b,z0,z1,z2)`.
+/// Owns its own table. `n` is the operand bit-length; requires `2*(⌈n/2⌉+1) ≤ WH`.
+pub(crate) struct KaratsubaNarrow<const WH: usize> {
+	pub(crate) table_id: TableId,
+	a: Col<B1, WH>,
+	b: Col<B1, WH>,
+	a_lo: Col<B1, WH>,
+	a_hi: Col<B1, WH>,
+	b_lo: Col<B1, WH>,
+	b_hi: Col<B1, WH>,
+	alo_hi: Col<B1, WH>,
+	blo_hi: Col<B1, WH>,
+	ahi_hi: Col<B1, WH>,
+	bhi_hi: Col<B1, WH>,
+	ahi_shl: Col<B1, WH>,
+	bhi_shl: Col<B1, WH>,
+	za: Adder<WH>,
+	zb: Adder<WH>,
+	z0: RawMul<WH>,
+	z2: RawMul<WH>,
+	zmid: RawMul<WH>,
+	z1: Col<B1, WH>,
+	id1: Adder<WH>,
+	id2: Adder<WH>,
+	/// `5 * WH/64` lane projections, in order `a, b, z0, z1, z2` — the pushed seam tuple.
+	seam: Vec<Col<B1, 64>>,
+	n: usize,
+	h: usize,
+}
+
+/// One instance's narrow-side outputs, handed to [`KaratsubaWide::populate`].
+pub(crate) struct KaratsubaParts {
+	pub(crate) a: Vec<bool>,
+	pub(crate) b: Vec<bool>,
+	pub(crate) z0: Vec<bool>,
+	pub(crate) z1: Vec<bool>,
+	pub(crate) z2: Vec<bool>,
+}
+
+impl<const WH: usize> KaratsubaNarrow<WH> {
+	pub(crate) fn build(cs: &mut ConstraintSystem<OurB256>, name: &str, n: usize, chan: ChannelId) -> Self {
+		let h = n.div_ceil(2);
+		let nh = n - h;
+		assert!(WH.is_power_of_two() && WH >= 64);
+		assert!(2 * (h + 1) <= WH, "narrow half must hold the widest sub-product (n={n}, WH={WH})");
+		let logw = WH.trailing_zeros() as usize;
+		let mut t = cs.add_table(format!("{name} (karatsuba narrow, n={n}, WH={WH})"));
+
+		let a = t.add_committed::<B1, WH>("a");
+		let b = t.add_committed::<B1, WH>("b");
+		let a_lo = t.add_committed::<B1, WH>("a_lo");
+		let a_hi = t.add_committed::<B1, WH>("a_hi");
+		let b_lo = t.add_committed::<B1, WH>("b_lo");
+		let b_hi = t.add_committed::<B1, WH>("b_hi");
+		// half-operand ranges: a_lo,b_lo < 2^h and a_hi,b_hi < 2^{n-h}.
+		let alo_hi = t.add_shifted("alo_hi", a_lo, logw, h, ShiftVariant::LogicalRight);
+		t.assert_zero("alo_rng", alo_hi * B1::ONE);
+		let blo_hi = t.add_shifted("blo_hi", b_lo, logw, h, ShiftVariant::LogicalRight);
+		t.assert_zero("blo_rng", blo_hi * B1::ONE);
+		let ahi_hi = t.add_shifted("ahi_hi", a_hi, logw, nh, ShiftVariant::LogicalRight);
+		t.assert_zero("ahi_rng", ahi_hi * B1::ONE);
+		let bhi_hi = t.add_shifted("bhi_hi", b_hi, logw, nh, ShiftVariant::LogicalRight);
+		t.assert_zero("bhi_rng", bhi_hi * B1::ONE);
+		// split binding a == a_lo + a_hi·2^h (disjoint ranges ⇒ XOR); this also FORCES a < 2^n.
+		let ahi_shl = t.add_shifted("ahi_shl", a_hi, logw, h, ShiftVariant::LogicalLeft);
+		t.assert_zero("a_split", a - a_lo - ahi_shl);
+		let bhi_shl = t.add_shifted("bhi_shl", b_hi, logw, h, ShiftVariant::LogicalLeft);
+		t.assert_zero("b_split", b - b_lo - bhi_shl);
+
+		let za = Adder::<WH>::build(&mut t, a_lo, a_hi, "za");
+		let zb = Adder::<WH>::build(&mut t, b_lo, b_hi, "zb");
+
+		let z0 = RawMul::<WH>::build(&mut t, "z0", h, a_lo, b_lo);
+		let z2 = RawMul::<WH>::build(&mut t, "z2", nh, a_hi, b_hi);
+		let zmid = RawMul::<WH>::build(&mut t, "zmid", h + 1, za.sum, zb.sum);
+
+		// additive Karatsuba identity: zmid == z0 + z2 + z1 (z1 committed, ≥ 0, no subtraction).
+		let z1 = t.add_committed::<B1, WH>("z1");
+		let id1 = Adder::<WH>::build(&mut t, z0.product, z2.product, "id1");
+		let id2 = Adder::<WH>::build(&mut t, id1.sum, z1, "id2");
+		t.assert_zero("karat_id", id2.sum - zmid.product);
+
+		// seam: project all WH bits of each of (a, b, z0, z1, z2) and push one tuple.
+		let lanes = WH / 64;
+		let mut seam = Vec::with_capacity(5 * lanes);
+		let mut packed = Vec::with_capacity(5 * lanes);
+		for (tag, src) in [("a", a), ("b", b), ("z0", z0.product), ("z1", z1), ("z2", z2.product)] {
+			for i in 0..lanes {
+				let sel = t.add_selected_block::<B1, WH, 64>(format!("seam_{tag}_sel{i}"), src, i);
+				packed.push(t.add_packed::<B1, 64, B64, 1>(format!("seam_{tag}_b64{i}"), sel));
+				seam.push(sel);
+			}
+		}
+		t.push(chan, packed);
+
+		Self {
+			table_id: t.id(),
+			a, b, a_lo, a_hi, b_lo, b_hi, alo_hi, blo_hi, ahi_hi, bhi_hi, ahi_shl, bhi_shl,
+			za, zb, z0, z2, zmid, z1, id1, id2, seam, n, h,
+		}
+	}
+
+	/// Fill one narrow row from operand bit-vectors; returns the parts the wide table needs.
+	pub(crate) fn populate(
+		&self,
+		seg: &mut TableWitnessSegment<OurB256>,
+		row: usize,
+		a: &[bool],
+		b: &[bool],
+	) -> Result<KaratsubaParts> {
+		let (h, nh) = (self.h, self.n - self.h);
+		let av = bits_to_big(a);
+		let bv = bits_to_big(b);
+		let mask_h = (num_bigint::BigUint::from(1u8) << h) - 1u8;
+		let alo_b = big_to_bits::<WH>(&(&av & &mask_h));
+		let ahi_b = big_to_bits::<WH>(&(&av >> h));
+		let blo_b = big_to_bits::<WH>(&(&bv & &mask_h));
+		let bhi_b = big_to_bits::<WH>(&(&bv >> h));
+		let a_b = big_to_bits::<WH>(&av);
+		let b_b = big_to_bits::<WH>(&bv);
+
+		write_col::<WH>(seg, self.a, row, &a_b)?;
+		write_col::<WH>(seg, self.b, row, &b_b)?;
+		write_col::<WH>(seg, self.a_lo, row, &alo_b)?;
+		write_col::<WH>(seg, self.a_hi, row, &ahi_b)?;
+		write_col::<WH>(seg, self.b_lo, row, &blo_b)?;
+		write_col::<WH>(seg, self.b_hi, row, &bhi_b)?;
+		// shifted columns are populated explicitly (m3 does not auto-derive them).
+		write_col::<WH>(seg, self.alo_hi, row, &shr(&alo_b, h))?;
+		write_col::<WH>(seg, self.blo_hi, row, &shr(&blo_b, h))?;
+		write_col::<WH>(seg, self.ahi_hi, row, &shr(&ahi_b, nh))?;
+		write_col::<WH>(seg, self.bhi_hi, row, &shr(&bhi_b, nh))?;
+		write_col::<WH>(seg, self.ahi_shl, row, &shl(&ahi_b, h))?;
+		write_col::<WH>(seg, self.bhi_shl, row, &shl(&bhi_b, h))?;
+
+		let za_v = self.za.populate(seg, row, &alo_b, &ahi_b)?;
+		let zb_v = self.zb.populate(seg, row, &blo_b, &bhi_b)?;
+		let z0v = self.z0.populate(seg, row, &alo_b, &blo_b)?;
+		let z2v = self.z2.populate(seg, row, &ahi_b, &bhi_b)?;
+		let zmv = self.zmid.populate(seg, row, &za_v, &zb_v)?;
+
+		let z1_big = &bits_to_big(&zmv) - &bits_to_big(&z0v) - &bits_to_big(&z2v);
+		let z1_b = big_to_bits::<WH>(&z1_big);
+		write_col::<WH>(seg, self.z1, row, &z1_b)?;
+		let s02 = self.id1.populate(seg, row, &z0v, &z2v)?;
+		self.id2.populate(seg, row, &s02, &z1_b)?;
+
+		let lanes = WH / 64;
+		for (grp, src) in [&a_b, &b_b, &z0v, &z1_b, &z2v].iter().enumerate() {
+			for i in 0..lanes {
+				write_col::<64>(seg, self.seam[grp * lanes + i], row, &src[i * 64..i * 64 + 64])?;
+			}
+		}
+		Ok(KaratsubaParts { a: a_b, b: b_b, z0: z0v, z1: z1_b, z2: z2v })
+	}
+}
+
+/// Wide (`W`-bit) half of the cross-width Karatsuba multiply: PULLS `(a,b,z0,z1,z2)` from the
+/// narrow table and assembles `product = z0 + z1·2^h + z2·2^{2h}`. `a`/`b` are exposed so a
+/// caller (the reduction) can constrain them; `product` is the multiply's output.
+pub(crate) struct KaratsubaWide<const W: usize, const WH: usize> {
+	pub(crate) a: Col<B1, W>,
+	pub(crate) b: Col<B1, W>,
+	z0: Col<B1, W>,
+	z1: Col<B1, W>,
+	z2: Col<B1, W>,
+	/// `x >> WH == 0` for each pulled value — makes the WH projected bits carry the WHOLE value.
+	seam_rng: Vec<Col<B1, W>>,
+	z1_shl: Col<B1, W>,
+	z2_shl: Col<B1, W>,
+	asm1: Adder<W>,
+	asm2: Adder<W>,
+	pub(crate) product: Col<B1, W>,
+	seam: Vec<Col<B1, 64>>,
+	h: usize,
+}
+
+impl<const W: usize, const WH: usize> KaratsubaWide<W, WH> {
+	/// Build inside an EXISTING wide table `t` (so the reduction can share the row).
+	pub(crate) fn build(t: &mut TableBuilder<OurB256>, name: &str, n: usize, chan: ChannelId) -> Self {
+		let h = n.div_ceil(2);
+		assert!(W.is_power_of_two() && WH < W && WH >= 64);
+		assert!(2 * n <= W, "product 2n bits must fit W (n={n}, W={W})");
+		let logw = W.trailing_zeros() as usize;
+
+		let a = t.add_committed::<B1, W>(format!("{name}_a"));
+		let b = t.add_committed::<B1, W>(format!("{name}_b"));
+		let z0 = t.add_committed::<B1, W>(format!("{name}_z0"));
+		let z1 = t.add_committed::<B1, W>(format!("{name}_z1"));
+		let z2 = t.add_committed::<B1, W>(format!("{name}_z2"));
+
+		let mut seam_rng = Vec::with_capacity(5);
+		for (tag, src) in [("a", a), ("b", b), ("z0", z0), ("z1", z1), ("z2", z2)] {
+			let hi = t.add_shifted(format!("{name}_{tag}_seamrng"), src, logw, WH, ShiftVariant::LogicalRight);
+			t.assert_zero(format!("{name}_{tag}_seamrng0"), hi * B1::ONE);
+			seam_rng.push(hi);
+		}
+
+		let lanes = WH / 64;
+		let mut seam = Vec::with_capacity(5 * lanes);
+		let mut packed = Vec::with_capacity(5 * lanes);
+		for (tag, src) in [("a", a), ("b", b), ("z0", z0), ("z1", z1), ("z2", z2)] {
+			for i in 0..lanes {
+				let sel = t.add_selected_block::<B1, W, 64>(format!("{name}_seam_{tag}_sel{i}"), src, i);
+				packed.push(t.add_packed::<B1, 64, B64, 1>(format!("{name}_seam_{tag}_b64{i}"), sel));
+				seam.push(sel);
+			}
+		}
+		t.pull(chan, packed);
+
+		let z1_shl = t.add_shifted(format!("{name}_z1_shl"), z1, logw, h, ShiftVariant::LogicalLeft);
+		let z2_shl = t.add_shifted(format!("{name}_z2_shl"), z2, logw, 2 * h, ShiftVariant::LogicalLeft);
+		let asm1 = Adder::<W>::build(t, z0, z1_shl, &format!("{name}_asm1"));
+		let asm2 = Adder::<W>::build(t, asm1.sum, z2_shl, &format!("{name}_asm2"));
+
+		Self { a, b, z0, z1, z2, seam_rng, z1_shl, z2_shl, asm1, asm2, product: asm2.sum, seam, h }
+	}
+
+	/// Fill one wide row from the narrow table's parts; returns the assembled product bits.
+	pub(crate) fn populate(
+		&self,
+		seg: &mut TableWitnessSegment<OurB256>,
+		row: usize,
+		parts: &KaratsubaParts,
+	) -> Result<Vec<bool>> {
+		let vals: [&Vec<bool>; 5] = [&parts.a, &parts.b, &parts.z0, &parts.z1, &parts.z2];
+		let cols = [self.a, self.b, self.z0, self.z1, self.z2];
+		let mut wide: Vec<Vec<bool>> = Vec::with_capacity(5);
+		for (k, v) in vals.iter().enumerate() {
+			let mut w = vec![false; W];
+			w[..v.len().min(W)].copy_from_slice(&v[..v.len().min(W)]);
+			write_col::<W>(seg, cols[k], row, &w)?;
+			write_col::<W>(seg, self.seam_rng[k], row, &shr(&w, WH))?;
+			wide.push(w);
+		}
+		let lanes = WH / 64;
+		for (grp, v) in vals.iter().enumerate() {
+			for i in 0..lanes {
+				write_col::<64>(seg, self.seam[grp * lanes + i], row, &v[i * 64..i * 64 + 64])?;
+			}
+		}
+		let z1_shl_b = shl(&wide[3], self.h);
+		let z2_shl_b = shl(&wide[4], 2 * self.h);
+		write_col::<W>(seg, self.z1_shl, row, &z1_shl_b)?;
+		write_col::<W>(seg, self.z2_shl, row, &z2_shl_b)?;
+		let s = self.asm1.populate(seg, row, &wide[2], &z1_shl_b)?;
+		self.asm2.populate(seg, row, &s, &z2_shl_b)
+	}
+}
+
 /// A non-native `a*b mod m` table over the 256-bit top field, width `W` (bits per row).
 pub struct ModMul<const W: usize> {
 	pub table_id: TableId,
@@ -3654,6 +3929,222 @@ mod tests {
 		println!(
 			"W2a GATE karatsuba: KaratsubaMul<{W}> (n={n}, single-width) validates and equals a·b \
 			 over 3 trials; a forged z1 is rejected by the additive identity zmid=z0+z2+z1."
+		);
+	}
+
+	/// W2b GATE — the CROSS-WIDTH Karatsuba multiply: sub-products in a `WH = W/2` table, assembly
+	/// in the `W` table, joined by a `(a,b,z0,z1,z2)` channel seam. Checks (a) the honest witness
+	/// validates and the assembled product equals `num-bigint`'s `a·b`; (b) a forged `z1` on the
+	/// narrow side is rejected by the additive identity; (c) a wide row whose `z2` disagrees with
+	/// the narrow row's is rejected by the seam (channel imbalance) — i.e. the wide table cannot
+	/// invent sub-products, which is what makes the whole split load-bearing rather than decorative.
+	#[test]
+	fn karatsuba_cross_width_sound() {
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+
+		const W: usize = 256;
+		const WH: usize = 128;
+		let n = 124usize; // 2n = 248 ≤ W; 2(h+1) = 126 ≤ WH
+		let mut rng = StdRng::seed_from_u64(0x2B22);
+
+		#[derive(Clone, Copy, PartialEq)]
+		enum Tamper {
+			None,
+			NarrowZ1,
+			WideZ2,
+		}
+
+		let build = |av: &num_bigint::BigUint, bv: &num_bigint::BigUint, tamper: Tamper| -> (bool, num_bigint::BigUint) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("karat_seam");
+			let narrow = KaratsubaNarrow::<WH>::build(&mut cs, "kn", n, chan);
+			let (wide_tid, kw) = {
+				let mut t = cs.add_table("karatsuba-w2b-wide");
+				let kw = KaratsubaWide::<W, WH>::build(&mut t, "kw", n, chan);
+				(t.id(), kw)
+			};
+			// table_sizes is indexed by table id; both tables carry one instance.
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+
+			let mut parts = {
+				let tw = witness.init_table(narrow.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let ab = big_to_bits::<WH>(av);
+				let bb = big_to_bits::<WH>(bv);
+				let p = narrow.populate(&mut seg, 0, &ab, &bb).unwrap();
+				if tamper == Tamper::NarrowZ1 {
+					let mut z1 = big_to_bits::<WH>(&(&(av * bv) >> 4)); // arbitrary wrong z1
+					z1.resize(WH, false);
+					write_col::<WH>(&mut seg, narrow.z1, 0, &z1).unwrap();
+				}
+				p
+			};
+			if tamper == Tamper::WideZ2 {
+				// wide side claims a DIFFERENT z2 than the narrow side computed and pushed.
+				parts.z2 = big_to_bits::<WH>(&(bits_to_big(&parts.z2) ^ num_bigint::BigUint::from(1u8)));
+			}
+			let product_bits = {
+				let tw = witness.init_table(wide_tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				kw.populate(&mut seg, 0, &parts).unwrap()
+			};
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let ok = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).is_ok();
+			(ok, bits_to_big(&product_bits))
+		};
+
+		for trial in 0..3 {
+			let av = rand_below(&mut rng, n);
+			let bv = rand_below(&mut rng, n);
+			let (ok, prod) = build(&av, &bv, Tamper::None);
+			assert!(ok, "trial {trial}: honest cross-width Karatsuba witness must validate");
+			assert_eq!(prod, &av * &bv, "trial {trial}: cross-width Karatsuba product != a·b");
+		}
+		let av = rand_below(&mut rng, n);
+		let bv = rand_below(&mut rng, n);
+		let (ok, _) = build(&av, &bv, Tamper::NarrowZ1);
+		assert!(!ok, "forged narrow z1 must be REJECTED by the additive identity");
+		let (ok, _) = build(&av, &bv, Tamper::WideZ2);
+		assert!(!ok, "wide z2 disagreeing with the pushed narrow z2 must be REJECTED by the seam");
+
+		println!(
+			"W2b GATE cross-width karatsuba: sub-products in a WH={WH} table + assembly in a W={W} \
+			 table (n={n}), joined by a (a,b,z0,z1,z2) B64 channel seam — honest witness validates and \
+			 equals a·b over 3 trials; a forged narrow z1 is rejected by the identity, and a wide z2 \
+			 that disagrees with the pushed narrow z2 is rejected by the seam."
+		);
+	}
+
+	/// W5 STOP-EARLY GATE — does the cross-width Karatsuba multiply actually beat the schoolbook
+	/// one at RSA width? Compares MULTIPLY-ONLY (`RawMul<W>` vs `KaratsubaNarrow<W/2>` +
+	/// `KaratsubaWide<W,W/2>`) because the mod-reduction that follows is IDENTICAL in both, so
+	/// the multiply-only delta IS the absolute saving a full `KaratsubaModMul` would inherit —
+	/// and it is far cheaper to measure than building the reduction first. Reported alongside the
+	/// share of `ModMul` the multiply represents, so the headline "% off ModMul" is not overstated.
+	///
+	/// Predicted area ratio 0.75 (3 half-length multiplies at half column width = 21·(n/2)·(W/2)
+	/// vs 7·n·W); prove time can beat that because the measured FRI exponent in width is ~1.74.
+	/// Run: `cargo test --release --lib --features parallel karatsuba_cross_width_gate -- --ignored --nocapture`
+	#[test]
+	#[ignore = "W5 gate: prove-time of cross-width Karatsuba vs schoolbook multiply at W=2048/4096"]
+	fn karatsuba_cross_width_gate() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		fn prove_cs(
+			cs: &ConstraintSystem<OurB256>,
+			statement: &Statement<OurB256>,
+			witness: WitnessIndex<OurB256>,
+		) -> u128 {
+			let ccs = cs.compile(statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).unwrap();
+			let t = Instant::now();
+			let _proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &[], witness, &binius_hal::make_portable_backend())
+			.unwrap();
+			t.elapsed().as_millis()
+		}
+
+		// schoolbook: one W-wide table holding a, b and a RawMul<W>.
+		fn school<const W: usize>(n: usize, av: &BigUint, bv: &BigUint) -> u128 {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let (tid, a, b, rm) = {
+				let mut t = cs.add_table("schoolbook-mul");
+				let a = t.add_committed::<B1, W>("a");
+				let b = t.add_committed::<B1, W>("b");
+				let rm = RawMul::<W>::build(&mut t, "rm", n, a, b);
+				(t.id(), a, b, rm)
+			};
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let ab = big_to_bits::<W>(av);
+				let bb = big_to_bits::<W>(bv);
+				write_col::<W>(&mut seg, a, 0, &ab).unwrap();
+				write_col::<W>(&mut seg, b, 0, &bb).unwrap();
+				rm.populate(&mut seg, 0, &ab, &bb).unwrap();
+			}
+			prove_cs(&cs, &statement, witness)
+		}
+
+		// cross-width Karatsuba: sub-products in a WH table, assembly in a W table.
+		fn karat<const W: usize, const WH: usize>(n: usize, av: &BigUint, bv: &BigUint) -> u128 {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("karat_seam");
+			let narrow = KaratsubaNarrow::<WH>::build(&mut cs, "kn", n, chan);
+			let (wide_tid, kw) = {
+				let mut t = cs.add_table("karatsuba-wide");
+				let kw = KaratsubaWide::<W, WH>::build(&mut t, "kw", n, chan);
+				(t.id(), kw)
+			};
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1, 1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let parts = {
+				let tw = witness.init_table(narrow.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				narrow
+					.populate(&mut seg, 0, &big_to_bits::<WH>(av), &big_to_bits::<WH>(bv))
+					.unwrap()
+			};
+			{
+				let tw = witness.init_table(wide_tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				kw.populate(&mut seg, 0, &parts).unwrap();
+			}
+			prove_cs(&cs, &statement, witness)
+		}
+
+		let mut rng = StdRng::seed_from_u64(0x5A5A);
+		let mut row = |label: &str, n: usize, s: u128, k: u128| {
+			let pct = 100.0 * (1.0 - k as f64 / s as f64);
+			println!("  {label:>18}  n={n:<5}  schoolbook {s:>7} ms   karatsuba {k:>7} ms   {pct:>6.1}% off multiply");
+			pct
+		};
+
+		let (a1, b1) = (rand_below(&mut rng, 1020), rand_below(&mut rng, 1020));
+		let s2048 = school::<2048>(1020, &a1, &b1);
+		let k2048 = karat::<2048, 1024>(1020, &a1, &b1);
+
+		let (a2, b2) = (rand_below(&mut rng, 2044), rand_below(&mut rng, 2044));
+		let s4096 = school::<4096>(2044, &a2, &b2);
+		let k4096 = karat::<4096, 2048>(2044, &a2, &b2);
+
+		println!("\n  W5 GATE — cross-width Karatsuba vs schoolbook, MULTIPLY ONLY (L1, B256):");
+		let p2048 = row("W=2048/WH=1024", 1020, s2048, k2048);
+		let p4096 = row("W=4096/WH=2048", 2044, s4096, k4096);
+		println!(
+			"\n  Predicted area ratio is 0.75 (=25% off the multiply). The multiply is ~7n of the\n\
+			 \x20 ~9n column-groups in ModMul (the q·m+r reduction is the rest and is UNCHANGED), so a\n\
+			 \x20 {p4096:.1}% cut on the multiply is worth ~{:.1}% off a full ModMul<4096> — against the\n\
+			 \x20 measured 117 s schoolbook ModMul<4096> baseline that is ~{:.0} s saved.\n\
+			 \x20 W=2048 cross-check: {p2048:.1}% off multiply.\n\
+			 \x20 VERDICT: {}",
+			p4096 * 7.0 / 9.0,
+			117.0 * p4096 * 7.0 / 900.0,
+			if p4096 > 15.0 {
+				"WIN — proceed to W3 (feed this product through the ModMul reduction) and W4 (soundness suite)"
+			} else {
+				"NOT WORTH IT — the cross-width split does not pay for its complexity; STOP here"
+			},
 		);
 	}
 
