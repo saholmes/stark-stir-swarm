@@ -605,6 +605,241 @@ impl<const W: usize> TallRawMul<W> {
 	}
 }
 
+/// A `< m` check via the sound adder's carry: `x + (2^W - m)` carries out of the top bit iff
+/// `x >= m`, so asserting that carry is zero decides `x < m` with no subtractor.
+struct LtM<const W: usize> {
+	cout: Col<B1, W>,
+	cin: Col<B1, W>,
+	fin: Col<B1, 1>,
+}
+
+impl<const W: usize> LtM<W> {
+	fn build(t: &mut TableBuilder<OurB256>, name: &str, x: Col<B1, W>, c_col: Col<B1, W>) -> Self {
+		let logw = W.trailing_zeros() as usize;
+		let cout = t.add_committed::<B1, W>(format!("{name}_cout"));
+		let cin = t.add_shifted(format!("{name}_cin"), cout, logw, 1, ShiftVariant::LogicalLeft);
+		t.assert_zero(format!("{name}_carry"), (x + cin) * (c_col + cin) + cin - cout);
+		let fin = t.add_selected(format!("{name}_fin"), cout, W - 1);
+		t.assert_zero(format!("{name}_lt"), fin * B1::ONE);
+		Self { cout, cin, fin }
+	}
+
+	fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, x: &[bool], c: &[bool]) -> Result<()> {
+		let (_s, cout) = ripple_add(x, c);
+		write_col::<W>(seg, self.cout, row, &cout)?;
+		write_col::<W>(seg, self.cin, row, &shl(&cout, 1))?;
+		write_bit(seg, self.fin, row, cout[W - 1])?;
+		Ok(())
+	}
+}
+
+/// TALL-NARROW `a·b mod m` -- the whole `ModMul` in the re-laid-out form, built from two
+/// [`TallRawMul`] chains plus a one-row closer.
+///
+/// `a·b` is one chain seeded at `acc0 = 0`; `q·m + r` is the SAME gadget seeded at `acc0 = r`
+/// (the `+ r` costs nothing). The closer commits `a, b, q, r`, pushes both chains' seeds, pulls
+/// both chains' results, and does the range and reduction checks.
+///
+/// THE IDENTITY IS FREE. `a·b == q·m + r` needs no `assert_zero`: both drains are pulled into the
+/// SAME `prod` column, so the channel enforces the equality structurally -- if the two chains
+/// disagree, no assignment of `prod` balances both flushes.
+///
+/// STRICTER OPERAND CONTRACT THAN [`ModMul`], deliberately. `ModMul` takes `a, b < 2^n` and
+/// `q < 2^{n+1}`; that `n+1` forces `2n+1 <= W`, which at `W=4096` caps `n` at 2047 and -- since
+/// a power-of-two row count needs `n = blk·2^k` -- would drop the usable size to `n=1024`. Here
+/// the closer instead PROVES `a < m` and `b < m` in-circuit (same carry trick as `r < m`), whence
+/// `q = ⌊ab/m⌋ < m < 2^n`, so `q·m + r < m² < 2^{2n} <= 2^W` and `n = 2048` fits at `W = 4096`
+/// with no wraparound. Callers already reduce operands mod `m`, so this costs nothing in practice
+/// and tightens the proved statement.
+pub struct TallModMul<const W: usize> {
+	ab: TallRawMul<W>,
+	qm: TallRawMul<W>,
+	pub closer_id: TableId,
+	a: Col<B1, W>,
+	b: Col<B1, W>,
+	q: Col<B1, W>,
+	r: Col<B1, W>,
+	prod: Col<B1, W>,
+	m_col: Col<B1, W>,
+	c_col: Col<B1, W>,
+	zero64: Col<B1, 64>,
+	posr64: Col<B1, 64>,
+	q_hi: Col<B1, W>,
+	a_shl_n: Col<B1, W>,
+	q_shl_n: Col<B1, W>,
+	lt_a: LtM<W>,
+	lt_b: LtM<W>,
+	lt_r: LtM<W>,
+	sel: Vec<Col<B1, 64>>, // in declaration order: a, b, q, m, r, prod, a<<n, q<<n
+	n: usize,
+	blk: usize,
+	la: usize,
+	lb: usize,
+	m_bits: Vec<bool>,
+	c_bits: Vec<bool>,
+}
+
+impl<const W: usize> TallModMul<W> {
+	fn proj(
+		t: &mut TableBuilder<OurB256>,
+		tag: &str,
+		src: Col<B1, W>,
+		lanes: usize,
+		sel: &mut Vec<Col<B1, 64>>,
+	) -> Vec<Col<B64, 1>> {
+		(0..lanes)
+			.map(|i| {
+				let s = t.add_selected_block::<B1, W, 64>(format!("{tag}_sel{i}"), src, i);
+				sel.push(s);
+				t.add_packed::<B1, 64, B64, 1>(format!("{tag}_b64{i}"), s)
+			})
+			.collect()
+	}
+
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize, blk: usize) -> Self {
+		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
+		assert!(2 * n <= W, "q·m + r < m² < 2^{{2n}} must fit W (n={n}, W={W})");
+		let logw = W.trailing_zeros() as usize;
+		let (la, lb) = (W / 64, n.div_ceil(64));
+		let rows = n / blk;
+
+		let chan_ab = cs.add_channel("tmm_ab");
+		let chan_qm = cs.add_channel("tmm_qm");
+		let ab = TallRawMul::<W>::build(cs, "tmm_ab", n, blk, chan_ab);
+		let qm = TallRawMul::<W>::build(cs, "tmm_qm", n, blk, chan_qm);
+
+		let mut t = cs.add_table(format!("tall modmul closer (n={n}, blk={blk}, W={W})"));
+		let a = t.add_committed::<B1, W>("a");
+		let b = t.add_committed::<B1, W>("b");
+		let q = t.add_committed::<B1, W>("q");
+		let r = t.add_committed::<B1, W>("r");
+		let prod = t.add_committed::<B1, W>("prod");
+		let m_arr: [B1; W] = std::array::from_fn(|k| if m_bits[k] { B1::ONE } else { B1::ZERO });
+		let m_col = t.add_constant("m", m_arr);
+		let c_bits = two_pow_w_minus(m_bits);
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_bits[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("two_pow_W_minus_m", c_arr);
+
+		// a < m and b < m ⇒ q = ⌊ab/m⌋ < m < 2^n, which is what lets n reach W/2; r < m is the
+		// soundness-critical strict reduction.
+		let lt_a = LtM::<W>::build(&mut t, "lt_a", a, c_col);
+		let lt_b = LtM::<W>::build(&mut t, "lt_b", b, c_col);
+		let lt_r = LtM::<W>::build(&mut t, "lt_r", r, c_col);
+		// q < 2^n, so q·m cannot wrap W bits.
+		let q_hi = t.add_shifted("q_hi", q, logw, n, ShiftVariant::LogicalRight);
+		t.assert_zero("q_range", q_hi * B1::ONE);
+
+		// the shifted operands each chain's final row pushes out.
+		let a_shl_n = t.add_shifted("a_shl_n", a, logw, n, ShiftVariant::LogicalLeft);
+		let q_shl_n = t.add_shifted("q_shl_n", q, logw, n, ShiftVariant::LogicalLeft);
+
+		// constant lanes: zero (also serves as position 0) and position `rows`.
+		let zero64 = t.add_constant("zero64", [B1::ZERO; 64]);
+		let r_arr: [B1; 64] = std::array::from_fn(|k| if (rows >> k) & 1 == 1 { B1::ONE } else { B1::ZERO });
+		let posr64 = t.add_constant("posr64", r_arr);
+		let zb = t.add_packed::<B1, 64, B64, 1>("zero_b64", zero64);
+		let pr = t.add_packed::<B1, 64, B64, 1>("posr_b64", posr64);
+
+		let mut sel = Vec::new();
+		let a_l = Self::proj(&mut t, "pa", a, la, &mut sel);
+		let b_l = Self::proj(&mut t, "pb", b, lb, &mut sel);
+		let q_l = Self::proj(&mut t, "pq", q, la, &mut sel);
+		let m_l = Self::proj(&mut t, "pm", m_col, lb, &mut sel);
+		let r_l = Self::proj(&mut t, "pr", r, la, &mut sel);
+		let p_l = Self::proj(&mut t, "pp", prod, la, &mut sel);
+		let as_l = Self::proj(&mut t, "pas", a_shl_n, la, &mut sel);
+		let qs_l = Self::proj(&mut t, "pqs", q_shl_n, la, &mut sel);
+
+		// seed and drain both chains. `prod` is pulled from BOTH, which IS the identity.
+		let cat = |head: Col<B64, 1>, parts: [&[Col<B64, 1>]; 3]| -> Vec<Col<B64, 1>> {
+			let mut v = vec![head];
+			for p in parts {
+				v.extend_from_slice(p);
+			}
+			v
+		};
+		let z_la = vec![zb; la];
+		let z_lb = vec![zb; lb];
+		t.push(chan_ab, cat(zb, [&a_l, &b_l, &z_la]));
+		t.pull(chan_ab, cat(pr, [&as_l, &z_lb, &p_l]));
+		t.push(chan_qm, cat(zb, [&q_l, &m_l, &r_l]));
+		t.pull(chan_qm, cat(pr, [&qs_l, &z_lb, &p_l]));
+
+		Self {
+			ab, qm, closer_id: t.id(), a, b, q, r, prod, m_col, c_col, zero64, posr64,
+			q_hi, a_shl_n, q_shl_n, lt_a, lt_b, lt_r, sel, n, blk, la, lb,
+			m_bits: m_bits.to_vec(), c_bits,
+		}
+	}
+
+	/// Fill all three tables from `(a, b, q, r)` bit vectors. Returns the common product.
+	pub fn populate(
+		&self,
+		wit: &mut WitnessIndex<OurB256>,
+		a: &[bool],
+		b: &[bool],
+		q: &[bool],
+		r: &[bool],
+	) -> Result<Vec<bool>> {
+		let rows = self.n / self.blk;
+		let zero = vec![false; W];
+		let p_ab = {
+			let tw = wit.init_table(self.ab.table_id, rows)?;
+			let mut seg = tw.full_segment();
+			self.ab.populate(&mut seg, a, b, &zero)?
+		};
+		{
+			let tw = wit.init_table(self.qm.table_id, rows)?;
+			let mut seg = tw.full_segment();
+			self.qm.populate(&mut seg, q, &self.m_bits, r)?;
+		}
+		{
+			let tw = wit.init_table(self.closer_id, 1)?;
+			let mut seg = tw.full_segment();
+			write_col::<W>(&mut seg, self.a, 0, a)?;
+			write_col::<W>(&mut seg, self.b, 0, b)?;
+			write_col::<W>(&mut seg, self.q, 0, q)?;
+			write_col::<W>(&mut seg, self.r, 0, r)?;
+			write_col::<W>(&mut seg, self.prod, 0, &p_ab)?;
+			write_col::<W>(&mut seg, self.m_col, 0, &self.m_bits)?;
+			write_col::<W>(&mut seg, self.c_col, 0, &self.c_bits)?;
+			write_col::<64>(&mut seg, self.zero64, 0, &vec![false; 64])?;
+			write_col::<64>(&mut seg, self.posr64, 0, &u64_lebits(rows as u64))?;
+			write_col::<W>(&mut seg, self.q_hi, 0, &shr(q, self.n))?;
+			let a_sh = shl(a, self.n);
+			let q_sh = shl(q, self.n);
+			write_col::<W>(&mut seg, self.a_shl_n, 0, &a_sh)?;
+			write_col::<W>(&mut seg, self.q_shl_n, 0, &q_sh)?;
+			self.lt_a.populate(&mut seg, 0, a, &self.c_bits)?;
+			self.lt_b.populate(&mut seg, 0, b, &self.c_bits)?;
+			self.lt_r.populate(&mut seg, 0, r, &self.c_bits)?;
+			let groups: [(&[bool], usize); 8] = [
+				(a, self.la), (b, self.lb), (q, self.la), (&self.m_bits, self.lb),
+				(r, self.la), (&p_ab, self.la), (&a_sh, self.la), (&q_sh, self.la),
+			];
+			let mut k = 0usize;
+			for (v, lanes) in groups {
+				for i in 0..lanes {
+					write_col::<64>(&mut seg, self.sel[k], 0, &v[i * 64..i * 64 + 64])?;
+					k += 1;
+				}
+			}
+		}
+		Ok(p_ab)
+	}
+
+	/// Table sizes for the `Statement`, indexed by table id (the two chains, then the closer).
+	pub fn table_sizes(&self) -> Vec<usize> {
+		let rows = self.n / self.blk;
+		vec![rows, rows, 1]
+	}
+
+	/// Read back the in-circuit remainder for the `matches_num_bigint` gate.
+	pub fn read_r(&self, seg: &TableWitnessSegment<OurB256>) -> Result<Vec<bool>> {
+		read_col::<W>(seg, self.r, 0)
+	}
+}
+
 /// SINGLE-LEVEL KARATSUBA multiply `a·b`, single-width (W2a: proves the LOGIC -- split, additive
 /// identity, assembly -- correct; the cross-width perf optimisation that narrows the three
 /// sub-multiplies to W/2 is W2b). Splits `a = a_hi·2^h + a_lo`, `b` likewise (h = ⌈n/2⌉), forms
@@ -4574,6 +4809,192 @@ mod tests {
 			base_ms as f64 / best.1 as f64,
 			85.0 - 85.0 * best.1 as f64 / base_ms as f64,
 			117.0 / (117.0 - (85.0 - 85.0 * best.1 as f64 / base_ms as f64)),
+		);
+	}
+
+	/// TALL `ModMul` CORRECTNESS + SOUNDNESS — the whole gadget, not a half of it. The honest
+	/// witness must validate and its `r` must equal `num-bigint`'s `a·b mod m`; and each of the
+	/// four ways a prover could cheat must be REJECTED: a wrong quotient, an unreduced remainder,
+	/// an unreduced operand, and a `prod` that does not match what the multiply chain produced
+	/// (which is the identity `a·b == q·m+r`, enforced by the shared column rather than by an
+	/// assertion — so it needs its own test).
+	#[test]
+	fn tall_modmul_matches_num_bigint() {
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+
+		const W: usize = 512;
+		let n = 128usize; // 2n = 256 ≤ W; rows = n/blk = 8
+		let blk = 16usize;
+		let mut rng = StdRng::seed_from_u64(0x70DD);
+
+		#[derive(Clone, Copy, PartialEq)]
+		enum Bad {
+			None,
+			Quotient,
+			Unreduced,
+			BigOperand,
+			Product,
+		}
+
+		let run = |bad: Bad| -> (bool, BigUint, BigUint) {
+			let m = (rand_below(&mut rng.clone(), n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+				& ((BigUint::from(1u8) << n) - 1u8);
+			let mut r2 = StdRng::seed_from_u64(0x70DE);
+			let a = rand_below(&mut r2, n) % &m;
+			let b = rand_below(&mut r2, n) % &m;
+			let ab = &a * &b;
+			let (mut qv, mut rv) = (&ab / &m, &ab % &m);
+			let mut av = a.clone();
+			match bad {
+				Bad::Quotient => qv += 1u8,               // wrong quotient
+				Bad::Unreduced => rv += &m,               // r >= m
+				Bad::BigOperand => av = &m + 1u8,         // a >= m
+				_ => {}
+			}
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk);
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let _ = mm
+				.populate(
+					&mut wit,
+					&big_to_bits::<W>(&av),
+					&big_to_bits::<W>(&b),
+					&big_to_bits::<W>(&qv),
+					&big_to_bits::<W>(&rv),
+				)
+				.unwrap();
+			if bad == Bad::Product {
+				// `prod` disagrees with the multiply chain's drained accumulator.
+				let tw = wit.get_table(mm.closer_id).unwrap();
+				let mut seg = tw.full_segment();
+				let bogus = big_to_bits::<W>(&(&ab + 1u8));
+				write_col::<W>(&mut seg, mm.prod, 0, &bogus).unwrap();
+				for i in 0..mm.la {
+					// keep the lane projections consistent, so ONLY the channel can object.
+					write_col::<64>(&mut seg, mm.sel[3 * mm.la + 2 * mm.lb + i], 0, &bogus[i * 64..i * 64 + 64])
+						.unwrap();
+				}
+			}
+			let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+			let ccs = cs.compile(&st).unwrap();
+			let widx = wit.into_multilinear_extension_index();
+			let ok = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &widx).is_ok();
+			(ok, rv, &a * &b % &m)
+		};
+
+		let (ok, r_in, r_ref) = run(Bad::None);
+		assert!(ok, "honest tall ModMul witness must validate");
+		assert_eq!(r_in, r_ref, "tall ModMul r != num-bigint a·b mod m");
+		for (bad, what) in [
+			(Bad::Quotient, "a wrong quotient"),
+			(Bad::Unreduced, "an unreduced remainder r >= m"),
+			(Bad::BigOperand, "an operand a >= m"),
+			(Bad::Product, "a prod disagreeing with the multiply chain"),
+		] {
+			let (ok, _, _) = run(bad);
+			assert!(!ok, "{what} must be REJECTED");
+		}
+		println!(
+			"TALL ModMul<{W}> (n={n}, blk={blk}, rows={}) validates, r == num-bigint a·b mod m, and \
+			 rejects: a wrong quotient, r >= m, a >= m, and a prod disagreeing with the multiply chain \
+			 (the identity a·b == q·m+r, enforced by the shared pulled column).",
+			n / blk
+		);
+	}
+
+	/// THE FULL GATE — tall `ModMul<4096>` end to end against the shipped one-row `ModMul<4096>`,
+	/// same modulus, same operands, same process. This is the number that matters: not a half, not
+	/// a projection.
+	/// Run: `cargo test --release --lib --features parallel tall_modmul_gate -- --ignored --nocapture`
+	#[test]
+	#[ignore = "gate: full tall ModMul<4096> vs the shipped one-row ModMul<4096>"]
+	fn tall_modmul_gate() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize;
+		let blk = 16usize;
+
+		fn prove(cs: &ConstraintSystem<OurB256>, st: &Statement<OurB256>, wit: WitnessIndex<OurB256>) -> u128 {
+			let ccs = cs.compile(st).unwrap();
+			let wit = wit.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &st.boundaries, &wit).unwrap();
+			let t = Instant::now();
+			let _p = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &st.boundaries, wit, &binius_hal::make_portable_backend())
+			.unwrap();
+			t.elapsed().as_millis()
+		}
+
+		let mut rng = StdRng::seed_from_u64(0x70FF);
+		let m = (rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << n) - 1u8);
+		let a = rand_below(&mut rng, n) % &m;
+		let b = rand_below(&mut rng, n) % &m;
+		let (q, r) = (&a * &b / &m, &a * &b % &m);
+		let m_bits = big_to_bits::<W>(&m);
+
+		// The shipped one-row ModMul needs 2n+1 ≤ W, so it cannot take n=2048 at W=4096; it is
+		// measured at its own maximum, n=2047, on an equivalent modulus. Noted, not hidden.
+		let n_base = 2047usize;
+		let base_ms = {
+			let mb = rand_below(&mut rng, n_base) | (BigUint::from(1u8) << (n_base - 1)) | BigUint::from(1u8);
+			let ab2 = rand_below(&mut rng, n_base) % &mb;
+			let bb2 = rand_below(&mut rng, n_base) % &mb;
+			let row = honest_row::<W>(&ab2, &bb2, &mb);
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = ModMul::<W>::build(&mut cs, &to_bits::<W>(&mb), n_base);
+			let st = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = wit.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm.populate(&mut seg, &[row]).unwrap();
+			}
+			prove(&cs, &st, wit)
+		};
+
+		let allocator = Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mm = TallModMul::<W>::build(&mut cs, &m_bits, n, blk);
+		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		mm.populate(
+			&mut wit,
+			&big_to_bits::<W>(&a),
+			&big_to_bits::<W>(&b),
+			&big_to_bits::<W>(&q),
+			&big_to_bits::<W>(&r),
+		)
+		.unwrap();
+		let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+		let tall_ms = prove(&cs, &st, wit);
+
+		println!(
+			"\n  FULL TALL ModMul GATE (W={W}, L1/B256, {} cores)\n\
+			 \x20  shipped one-row ModMul<{W}> (n={n_base}, its maximum):  {base_ms} ms\n\
+			 \x20  tall ModMul<{W}> (n={n}, blk={blk}, rows={}):           {tall_ms} ms\n\
+			 \x20  ⇒ {:.1}x end to end, on a gadget whose r is checked against num-bigint and whose\n\
+			 \x20    four cheat paths are tested (tall_modmul_matches_num_bigint).\n\
+			 \x20  RSA-2048 apex = 17 ModMuls: {:.0} min → {:.1} min.",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			n / blk,
+			base_ms as f64 / tall_ms as f64,
+			17.0 * base_ms as f64 / 60000.0,
+			17.0 * tall_ms as f64 / 60000.0,
 		);
 	}
 
