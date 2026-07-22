@@ -4019,6 +4019,161 @@ mod tests {
 		);
 	}
 
+	/// COST-MODEL CALIBRATION — the parameter that decides every remaining ModMul optimisation.
+	///
+	/// The Karatsuba post-mortem fitted `cost = α·C + β·C·W` (C = columns, W = column width) from
+	/// only TWO points and concluded α ≈ β·W, i.e. ~half of prover cost is a PER-COLUMN charge that
+	/// narrowing columns cannot touch. Every remaining lever is priced by α: a tall-narrow re-layout
+	/// (move bits from columns into rows at constant total bits) is worth exactly the α·C term, and
+	/// radix-2^k windowing is worth `Δ C` times whatever the true per-column slope is. So measure α
+	/// directly instead of inferring it a third time.
+	///
+	/// The unit is a chain of `Adder<W>` gadgets — not a synthetic filler, but literally the inner
+	/// loop that dominates `ModMul` (3 columns and 2 constraints per adder), so the calibration is
+	/// taken on the same shape as the thing being optimised.
+	///
+	/// Three sweeps:
+	///   S1 SHAPE at FIXED TOTAL BITS (`k·rows` const): the whole point. If cost is purely per-bit
+	///      every row is equal; any decrease as columns move into rows IS the α·C term, and bounds
+	///      what a tall-narrow `ModMul` rewrite can win.
+	///   S2 SCALING IN COLUMN COUNT at rows=1: is prove LINEAR or SUPER-linear in C? (`validate` is
+	///      ~O(C²); if prove is too, cutting columns wins more than proportionally.)
+	///   S3 THE KARATSUBA TRADE IN PURE FORM: 2× the columns at half the width, same total bits —
+	///      an independent check of the α ≈ β·W fit, with no Karatsuba-specific logic involved.
+	///
+	/// Peak RSS is deliberately NOT reported: getrusage is process-monotonic, so a multi-config
+	/// single-process run can only produce a cumulative high-water mark, not a per-config figure.
+	/// Run: `cargo test --release --lib --features parallel modmul_cost_model_calibration -- --ignored --nocapture`
+	#[test]
+	#[ignore = "cost-model calibration: prove time vs column count / rows / width at fixed total bits"]
+	fn modmul_cost_model_calibration() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		/// A `k`-long chain of `Adder<W>` over `rows` rows: `1 + 3k` columns, `2k` constraints.
+		/// Returns (prove_ms, columns). Operands are `W/2`-bit so the accumulator cannot overflow.
+		fn chain<const W: usize>(k: usize, rows: usize, seed: u64) -> (u128, usize) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let (tid, x, adders) = {
+				let mut t = cs.add_table(format!("calib k={k} rows={rows} W={W}"));
+				let x = t.add_committed::<B1, W>("x");
+				let mut acc = x;
+				let mut adders = Vec::with_capacity(k);
+				for i in 0..k {
+					let ad = Adder::<W>::build(&mut t, acc, x, &format!("ad{i}"));
+					acc = ad.sum;
+					adders.push(ad);
+				}
+				(t.id(), x, adders)
+			};
+			let statement = Statement { boundaries: vec![], table_sizes: vec![rows] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(tid, rows).unwrap();
+				let mut seg = tw.full_segment();
+				let mut rng = StdRng::seed_from_u64(seed);
+				for row in 0..rows {
+					// operand < 2^{W/2} ⇒ (k+1)·x still fits W bits for any k ≤ 2^{W/2}.
+					let xb = big_to_bits::<W>(&rand_below(&mut rng, W / 2));
+					write_col::<W>(&mut seg, x, row, &xb).unwrap();
+					let mut acc = xb.clone();
+					for ad in &adders {
+						acc = ad.populate(&mut seg, row, &acc, &xb).unwrap();
+					}
+				}
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let t0 = Instant::now();
+			let _proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &[], witness, &binius_hal::make_portable_backend())
+			.unwrap();
+			(t0.elapsed().as_millis(), 1 + 3 * k)
+		}
+
+		let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+		println!(
+			"\n  MODMUL COST-MODEL CALIBRATION (L1, B256, `parallel` on, {threads} logical cores;\n\
+			 \x20 set RAYON_NUM_THREADS to pin). Unit = Adder<W> chain: 1+3k columns, 2k constraints."
+		);
+
+		// ---- S1: shape at FIXED total bits (k·rows = 768 ⇒ every config commits the same bits).
+		println!("\n  S1  SHAPE AT FIXED TOTAL BITS  (W=4096, k·rows=768 ⇒ identical committed bits)");
+		println!("       rows      k   columns   prove ms   vs widest");
+		let s1: Vec<(usize, usize, u128, usize)> = [(1usize, 768usize), (4, 192), (16, 48), (64, 12)]
+			.iter()
+			.map(|&(rows, k)| {
+				let (ms, cols) = chain::<4096>(k, rows, 0xC0 + rows as u64);
+				(rows, k, ms, cols)
+			})
+			.collect();
+		let widest = s1[0].2 as f64;
+		for &(rows, k, ms, cols) in &s1 {
+			println!("      {rows:>5}  {k:>5}   {cols:>7}   {ms:>8}   {:>6.2}x", ms as f64 / widest);
+		}
+		// Least squares for t = α·C + I over the four points; at fixed total bits I ≈ β·(total bits).
+		let n = s1.len() as f64;
+		let (sx, sy): (f64, f64) = s1.iter().fold((0.0, 0.0), |(a, b), &(_, _, ms, c)| (a + c as f64, b + ms as f64));
+		let (mx, my) = (sx / n, sy / n);
+		let (mut num, mut den) = (0.0f64, 0.0f64);
+		for &(_, _, ms, c) in &s1 {
+			num += (c as f64 - mx) * (ms as f64 - my);
+			den += (c as f64 - mx).powi(2);
+		}
+		let alpha = num / den; // ms per column
+		let intercept = my - alpha * mx; // ms attributable to the (constant) bit volume
+		let widest_cols = s1[0].3 as f64;
+		let per_col_share = 100.0 * alpha * widest_cols / widest;
+		println!(
+			"    fit t = α·C + I over S1:  α = {alpha:.4} ms/column,  I = {intercept:.0} ms\n\
+			 \x20   ⇒ at the one-row shape ({} cols) the PER-COLUMN term is {per_col_share:.0}% of prove time.\n\
+			 \x20   That is the ceiling on what a tall-narrow ModMul re-layout can remove.",
+			s1[0].3
+		);
+
+		// ---- S2: scaling in column count at rows=1 — linear, or super-linear like validate?
+		println!("\n  S2  SCALING IN COLUMN COUNT  (W=4096, rows=1)");
+		println!("           k   columns   prove ms   ratio vs prev   exponent");
+		let mut prev: Option<(f64, f64)> = None;
+		for k in [192usize, 384, 768] {
+			let (ms, cols) = chain::<4096>(k, 1, 0xD0 + k as u64);
+			let (r, e) = match prev {
+				Some((pc, pm)) => (ms as f64 / pm, (ms as f64 / pm).log2() / (cols as f64 / pc).log2()),
+				None => (f64::NAN, f64::NAN),
+			};
+			if prev.is_none() {
+				println!("      {k:>6}   {cols:>7}   {ms:>8}        --            --");
+			} else {
+				println!("      {k:>6}   {cols:>7}   {ms:>8}      {r:>5.2}x        {e:>5.2}");
+			}
+			prev = Some((cols as f64, ms as f64));
+		}
+		println!("    exponent ≈ 1 ⇒ prove is LINEAR in columns (cutting C by x% saves x%);");
+		println!("    exponent > 1 ⇒ super-linear, and radix windowing wins MORE than proportionally.");
+
+		// ---- S3: the Karatsuba trade in pure form — 2x columns at half width, same total bits.
+		println!("\n  S3  WIDTH-FOR-COUNT TRADE AT FIXED TOTAL BITS  (independent check of α ≈ β·W)");
+		let (t_wide, c_wide) = chain::<4096>(384, 1, 0xE1);
+		let (t_narrow, c_narrow) = chain::<2048>(768, 1, 0xE2);
+		println!("      W=4096  k=384  {c_wide:>6} cols   {t_wide:>8} ms");
+		println!("      W=2048  k=768  {c_narrow:>6} cols   {t_narrow:>8} ms   {:.2}x", t_narrow as f64 / t_wide as f64);
+		println!(
+			"    Karatsuba's trade in isolation. >1.00x reproduces the W2b loss with NO Karatsuba\n\
+			 \x20   logic involved, confirming the cause is the column/width trade itself."
+		);
+	}
+
 	/// W5 STOP-EARLY GATE — does the cross-width Karatsuba multiply actually beat the schoolbook
 	/// one at RSA width? Compares MULTIPLY-ONLY (`RawMul<W>` vs `KaratsubaNarrow<W/2>` +
 	/// `KaratsubaWide<W,W/2>`) because the mod-reduction that follows is IDENTICAL in both, so
