@@ -3290,6 +3290,88 @@ mod tests {
 	/// range check is a virtual `add_shifted`+`assert_zero` (`a_hi`/`b_hi`/`q_hi`, NOT committed);
 	/// only the `r<m` reduction check commits columns. This test prints the committed-column
 	/// breakdown so the paper can state the Binius LogUp ceiling from a real measurement.
+	/// KARATSUBA PROBE — the decisive unknown before building a Karatsuba ModMul: is proving 3
+	/// HALF-width (W=512) ModMuls cheaper than 1 FULL-width (W=1024) ModMul? Karatsuba turns one
+	/// n-bit multiply into 3 (n/2)-bit sub-multiplies plus an O(W) combination; the win requires
+	/// 3·(half-mult prove) + combination < full-mult prove. This measures the ModMul FRI-prove
+	/// cost at both widths directly (correct existing gadget, no new unproven Karatsuba code) so
+	/// the go/no-go is a measured number, not an estimate.
+	///
+	/// Caveat: the half-width ModMul here INCLUDES its mod-reduction, whereas real Karatsuba
+	/// sub-multiplies are RAW products (reduction happens once at the end) -- so 3× this is a
+	/// CONSERVATIVE (pessimistic) upper bound; a real win here means Karatsuba wins by more.
+	/// Run: `cargo test --release --lib karatsuba_modmul_cost_probe -- --ignored --nocapture`
+	#[test]
+	#[ignore = "Karatsuba probe: 3× half-width (W=512) ModMul prove vs 1× full (W=1024)"]
+	fn karatsuba_modmul_cost_probe() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		// build+populate+PROVE one ModMul<W> for a random np-bit odd modulus; return (prove_ms, rss).
+		fn prove_one<const W: usize>(np: usize, seed: u64) -> (u128, f64) {
+			let mut rng = StdRng::seed_from_u64(seed);
+			// np-bit odd modulus (top bit set so it is exactly np bits), a,b < m.
+			let m = (rand_below(&mut rng, np) | (BigUint::from(1u8) << (np - 1)) | BigUint::from(1u8))
+				& ((BigUint::from(1u8) << np) - 1u8);
+			let a = rand_below(&mut rng, np) % &m;
+			let b = rand_below(&mut rng, np) % &m;
+			let row = honest_row::<W>(&a, &b, &m);
+			let m_bits = to_bits::<W>(&m);
+
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = ModMul::<W>::build(&mut cs, &m_bits, np);
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm.populate(&mut seg, &[row]).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).unwrap();
+			let t = Instant::now();
+			let _proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &[], witness, &binius_hal::make_portable_backend())
+			.unwrap();
+			let ms = t.elapsed().as_millis();
+			let rss = crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0);
+			(ms, rss)
+		}
+
+		let (t1024, r1024) = prove_one::<1024>(504, 0x4A5A);
+		let (t512, r512) = prove_one::<512>(252, 0x4A5B);
+		let three_half = 3 * t512;
+		let ratio = three_half as f64 / t1024 as f64;
+		println!(
+			"\n  KARATSUBA PROBE (ModMul FRI-prove, L1):\n\
+			 \x20   full  W=1024 k=504: {t1024} ms   ({r1024:.0} MiB)\n\
+			 \x20   half  W=512  k=252: {t512} ms   ({r512:.0} MiB)\n\
+			 \x20   half/full width scaling: {:.2}x (expect ~4x if O(W^2))\n\
+			 \x20   3× half = {three_half} ms   vs   1× full = {t1024} ms   →  {ratio:.2}x\n\
+			 \x20   VERDICT: {} — one Karatsuba level replaces 1 full mult with 3 half mults +\n\
+			 \x20   an O(W) combination (small vs O(W^2) mults). 3×half is a CONSERVATIVE upper\n\
+			 \x20   bound (each half here includes its reduction; raw sub-mults are cheaper).",
+			t1024 as f64 / t512 as f64,
+			if ratio < 0.95 {
+				"WIN — 3×half < full, so Karatsuba reduces prove cost; the win compounds toward W=4096"
+			} else {
+				"NO WIN at this width — combination/constant factors dominate; revisit nearer W=4096"
+			}
+		);
+	}
+
 	#[test]
 	fn measure_modmul_logup_ceiling_over_binius() {
 		const W: usize = 1024; // W >= 2n+1; the EC double-and-add round uses ModMul<1024>
