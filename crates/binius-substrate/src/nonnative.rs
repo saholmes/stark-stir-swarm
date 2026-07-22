@@ -4174,6 +4174,202 @@ mod tests {
 		);
 	}
 
+	/// S4 — PRICE THE ACCUMULATOR SEAM, the one unknown the S1 calibration does not model.
+	///
+	/// S1 showed that at fixed total bits, moving columns into rows is worth up to 21x. But S1's
+	/// rows are INDEPENDENT, and a real tall-narrow `ModMul` cannot be: its partial-product
+	/// accumulator is sequential, so row `i+1` must consume row `i`'s output. Binding that across
+	/// rows needs a channel, and a `W`-bit accumulator costs `W/64` lane projections in EACH
+	/// direction — 128 extra columns per row at `W=4096` against only ~7 columns of real work.
+	/// So the seam could plausibly eat the entire win. This measures it.
+	///
+	/// Same `(k, rows)` configurations run BOTH ways in one process on one machine, so the
+	/// difference is purely the seam:
+	///   UNLINKED — S1's shape: every row restarts the chain from its own operand.
+	///   LINKED   — each row PULLS `(pos, acc_in)` and PUSHES `(pos+1, acc_out)` on one channel,
+	///              with boundary flushes seeding `(0, acc_0)` and draining `(R, acc_R)`; the
+	///              position lane is what stops the multiset from admitting a reordering.
+	///
+	/// Because the seam is paid PER ROW while the chain work per row shrinks as rows grow, the
+	/// two costs trade off and there is an optimum blocking factor. That optimum — not the raw
+	/// 21x — is what a tall-narrow `ModMul` would actually be built at.
+	/// Run: `cargo test --release --lib --features parallel tallnarrow_seam_probe -- --ignored --nocapture`
+	#[test]
+	#[ignore = "S4: cost of threading a sequential accumulator across rows via a channel"]
+	fn tallnarrow_seam_probe() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, FlushDirection, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		const LANES: usize = W / 64;
+
+		fn lane_u64(bits: &[bool], i: usize) -> u64 {
+			(0..64).fold(0u64, |v, k| if bits[i * 64 + k] { v | (1u64 << k) } else { v })
+		}
+		fn u64_bits(x: u64) -> Vec<bool> {
+			(0..64).map(|k| (x >> k) & 1 == 1).collect()
+		}
+
+		/// `k` adders per row over `rows` rows. `linked` threads the accumulator row-to-row on a
+		/// channel (plus a position lane); otherwise each row restarts. Returns (prove_ms, columns).
+		fn run(k: usize, rows: usize, linked: bool, seed: u64) -> (u128, usize) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("acc_seam");
+			let mut n_cols = 0usize;
+
+			let mut t = cs.add_table(format!("seam k={k} rows={rows} linked={linked}"));
+			let x = t.add_committed::<B1, W>("x");
+			n_cols += 1;
+			// starting accumulator: committed and channel-bound when linked, else just `x`.
+			let acc_in = if linked {
+				n_cols += 1;
+				Some(t.add_committed::<B1, W>("acc_in"))
+			} else {
+				None
+			};
+			let mut acc = acc_in.unwrap_or(x);
+			let mut adders = Vec::with_capacity(k);
+			for i in 0..k {
+				let ad = Adder::<W>::build(&mut t, acc, x, &format!("ad{i}"));
+				acc = ad.sum;
+				adders.push(ad);
+				n_cols += 3;
+			}
+			let acc_out = acc;
+
+			// seam: pull (pos, acc_in lanes), push (pos+1, acc_out lanes).
+			let seam = linked.then(|| {
+				let pos_in = t.add_committed::<B1, 64>("pos_in");
+				let one_arr: [B1; 64] = std::array::from_fn(|k| if k == 0 { B1::ONE } else { B1::ZERO });
+				let one = t.add_constant("one", one_arr);
+				let posinc = Adder::<64>::build(&mut t, pos_in, one, "posinc");
+				n_cols += 5;
+				let mut sel_in = Vec::with_capacity(LANES);
+				let mut sel_out = Vec::with_capacity(LANES);
+				let mut pull_t = vec![t.add_packed::<B1, 64, B64, 1>("pos_in_b64", pos_in)];
+				let mut push_t = vec![t.add_packed::<B1, 64, B64, 1>("pos_out_b64", posinc.sum)];
+				for i in 0..LANES {
+					let si = t.add_selected_block::<B1, W, 64>(format!("ain_sel{i}"), acc_in.unwrap(), i);
+					let so = t.add_selected_block::<B1, W, 64>(format!("aout_sel{i}"), acc_out, i);
+					pull_t.push(t.add_packed::<B1, 64, B64, 1>(format!("ain_b64{i}"), si));
+					push_t.push(t.add_packed::<B1, 64, B64, 1>(format!("aout_b64{i}"), so));
+					sel_in.push(si);
+					sel_out.push(so);
+					n_cols += 4;
+				}
+				t.pull(chan, pull_t);
+				t.push(chan, push_t);
+				// `one` is carried out so populate can fill it per row: m3 constant columns are NOT
+				// auto-filled (ModMul::populate writes its `c_col` every row for the same reason).
+				(pos_in, one, posinc, sel_in, sel_out)
+			});
+			let tid = t.id();
+
+			// populate, recording the honest accumulator trajectory for the boundary flushes.
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let mut acc_first = vec![false; W];
+			let mut acc_last = vec![false; W];
+			{
+				let tw = witness.init_table(tid, rows).unwrap();
+				let mut seg = tw.full_segment();
+				let mut rng = StdRng::seed_from_u64(seed);
+				// operands < 2^{W/4} so (k·rows+1)·x cannot overflow W bits even when linked.
+				let mut running = big_to_bits::<W>(&rand_below(&mut rng, W / 4));
+				acc_first = running.clone();
+				for row in 0..rows {
+					let xb = big_to_bits::<W>(&rand_below(&mut rng, W / 4));
+					write_col::<W>(&mut seg, x, row, &xb).unwrap();
+					let start = if linked {
+						write_col::<W>(&mut seg, acc_in.unwrap(), row, &running).unwrap();
+						running.clone()
+					} else {
+						xb.clone()
+					};
+					let mut a = start;
+					for ad in &adders {
+						a = ad.populate(&mut seg, row, &a, &xb).unwrap();
+					}
+					if let Some((pos_in, one, posinc, sel_in, sel_out)) = &seam {
+						write_col::<64>(&mut seg, *pos_in, row, &u64_bits(row as u64)).unwrap();
+						write_col::<64>(&mut seg, *one, row, &u64_bits(1)).unwrap();
+						posinc.populate(&mut seg, row, &u64_bits(row as u64), &u64_bits(1)).unwrap();
+						for i in 0..LANES {
+							write_col::<64>(&mut seg, sel_in[i], row, &running[i * 64..i * 64 + 64]).unwrap();
+							write_col::<64>(&mut seg, sel_out[i], row, &a[i * 64..i * 64 + 64]).unwrap();
+						}
+						running = a.clone();
+					}
+					acc_last = a;
+				}
+			}
+
+			// boundary flushes close the chain: PUSH (0, acc_0) in, PULL (R, acc_R) out.
+			let bval = |v: u64| OurB256::from(B64::new(v));
+			let boundaries = if linked {
+				let mut seed_vals = vec![bval(0)];
+				seed_vals.extend((0..LANES).map(|i| bval(lane_u64(&acc_first, i))));
+				let mut drain_vals = vec![bval(rows as u64)];
+				drain_vals.extend((0..LANES).map(|i| bval(lane_u64(&acc_last, i))));
+				vec![
+					Boundary { values: seed_vals, channel_id: chan, direction: FlushDirection::Push, multiplicity: 1 },
+					Boundary { values: drain_vals, channel_id: chan, direction: FlushDirection::Pull, multiplicity: 1 },
+				]
+			} else {
+				vec![]
+			};
+			let statement = Statement { boundaries, table_sizes: vec![rows] };
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)
+				.expect("honest seam witness must validate");
+			let t0 = Instant::now();
+			let _proof = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend())
+			.unwrap();
+			(t0.elapsed().as_millis(), n_cols)
+		}
+
+		let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+		println!(
+			"\n  S4  ACCUMULATOR-SEAM COST (W={W}, k·rows=768 ⇒ identical work; L1, B256, {threads} cores)\n\
+			 \x20  UNLINKED = S1's independent rows.  LINKED = accumulator threaded row-to-row on a\n\
+			 \x20  channel ({LANES} lanes each way + a position lane), the shape a real tall-narrow ModMul needs.\n\
+			 \x20  rows      k   unlinked ms  (cols)    linked ms  (cols)   seam cost"
+		);
+		let mut best: Option<(usize, u128)> = None;
+		for (rows, k) in [(4usize, 192usize), (16, 48), (64, 12), (256, 3)] {
+			let (tu, cu) = run(k, rows, false, 0xF0 + rows as u64);
+			let (tl, cl) = run(k, rows, true, 0xF0 + rows as u64);
+			println!(
+				"     {rows:>5}  {k:>5}   {tu:>9}  {cu:>6}    {tl:>9}  {cl:>6}     {:>5.2}x",
+				tl as f64 / tu as f64
+			);
+			if best.map_or(true, |(_, b)| tl < b) {
+				best = Some((rows, tl));
+			}
+		}
+		let (best_rows, best_ms) = best.unwrap();
+		println!(
+			"\n    S1 baseline for the SAME work in ONE row was 10247 ms (2305 columns).\n\
+			 \x20   Best LINKED shape here: rows={best_rows} at {best_ms} ms ⇒ {:.1}x vs the one-row layout.\n\
+			 \x20   The seam is paid PER ROW while chain work per row shrinks, so the ratio column shows\n\
+			 \x20   where that trade turns over — that blocking factor, not the raw 21x, is what a real\n\
+			 \x20   tall-narrow ModMul should be built at.",
+			10247.0 / best_ms as f64
+		);
+	}
+
 	/// W5 STOP-EARLY GATE — does the cross-width Karatsuba multiply actually beat the schoolbook
 	/// one at RSA width? Compares MULTIPLY-ONLY (`RawMul<W>` vs `KaratsubaNarrow<W/2>` +
 	/// `KaratsubaWide<W,W/2>`) because the mod-reduction that follows is IDENTICAL in both, so
