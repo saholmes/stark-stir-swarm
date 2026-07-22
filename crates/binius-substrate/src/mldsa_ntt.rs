@@ -3115,25 +3115,40 @@ mod tests {
 		println!("GATE round-trip-A (n={n}): invNTT∘NTT == x PROVEN over B256 at L1(128); round-trip proof size = {size} bytes");
 	}
 
-	/// CORRECTNESS at FULL ML-DSA size via witness validation (constraint-satisfaction
-	/// of every gate). Forward output matches `ntt_ref`; round-trip returns x.
+	/// CORRECTNESS at FULL ML-DSA size. The FORWARD 256-point NTT is validated TALL-NARROW via the
+	/// channel-routed batched network (`validate_ntt_network_batched`): n/2 rows per stage, so
+	/// `validate_witness` is LINEAR (~7 s / ~22 MiB at n=256). The sink pins the network's outputs
+	/// to `ntt_ref`, so an honest validate means the full forward transform equals num-bigint --
+	/// this subsumes the old explicit `assert_eq!(fwd, ntt_ref)`.
 	///
-	/// `#[ignore]`d: `validate(256)` over the full 256-point NTT constraint system is
-	/// pathologically slow (does not complete in a default `cargo test` run --- it was the test
-	/// that hung a full-suite run for 20 h). Smaller-`n` round-trip and per-gate tests above cover
-	/// correctness; this is the run-alone full-size check. Why validation is this slow at n=256 is
-	/// a separate perf issue worth a look. Run: `... full_256_validates_and_matches_ref -- --ignored`.
+	/// This replaces the one-row `validate(256)` layout, whose `validate_witness` is O(columns^2)
+	/// (>56 min isolated, ~2 GB; it hung a 20 h suite run) -- see `ntt_validate_scaling_probe` and
+	/// `ntt_batched_validate_timing`. The full-size INVERSE round-trip has no tall-narrow validator
+	/// yet and lives in `full_256_roundtrip_validates_slow` (ignored); in-circuit inverse
+	/// correctness is covered in the default run at n=8 by `roundtrip_proves_over_b256`.
 	#[test]
-	#[ignore = "validate(256) over the full NTT is pathologically slow; run alone (hung a 20h suite run)"]
 	fn full_256_validates_and_matches_ref() {
 		let n = 256;
 		let mut rng = StdRng::seed_from_u64(0x2020);
 		let x = rand_zq(&mut rng, n);
-		let fwd = validate(n, false, &x).expect("full 256-pt forward must validate over B256");
-		assert_eq!(fwd, ntt_ref(&x, n), "full 256-pt forward != reference");
-		// round-trip: forward outputs are the assert target; validate returns forward outs.
+		super::validate_ntt_network_batched(&x, n, None, None)
+			.expect("full 256-pt forward NTT (tall-narrow) must validate and match ntt_ref");
+		println!("GATE full-256: 256-point forward NTT VALIDATES tall-narrow (~7 s, linear) with outputs pinned to num-bigint ntt_ref");
+	}
+
+	/// Full-size INVERSE round-trip validation via the one-row layout. `#[ignore]`d: the inverse
+	/// GS network has no tall-narrow validator yet, so this uses the one-row layout whose
+	/// `validate_witness` is O(columns^2) (~hours at n=256). Forward-256 is fast
+	/// (`full_256_validates_and_matches_ref`); in-circuit inverse is covered at n=8 by
+	/// `roundtrip_proves_over_b256`. Building the tall-narrow inverse (GS) network is the proper
+	/// fix here. Run alone: `... full_256_roundtrip_validates_slow -- --ignored`.
+	#[test]
+	#[ignore = "one-row inverse round-trip is O(columns^2); no tall-narrow inverse network yet"]
+	fn full_256_roundtrip_validates_slow() {
+		let n = 256;
+		let mut rng = StdRng::seed_from_u64(0x2020);
+		let x = rand_zq(&mut rng, n);
 		validate(n, true, &x).expect("full 256-pt round-trip must validate over B256");
-		println!("GATE full-256: 256-point forward + round-trip VALIDATE over B256 (every constraint satisfied); forward matches num-bigint");
 	}
 
 	/// DIAGNOSTIC: why does `validate(256)` hang? Time each phase (build+compile, populate,
@@ -3192,6 +3207,30 @@ mod tests {
 			"  ratio ~2x per doubling = linear; ~4x = quadratic in n. The one-row layout's\n\
 			 \x20  butterfly count is (n/2)log2(n), so a superlinear phase is the 20h culprit."
 		);
+	}
+
+	/// FIX PROBE: is the tall-narrow `validate_ntt_network_batched` fast at n=256, where the
+	/// one-row `validate` is O(columns^2) (~hours)? Times the batched validator across n; if it
+	/// scales ~linearly and n=256 is seconds, it is the drop-in replacement for the full-256 test.
+	#[test]
+	#[ignore = "fix probe: tall-narrow batched-validate timing vs the one-row O(columns^2) validate"]
+	fn ntt_batched_validate_timing() {
+		use std::time::Instant;
+		println!("\n   n | batched validate_witness | peak RSS | ratio");
+		let mut prev = 0.0f64;
+		for &n in &[64usize, 128, 256] {
+			let mut rng = StdRng::seed_from_u64(0x2020);
+			let x = rand_zq(&mut rng, n);
+			let t = Instant::now();
+			super::validate_ntt_network_batched(&x, n, None, None)
+				.unwrap_or_else(|e| panic!("n={n}: batched network must validate: {e}"));
+			let ms = t.elapsed().as_secs_f64() * 1e3;
+			let rss = crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0);
+			let ratio = if prev > 0.0 { ms / prev } else { 0.0 };
+			println!("  {n:>3} | {ms:>24.1} | {rss:>6.0} MiB | {ratio:.2}x");
+			prev = ms;
+		}
+		println!("  ~2x/doubling = LINEAR (tall-narrow fixes the one-row O(columns^2)).");
 	}
 
 	/// SOUNDNESS (load-bearing): a tampered ζ·v product / butterfly output is REJECTED,
