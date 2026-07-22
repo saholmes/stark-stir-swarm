@@ -265,6 +265,97 @@ struct MulBit<const W: usize> {
 	pp: Col<B1, W>,
 }
 
+/// RAW schoolbook multiply `a·b` (n-bit operands → up-to-2n-bit product), NO mod reduction --
+/// the multiply half of `ModMul`, extracted so a single-level Karatsuba can compose three
+/// half-width raw products (W1 of the Karatsuba-ModMul scope). `a` and `b` are INPUT columns the
+/// caller supplies (committed or derived); RawMul range-checks them `< 2^n` and exposes the
+/// product in `product`. The product column is the tail of the accumulator chain, so it is bound
+/// to `a·b` by the same partial-product + carry constraints ModMul uses.
+pub(crate) struct RawMul<const W: usize> {
+	/// `= a·b` (`< 2^{2n}`), the accumulator-chain output.
+	pub(crate) product: Col<B1, W>,
+	mul_bits: Vec<MulBit<W>>,
+	mul_adders: Vec<Adder<W>>,
+	a_hi: Col<B1, W>,
+	b_hi: Col<B1, W>,
+	n: usize,
+}
+
+impl<const W: usize> RawMul<W> {
+	pub(crate) fn build(
+		t: &mut TableBuilder<OurB256>,
+		name: &str,
+		n: usize,
+		a: Col<B1, W>,
+		b: Col<B1, W>,
+	) -> Self {
+		assert!(n >= 1 && 2 * n <= W, "need 2n ≤ W for the product headroom (n={n}, W={W})");
+		let logw = W.trailing_zeros() as usize;
+		// operand bounds: a, b < 2^n  ⇔  a>>n == 0.
+		let a_hi = t.add_shifted(format!("{name}_a_hi"), a, logw, n, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_a_range"), a_hi * B1::ONE);
+		let b_hi = t.add_shifted(format!("{name}_b_hi"), b, logw, n, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_b_range"), b_hi * B1::ONE);
+		// a·b = Σ_i b_i·(a<<i), broadcast-and-accumulate (mirrors ModMul's multiply).
+		let mut mul_bits = Vec::with_capacity(n);
+		for i in 0..n {
+			let a_shl = if i == 0 {
+				None
+			} else {
+				Some(t.add_shifted(format!("{name}_a_shl{i}"), a, logw, i, ShiftVariant::LogicalLeft))
+			};
+			let sa = a_shl.unwrap_or(a);
+			let bcast = t.add_committed::<B1, W>(format!("{name}_bcast{i}"));
+			let bcast_rot =
+				t.add_shifted(format!("{name}_bcast{i}_rot"), bcast, logw, 1, ShiftVariant::CircularLeft);
+			t.assert_zero(format!("{name}_bcast{i}_eq"), bcast - bcast_rot);
+			let bcast_lane0 = t.add_selected(format!("{name}_bcast{i}_lane0"), bcast, 0);
+			let b_bit = t.add_selected(format!("{name}_b_bit{i}"), b, i);
+			t.assert_zero(format!("{name}_bcast{i}_bind"), bcast_lane0 - b_bit);
+			let pp = t.add_computed(format!("{name}_pp{i}"), bcast * sa);
+			mul_bits.push(MulBit { a_shl, bcast, bcast_rot, bcast_lane0, b_bit, pp });
+		}
+		let mut mul_adders = Vec::with_capacity(n.saturating_sub(1));
+		let mut acc = mul_bits[0].pp;
+		for i in 1..n {
+			let adder = Adder::<W>::build(t, acc, mul_bits[i].pp, &format!("{name}_mul{i}"));
+			acc = adder.sum;
+			mul_adders.push(adder);
+		}
+		Self { product: acc, mul_bits, mul_adders, a_hi, b_hi, n }
+	}
+
+	/// Fill the multiply columns from operand bit-vectors; returns the product bits (`= a·b`).
+	pub(crate) fn populate(
+		&self,
+		seg: &mut TableWitnessSegment<OurB256>,
+		row: usize,
+		a: &[bool],
+		b: &[bool],
+	) -> Result<Vec<bool>> {
+		write_col::<W>(seg, self.a_hi, row, &shr(a, self.n))?;
+		write_col::<W>(seg, self.b_hi, row, &shr(b, self.n))?;
+		for (i, mb) in self.mul_bits.iter().enumerate() {
+			if let Some(a_shl) = mb.a_shl {
+				write_col::<W>(seg, a_shl, row, &shl(a, i))?;
+			}
+			let uniform = if b[i] { vec![true; W] } else { vec![false; W] };
+			write_col::<W>(seg, mb.bcast, row, &uniform)?;
+			write_col::<W>(seg, mb.bcast_rot, row, &uniform)?;
+			write_bit(seg, mb.bcast_lane0, row, b[i])?;
+			write_bit(seg, mb.b_bit, row, b[i])?;
+			let pp_val = if b[i] { shl(a, i) } else { vec![false; W] };
+			write_col::<W>(seg, mb.pp, row, &pp_val)?;
+		}
+		let mut acc = if b[0] { a.to_vec() } else { vec![false; W] };
+		for (i, adder) in self.mul_adders.iter().enumerate() {
+			let pp = if b[i + 1] { shl(a, i + 1) } else { vec![false; W] };
+			acc = adder.populate(seg, row, &acc, &pp)?;
+		}
+		Ok(acc)
+	}
+}
+
 /// A non-native `a*b mod m` table over the 256-bit top field, width `W` (bits per row).
 pub struct ModMul<const W: usize> {
 	pub table_id: TableId,
@@ -3290,6 +3381,55 @@ mod tests {
 	/// range check is a virtual `add_shifted`+`assert_zero` (`a_hi`/`b_hi`/`q_hi`, NOT committed);
 	/// only the `r<m` reduction check commits columns. This test prints the committed-column
 	/// breakdown so the paper can state the Binius LogUp ceiling from a real measurement.
+	/// W1 GATE — the raw multiply gadget computes `a·b` (no reduction) and validates. This is the
+	/// building block for the single-level Karatsuba ModMul (3 half-width raw products).
+	#[test]
+	fn raw_mul_matches_native() {
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+
+		const W: usize = 512;
+		let n = 252usize;
+		let mut rng = StdRng::seed_from_u64(0x4A60);
+
+		for trial in 0..3 {
+			let av = rand_below(&mut rng, n);
+			let bv = rand_below(&mut rng, n);
+			let expected = &av * &bv;
+
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let (tid, a, b, rm) = {
+				let mut t = cs.add_table("rawmul-w1");
+				let a = t.add_committed::<B1, W>("a");
+				let b = t.add_committed::<B1, W>("b");
+				let rm = RawMul::<W>::build(&mut t, "rm", n, a, b);
+				(t.id(), a, b, rm)
+			};
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let product_bits = {
+				let tw = witness.init_table(tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let ab = to_bits::<W>(&av);
+				let bb = to_bits::<W>(&bv);
+				write_col::<W>(&mut seg, a, 0, &ab).unwrap();
+				write_col::<W>(&mut seg, b, 0, &bb).unwrap();
+				rm.populate(&mut seg, 0, &ab, &bb).unwrap()
+			};
+			assert_eq!(from_bits(&product_bits), expected, "trial {trial}: RawMul product != a·b");
+
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness)
+				.unwrap_or_else(|e| panic!("trial {trial}: RawMul honest witness must validate: {e}"));
+		}
+		println!(
+			"W1 GATE raw-mul: RawMul<{W}> computes a·b for {n}-bit operands over 3 random trials, \
+			 validates every constraint, and its product column equals num-bigint a·b."
+		);
+	}
+
 	/// KARATSUBA PROBE — the decisive unknown before building a Karatsuba ModMul: is proving 3
 	/// HALF-width (W=512) ModMuls cheaper than 1 FULL-width (W=1024) ModMul? Karatsuba turns one
 	/// n-bit multiply into 3 (n/2)-bit sub-multiplies plus an O(W) combination; the win requires
