@@ -121,6 +121,11 @@ pub(crate) fn big_to_bits<const W: usize>(v: &num_bigint::BigUint) -> Vec<bool> 
 	(0..W as u64).map(|i| v.bit(i)).collect()
 }
 
+/// Length-64 LE bit vector of a `u64` (channel position lanes).
+pub(crate) fn u64_lebits(x: u64) -> Vec<bool> {
+	(0..64).map(|k| (x >> k) & 1 == 1).collect()
+}
+
 /// `BigUint` from a LE bit vector.
 pub(crate) fn bits_to_big(bits: &[bool]) -> num_bigint::BigUint {
 	let mut bytes = vec![0u8; bits.len().div_ceil(8)];
@@ -369,6 +374,217 @@ impl<const W: usize> RawMul<W> {
 			acc = adder.populate(seg, row, &acc, &pp)?;
 		}
 		Ok(acc)
+	}
+}
+
+/// TALL-NARROW raw multiply `a·b` -- the same schoolbook algorithm as [`RawMul`], re-laid-out as
+/// `n/blk` ROWS of `blk` partial products instead of ONE row of `n`. Motivation is measured, not
+/// aesthetic: prove cost on this backend is ~97% PER-COLUMN (`modmul_cost_model_calibration`), so
+/// at fixed total bits, trading columns for rows is worth up to 21x, and the sequential-accumulator
+/// channel seam that makes it possible costs only ~1.4x at its optimum (`tallnarrow_seam_probe`).
+///
+/// THE LAYOUT PROBLEM AND ITS FIX. `add_shifted`/`add_selected` take COMPILE-TIME indices, but row
+/// `r` needs bit `r·blk + j` of `b` and `a << (r·blk + j)` -- both row-dependent, so neither can be
+/// expressed directly. Instead the OPERANDS ride the channel alongside the accumulator: row `r`
+/// holds `a_r = a << (r·blk)` and `b_r = b >> (r·blk)`, and pushes `a_r << blk` / `b_r >> blk` to
+/// row `r+1`. Every index used INSIDE a row is then `j ∈ [0, blk)` -- compile-time. The channel
+/// tuple is `(pos, a_r, b_r, acc_r)`; the position lane stops the multiset from admitting a
+/// reordering of rows, and boundary flushes seed `(0, a, b, 0)` and drain `(R, a<<n, 0, a·b)`.
+///
+/// `b_r` is projected on `⌈n/64⌉` lanes rather than all `W/64`, with a per-row `b_r >> n == 0`
+/// range check so nothing can hide above the projection and ratchet down into the low bits as `b`
+/// shifts right -- one column per row instead of ~32 extra lane pairs.
+pub(crate) struct TallRawMul<const W: usize> {
+	pub(crate) table_id: TableId,
+	a_in: Col<B1, W>,
+	b_in: Col<B1, W>,
+	acc_in: Col<B1, W>,
+	a_out: Col<B1, W>,
+	b_out: Col<B1, W>,
+	b_rng: Col<B1, W>,
+	pos_in: Col<B1, 64>,
+	one: Col<B1, 64>,
+	posinc: Adder<64>,
+	mul_bits: Vec<MulBit<W>>,
+	adders: Vec<Adder<W>>,
+	sel_pull: Vec<Col<B1, 64>>,
+	sel_push: Vec<Col<B1, 64>>,
+	n: usize,
+	blk: usize,
+	la: usize,
+	lb: usize,
+}
+
+impl<const W: usize> TallRawMul<W> {
+	/// `n` = operand bit-length (must be a multiple of `blk`); `rows = n/blk`.
+	pub(crate) fn build(cs: &mut ConstraintSystem<OurB256>, name: &str, n: usize, blk: usize, chan: ChannelId) -> Self {
+		assert!(2 * n <= W, "product 2n bits must fit W (n={n}, W={W})");
+		assert!(blk >= 1 && n % blk == 0, "n must be a multiple of the blocking factor");
+		let logw = W.trailing_zeros() as usize;
+		let (la, lb) = (W / 64, n.div_ceil(64));
+		let mut t = cs.add_table(format!("{name} (tall raw mul, n={n}, blk={blk}, W={W})"));
+
+		let a_in = t.add_committed::<B1, W>("a_in");
+		let b_in = t.add_committed::<B1, W>("b_in");
+		let acc_in = t.add_committed::<B1, W>("acc_in");
+		// operands advance one block per row; all indices used inside the row are compile-time.
+		let a_out = t.add_shifted("a_out", a_in, logw, blk, ShiftVariant::LogicalLeft);
+		let b_out = t.add_shifted("b_out", b_in, logw, blk, ShiftVariant::LogicalRight);
+		// nothing may hide above b's projected lanes and ratchet down as b shifts right.
+		let b_rng = t.add_shifted("b_rng", b_in, logw, n, ShiftVariant::LogicalRight);
+		t.assert_zero("b_range", b_rng * B1::ONE);
+
+		let pos_in = t.add_committed::<B1, 64>("pos_in");
+		let one_arr: [B1; 64] = std::array::from_fn(|k| if k == 0 { B1::ONE } else { B1::ZERO });
+		let one = t.add_constant("one", one_arr);
+		let posinc = Adder::<64>::build(&mut t, pos_in, one, "posinc");
+
+		// blk partial products of THIS row, accumulated onto acc_in.
+		let mut mul_bits = Vec::with_capacity(blk);
+		let mut adders = Vec::with_capacity(blk);
+		let mut acc = acc_in;
+		for j in 0..blk {
+			let a_shl = if j == 0 {
+				None
+			} else {
+				Some(t.add_shifted(format!("a_shl{j}"), a_in, logw, j, ShiftVariant::LogicalLeft))
+			};
+			let sa = a_shl.unwrap_or(a_in);
+			let bcast = t.add_committed::<B1, W>(format!("bcast{j}"));
+			let bcast_rot = t.add_shifted(format!("bcast{j}_rot"), bcast, logw, 1, ShiftVariant::CircularLeft);
+			t.assert_zero(format!("bcast{j}_eq"), bcast - bcast_rot);
+			let bcast_lane0 = t.add_selected(format!("bcast{j}_lane0"), bcast, 0);
+			let b_bit = t.add_selected(format!("b_bit{j}"), b_in, j);
+			t.assert_zero(format!("bcast{j}_bind"), bcast_lane0 - b_bit);
+			let pp = t.add_computed(format!("pp{j}"), bcast * sa);
+			let ad = Adder::<W>::build(&mut t, acc, pp, &format!("acc{j}"));
+			acc = ad.sum;
+			mul_bits.push(MulBit { a_shl, bcast, bcast_rot, bcast_lane0, b_bit, pp });
+			adders.push(ad);
+		}
+		let acc_out = acc;
+
+		// seam: pull (pos, a_in, b_in, acc_in), push (pos+1, a_out, b_out, acc_out).
+		let mut sel_pull = Vec::with_capacity(1 + la + lb + la);
+		let mut sel_push = Vec::with_capacity(1 + la + lb + la);
+		let mut pull_t = vec![t.add_packed::<B1, 64, B64, 1>("pos_in_b64", pos_in)];
+		let mut push_t = vec![t.add_packed::<B1, 64, B64, 1>("pos_out_b64", posinc.sum)];
+		for (tag, src, lanes) in [("a", a_in, la), ("b", b_in, lb), ("acc", acc_in, la)] {
+			for i in 0..lanes {
+				let s = t.add_selected_block::<B1, W, 64>(format!("{tag}in_sel{i}"), src, i);
+				pull_t.push(t.add_packed::<B1, 64, B64, 1>(format!("{tag}in_b64{i}"), s));
+				sel_pull.push(s);
+			}
+		}
+		for (tag, src, lanes) in [("a", a_out, la), ("b", b_out, lb), ("acc", acc_out, la)] {
+			for i in 0..lanes {
+				let s = t.add_selected_block::<B1, W, 64>(format!("{tag}out_sel{i}"), src, i);
+				push_t.push(t.add_packed::<B1, 64, B64, 1>(format!("{tag}out_b64{i}"), s));
+				sel_push.push(s);
+			}
+		}
+		t.pull(chan, pull_t);
+		t.push(chan, push_t);
+
+		Self {
+			table_id: t.id(),
+			a_in, b_in, acc_in, a_out, b_out, b_rng, pos_in, one, posinc,
+			mul_bits, adders, sel_pull, sel_push, n, blk, la, lb,
+		}
+	}
+
+	/// Fill every row; returns the product `a·b` (= the final accumulator).
+	pub(crate) fn populate(
+		&self,
+		seg: &mut TableWitnessSegment<OurB256>,
+		a: &[bool],
+		b: &[bool],
+	) -> Result<Vec<bool>> {
+		let (blk, rows) = (self.blk, self.n / self.blk);
+		let (mut a_r, mut b_r) = (a.to_vec(), b.to_vec());
+		let mut acc = vec![false; W];
+		for row in 0..rows {
+			let a_nx = shl(&a_r, blk);
+			let b_nx = shr(&b_r, blk);
+			write_col::<W>(seg, self.a_in, row, &a_r)?;
+			write_col::<W>(seg, self.b_in, row, &b_r)?;
+			write_col::<W>(seg, self.acc_in, row, &acc)?;
+			write_col::<W>(seg, self.a_out, row, &a_nx)?;
+			write_col::<W>(seg, self.b_out, row, &b_nx)?;
+			write_col::<W>(seg, self.b_rng, row, &shr(&b_r, self.n))?;
+			// m3 fills NOTHING automatically -- constants included.
+			write_col::<64>(seg, self.pos_in, row, &u64_lebits(row as u64))?;
+			write_col::<64>(seg, self.one, row, &u64_lebits(1))?;
+			self.posinc.populate(seg, row, &u64_lebits(row as u64), &u64_lebits(1))?;
+
+			let acc_before = acc.clone();
+			for (j, mb) in self.mul_bits.iter().enumerate() {
+				if let Some(a_shl) = mb.a_shl {
+					write_col::<W>(seg, a_shl, row, &shl(&a_r, j))?;
+				}
+				let uniform = if b_r[j] { vec![true; W] } else { vec![false; W] };
+				write_col::<W>(seg, mb.bcast, row, &uniform)?;
+				write_col::<W>(seg, mb.bcast_rot, row, &uniform)?;
+				write_bit(seg, mb.bcast_lane0, row, b_r[j])?;
+				write_bit(seg, mb.b_bit, row, b_r[j])?;
+				let pp = if b_r[j] { shl(&a_r, j) } else { vec![false; W] };
+				write_col::<W>(seg, mb.pp, row, &pp)?;
+				acc = self.adders[j].populate(seg, row, &acc, &pp)?;
+			}
+			let _ = acc_before;
+
+			// seam lane projections (pull side = this row's inputs, push side = its outputs).
+			let pull_src = [(&a_r, self.la), (&b_r, self.lb), (&acc_before, self.la)];
+			let push_src = [(&a_nx, self.la), (&b_nx, self.lb), (&acc, self.la)];
+			let mut k = 0usize;
+			for (v, lanes) in pull_src {
+				for i in 0..lanes {
+					write_col::<64>(seg, self.sel_pull[k], row, &v[i * 64..i * 64 + 64])?;
+					k += 1;
+				}
+			}
+			k = 0;
+			for (v, lanes) in push_src {
+				for i in 0..lanes {
+					write_col::<64>(seg, self.sel_push[k], row, &v[i * 64..i * 64 + 64])?;
+					k += 1;
+				}
+			}
+			a_r = a_nx;
+			b_r = b_nx;
+		}
+		Ok(acc)
+	}
+
+	/// The two boundary flushes that close the accumulator chain: seed `(0, a, b, 0)`, drain
+	/// `(rows, a<<n, b>>n, a·b)`. Returned in the order the pull/push tuples were declared.
+	pub(crate) fn boundaries(
+		&self,
+		a: &[bool],
+		b: &[bool],
+		product: &[bool],
+		chan: ChannelId,
+	) -> Vec<binius_m3::builder::Boundary<OurB256>> {
+		use binius_m3::builder::{Boundary, FlushDirection};
+		let rows = self.n / self.blk;
+		let bval = |v: u64| OurB256::from(B64::new(v));
+		let lanes = |v: &[bool], n_lanes: usize| -> Vec<OurB256> {
+			(0..n_lanes)
+				.map(|i| bval((0..64).fold(0u64, |acc, k| if v[i * 64 + k] { acc | (1u64 << k) } else { acc })))
+				.collect()
+		};
+		let mut seed = vec![bval(0)];
+		seed.extend(lanes(a, self.la));
+		seed.extend(lanes(b, self.lb));
+		seed.extend(lanes(&vec![false; W], self.la));
+		let mut drain = vec![bval(rows as u64)];
+		drain.extend(lanes(&shl(a, self.n), self.la));
+		drain.extend(lanes(&shr(b, self.n), self.lb));
+		drain.extend(lanes(product, self.la));
+		vec![
+			Boundary { values: seed, channel_id: chan, direction: FlushDirection::Push, multiplicity: 1 },
+			Boundary { values: drain, channel_id: chan, direction: FlushDirection::Pull, multiplicity: 1 },
+		]
 	}
 }
 
@@ -4171,6 +4387,176 @@ mod tests {
 		println!(
 			"    Karatsuba's trade in isolation. >1.00x reproduces the W2b loss with NO Karatsuba\n\
 			 \x20   logic involved, confirming the cause is the column/width trade itself."
+		);
+	}
+
+	/// TALL-NARROW RawMul CORRECTNESS — the re-layout must compute the same product before any
+	/// timing of it means anything. Checks the honest witness validates AND the drained accumulator
+	/// equals `num-bigint`'s `a·b`, across several blocking factors; then checks the seam is
+	/// load-bearing by corrupting one row's carried operand, which must break the channel.
+	#[test]
+	fn tall_raw_mul_matches_native() {
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+
+		const W: usize = 512;
+		let n = 128usize; // 2n = 256 ≤ W
+		let mut rng = StdRng::seed_from_u64(0x7A11);
+
+		let run = |blk: usize, av: &BigUint, bv: &BigUint, tamper: bool| -> (bool, BigUint) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("tall_seam");
+			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, chan);
+			let rows = n / blk;
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let (ab, bb) = (big_to_bits::<W>(av), big_to_bits::<W>(bv));
+			let product = {
+				let tw = witness.init_table(tm.table_id, rows).unwrap();
+				let mut seg = tw.full_segment();
+				let p = tm.populate(&mut seg, &ab, &bb).unwrap();
+				if tamper && rows > 1 {
+					// row 1 claims a different carried `a` than row 0 pushed: the seam must catch it.
+					let bad = shl(&ab, tm.blk + 1);
+					write_col::<W>(&mut seg, tm.a_in, 1, &bad).unwrap();
+					for i in 0..tm.la {
+						write_col::<64>(&mut seg, tm.sel_pull[i], 1, &bad[i * 64..i * 64 + 64]).unwrap();
+					}
+				}
+				p
+			};
+			let statement = Statement {
+				boundaries: tm.boundaries(&ab, &bb, &product, chan),
+				table_sizes: vec![rows],
+			};
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let ok =
+				binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness).is_ok();
+			(ok, bits_to_big(&product))
+		};
+
+		for blk in [8usize, 16, 32] {
+			for trial in 0..2 {
+				let (av, bv) = (rand_below(&mut rng, n), rand_below(&mut rng, n));
+				let (ok, prod) = run(blk, &av, &bv, false);
+				assert!(ok, "blk={blk} trial {trial}: honest tall-narrow witness must validate");
+				assert_eq!(prod, &av * &bv, "blk={blk} trial {trial}: tall-narrow product != a·b");
+			}
+		}
+		let (av, bv) = (rand_below(&mut rng, n), rand_below(&mut rng, n));
+		let (ok, _) = run(16, &av, &bv, true);
+		assert!(!ok, "a row carrying an operand its predecessor did not push must be REJECTED");
+
+		println!(
+			"TALL-NARROW RawMul<{W}> (n={n}) validates and equals a·b at blk ∈ {{8,16,32}} over 2 trials \
+			 each; a row whose carried operand disagrees with the one pushed to it is rejected by the seam."
+		);
+	}
+
+	/// THE GATE — does the tall-narrow re-layout actually beat the schoolbook multiply at RSA width?
+	/// Multiply-only again (the `q·m+r` reduction is identical either way, so this delta is the
+	/// absolute saving), same `n` for both, same process, same machine. Sweeps the blocking factor
+	/// because `tallnarrow_seam_probe` showed the optimum is interior: too few rows keeps the
+	/// per-column cost, too many rows pays the seam `n/blk` times.
+	/// Run: `cargo test --release --lib --features parallel tall_raw_mul_gate -- --ignored --nocapture`
+	#[test]
+	#[ignore = "gate: tall-narrow vs schoolbook RawMul at W=4096, sweeping the blocking factor"]
+	fn tall_raw_mul_gate() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize; // 2n = W exactly; a multiple of every blocking factor swept
+
+		fn prove(cs: &ConstraintSystem<OurB256>, st: &Statement<OurB256>, wit: WitnessIndex<OurB256>) -> u128 {
+			let ccs = cs.compile(st).unwrap();
+			let wit = wit.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &st.boundaries, &wit).unwrap();
+			let t = Instant::now();
+			let _p = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &st.boundaries, wit, &binius_hal::make_portable_backend())
+			.unwrap();
+			t.elapsed().as_millis()
+		}
+
+		let mut rng = StdRng::seed_from_u64(0x7A7E);
+		let (av, bv) = (rand_below(&mut rng, n), rand_below(&mut rng, n));
+		let (ab, bb) = (big_to_bits::<W>(&av), big_to_bits::<W>(&bv));
+		let expect = &av * &bv;
+
+		// baseline: the shipped one-row schoolbook multiply.
+		let base_ms = {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let (tid, a, b, rm) = {
+				let mut t = cs.add_table("schoolbook");
+				let a = t.add_committed::<B1, W>("a");
+				let b = t.add_committed::<B1, W>("b");
+				let rm = RawMul::<W>::build(&mut t, "rm", n, a, b);
+				(t.id(), a, b, rm)
+			};
+			let st = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = wit.init_table(tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, a, 0, &ab).unwrap();
+				write_col::<W>(&mut seg, b, 0, &bb).unwrap();
+				let p = rm.populate(&mut seg, 0, &ab, &bb).unwrap();
+				assert_eq!(bits_to_big(&p), expect, "schoolbook baseline product wrong");
+			}
+			prove(&cs, &st, wit)
+		};
+
+		println!(
+			"\n  TALL-NARROW RawMul GATE (W={W}, n={n}, multiply only, L1/B256, {} cores)\n\
+			 \x20  schoolbook one-row baseline: {base_ms} ms\n\
+			 \x20     blk    rows   tall ms   speedup",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0)
+		);
+		let mut best = (0usize, u128::MAX);
+		for blk in [16usize, 32, 64, 128] {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("tall_seam");
+			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, chan);
+			let rows = n / blk;
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let product = {
+				let tw = wit.init_table(tm.table_id, rows).unwrap();
+				let mut seg = tw.full_segment();
+				tm.populate(&mut seg, &ab, &bb).unwrap()
+			};
+			assert_eq!(bits_to_big(&product), expect, "blk={blk}: tall-narrow product != a·b");
+			let st = Statement { boundaries: tm.boundaries(&ab, &bb, &product, chan), table_sizes: vec![rows] };
+			let ms = prove(&cs, &st, wit);
+			println!("     {blk:>5}  {rows:>6}  {ms:>8}    {:>5.2}x", base_ms as f64 / ms as f64);
+			if ms < best.1 {
+				best = (blk, ms);
+			}
+		}
+		println!(
+			"\n    Best: blk={} at {} ms ⇒ {:.1}x off the multiply. Every configuration's product was\n\
+			 \x20   checked against num-bigint, so this is a speedup of a CORRECT multiply, not of a\n\
+			 \x20   cheaper circuit. The q·m+r reduction is unchanged and still to be re-laid-out;\n\
+			 \x20   against the 117 s schoolbook ModMul<4096> whose multiply half is ~85 s, this is\n\
+			 \x20   worth ~{:.0} s per ModMul, i.e. ~{:.0}x on the 17-ModMul RSA-2048 apex chain.",
+			best.0,
+			best.1,
+			base_ms as f64 / best.1 as f64,
+			85.0 - 85.0 * best.1 as f64 / base_ms as f64,
+			117.0 / (117.0 - (85.0 - 85.0 * best.1 as f64 / base_ms as f64)),
 		);
 	}
 
