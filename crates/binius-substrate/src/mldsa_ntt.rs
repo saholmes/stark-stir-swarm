@@ -3136,6 +3136,64 @@ mod tests {
 		println!("GATE full-256: 256-point forward + round-trip VALIDATE over B256 (every constraint satisfied); forward matches num-bigint");
 	}
 
+	/// DIAGNOSTIC: why does `validate(256)` hang? Time each phase (build+compile, populate,
+	/// validate_witness) across n to expose the scaling exponent. The one-row `Ntt` layout puts
+	/// every butterfly's columns in a single row, so if any phase is superlinear in the column
+	/// count the cost explodes with n. Run: `... ntt_validate_scaling_probe -- --ignored --nocapture`.
+	#[test]
+	#[ignore = "diagnostic scaling probe for the validate(256) hang"]
+	fn ntt_validate_scaling_probe() {
+		use std::time::Instant;
+		// NTT_PROBE_N=<n> runs a SINGLE n in this process so `getrusage` peak RSS is clean (it is
+		// process-monotonic); otherwise sweep 8..64 for the time-scaling ratio.
+		let single: Option<usize> = std::env::var("NTT_PROBE_N").ok().and_then(|v| v.parse().ok());
+		let ns: Vec<usize> = single.map(|n| vec![n]).unwrap_or_else(|| vec![8, 16, 32, 64]);
+		println!("\n   n | build+compile | populate | validate_witness | peak RSS | butterflies | ratio");
+		let mut prev = 0.0f64;
+		for &n in &ns {
+			let mut rng = StdRng::seed_from_u64(0x2020);
+			let x = rand_zq(&mut rng, n);
+
+			let t0 = Instant::now();
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let ntt = Ntt::build(&mut cs, n, false);
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let tb = Instant::now();
+
+			{
+				let tw = witness.init_table(ntt.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				ntt.populate(&mut seg, 0, &x).unwrap();
+			}
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let ccs = cs.compile(&statement).unwrap();
+			let tp = Instant::now();
+
+			let widx = witness.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &[], &widx).unwrap();
+			let tv = Instant::now();
+
+			let build_ms = tb.duration_since(t0).as_secs_f64() * 1e3;
+			let pop_ms = tp.duration_since(tb).as_secs_f64() * 1e3;
+			let val_ms = tv.duration_since(tp).as_secs_f64() * 1e3;
+			let total = build_ms + pop_ms + val_ms;
+			let ratio = if prev > 0.0 { total / prev } else { 0.0 };
+			let rss_mib = crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0);
+			// column/butterfly count for this n is (n/2)*log2(n) butterflies, each a wide-field
+			// ModMul; validate_witness time grows ~quadratically in that, so it is O(columns^2).
+			let butterflies = (n / 2) * (n.trailing_zeros() as usize);
+			println!(
+				"  {n:>3} | {build_ms:>13.1} | {pop_ms:>8.1} | {val_ms:>16.1} | {rss_mib:>6.0} MiB | {butterflies:>5} bfly | {ratio:.2}x"
+			);
+			prev = total;
+		}
+		println!(
+			"  ratio ~2x per doubling = linear; ~4x = quadratic in n. The one-row layout's\n\
+			 \x20  butterfly count is (n/2)log2(n), so a superlinear phase is the 20h culprit."
+		);
+	}
+
 	/// SOUNDNESS (load-bearing): a tampered ζ·v product / butterfly output is REJECTED,
 	/// isolated to the constraint that binds it. Run at full 256-pt.
 	#[test]
