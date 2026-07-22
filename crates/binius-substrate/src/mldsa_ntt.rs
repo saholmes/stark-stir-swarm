@@ -1333,6 +1333,227 @@ pub fn validate_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usiz
 	Ok(())
 }
 
+// ══════════════ TALL-NARROW INVERSE (GS) butterfly + network ══════════════
+//
+// Mirrors the forward CT network above, for the inverse Gentleman-Sande network. The GS
+// butterfly is `(a, b) → (o_j, o_k)` with `o_j = (a+b)·inv2`, `o_k = (a−b)·inv2z`, where
+// `inv2 = 1/2 mod q` (a compile-time constant, same every row) and `inv2z = 1/(2ζ) mod q`
+// (a per-row twiddle, committed and schedule-pinned). Stages run in REVERSED order
+// (`forward_groups().rev()`, i.e. len ascending), so inverse stage index = log2(len).
+// The sink pins the outputs to `reference::invntt_ref`, so an honest validate means the full
+// inverse transform matches num-bigint. Same routing discipline as the forward: n/2 rows per
+// stage, one (position, value) channel with `position = version·n + slot`.
+
+/// A tall-narrow inverse-GS butterfly stage table (n/2 rows), positional-routed.
+pub struct InvButterflyBatch {
+	pub table_id: TableId,
+	c_col: Col<B1, W>,
+	a: Col<B1, W>,
+	b: Col<B1, W>,
+	inv2z: Col<B1, W>,
+	a_lt: LtQ,
+	b_lt: LtQ,
+	iz_lt: LtQ,
+	add: ModAdd,
+	oj: ModMulConst, // ×inv2 (constant)
+	sub: ModSub,
+	ok: ModMulVar, // ×inv2z (per-row var)
+	pos: [Col<B1, W>; 4],
+}
+
+impl InvButterflyBatch {
+	fn build_seamed_positional(cs: &mut ConstraintSystem<OurB256>, chan: ChannelId, sched: ChannelId) -> Self {
+		let mut t = cs.add_table("mldsa tall-narrow POSITIONAL inverse-GS-butterfly stage");
+		let c_arr: [B1; W] = std::array::from_fn(|k| if c_q_bits()[k] { B1::ONE } else { B1::ZERO });
+		let c_col = t.add_constant("c_q", c_arr);
+		let q_set = set_bits_of(Q);
+		let inv2 = modinv(2);
+		let a = t.add_committed::<B1, W>("a");
+		let b = t.add_committed::<B1, W>("b");
+		let inv2z = t.add_committed::<B1, W>("inv2z");
+		let a_lt = LtQ::build(&mut t, "a", a, c_col);
+		let b_lt = LtQ::build(&mut t, "b", b, c_col);
+		let iz_lt = LtQ::build(&mut t, "inv2z", inv2z, c_col);
+		let add = ModAdd::build(&mut t, "add", a, b, c_col, &q_set);
+		let oj = ModMulConst::build(&mut t, "oj", add.out, inv2, c_col, &q_set);
+		let sub = ModSub::build(&mut t, "sub", a, b, c_col, &q_set);
+		let ok = ModMulVar::build(&mut t, "ok", sub.out, inv2z, c_col, &q_set);
+		let pos_a = t.add_committed::<B1, W>("pos_a");
+		let pos_b = t.add_committed::<B1, W>("pos_b");
+		let pos_j = t.add_committed::<B1, W>("pos_j");
+		let pos_k = t.add_committed::<B1, W>("pos_k");
+		let b64 = |t: &mut TableBuilder<OurB256>, col: Col<B1, W>, nm: &str| -> Col<B64, 1> {
+			t.add_packed::<B1, 64, B64, 1>(format!("{nm}_b64"), col)
+		};
+		let (pa_b, pb_b, pj_b, pk_b, iz_b) = (
+			b64(&mut t, pos_a, "pa"),
+			b64(&mut t, pos_b, "pb"),
+			b64(&mut t, pos_j, "pj"),
+			b64(&mut t, pos_k, "pk"),
+			b64(&mut t, inv2z, "iz"),
+		);
+		let (a_b, b_b, oj_b, ok_b) =
+			(b64(&mut t, a, "a"), b64(&mut t, b, "b"), b64(&mut t, oj.out, "oj"), b64(&mut t, ok.out, "ok"));
+		// ROUTING on `chan`: pull inputs at their positions, push outputs at theirs.
+		t.pull(chan, [pa_b, a_b]);
+		t.pull(chan, [pb_b, b_b]);
+		t.push(chan, [pj_b, oj_b]);
+		t.push(chan, [pk_b, ok_b]);
+		// PIN on `sched`: this row's (positions, inv2z) must be a public schedule tuple.
+		t.pull(sched, [pa_b, pb_b, pj_b, pk_b, iz_b]);
+		Self { table_id: t.id(), c_col, a, b, inv2z, a_lt, b_lt, iz_lt, add, oj, sub, ok, pos: [pos_a, pos_b, pos_j, pos_k] }
+	}
+
+	fn populate_positional(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, a: u64, b: u64, inv2z: u64, pos: [u64; 4]) -> Result<(u64, u64)> {
+		let c = c_q_bits();
+		let (ab, bb, izb) = (bits64(a), bits64(b), bits64(inv2z));
+		write_col::<W>(seg, self.c_col, row, &c)?;
+		write_col::<W>(seg, self.a, row, &ab)?;
+		write_col::<W>(seg, self.b, row, &bb)?;
+		write_col::<W>(seg, self.inv2z, row, &izb)?;
+		self.a_lt.populate(seg, row, &ab, &c)?;
+		self.b_lt.populate(seg, row, &bb, &c)?;
+		self.iz_lt.populate(seg, row, &izb, &c)?;
+		let addb = self.add.populate(seg, row, &ab, &bb, &c)?;
+		let ojb = self.oj.populate(seg, row, &addb, &c)?;
+		let subb = self.sub.populate(seg, row, &ab, &bb, &c)?;
+		let okb = self.ok.populate(seg, row, &subb, &izb, &c)?;
+		for (k, &p) in pos.iter().enumerate() {
+			write_col::<W>(seg, self.pos[k], row, &bits64(p))?;
+		}
+		Ok((to_u64(&ojb), to_u64(&okb)))
+	}
+}
+
+/// Validate the whole inverse GS network tall-narrow: each of the `log₂n` stages is ONE
+/// positional table (n/2 rows), routed on a single `(pos, value)` channel; the sink pins the
+/// outputs to `reference::invntt_ref(input)`. Honest validates; a corrupted `inv2z` (twiddle)
+/// or position is rejected by the schedule pin, and a corrupted butterfly by channel unbalance.
+/// `tamper`/`pos_tamper` corrupt the b-th butterfly's twiddle / position (for the soundness gate).
+pub fn validate_inv_ntt_network_batched(input: &[u64], n: usize, tamper: Option<usize>, pos_tamper: Option<usize>) -> Result<()> {
+	assert!(n.is_power_of_two() && n >= 2, "n must be a power of two ≥ 2");
+	let logn = n.trailing_zeros() as usize;
+	let inv2 = modinv(2);
+	let arr_of = |x: u64| -> [B1; W] { std::array::from_fn(|k| if (x >> k) & 1 == 1 { B1::ONE } else { B1::ZERO }) };
+
+	// native inverse GS pass (REVERSED schedule, len ascending) → per-stage rows + expected out.
+	// each row: (a, b, inv2z_witness, positions[4], inv2z_honest).
+	let mut a = input.to_vec();
+	let mut stage_rows: Vec<Vec<(u64, u64, u64, [u64; 4], u64)>> = vec![Vec::new(); logn];
+	let mut bi = 0usize;
+	for (start, len, zeta) in forward_groups(n).into_iter().rev() {
+		let s = len.trailing_zeros() as usize; // inverse stage index = log2(len)
+		let inv2z = modinv((2 * zeta) % Q);
+		for j in start..start + len {
+			let (av, bv) = (a[j], a[j + len]);
+			let iz_use = if tamper == Some(bi) { (inv2z + 1) % Q } else { inv2z };
+			let pos = [
+				(s * n + j) as u64,
+				(s * n + j + len) as u64,
+				((s + 1) * n + j) as u64,
+				((s + 1) * n + j + len) as u64,
+			];
+			let oj = ((av as u128 + bv as u128) % Q as u128 * inv2 as u128 % Q as u128) as u64;
+			let ok = ((av as u128 + Q as u128 - bv as u128) % Q as u128 * inv2z as u128 % Q as u128) as u64;
+			a[j] = oj;
+			a[j + len] = ok;
+			stage_rows[s].push((av, bv, iz_use, pos, inv2z));
+			bi += 1;
+		}
+	}
+	let expected = a; // = reference::invntt_ref(input)
+
+	let allocator = Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let net: ChannelId = cs.add_channel("inv-net");
+	let sched: Vec<ChannelId> = (0..logn).map(|s| cs.add_channel(format!("inv-sched{s}"))).collect();
+
+	// SOURCE: push n tokens [pos(j,0)=j, input[j]].
+	let mut src = cs.add_table("inv batched-net source");
+	let src_cols: Vec<(Col<B1, W>, Col<B1, W>, u64, u64)> = (0..n)
+		.map(|j| {
+			let pc = src.add_constant(format!("sp{j}"), arr_of(j as u64));
+			let vc = src.add_constant(format!("sv{j}"), arr_of(input[j]));
+			let pb = src.add_packed::<B1, 64, B64, 1>(format!("sp{j}b"), pc);
+			let vb = src.add_packed::<B1, 64, B64, 1>(format!("sv{j}b"), vc);
+			src.push(net, [pb, vb]);
+			(pc, vc, j as u64, input[j])
+		})
+		.collect();
+	let src_id = src.id();
+
+	let stages: Vec<InvButterflyBatch> =
+		(0..logn).map(|s| InvButterflyBatch::build_seamed_positional(&mut cs, net, sched[s])).collect();
+
+	// schedule boundaries: push each stage's honest [pos_a, pos_b, pos_j, pos_k, inv2z] tuples.
+	let bval = |x: u64| OurB256::from(B64::new(x));
+	let mut boundaries = Vec::new();
+	for (s, rows) in stage_rows.iter().enumerate() {
+		for &(_, _, _, pos, iz_honest) in rows {
+			boundaries.push(Boundary {
+				values: vec![bval(pos[0]), bval(pos[1]), bval(pos[2]), bval(pos[3]), bval(iz_honest)],
+				channel_id: sched[s],
+				direction: FlushDirection::Push,
+				multiplicity: 1,
+			});
+		}
+	}
+
+	// SINK: pull n tokens [pos(j,logn)=logn·n+j, expected[j]].
+	let mut snk = cs.add_table("inv batched-net sink");
+	let snk_cols: Vec<(Col<B1, W>, Col<B1, W>, u64, u64)> = (0..n)
+		.map(|j| {
+			let posv = (logn * n + j) as u64;
+			let pc = snk.add_constant(format!("kp{j}"), arr_of(posv));
+			let vc = snk.add_constant(format!("kv{j}"), arr_of(expected[j]));
+			let pb = snk.add_packed::<B1, 64, B64, 1>(format!("kp{j}b"), pc);
+			let vb = snk.add_packed::<B1, 64, B64, 1>(format!("kv{j}b"), vc);
+			snk.pull(net, [pb, vb]);
+			(pc, vc, posv, expected[j])
+		})
+		.collect();
+	let snk_id = snk.id();
+
+	let mut table_sizes = vec![1usize];
+	table_sizes.extend(std::iter::repeat_n(n / 2, logn));
+	table_sizes.push(1);
+	let statement = Statement { boundaries, table_sizes };
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(src_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (pc, vc, p, val) in &src_cols {
+			write_col::<W>(&mut seg, *pc, 0, &bits64(*p))?;
+			write_col::<W>(&mut seg, *vc, 0, &bits64(*val))?;
+		}
+	}
+	let mut gi = 0usize;
+	for (s, bb) in stages.iter().enumerate() {
+		let tw = witness.init_table(bb.table_id, n / 2)?;
+		let mut seg = tw.full_segment();
+		for (row, &(av, bv, iz, pos, _iz_honest)) in stage_rows[s].iter().enumerate() {
+			let mut wpos = pos;
+			if pos_tamper == Some(gi) {
+				wpos[0] ^= 1;
+			}
+			bb.populate_positional(&mut seg, row, av, bv, iz, wpos)?;
+			gi += 1;
+		}
+	}
+	{
+		let tw = witness.init_table(snk_id, 1)?;
+		let mut seg = tw.full_segment();
+		for (pc, vc, p, val) in &snk_cols {
+			write_col::<W>(&mut seg, *pc, 0, &bits64(*p))?;
+			write_col::<W>(&mut seg, *vc, 0, &bits64(*val))?;
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let witness = witness.into_multilinear_extension_index();
+	binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &witness)?;
+	Ok(())
+}
+
 /// One butterfly's fleet-shard spec: `(u, v, ζ, [pos_u, pos_v, pos_a, pos_s])`.
 pub type ButterflySpec = (u64, u64, u64, [u64; 4]);
 
@@ -2569,6 +2790,36 @@ mod tests {
 		println!("GATE ntt-network-batched: each stage is ONE tall-narrow positional table routed by a single (pos,value) channel, with positions+twiddle PINNED to the public schedule via boundary flushes; honest validates, any corrupted twiddle OR position REJECTED");
 	}
 
+	/// INVERSE GS network, tall-narrow: the honest network validates and its output equals
+	/// `reference::invntt_ref`; a corrupted twiddle (inv2z) or position is REJECTED by the
+	/// schedule pin. Same discipline as the forward batched network, for the reversed GS schedule.
+	#[test]
+	fn inv_ntt_network_batched_composed_and_tamper_rejected() {
+		for &n in &[4usize, 8, 16] {
+			let mut rng = StdRng::seed_from_u64(0x1DA7 ^ n as u64);
+			let y = rand_zq(&mut rng, n);
+			// honest inverse network validates (sink pins outputs to invntt_ref(y)).
+			super::validate_inv_ntt_network_batched(&y, n, None, None)
+				.unwrap_or_else(|e| panic!("n={n}: honest inverse GS network must validate: {e}"));
+			let nbf = (n / 2) * (n.trailing_zeros() as usize);
+			for &b in &[0usize, nbf / 2, nbf - 1] {
+				assert!(
+					super::validate_inv_ntt_network_batched(&y, n, Some(b), None).is_err(),
+					"n={n}: a corrupted inverse twiddle at butterfly {b} must be REJECTED"
+				);
+				assert!(
+					super::validate_inv_ntt_network_batched(&y, n, None, Some(b)).is_err(),
+					"n={n}: a corrupted inverse position at butterfly {b} must be REJECTED"
+				);
+			}
+			// round-trip identity: inverse of the forward output returns the input.
+			let fwd = super::reference::ntt_ref(&y, n);
+			super::validate_inv_ntt_network_batched(&fwd, n, None, None)
+				.unwrap_or_else(|e| panic!("n={n}: inverse of ntt_ref(y) must validate (round-trip): {e}"));
+		}
+		println!("GATE inv-ntt-network-batched: the tall-narrow inverse GS network validates (outputs pinned to invntt_ref), rejects any corrupted twiddle/position, and inverts the forward output (round-trip)");
+	}
+
 	/// FLEET SHARDING: split a stage's butterflies into G independent shards, each a standalone
 	/// proof (its I/O + schedule as boundary seams).  Every honest shard validates; a tampered
 	/// shard is rejected; the union of shards is the whole stage (G·per = n/2 butterflies).
@@ -3123,9 +3374,8 @@ mod tests {
 	///
 	/// This replaces the one-row `validate(256)` layout, whose `validate_witness` is O(columns^2)
 	/// (>56 min isolated, ~2 GB; it hung a 20 h suite run) -- see `ntt_validate_scaling_probe` and
-	/// `ntt_batched_validate_timing`. The full-size INVERSE round-trip has no tall-narrow validator
-	/// yet and lives in `full_256_roundtrip_validates_slow` (ignored); in-circuit inverse
-	/// correctness is covered in the default run at n=8 by `roundtrip_proves_over_b256`.
+	/// `ntt_batched_validate_timing`. The full-size INVERSE round-trip is likewise tall-narrow now
+	/// (`full_256_roundtrip_validates`, using the inverse GS network).
 	#[test]
 	fn full_256_validates_and_matches_ref() {
 		let n = 256;
@@ -3136,19 +3386,23 @@ mod tests {
 		println!("GATE full-256: 256-point forward NTT VALIDATES tall-narrow (~7 s, linear) with outputs pinned to num-bigint ntt_ref");
 	}
 
-	/// Full-size INVERSE round-trip validation via the one-row layout. `#[ignore]`d: the inverse
-	/// GS network has no tall-narrow validator yet, so this uses the one-row layout whose
-	/// `validate_witness` is O(columns^2) (~hours at n=256). Forward-256 is fast
-	/// (`full_256_validates_and_matches_ref`); in-circuit inverse is covered at n=8 by
-	/// `roundtrip_proves_over_b256`. Building the tall-narrow inverse (GS) network is the proper
-	/// fix here. Run alone: `... full_256_roundtrip_validates_slow -- --ignored`.
+	/// Full-size ROUND-TRIP, tall-narrow (both halves): the forward network validates
+	/// `NTT(x) == ntt_ref(x)` and the inverse GS network validates `invNTT(ntt_ref(x)) == x`
+	/// (its sink pins outputs to `invntt_ref`, and `invntt_ref(ntt_ref(x)) == x`). Each half is
+	/// checked against the independent num-bigint reference at full size in seconds -- so this is
+	/// strictly stronger than the old one-row `validate(256, true)` (which only asserted the two
+	/// circuits are mutually inverse, and was O(columns^2) / ~hours). Runs in the DEFAULT suite.
 	#[test]
-	#[ignore = "one-row inverse round-trip is O(columns^2); no tall-narrow inverse network yet"]
-	fn full_256_roundtrip_validates_slow() {
+	fn full_256_roundtrip_validates() {
 		let n = 256;
 		let mut rng = StdRng::seed_from_u64(0x2020);
 		let x = rand_zq(&mut rng, n);
-		validate(n, true, &x).expect("full 256-pt round-trip must validate over B256");
+		super::validate_ntt_network_batched(&x, n, None, None)
+			.expect("full 256-pt forward NTT (tall-narrow) must validate");
+		let fwd = super::reference::ntt_ref(&x, n);
+		super::validate_inv_ntt_network_batched(&fwd, n, None, None)
+			.expect("full 256-pt inverse GS round-trip (tall-narrow) must validate");
+		println!("GATE full-256-roundtrip: forward NTT and inverse GS both VALIDATE tall-narrow at n=256, each pinned to num-bigint; invNTT(NTT(x))==x");
 	}
 
 	/// DIAGNOSTIC: why does `validate(256)` hang? Time each phase (build+compile, populate,
