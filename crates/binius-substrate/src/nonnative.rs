@@ -420,6 +420,17 @@ impl<const W: usize> TallRawMul<W> {
 	pub(crate) fn build(cs: &mut ConstraintSystem<OurB256>, name: &str, n: usize, blk: usize, chan: ChannelId) -> Self {
 		assert!(2 * n <= W, "product 2n bits must fit W (n={n}, W={W})");
 		assert!(blk >= 1 && n % blk == 0, "n must be a multiple of the blocking factor");
+		// `n/blk` MUST be a power of two. m3 pads a table up to one, and a padding row is not
+		// harmless here: the `one` constant oracle is `Repeating`, so it must hold 1 on padded rows
+		// as well (a partly-filled table fails with `VirtualOracleEvalMismatch{ oracle: "Repeating:
+		// one" }` at the first padded index), and a padding row would ALSO flush its channel tuple
+		// and unbalance the seam. Requiring the row count to be exact is cheaper and clearer than
+		// synthesising consistent padding rows.
+		assert!(
+			(n / blk).is_power_of_two(),
+			"rows = n/blk must be a power of two (n={n}, blk={blk}, rows={})",
+			n / blk
+		);
 		let logw = W.trailing_zeros() as usize;
 		let (la, lb) = (W / 64, n.div_ceil(64));
 		let mut t = cs.add_table(format!("{name} (tall raw mul, n={n}, blk={blk}, W={W})"));
@@ -493,16 +504,21 @@ impl<const W: usize> TallRawMul<W> {
 		}
 	}
 
-	/// Fill every row; returns the product `a·b` (= the final accumulator).
+	/// Fill every row; returns the final accumulator, `= acc0 + a·b`.
+	///
+	/// `acc0` is what makes this gadget serve BOTH halves of a `ModMul`: with `acc0 = 0` it is the
+	/// multiply `a·b`, and with `acc0 = r` it is the reduction's `q·m + r` — the `+ r` costs
+	/// nothing at all, being just the seed of the accumulator chain.
 	pub(crate) fn populate(
 		&self,
 		seg: &mut TableWitnessSegment<OurB256>,
 		a: &[bool],
 		b: &[bool],
+		acc0: &[bool],
 	) -> Result<Vec<bool>> {
 		let (blk, rows) = (self.blk, self.n / self.blk);
 		let (mut a_r, mut b_r) = (a.to_vec(), b.to_vec());
-		let mut acc = vec![false; W];
+		let mut acc = acc0.to_vec();
 		for row in 0..rows {
 			let a_nx = shl(&a_r, blk);
 			let b_nx = shr(&b_r, blk);
@@ -556,12 +572,13 @@ impl<const W: usize> TallRawMul<W> {
 		Ok(acc)
 	}
 
-	/// The two boundary flushes that close the accumulator chain: seed `(0, a, b, 0)`, drain
-	/// `(rows, a<<n, b>>n, a·b)`. Returned in the order the pull/push tuples were declared.
+	/// The two boundary flushes that close the accumulator chain: seed `(0, a, b, acc0)`, drain
+	/// `(rows, a<<n, b>>n, acc0 + a·b)`. Returned in the order the pull/push tuples were declared.
 	pub(crate) fn boundaries(
 		&self,
 		a: &[bool],
 		b: &[bool],
+		acc0: &[bool],
 		product: &[bool],
 		chan: ChannelId,
 	) -> Vec<binius_m3::builder::Boundary<OurB256>> {
@@ -576,7 +593,7 @@ impl<const W: usize> TallRawMul<W> {
 		let mut seed = vec![bval(0)];
 		seed.extend(lanes(a, self.la));
 		seed.extend(lanes(b, self.lb));
-		seed.extend(lanes(&vec![false; W], self.la));
+		seed.extend(lanes(acc0, self.la));
 		let mut drain = vec![bval(rows as u64)];
 		drain.extend(lanes(&shl(a, self.n), self.la));
 		drain.extend(lanes(&shr(b, self.n), self.lb));
@@ -4414,7 +4431,7 @@ mod tests {
 			let product = {
 				let tw = witness.init_table(tm.table_id, rows).unwrap();
 				let mut seg = tw.full_segment();
-				let p = tm.populate(&mut seg, &ab, &bb).unwrap();
+				let p = tm.populate(&mut seg, &ab, &bb, &vec![false; W]).unwrap();
 				if tamper && rows > 1 {
 					// row 1 claims a different carried `a` than row 0 pushed: the seam must catch it.
 					let bad = shl(&ab, tm.blk + 1);
@@ -4426,7 +4443,7 @@ mod tests {
 				p
 			};
 			let statement = Statement {
-				boundaries: tm.boundaries(&ab, &bb, &product, chan),
+				boundaries: tm.boundaries(&ab, &bb, &vec![false; W], &product, chan),
 				table_sizes: vec![rows],
 			};
 			let ccs = cs.compile(&statement).unwrap();
@@ -4536,10 +4553,10 @@ mod tests {
 			let product = {
 				let tw = wit.init_table(tm.table_id, rows).unwrap();
 				let mut seg = tw.full_segment();
-				tm.populate(&mut seg, &ab, &bb).unwrap()
+				tm.populate(&mut seg, &ab, &bb, &vec![false; W]).unwrap()
 			};
 			assert_eq!(bits_to_big(&product), expect, "blk={blk}: tall-narrow product != a·b");
-			let st = Statement { boundaries: tm.boundaries(&ab, &bb, &product, chan), table_sizes: vec![rows] };
+			let st = Statement { boundaries: tm.boundaries(&ab, &bb, &vec![false; W], &product, chan), table_sizes: vec![rows] };
 			let ms = prove(&cs, &st, wit);
 			println!("     {blk:>5}  {rows:>6}  {ms:>8}    {:>5.2}x", base_ms as f64 / ms as f64);
 			if ms < best.1 {
@@ -4557,6 +4574,155 @@ mod tests {
 			base_ms as f64 / best.1 as f64,
 			85.0 - 85.0 * best.1 as f64 / base_ms as f64,
 			117.0 / (117.0 - (85.0 - 85.0 * best.1 as f64 / base_ms as f64)),
+		);
+	}
+
+	/// THE REDUCTION GATE — `q·m + r`, now the dominant term in `ModMul` after the multiply was
+	/// re-laid-out (117 s = ~85 s multiply + ~32 s reduction; the multiply is now ~9.7 s).
+	///
+	/// A NOTE ON WHAT IS BEING TRADED, because the tall version does strictly MORE arithmetic.
+	/// The one-row reduction exploits `m` being a compile-time constant: it emits `q << p` only for
+	/// the `popcount(m) ≈ n/2` SET bits, at ~4 columns each. A tall-narrow row cannot do that — every
+	/// row of a table runs the SAME constraints, so it cannot skip a zero bit of `m` in one row and
+	/// not another. So the tall version must treat `m` as data: it walks all `n` bit positions and
+	/// gates each by a broadcast `m`-bit, at ~7 columns each — roughly 3.5x the work. It wins anyway
+	/// if the layout is worth more than 3.5x, which the multiply gate says it is (8.7x).
+	///
+	/// Carrying `m` on the channel is not a concession: seeding it by a boundary flush makes the
+	/// modulus a PUBLIC input, which is exactly what a modulus should be.
+	///
+	/// `+ r` is free — it is just the seed of the accumulator chain (`acc0 = r`), which is why this
+	/// reuses `TallRawMul` unchanged rather than needing a second gadget.
+	/// Run: `cargo test --release --lib --features parallel tall_reduction_gate -- --ignored --nocapture`
+	#[test]
+	#[ignore = "gate: tall-narrow q·m+r vs the one-row constant-m reduction at W=4096"]
+	fn tall_reduction_gate() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize; // q,m < 2^n with q<m ⇒ q·m+r ≤ m²-1 < 2^W; rows = n/blk is a power of two
+
+		fn prove(cs: &ConstraintSystem<OurB256>, st: &Statement<OurB256>, wit: WitnessIndex<OurB256>) -> u128 {
+			let ccs = cs.compile(st).unwrap();
+			let wit = wit.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &st.boundaries, &wit).unwrap();
+			let t = Instant::now();
+			let _p = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &st.boundaries, wit, &binius_hal::make_portable_backend())
+			.unwrap();
+			t.elapsed().as_millis()
+		}
+
+		let mut rng = StdRng::seed_from_u64(0x5EDD);
+		// odd n-bit modulus (top bit set), q and r below it — the real reduction operand shapes.
+		let m = (rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << n) - 1u8);
+		let q = rand_below(&mut rng, n) % &m;
+		let r = rand_below(&mut rng, n) % &m;
+		let expect = &q * &m + &r;
+		let (qb, mb, rb) = (big_to_bits::<W>(&q), big_to_bits::<W>(&m), big_to_bits::<W>(&r));
+		let m_set: Vec<usize> = (0..W).filter(|&k| mb[k]).collect();
+
+		// baseline: the shipped one-row form — one shifted `q<<p` per SET bit of m, chained adders,
+		// seeded with r. This is exactly ModMul's (ii-rhs) block, built standalone to time it.
+		let base_ms = {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let logw = W.trailing_zeros() as usize;
+			let (tid, q_col, r_col, terms, adders) = {
+				let mut t = cs.add_table("one-row reduction");
+				let q_col = t.add_committed::<B1, W>("q");
+				let r_col = t.add_committed::<B1, W>("r");
+				let mut terms = Vec::with_capacity(m_set.len());
+				for &p in &m_set {
+					terms.push(if p == 0 {
+						q_col
+					} else {
+						t.add_shifted(format!("q_shl{p}"), q_col, logw, p, ShiftVariant::LogicalLeft)
+					});
+				}
+				let mut adders = Vec::with_capacity(m_set.len());
+				let mut acc = r_col;
+				for (i, &term) in terms.iter().enumerate() {
+					let ad = Adder::<W>::build(&mut t, acc, term, &format!("qm{i}"));
+					acc = ad.sum;
+					adders.push(ad);
+				}
+				(t.id(), q_col, r_col, terms, adders)
+			};
+			let st = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = wit.init_table(tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				write_col::<W>(&mut seg, q_col, 0, &qb).unwrap();
+				write_col::<W>(&mut seg, r_col, 0, &rb).unwrap();
+				for (i, &p) in m_set.iter().enumerate() {
+					if p != 0 {
+						write_col::<W>(&mut seg, terms[i], 0, &shl(&qb, p)).unwrap();
+					}
+				}
+				let mut acc = rb.clone();
+				for (i, &p) in m_set.iter().enumerate() {
+					acc = adders[i].populate(&mut seg, 0, &acc, &shl(&qb, p)).unwrap();
+				}
+				assert_eq!(bits_to_big(&acc), expect, "one-row reduction baseline is wrong");
+			}
+			prove(&cs, &st, wit)
+		};
+
+		println!(
+			"\n  REDUCTION GATE (W={W}, n={n}, popcount(m)={}, L1/B256, {} cores)\n\
+			 \x20  one-row baseline (constant-m, {} shifted terms): {base_ms} ms\n\
+			 \x20     blk    rows   tall ms   speedup",
+			m_set.len(),
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			m_set.len()
+		);
+		let mut best = (0usize, u128::MAX);
+		for blk in [8usize, 16, 32] {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let chan = cs.add_channel("qm_seam");
+			let tm = TallRawMul::<W>::build(&mut cs, "qm", n, blk, chan);
+			let rows = n / blk;
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let out = {
+				let tw = wit.init_table(tm.table_id, rows).unwrap();
+				let mut seg = tw.full_segment();
+				tm.populate(&mut seg, &qb, &mb, &rb).unwrap()
+			};
+			assert_eq!(bits_to_big(&out), expect, "blk={blk}: tall q·m+r != q·m+r");
+			let st = Statement { boundaries: tm.boundaries(&qb, &mb, &rb, &out, chan), table_sizes: vec![rows] };
+			let ms = prove(&cs, &st, wit);
+			println!("     {blk:>5}  {rows:>6}  {ms:>8}    {:>5.2}x", base_ms as f64 / ms as f64);
+			if ms < best.1 {
+				best = (blk, ms);
+			}
+		}
+		println!(
+			"\n    Best: blk={} at {} ms ⇒ {:.1}x off the reduction, DESPITE walking all {n} bit\n\
+			 \x20   positions where the one-row form walks only the {} set bits of m. Every result was\n\
+			 \x20   checked against num-bigint.\n\
+			 \x20   Combined with the 9.7 s tall multiply, a tall ModMul<4096> projects to ~{:.0} s\n\
+			 \x20   against the measured 117 s — but the two halves are still SEPARATE tables here;\n\
+			 \x20   the identity a·b == q·m+r and the r<m check are NOT yet wired.",
+			best.0,
+			best.1,
+			base_ms as f64 / best.1 as f64,
+			m_set.len(),
+			9.7 + best.1 as f64 / 1000.0,
 		);
 	}
 
