@@ -116,6 +116,22 @@ pub(crate) fn shr(x: &[bool], s: usize) -> Vec<bool> {
 	(0..w).map(|k| if k + s < w { x[k + s] } else { false }).collect()
 }
 
+/// Length-`W` LE bit vector of a `BigUint` (bits at or above `W` are dropped).
+pub(crate) fn big_to_bits<const W: usize>(v: &num_bigint::BigUint) -> Vec<bool> {
+	(0..W as u64).map(|i| v.bit(i)).collect()
+}
+
+/// `BigUint` from a LE bit vector.
+pub(crate) fn bits_to_big(bits: &[bool]) -> num_bigint::BigUint {
+	let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+	for (i, &bit) in bits.iter().enumerate() {
+		if bit {
+			bytes[i / 8] |= 1 << (i % 8);
+		}
+	}
+	num_bigint::BigUint::from_bytes_le(&bytes)
+}
+
 /// Ripple-carry add of two W-bit little-endian numbers. Returns `(sum, cout)` where
 /// `sum = (x + y) mod 2^W` and `cout[k]` is the carry OUT of bit position `k` (i.e. the
 /// carry INTO bit `k+1`) — exactly the `cout` column the in-circuit adder commits.
@@ -353,6 +369,149 @@ impl<const W: usize> RawMul<W> {
 			acc = adder.populate(seg, row, &acc, &pp)?;
 		}
 		Ok(acc)
+	}
+}
+
+/// SINGLE-LEVEL KARATSUBA multiply `a·b`, single-width (W2a: proves the LOGIC -- split, additive
+/// identity, assembly -- correct; the cross-width perf optimisation that narrows the three
+/// sub-multiplies to W/2 is W2b). Splits `a = a_hi·2^h + a_lo`, `b` likewise (h = ⌈n/2⌉), forms
+/// `z0 = a_lo·b_lo`, `z2 = a_hi·b_hi`, `zmid = (a_lo+a_hi)(b_lo+b_hi)` as three `RawMul`s, and
+/// recovers `z1` via the ADDITIVE identity `zmid = z0 + z2 + z1` (z1 committed, `≥ 0` by the
+/// Karatsuba identity -- no in-circuit subtraction), then assembles
+/// `product = z2·2^{2h} + z1·2^h + z0`. All bound by add/carry constraints.
+pub(crate) struct KaratsubaMul<const W: usize> {
+	a_lo: Col<B1, W>,
+	a_hi: Col<B1, W>,
+	b_lo: Col<B1, W>,
+	b_hi: Col<B1, W>,
+	alo_hi: Col<B1, W>, // a_lo >> h  (range: == 0)
+	blo_hi: Col<B1, W>,
+	ahi_hi: Col<B1, W>, // a_hi >> (n-h) (range)
+	bhi_hi: Col<B1, W>,
+	ahi_shl: Col<B1, W>, // a_hi << h  (split reconstruction)
+	bhi_shl: Col<B1, W>,
+	za: Adder<W>,
+	zb: Adder<W>,
+	z0: RawMul<W>,
+	z2: RawMul<W>,
+	zmid: RawMul<W>,
+	z1: Col<B1, W>,
+	id1: Adder<W>, // z0 + z2
+	id2: Adder<W>, // (z0+z2) + z1  == zmid
+	z1_shl: Col<B1, W>,
+	z2_shl: Col<B1, W>,
+	asm1: Adder<W>, // z0 + z1<<h
+	asm2: Adder<W>, // + z2<<2h  == product
+	pub(crate) product: Col<B1, W>,
+	n: usize,
+	h: usize,
+}
+
+impl<const W: usize> KaratsubaMul<W> {
+	pub(crate) fn build(t: &mut TableBuilder<OurB256>, name: &str, n: usize, a: Col<B1, W>, b: Col<B1, W>) -> Self {
+		let h = n.div_ceil(2);
+		let nh = n - h; // high-half bit-length
+		assert!(2 * n <= W && 2 * h + 2 * nh <= W, "product 2n bits must fit W (n={n}, W={W})");
+		let logw = W.trailing_zeros() as usize;
+
+		// committed half-operands, range-checked (a_lo<2^h, a_hi<2^{nh}, likewise b).
+		let a_lo = t.add_committed::<B1, W>(format!("{name}_a_lo"));
+		let a_hi = t.add_committed::<B1, W>(format!("{name}_a_hi"));
+		let b_lo = t.add_committed::<B1, W>(format!("{name}_b_lo"));
+		let b_hi = t.add_committed::<B1, W>(format!("{name}_b_hi"));
+		let alo_hi = t.add_shifted(format!("{name}_alo_hi"), a_lo, logw, h, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_alo_rng"), alo_hi * B1::ONE);
+		let blo_hi = t.add_shifted(format!("{name}_blo_hi"), b_lo, logw, h, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_blo_rng"), blo_hi * B1::ONE);
+		let ahi_hi = t.add_shifted(format!("{name}_ahi_hi"), a_hi, logw, nh, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_ahi_rng"), ahi_hi * B1::ONE);
+		let bhi_hi = t.add_shifted(format!("{name}_bhi_hi"), b_hi, logw, nh, ShiftVariant::LogicalRight);
+		t.assert_zero(format!("{name}_bhi_rng"), bhi_hi * B1::ONE);
+		// split binding: a == a_lo + a_hi·2^h (disjoint ranges ⇒ XOR); same for b.
+		let ahi_shl = t.add_shifted(format!("{name}_ahi_shl"), a_hi, logw, h, ShiftVariant::LogicalLeft);
+		t.assert_zero(format!("{name}_a_split"), a - a_lo - ahi_shl);
+		let bhi_shl = t.add_shifted(format!("{name}_bhi_shl"), b_hi, logw, h, ShiftVariant::LogicalLeft);
+		t.assert_zero(format!("{name}_b_split"), b - b_lo - bhi_shl);
+
+		// za = a_lo + a_hi, zb = b_lo + b_hi  (≤ h+1 bits).
+		let za = Adder::<W>::build(t, a_lo, a_hi, &format!("{name}_za"));
+		let zb = Adder::<W>::build(t, b_lo, b_hi, &format!("{name}_zb"));
+
+		// three sub-products.
+		let z0 = RawMul::<W>::build(t, &format!("{name}_z0"), h, a_lo, b_lo);
+		let z2 = RawMul::<W>::build(t, &format!("{name}_z2"), nh, a_hi, b_hi);
+		let zmid = RawMul::<W>::build(t, &format!("{name}_zmid"), h + 1, za.sum, zb.sum);
+
+		// additive Karatsuba identity: zmid == z0 + z2 + z1  (z1 committed, ≥ 0).
+		let z1 = t.add_committed::<B1, W>(format!("{name}_z1"));
+		let id1 = Adder::<W>::build(t, z0.product, z2.product, &format!("{name}_id1"));
+		let id2 = Adder::<W>::build(t, id1.sum, z1, &format!("{name}_id2"));
+		t.assert_zero(format!("{name}_karat_id"), id2.sum - zmid.product);
+
+		// assembly: product = z0 + z1·2^h + z2·2^{2h}.
+		let z1_shl = t.add_shifted(format!("{name}_z1_shl"), z1, logw, h, ShiftVariant::LogicalLeft);
+		let z2_shl = t.add_shifted(format!("{name}_z2_shl"), z2.product, logw, 2 * h, ShiftVariant::LogicalLeft);
+		let asm1 = Adder::<W>::build(t, z0.product, z1_shl, &format!("{name}_asm1"));
+		let asm2 = Adder::<W>::build(t, asm1.sum, z2_shl, &format!("{name}_asm2"));
+
+		Self {
+			a_lo, a_hi, b_lo, b_hi, alo_hi, blo_hi, ahi_hi, bhi_hi, ahi_shl, bhi_shl, za, zb,
+			z0, z2, zmid, z1, id1, id2, z1_shl, z2_shl, asm1, asm2,
+			product: asm2.sum, n, h,
+		}
+	}
+
+	pub(crate) fn populate(&self, seg: &mut TableWitnessSegment<OurB256>, row: usize, a: &[bool], b: &[bool]) -> Result<Vec<bool>> {
+		let h = self.h;
+		let av = bits_to_big(a);
+		let bv = bits_to_big(b);
+		let mask_h = (num_bigint::BigUint::from(1u8) << h) - 1u8;
+		let alo = &av & &mask_h;
+		let ahi = &av >> h;
+		let blo = &bv & &mask_h;
+		let bhi = &bv >> h;
+		let alo_b = big_to_bits::<W>(&alo);
+		let ahi_b = big_to_bits::<W>(&ahi);
+		let blo_b = big_to_bits::<W>(&blo);
+		let bhi_b = big_to_bits::<W>(&bhi);
+		let nh = self.n - h;
+		write_col::<W>(seg, self.a_lo, row, &alo_b)?;
+		write_col::<W>(seg, self.a_hi, row, &ahi_b)?;
+		write_col::<W>(seg, self.b_lo, row, &blo_b)?;
+		write_col::<W>(seg, self.b_hi, row, &bhi_b)?;
+		// add_shifted columns are populated explicitly (m3 does not auto-derive them).
+		write_col::<W>(seg, self.alo_hi, row, &shr(&alo_b, h))?;
+		write_col::<W>(seg, self.blo_hi, row, &shr(&blo_b, h))?;
+		write_col::<W>(seg, self.ahi_hi, row, &shr(&ahi_b, nh))?;
+		write_col::<W>(seg, self.bhi_hi, row, &shr(&bhi_b, nh))?;
+		write_col::<W>(seg, self.ahi_shl, row, &shl(&ahi_b, h))?;
+		write_col::<W>(seg, self.bhi_shl, row, &shl(&bhi_b, h))?;
+
+		let za_v = &alo + &ahi;
+		let zb_v = &blo + &bhi;
+		self.za.populate(seg, row, &alo_b, &ahi_b)?;
+		self.zb.populate(seg, row, &blo_b, &bhi_b)?;
+
+		let z0v = self.z0.populate(seg, row, &alo_b, &blo_b)?;
+		let z2v = self.z2.populate(seg, row, &ahi_b, &bhi_b)?;
+		let zmv = self.zmid.populate(seg, row, &big_to_bits::<W>(&za_v), &big_to_bits::<W>(&zb_v))?;
+
+		let z0_big = bits_to_big(&z0v);
+		let z2_big = bits_to_big(&z2v);
+		let zmid_big = bits_to_big(&zmv);
+		let z1_big = &zmid_big - &z0_big - &z2_big; // ≥ 0 by the Karatsuba identity
+		let z1_b = big_to_bits::<W>(&z1_big);
+		write_col::<W>(seg, self.z1, row, &z1_b)?;
+		let s02 = self.id1.populate(seg, row, &z0v, &z2v)?;
+		self.id2.populate(seg, row, &s02, &z1_b)?;
+
+		let z1_shl_b = shl(&z1_b, h);
+		let z2_shl_b = shl(&z2v, 2 * h);
+		write_col::<W>(seg, self.z1_shl, row, &z1_shl_b)?;
+		write_col::<W>(seg, self.z2_shl, row, &z2_shl_b)?;
+		let asm1 = self.asm1.populate(seg, row, &z0v, &z1_shl_b)?;
+		let prod = self.asm2.populate(seg, row, &asm1, &z2_shl_b)?;
+		Ok(prod)
 	}
 }
 
@@ -3427,6 +3586,74 @@ mod tests {
 		println!(
 			"W1 GATE raw-mul: RawMul<{W}> computes a·b for {n}-bit operands over 3 random trials, \
 			 validates every constraint, and its product column equals num-bigint a·b."
+		);
+	}
+
+	/// W2a GATE — single-width Karatsuba multiply. Proves the LOGIC (split, three sub-products, the
+	/// ADDITIVE identity `zmid = z0+z2+z1`, and product assembly) is correct AND sound: honest
+	/// witness validates and its product == a·b; a tampered `z1` (the one degree of freedom the
+	/// prover chooses) is REJECTED by the Karatsuba-identity constraint. Widths stay uniform here
+	/// (the perf win from narrowing the three sub-mults to W/2 is W2b).
+	#[test]
+	fn karatsuba_mul_single_width_sound() {
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex, B1};
+		use bumpalo::Bump;
+
+		const W: usize = 256;
+		let n = 124usize; // product 2n=248 ≤ W
+		let mut rng = StdRng::seed_from_u64(0x2A11);
+
+		let build = |av: &num_bigint::BigUint, bv: &num_bigint::BigUint, tamper: bool| -> (bool, num_bigint::BigUint) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let (tid, a, b, km) = {
+				let mut t = cs.add_table("karatsuba-w2a");
+				let a = t.add_committed::<B1, W>("a");
+				let b = t.add_committed::<B1, W>("b");
+				let km = KaratsubaMul::<W>::build(&mut t, "km", n, a, b);
+				(t.id(), a, b, km)
+			};
+			let statement = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let product_bits = {
+				let tw = witness.init_table(tid, 1).unwrap();
+				let mut seg = tw.full_segment();
+				let ab = to_bits::<W>(av);
+				let bb = to_bits::<W>(bv);
+				write_col::<W>(&mut seg, a, 0, &ab).unwrap();
+				write_col::<W>(&mut seg, b, 0, &bb).unwrap();
+				let mut prod = km.populate(&mut seg, 0, &ab, &bb).unwrap();
+				if tamper {
+					// flip one bit of the committed z1 free variable; identity must catch it.
+					let mut z1_bits = big_to_bits::<W>(&(&(av * bv) >> 4)); // arbitrary wrong z1
+					z1_bits.resize(W, false);
+					write_col::<W>(&mut seg, km.z1, 0, &z1_bits).unwrap();
+					prod = vec![]; // product no longer meaningful under tamper
+				}
+				prod
+			};
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let ok = binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).is_ok();
+			(ok, from_bits(&product_bits))
+		};
+
+		for trial in 0..3 {
+			let av = rand_below(&mut rng, n);
+			let bv = rand_below(&mut rng, n);
+			let (ok, prod) = build(&av, &bv, false);
+			assert!(ok, "trial {trial}: honest Karatsuba witness must validate");
+			assert_eq!(prod, &av * &bv, "trial {trial}: Karatsuba product != a·b");
+		}
+		// soundness: a forged z1 must not validate.
+		let av = rand_below(&mut rng, n);
+		let bv = rand_below(&mut rng, n);
+		let (ok, _) = build(&av, &bv, true);
+		assert!(!ok, "tampered z1 must be REJECTED by the Karatsuba identity constraint");
+
+		println!(
+			"W2a GATE karatsuba: KaratsubaMul<{W}> (n={n}, single-width) validates and equals a·b \
+			 over 3 trials; a forged z1 is rejected by the additive identity zmid=z0+z2+z1."
 		);
 	}
 
