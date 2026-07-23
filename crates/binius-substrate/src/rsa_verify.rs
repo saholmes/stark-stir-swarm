@@ -1095,4 +1095,149 @@ mod tests {
 			 chain (strand-seamed) + EMSA byte-equality boundary over binius_circuits::sha256"
 		);
 	}
+	/// GATE prove-D-parent-fullwidth-TALL — the SAME full-width RSA-2048 e=65537 parent link as
+	/// `rsa2048_full_width_parent_link_e65537_over_b256`, on the SAME real vector, but with each
+	/// strand proved by the tall-narrow `TallModMul` instead of the one-row `ModMul`. Two wins
+	/// compose here:
+	///   * LAYOUT — the strand becomes n/blk rows of blk partial products with its accumulator
+	///     threaded over a channel (measured 5.8x on the gadget alone, and 4.5x less peak RSS).
+	///   * WIDTH  — the one-row gadget needs `2·np+1 <= W`, forcing W=8192 for np=2048. TallModMul
+	///     PROVES `a<m` and `b<m` in-circuit, so `q = floor(ab/m) < m < 2^np` and only `2·np <= W`
+	///     is required: W=4096 suffices, halving the column width on top of the layout win.
+	/// The seam contract is unchanged (`a`/`b` pulled, `r` pushed, boundary-flushed per strand), so
+	/// this is a drop-in: each strand stays an INDEPENDENT bounded-memory proof.
+	/// #[ignore]d — heavy; run explicitly:
+	///   cargo test --release --features parallel --lib rsa2048_full_width_parent_link_e65537_tall -- --include-ignored --nocapture
+	#[test]
+	#[ignore]
+	fn rsa2048_full_width_parent_link_e65537_tall() {
+		use crate::b256_field::{B256TowerFamily, B256 as OurB256, U256};
+		use crate::nonnative::TallModMul;
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex, B64};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::io::Write;
+		use std::time::Instant;
+
+		const W: usize = 4096; // np=2048 needs only 2·np <= W here, not 2·np+1
+		const BLK: usize = 16; // bracketed interior optimum
+		fn to_bits(x: &BigUint) -> Vec<bool> {
+			(0..W as u64).map(|i| x.bit(i)).collect()
+		}
+
+		let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap();
+		let s = BigUint::parse_bytes(SIG_HEX.as_bytes(), 16).unwrap() % &n;
+		let np = n.bits() as usize; // 2048
+		assert!(2 * np <= W, "np={np} needs W>=2np for the tall gadget");
+		let n_lanes = (np + 63) / 64; // 32 — identical seam width to the one-row chain
+		let n_bits = to_bits(&n);
+
+		let to_boundary = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(n_lanes * 8, 0);
+			(0..n_lanes)
+				.map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))))
+				.collect()
+		};
+
+		// One strand a·b mod N (a squaring passes the same channel twice, multiplicity 2).
+		let prove_strand = |a: &BigUint, b: &BigUint, r_pub: &BigUint, square: bool| -> (bool, f64, f64) {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let cha = cs.add_channel("chA");
+			let chb = if square { cha } else { cs.add_channel("chB") };
+			let chout = cs.add_channel("chOut");
+			let mm = TallModMul::<W>::build_seamed(
+				&mut cs, &n_bits, np, BLK, 1, Some(cha), Some(chb), Some(chout),
+			);
+			let mut boundaries = vec![Boundary {
+				values: to_boundary(a),
+				channel_id: cha,
+				direction: FlushDirection::Push,
+				multiplicity: if square { 2 } else { 1 },
+			}];
+			if !square {
+				boundaries.push(Boundary {
+					values: to_boundary(b),
+					channel_id: chb,
+					direction: FlushDirection::Push,
+					multiplicity: 1,
+				});
+			}
+			boundaries.push(Boundary {
+				values: to_boundary(r_pub),
+				channel_id: chout,
+				direction: FlushDirection::Pull,
+				multiplicity: 1,
+			});
+			let statement = Statement { boundaries, table_sizes: mm.table_sizes() };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			let (q, r_true) = ((a * b) / &n, (a * b) % &n);
+			mm.populate(&mut witness, &to_bits(a), &to_bits(b), &to_bits(&q), &to_bits(&r_true))
+				.unwrap();
+			let ccs = cs.compile(&statement).unwrap();
+			let witness = witness.into_multilinear_extension_index();
+			let tp = Instant::now();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &statement.boundaries, witness, &binius_hal::make_portable_backend());
+			let pms = tp.elapsed().as_secs_f64() * 1e3;
+			match proof {
+				Err(_) => (false, pms, 0.0),
+				Ok(pf) => {
+					let tv = Instant::now();
+					let ok = binius_core::constraint_system::verify::<
+						U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+					>(&ccs, 1, 128, &statement.boundaries, pf)
+					.is_ok();
+					(ok, pms, tv.elapsed().as_secs_f64() * 1e3)
+				}
+			}
+		};
+
+		println!("[full-width e=65537, TALL] W={W}, np={np}, blk={BLK}, {n_lanes} lanes — 17 strands (16 sq + 1 mul):");
+		let _ = std::io::stdout().flush();
+
+		let t_total = Instant::now();
+		let (mut total_prove, mut total_verify) = (0.0f64, 0.0f64);
+		let mut cur = s.clone();
+		for i in 0..16 {
+			let ts = Instant::now();
+			let nxt = (&cur * &cur) % &n;
+			let (ok, pms, vms) = prove_strand(&cur, &cur, &nxt, true);
+			assert!(ok, "squaring strand {i} must PROVE+VERIFY");
+			total_prove += pms;
+			total_verify += vms;
+			println!(
+				"  [{:2}/17] square prove {:7.1}s  verify {:6.1}s  (strand wall {:.1}s, cum {:.1}s)",
+				i + 1, pms / 1e3, vms / 1e3, ts.elapsed().as_secs_f64(), t_total.elapsed().as_secs_f64()
+			);
+			let _ = std::io::stdout().flush();
+			cur = nxt;
+		}
+		let ts = Instant::now();
+		let em = (&cur * &s) % &n;
+		let (ok, pms, vms) = prove_strand(&cur, &s, &em, false);
+		assert!(ok, "final multiply strand (s^65536 · s) must PROVE+VERIFY");
+		total_prove += pms;
+		total_verify += vms;
+		println!(
+			"  [17/17] mult   s^65537 prove {:7.1}s  verify {:6.1}s  (strand wall {:.1}s, cum {:.1}s)",
+			pms / 1e3, vms / 1e3, ts.elapsed().as_secs_f64(), t_total.elapsed().as_secs_f64()
+		);
+		let _ = std::io::stdout().flush();
+
+		assert_eq!(em, s.modpow(&BigUint::from(65537u32), &n), "chain must compose to s^65537 mod N");
+		let (bad, _, _) = prove_strand(&cur, &s, &((&em + 1u32) % &n), false);
+		assert!(!bad, "SOUNDNESS FAILURE: a strand lying about s^65537 was accepted");
+
+		println!(
+			"GATE prove-D-parent-fullwidth-TALL: FULL-WIDTH RSA-2048 e=65537 (W={W}, blk={BLK}, real N_HEX/SIG_HEX) proven in-circuit over B256 @L1(128) as 17 seam-glued TallModMul strands; chain == s.modpow(65537,N); tamper REJECTED. TOTAL prove {:.1}s + verify {:.1}s over 17 strands; wall {:.1}s ({:.1} min).",
+			total_prove / 1e3, total_verify / 1e3, t_total.elapsed().as_secs_f64(), t_total.elapsed().as_secs_f64() / 60.0
+		);
+	}
+
 }

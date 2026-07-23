@@ -793,6 +793,14 @@ pub struct TallModMul<const W: usize> {
 	lt_b: LtM<W>,
 	lt_r: LtM<W>,
 	sel: Vec<Col<B1, 64>>, // in declaration order: a, b, q, m, r, prod, a<<n, q<<n
+	/// EXTERNAL seams (chaining this ModMul to its neighbours), each `⌈n/64⌉` lanes: `a` and `b`
+	/// PULLED from a predecessor's output, `r` PUSHED to a successor. `⌈n/64⌉` lanes suffice to
+	/// carry the whole value precisely because the closer PROVES `a,b,r < m < 2^n` — the stricter
+	/// operand contract pays for itself twice.
+	seam_a: Vec<Col<B1, 64>>,
+	seam_b: Vec<Col<B1, 64>>,
+	seam_r: Vec<Col<B1, 64>>,
+	nl: usize,
 	n: usize,
 	blk: usize,
 	la: usize,
@@ -819,6 +827,24 @@ impl<const W: usize> TallModMul<W> {
 	}
 
 	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize, blk: usize, bpd: usize) -> Self {
+		Self::build_seamed(cs, m_bits, n, blk, bpd, None, None, None)
+	}
+
+	/// Chain link. `in_a`/`in_b` PULL the operands from a predecessor's output channel and `out_r`
+	/// PUSHES the remainder onward, so a modexp can be proved as independent per-`ModMul` strands
+	/// glued by channels — the same seam contract as [`ModMul::build_seamed_in2_chain`], so this is
+	/// a drop-in for an existing chain. A squaring passes the SAME channel as `in_a` and `in_b`
+	/// (the caller's boundary flush then carries multiplicity 2).
+	pub fn build_seamed(
+		cs: &mut ConstraintSystem<OurB256>,
+		m_bits: &[bool],
+		n: usize,
+		blk: usize,
+		bpd: usize,
+		in_a: Option<ChannelId>,
+		in_b: Option<ChannelId>,
+		out_r: Option<ChannelId>,
+	) -> Self {
 		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
 		assert!(2 * n <= W, "q·m + r < m² < 2^{{2n}} must fit W (n={n}, W={W})");
 		let logw = W.trailing_zeros() as usize;
@@ -887,9 +913,43 @@ impl<const W: usize> TallModMul<W> {
 		t.push(chan_qm, cat(zb, [&q_l, &m_l, &r_l]));
 		t.pull(chan_qm, cat(pr, [&qs_l, &z_lb, &p_l]));
 
+		// External chaining seams, `⌈n/64⌉` lanes each — sound at that width because a,b,r < m < 2^n
+		// is proved above, so the projected lanes carry the whole value.
+		let nl = n.div_ceil(64);
+		let mut ext = |t: &mut TableBuilder<OurB256>,
+		               tag: &str,
+		               src: Col<B1, W>,
+		               chan: Option<ChannelId>,
+		               pull: bool|
+		 -> Vec<Col<B1, 64>> {
+			match chan {
+				None => Vec::new(),
+				Some(c) => {
+					let mut sel = Vec::with_capacity(nl);
+					let packed = (0..nl)
+						.map(|i| {
+							let s =
+								t.add_selected_block::<B1, W, 64>(format!("ext_{tag}_sel{i}"), src, i);
+							sel.push(s);
+							t.add_packed::<B1, 64, B64, 1>(format!("ext_{tag}_b64{i}"), s)
+						})
+						.collect::<Vec<_>>();
+					if pull {
+						t.pull(c, packed);
+					} else {
+						t.push(c, packed);
+					}
+					sel
+				}
+			}
+		};
+		let seam_a = ext(&mut t, "a", a, in_a, true);
+		let seam_b = ext(&mut t, "b", b, in_b, true);
+		let seam_r = ext(&mut t, "r", r, out_r, false);
+
 		Self {
 			ab, qm, closer_id: t.id(), a, b, q, r, prod, m_col, c_col, zero64, posr64,
-			q_hi, a_shl_n, q_shl_n, lt_a, lt_b, lt_r, sel, n, blk, la, lb,
+			q_hi, a_shl_n, q_shl_n, lt_a, lt_b, lt_r, sel, seam_a, seam_b, seam_r, nl, n, blk, la, lb,
 			m_bits: m_bits.to_vec(), c_bits,
 		}
 	}
@@ -944,6 +1004,12 @@ impl<const W: usize> TallModMul<W> {
 				for i in 0..lanes {
 					write_col::<64>(&mut seg, self.sel[k], 0, &v[i * 64..i * 64 + 64])?;
 					k += 1;
+				}
+			}
+			// external chaining seams (empty unless this link is seamed).
+			for (sels, v) in [(&self.seam_a, a), (&self.seam_b, b), (&self.seam_r, r)] {
+				for (i, &s) in sels.iter().enumerate() {
+					write_col::<64>(&mut seg, s, 0, &v[i * 64..i * 64 + 64])?;
 				}
 			}
 		}
@@ -5225,6 +5291,99 @@ mod tests {
 			best.0,
 			if best.1 == 1 { 2 } else { 4 },
 			best.2,
+		);
+	}
+
+	/// VERIFY, which this whole arc had not measured. The tall re-layout was gated on PROVE time
+	/// and peak RSS throughout; the RSA apex chain then showed verify at 33.2 s per strand against
+	/// 20.2 s prove — i.e. the bottleneck moved, and verify is precisely the side that runs on the
+	/// resolver/edge device the deployment claims are about. This measures both layouts on the same
+	/// statement: prove, VERIFY, and proof size.
+	///
+	/// The one-row gadget needs `2n+1 <= W` so it is measured at W=8192 for np=2048 — which is the
+	/// honest comparison, because that width is exactly what the apex chain must use without the
+	/// tall gadget's stricter `a<m`/`b<m` contract.
+	/// Run: `cargo test --release --lib --features parallel verify_cost_onerow_vs_tall -- --ignored --nocapture`
+	#[test]
+	#[ignore = "verify-cost comparison: one-row W=8192 vs tall W=4096 at np=2048"]
+	fn verify_cost_onerow_vs_tall() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		let np = 2048usize;
+		let mut rng = StdRng::seed_from_u64(0x9E71);
+		let m = (rand_below(&mut rng, np) | (BigUint::from(1u8) << (np - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << np) - 1u8);
+		let a = rand_below(&mut rng, np) % &m;
+		let b = rand_below(&mut rng, np) % &m;
+		let (q, r) = (&a * &b / &m, &a * &b % &m);
+
+		// tall, W=4096
+		let (tp, tv, tsz) = {
+			const W: usize = 4096;
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), np, 16, 1);
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			mm.populate(&mut wit, &big_to_bits::<W>(&a), &big_to_bits::<W>(&b), &big_to_bits::<W>(&q), &big_to_bits::<W>(&r)).unwrap();
+			let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+			let ccs = cs.compile(&st).unwrap();
+			let widx = wit.into_multilinear_extension_index();
+			let t0 = Instant::now();
+			let pf = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend()).unwrap();
+			let p = t0.elapsed().as_secs_f64();
+			let sz = pf.get_proof_size();
+			let t1 = Instant::now();
+			binius_core::constraint_system::verify::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+			>(&ccs, 1, 128, &[], pf).unwrap();
+			(p, t1.elapsed().as_secs_f64(), sz)
+		};
+
+		// one-row, W=8192 (its minimum legal width for np=2048)
+		let (op, ov, osz) = {
+			const W: usize = 8192;
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = ModMul::<W>::build(&mut cs, &to_bits::<W>(&m), np);
+			let st = Statement { boundaries: vec![], table_sizes: vec![1] };
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = wit.init_table(mm.table_id, 1).unwrap();
+				let mut seg = tw.full_segment();
+				mm.populate(&mut seg, &[honest_row::<W>(&a, &b, &m)]).unwrap();
+			}
+			let ccs = cs.compile(&st).unwrap();
+			let widx = wit.into_multilinear_extension_index();
+			let t0 = Instant::now();
+			let pf = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend()).unwrap();
+			let p = t0.elapsed().as_secs_f64();
+			let sz = pf.get_proof_size();
+			let t1 = Instant::now();
+			binius_core::constraint_system::verify::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+			>(&ccs, 1, 128, &[], pf).unwrap();
+			(p, t1.elapsed().as_secs_f64(), sz)
+		};
+
+		println!(
+			"\n  PROVE *AND VERIFY* (np={np}, L1/B256, {} cores) — one ModMul, both layouts\n\
+			 \x20                        prove      verify    proof size\n\
+			 \x20  one-row W=8192   {op:8.1}s  {ov:8.1}s   {osz:>8} B\n\
+			 \x20  tall    W=4096   {tp:8.1}s  {tv:8.1}s   {tsz:>8} B\n\
+			 \x20  ratio            {:8.2}x  {:8.2}x   {:8.2}x\n\
+			 \x20  Verify is the side that runs on the resolver/edge device, so a re-layout that\n\
+			 \x20  improves prove and worsens verify is NOT automatically a deployment win.",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			op / tp, ov / tv, osz as f64 / tsz as f64,
 		);
 	}
 
