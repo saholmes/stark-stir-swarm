@@ -350,6 +350,263 @@ pub fn prove_fold_tree(steps: &[FoldStepIn]) -> Result<(bool, u128, u128, usize)
 	Ok((true, prove_ms, t1.elapsed().as_millis(), sz))
 }
 
+/// Tamper knob for the chained fold-tree soundness tests.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ChainTamper {
+	None,
+	/// Forge an intermediate accumulator value the prover feeds into the next fold (row `at`).
+	ForgeAccValue { at: usize },
+	/// Reorder: swap which predecessor accumulator two rows consume (breaks the chain).
+	SwapAccInputs,
+}
+
+/// CHAINED, ONE-PROOF fold tree — the F2 collapse, FRI-native. `run_ivc` folds N leaf claims into
+/// one via N−1 steps but proves each step as a SEPARATE proof (O(N) verify). This proves the WHOLE
+/// chain in ONE proof: N−1 fold rows in one table, threaded by an accumulator CHANNEL (row j PULLS
+/// `acc_{j-1}` and PUSHES `acc_j`; a boundary pushes `acc_0` = leaf 0 and pulls the final `acc`),
+/// with a per-row STEP-POSITION lane so the multiset cannot admit a re-ordering. So the resolver
+/// verifies ONE FRI proof (polylog in N) whose channel structurally forces the folds to be the
+/// real chain — not N independent folds (`prove_fold_tree`) nor N separate proofs (`run_ivc`).
+///
+/// SOUNDNESS this milestone establishes (tamper-tested): a forged intermediate accumulator, or a
+/// re-ordered chain, is REJECTED. The `pi_hash` public-input binding (leaf points ==
+/// derive_point(pi_hash,i), challenges == H(pi_hash‖R*‖k)) is the NEXT layer; here the leaves and
+/// challenges are inputs, and the decider `mle256(P, acc.point) == acc.value` is checked natively
+/// (in production it is the committed-decider FRI opening — one opening, O(1) in N).
+///
+/// Returns `(chain_valid_in_circuit, decider_holds, prove_ms, verify_ms, proof_bytes)`.
+pub fn prove_chained_fold_tree(
+	p: &[OurB256],
+	leaves: &[(Vec<OurB256>, OurB256)],
+	challenges: &[OurB256],
+	tamper: ChainTamper,
+) -> Result<(bool, bool, u128, u128, usize)> {
+	use binius_core::constraint_system::channel::FlushDirection;
+	use binius_m3::builder::Boundary;
+	use std::time::Instant;
+
+	let nlv = leaves.len();
+	assert!(nlv >= 2 && nlv.is_power_of_two(), "need ≥2 leaves, power of two");
+	assert_eq!(challenges.len(), nlv - 1, "one challenge per fold");
+	let d = leaves[0].0.len();
+	assert!(d >= 1 && leaves.iter().all(|(pt, _)| pt.len() == d));
+
+	// ── native chain: acc_0 = leaf 0; acc_j = fold(acc_{j-1}, leaf_j). Record per-fold (g,t,r0,r1)
+	//    and the outputs (line, folded). `g` is the coeff-form line restriction of P.
+	let eval_coeffs = |g: &[OurB256], t: OurB256| -> OurB256 {
+		let mut acc = g[g.len() - 1];
+		for i in (0..g.len() - 1).rev() {
+			acc = acc * t + g[i];
+		}
+		acc
+	};
+	struct Fold {
+		g: Vec<OurB256>,
+		t: OurB256,
+		r0: Vec<OurB256>,
+		r1: Vec<OurB256>,
+		v0: OurB256,
+		v1: OurB256,
+		line: Vec<OurB256>,
+		folded: OurB256,
+	}
+	let mut acc = leaves[0].clone();
+	let mut folds: Vec<Fold> = Vec::with_capacity(nlv - 1);
+	for j in 1..nlv {
+		let (r0, v0) = (acc.0.clone(), acc.1);
+		let (r1, v1) = (leaves[j].0.clone(), leaves[j].1);
+		let t = challenges[j - 1];
+		let g = restrict_to_line_coeffs(p, &r0, &r1);
+		debug_assert_eq!(g[0], v0);
+		debug_assert_eq!(g.iter().copied().fold(OurB256::ZERO, |a, c| a + c), v1);
+		let line = line256(&r0, &r1, t);
+		let folded = eval_coeffs(&g, t);
+		acc = (line.clone(), folded);
+		folds.push(Fold { g, t, r0, r1, v0, v1, line, folded });
+	}
+	let decider_holds = mle256(p, &acc.0) == acc.1;
+
+	// ── the AIR: one table, `nrows` = N−1 fold rows (padded to a power of two). Each row proves one
+	//    fold-verify AND flows the accumulator through the `acc` channel with a step-position lane.
+	let dg = d; // fold-poly degree == point dim (line restriction of P over d vars)
+	let allocator = bumpalo::Bump::new();
+	let mut cs = ConstraintSystem::<OurB256>::new();
+	let acc_ch = cs.add_channel("acc-chain");
+	let mut tb = cs.add_table("chained fold tree");
+	let beta_col = tb.add_committed::<B64, 1>("beta");
+	let cg: Vec<C4> = (0..=dg).map(|i| col4(&mut tb, &format!("g{i}"))).collect();
+	let ct = col4(&mut tb, "t");
+	let cv0 = col4(&mut tb, "v0");
+	let cv1 = col4(&mut tb, "v1");
+	let cr0: Vec<C4> = (0..dg).map(|k| col4(&mut tb, &format!("r0_{k}"))).collect();
+	let cr1: Vec<C4> = (0..dg).map(|k| col4(&mut tb, &format!("r1_{k}"))).collect();
+	let cpos_in = tb.add_committed::<B64, 1>("pos_in");
+	let cpos_out = tb.add_committed::<B64, 1>("pos_out");
+
+	// g(0)=v0 ; g(1)=Σg=v1
+	for j in 0..4 {
+		tb.assert_zero(format!("g0eq{j}"), cg[0][j] - cv0[j]);
+	}
+	for j in 0..4 {
+		let mut a = cg[0][j] + cg[1][j];
+		for c in cg.iter().skip(2) {
+			a = a + c[j];
+		}
+		tb.assert_zero(format!("g1eq{j}"), a - cv1[j]);
+	}
+	// Horner: folded = g(t).
+	let mut horner_m = Vec::with_capacity(dg);
+	let mut hacc = Vec::with_capacity(dg);
+	let mut acc_e = cg[dg];
+	for i in (0..dg).rev() {
+		let m = build_b256_mul(&mut tb, beta_col, acc_e, ct, &format!("hm{i}_"));
+		let next = col4(&mut tb, &format!("hacc{i}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("hacc{i}_{j}"), next[j] - (m.c[j] + cg[i][j]));
+		}
+		horner_m.push(m);
+		hacc.push(next);
+		acc_e = next;
+	}
+	let folded_col = *hacc.last().unwrap(); // = g(t)
+	// line[k] = r0[k] + t·(r0[k]+r1[k]).
+	let mut s_cols = Vec::with_capacity(dg);
+	let mut line_m = Vec::with_capacity(dg);
+	let mut cline = Vec::with_capacity(dg);
+	for k in 0..dg {
+		let s = col4(&mut tb, &format!("s{k}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("s{k}_{j}"), s[j] - (cr0[k][j] + cr1[k][j]));
+		}
+		let m = build_b256_mul(&mut tb, beta_col, ct, s, &format!("lm{k}_"));
+		let l = col4(&mut tb, &format!("line{k}"));
+		for j in 0..4 {
+			tb.assert_zero(format!("line{k}_{j}"), l[j] - (cr0[k][j] + m.c[j]));
+		}
+		s_cols.push(s);
+		line_m.push(m);
+		cline.push(l);
+	}
+
+	// accumulator channel: PULL (pos_in ‖ r0[0..d] ‖ v0) = acc_{j-1}; PUSH (pos_out ‖ line ‖ folded) = acc_j.
+	let mut pull_t: Vec<Col<B64, 1>> = vec![cpos_in];
+	for k in 0..dg {
+		pull_t.extend_from_slice(&cr0[k]);
+	}
+	pull_t.extend_from_slice(&cv0);
+	let mut push_t: Vec<Col<B64, 1>> = vec![cpos_out];
+	for k in 0..dg {
+		push_t.extend_from_slice(&cline[k]);
+	}
+	push_t.extend_from_slice(&folded_col);
+	tb.pull(acc_ch, pull_t);
+	tb.push(acc_ch, push_t);
+	let table_id = tb.id();
+
+	let nrows = (nlv - 1).next_power_of_two();
+	// boundary tuples: seed acc_0 (pos 0, leaf0.point, leaf0.value) PUSH; drain acc_{N-1} PULL.
+	let posf = |k: usize| OurB256::from(B64::new(k as u64));
+	let bval = |x: OurB256| x; // channel carries B64 lanes of the B256; boundary values are B256 split.
+	let _ = bval;
+	// Represent each B256 as its 4 B64 lanes for the boundary (matching the packed channel columns).
+	let lanes256 = |x: OurB256| -> Vec<OurB256> { split256(x).iter().map(|&w| OurB256::from(w)).collect() };
+	let mut seed = vec![posf(0)];
+	for c in &leaves[0].0 {
+		seed.extend(lanes256(*c));
+	}
+	seed.extend(lanes256(leaves[0].1));
+	let mut drain = vec![posf(nlv - 1)];
+	for c in &acc.0 {
+		drain.extend(lanes256(*c));
+	}
+	drain.extend(lanes256(acc.1));
+	let boundaries = vec![
+		Boundary { values: seed, channel_id: acc_ch, direction: FlushDirection::Push, multiplicity: 1 },
+		Boundary { values: drain, channel_id: acc_ch, direction: FlushDirection::Pull, multiplicity: 1 },
+	];
+	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+
+	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+	{
+		let tw = witness.init_table(table_id, nrows)?;
+		let mut seg = tw.full_segment();
+		// A padding row is a SELF-FOLD: r0=r1 (a fixed point q), g=[P(q),0,…] constant, t arbitrary
+		// ⇒ line=q, folded=P(q)=v0=v1, and pos_in=pos_out=`pad_pos` (a value outside 0..N used only
+		// here). Its channel PUSH and PULL tuples are then identical and cancel, so padding does not
+		// unbalance the accumulator chain.
+		let pad_pos = nlv; // distinct from every real position 0..=N−1
+		let (pq, pqv) = (leaves[0].0.clone(), leaves[0].1);
+		for row in 0..nrows {
+			let real = row < folds.len();
+			wc64(&mut seg, beta_col, row, beta())?;
+			// per-row logical fold data, with tamper applied to a real row's consumed accumulator.
+			let (g, t, mut r0, r1, mut v0, v1, pin, pout) = if real {
+				let f = &folds[row];
+				(f.g.clone(), f.t, f.r0.clone(), f.r1.clone(), f.v0, f.v1, row, row + 1)
+			} else {
+				let mut g = vec![OurB256::ZERO; dg + 1];
+				g[0] = pqv;
+				(g, OurB256::ONE, pq.clone(), pq.clone(), pqv, pqv, pad_pos, pad_pos)
+			};
+			if let ChainTamper::ForgeAccValue { at } = tamper {
+				if row == at && real {
+					r0[0] = r0[0] + OurB256::ONE; // corrupt the consumed accumulator point
+				}
+			}
+			if tamper == ChainTamper::SwapAccInputs && real && folds.len() >= 2 && (row == 0 || row == 1) {
+				let other = &folds[1 - row];
+				r0 = other.r0.clone();
+				v0 = other.v0;
+			}
+			wc64(&mut seg, cpos_in, row, split256(posf(pin))[0])?;
+			wc64(&mut seg, cpos_out, row, split256(posf(pout))[0])?;
+			for i in 0..=dg {
+				put(&mut seg, row, &cg[i], g[i])?;
+			}
+			put(&mut seg, row, &ct, t)?;
+			put(&mut seg, row, &cv0, v0)?;
+			put(&mut seg, row, &cv1, v1)?;
+			for k in 0..dg {
+				put(&mut seg, row, &cr0[k], r0[k])?;
+				put(&mut seg, row, &cr1[k], r1[k])?;
+			}
+			// Horner witness for folded = g(t).
+			let mut a = g[dg];
+			for (idx, i) in (0..dg).rev().enumerate() {
+				pop_b256_mul(&horner_m[idx], &mut seg, row, split256(a), split256(t))?;
+				a = a * t + g[i];
+				put(&mut seg, row, &hacc[idx], a)?;
+			}
+			// line witness from the (possibly tampered) r0.
+			for k in 0..dg {
+				let s = r0[k] + r1[k];
+				put(&mut seg, row, &s_cols[k], s)?;
+				pop_b256_mul(&line_m[k], &mut seg, row, split256(t), split256(s))?;
+				let l = r0[k] + t * s;
+				put(&mut seg, row, &cline[k], l)?;
+			}
+		}
+	}
+	let ccs = cs.compile(&statement).unwrap();
+	let widx = witness.into_multilinear_extension_index();
+	let chain_valid = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &widx).is_ok();
+	if !chain_valid {
+		return Ok((false, decider_holds, 0, 0, 0));
+	}
+	let t0 = Instant::now();
+	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
+		&ccs, 1, 128, &statement.boundaries, widx, &make_portable_backend(),
+	)?;
+	let prove_ms = t0.elapsed().as_millis();
+	let sz = proof.get_proof_size();
+	let t1 = Instant::now();
+	let vok = binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
+		&ccs, 1, 128, &statement.boundaries, proof,
+	)
+	.is_ok();
+	Ok((vok, decider_holds, prove_ms, t1.elapsed().as_millis(), sz))
+}
+
 /// O(1)-COLLAPSED trustless combiner: fold N shard-output claims and prove ALL N−1 folds in ONE
 /// table (`prove_fold_tree`), so the resolver verifies a SINGLE proof (polylog in N) + the final
 /// claim — trustless AND ~constant-verify.  Returns `(accepted, prove_ms, verify_ms, proof_bytes)`.
@@ -1039,6 +1296,50 @@ mod tests {
 			println!("  PEAK RSS (verify-only, TRUE edge): {:.0} MiB", mib(peak));
 			println!("  ⇒ fits 1 GB Pi with room to spare: {}", if mib(peak) < 500.0 { "YES (< 500 MiB)" } else if mib(peak) < 874.0 { "yes (tight)" } else { "NO" });
 		}
+	}
+
+	/// GATE chained-fold-tree (F2 collapse, milestone 1) — the WHOLE fold chain proves in ONE
+	/// proof (not N), and the accumulator channel makes it SOUND: an honest chain verifies and its
+	/// decider holds; a forged intermediate accumulator is REJECTED; a re-ordered chain is REJECTED.
+	#[test]
+	#[ignore = "heavy (~1 min): chained one-proof fold tree + tamper"]
+	fn chained_fold_tree_sound() {
+		use super::{prove_chained_fold_tree, ChainTamper};
+		use rand::{RngCore, SeedableRng};
+		let (n, inner) = (4usize, 6usize);
+		let m = n.trailing_zeros() as usize;
+		let mut rng = rand::rngs::StdRng::from_seed([0x3c; 32]);
+		let rf = |r: &mut rand::rngs::StdRng| OurB256::from(binius_field::BinaryField128b::new(((r.next_u64() as u128) << 64) | r.next_u64() as u128));
+		let inner_sz = 1usize << inner;
+		let mut p = Vec::with_capacity(inner_sz * n);
+		let mut leaves = Vec::with_capacity(n);
+		for i in 0..n {
+			let evals: Vec<OurB256> = (0..inner_sz).map(|_| rf(&mut rng)).collect();
+			let r: Vec<OurB256> = (0..inner).map(|_| rf(&mut rng)).collect();
+			let v = mle256(&evals, &r);
+			p.extend_from_slice(&evals);
+			let mut point = r;
+			for b in 0..m {
+				point.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO });
+			}
+			leaves.push((point, v));
+		}
+		let challenges: Vec<OurB256> = (0..n - 1).map(|_| rf(&mut rng)).collect();
+
+		let (v_ok, dec, pms, vms, sz) = prove_chained_fold_tree(&p, &leaves, &challenges, ChainTamper::None).unwrap();
+		assert!(v_ok, "honest chained fold tree must VERIFY in one proof");
+		assert!(dec, "honest decider must hold: mle(P, acc.point) == acc.value");
+		let (bad1, _, _, _, _) = prove_chained_fold_tree(&p, &leaves, &challenges, ChainTamper::ForgeAccValue { at: 1 }).unwrap();
+		assert!(!bad1, "a forged intermediate accumulator must be REJECTED");
+		let (bad2, _, _, _, _) = prove_chained_fold_tree(&p, &leaves, &challenges, ChainTamper::SwapAccInputs).unwrap();
+		assert!(!bad2, "a re-ordered chain must be REJECTED");
+		println!(
+			"GATE chained-fold-tree: N={n} leaves fold into ONE proof ({pms} ms prove / {vms} ms verify / \
+			 {} KiB), decider holds; a forged intermediate accumulator AND a re-ordered chain are both \
+			 rejected by the accumulator channel + position lane. F2 collapse milestone 1: sound chaining \
+			 in one proof (pi_hash public-input binding is milestone 2).",
+			sz / 1024
+		);
 	}
 
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
