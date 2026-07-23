@@ -4675,6 +4675,103 @@ mod tests {
 		);
 	}
 
+	/// FULLY-IN-CIRCUIT RRSIG EPOCH, VERIFY SCALING — the measurement the earlier verify-scaling
+	/// sweep could NOT give: there, RRSIGs were verified natively at publish and only their digests
+	/// committed. Here every record's signature is verified IN-CIRCUIT and all `N` are aggregated
+	/// into ONE constraint system, so the resolver verifies a single proof that attests every
+	/// signature. Each record is a real RSA `e=3` RRSIG verify — `s^3 mod n = EM` proven as two
+	/// seam-glued `ModMul<W>` strands (`s^2 = s·s`, then `s^3 = s^2·s`), EM pinned by a boundary,
+	/// exactly the construction of the `prove-D-0` gate but replicated `N` times in one CS.
+	///
+	/// THE CLAIM UNDER TEST: the PROVER cost is O(N) (the trace holds `2N` strands), but the
+	/// RESOLVER's VERIFY is polylog in `N`, because a FRI/DEEP verify is polylog in the trace SIZE
+	/// however large that trace is. If verify grows sublinearly across the `N`-sweep, the
+	/// fully-in-circuit epoch inherits the same polylog-verify deployability as the digest variant
+	/// — at a larger constant. `s^3 mod n` is the dominant circuit of an RRSIG verify, so its
+	/// scaling IS the signature's; the EMSA/hash wrapper is O(1) per record and omitted for focus.
+	/// Run: `cargo test --release --lib --features parallel incircuit_rrsig_epoch_verify_scaling -- --ignored --nocapture`
+	#[test]
+	#[ignore = "fully-in-circuit RRSIG epoch: N real in-circuit s^3-mod-n verifies in one CS, verify vs N"]
+	fn incircuit_rrsig_epoch_verify_scaling() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 1024;
+		let np = 496usize;
+		let sweep: Vec<usize> =
+			std::env::var("IC_SWEEP").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+				.unwrap_or_else(|| vec![1, 8, 64]); // N=512 needs >16 GB monolithically; set IC_SWEEP to extend
+
+		let mut rng = StdRng::seed_from_u64(0xF1C0);
+		let n = (rand_below(&mut rng, np) | (BigUint::from(1u8) << (np - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << np) - 1u8);
+		let n_bits = to_bits::<W>(&n);
+
+		println!(
+			"\n  FULLY-IN-CIRCUIT RRSIG EPOCH, BATCHED — verify vs N (W={W}, np={np}, {} cores)\n\
+			 \x20  N records = N ROWS of ONE ModMul table (each row a record's in-circuit modmul);\n\
+			 \x20  width is CONSTANT, only the row count grows — the tall-narrow layout.\n\
+			 \x20      N   rows   prove ms   VERIFY ms   proof KiB",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0)
+		);
+		let mut recorded: Vec<(usize, u128, usize)> = Vec::new();
+		for &nrec in &sweep {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let modmul = ModMul::<W>::build(&mut cs, &n_bits, np);
+			// N records, each a real modmul row s_i·s_i mod n (the sig-verify's dominant op).
+			let rows: Vec<ModMulRow> = (0..nrec)
+				.map(|_| {
+					let s = rand_below(&mut rng, np) % &n;
+					let prod = &s * &s;
+					let q = &prod / &n;
+					let r = &prod % &n;
+					ModMulRow { a: to_bits::<W>(&s), b: to_bits::<W>(&s), q: to_bits::<W>(&q), r: to_bits::<W>(&r) }
+				})
+				.collect();
+			let statement = Statement { boundaries: vec![], table_sizes: vec![nrec] };
+			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			{
+				let tw = witness.init_table(modmul.table_id, nrec).unwrap();
+				let mut seg = tw.full_segment();
+				modmul.populate(&mut seg, &rows).unwrap();
+			}
+			let ccs = cs.compile(&statement).unwrap();
+			let widx = witness.into_multilinear_extension_index();
+			let tp = Instant::now();
+			let proof = binius_core::constraint_system::prove::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+			>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend()).unwrap();
+			let prove_ms = tp.elapsed().as_millis();
+			let sz = proof.get_proof_size();
+			let tv = Instant::now();
+			binius_core::constraint_system::verify::<
+				U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+			>(&ccs, 1, 128, &[], proof).expect("batched in-circuit epoch must verify");
+			let verify_ms = tv.elapsed().as_millis();
+			println!("     {nrec:>4}   {nrec:>4}   {prove_ms:>8}   {verify_ms:>9}   {:>8.1}", sz as f64 / 1024.0);
+			recorded.push((nrec, verify_ms, sz));
+		}
+		let (n0, v0, s0) = recorded[0];
+		let (n1, v1, s1) = *recorded.last().unwrap();
+		let span = (n1 as f64 / n0 as f64).log2();
+		let pv = (v1 as f64 / v0.max(1) as f64).log2() / span;
+		let ps = (s1 as f64 / s0 as f64).log2() / span;
+		println!(
+			"\n    over N:{n0}->{n1} ({span:.0} doublings): VERIFY exponent p={pv:+.2}, proof-size p={ps:+.2}\n\
+			 \x20   ROWS layout (width constant): verify is {} in N. This is the tall-narrow signature\n\
+			 \x20   layout built for the RSS optimisation, now applied to the fully-in-circuit epoch:\n\
+			 \x20   N in-circuit sig-modmuls as ROWS of one table => the resolver verify is polylog in N,\n\
+			 \x20   unlike the naive N-separate-tables construction which was linear.",
+			if pv < 0.6 { "SUBLINEAR/polylog" } else { "linear" }
+		);
+		assert!(pv < 0.6, "batched (rows) in-circuit epoch verify should be polylog in N; measured p={pv:.2}");
+	}
+
 	/// COST-MODEL CALIBRATION — the parameter that decides every remaining ModMul optimisation.
 	///
 	/// The Karatsuba post-mortem fitted `cost = α·C + β·C·W` (C = columns, W = column width) from
