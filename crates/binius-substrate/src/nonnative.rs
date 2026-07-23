@@ -4998,6 +4998,131 @@ mod tests {
 		);
 	}
 
+	/// PEAK RSS, one-row `ModMul<4096>` — the memory baseline the paper's edge/IoT claims rest on.
+	///
+	/// ★ MUST BE RUN IN ITS OWN PROCESS, and so must its tall counterpart. `getrusage` reports a
+	/// process-MONOTONIC high-water mark, so measuring both layouts in one process yields the max
+	/// of the two twice over, not two figures. Hence two tests rather than one sweep:
+	///   `cargo test --release --lib --features parallel rss_modmul_one_row -- --ignored --nocapture`
+	///   `cargo test --release --lib --features parallel rss_modmul_tall    -- --ignored --nocapture`
+	/// RSS is sampled after witness construction and again after prove, so the two phases can be
+	/// told apart — a layout can win on prove time and still lose on peak memory in the witness.
+	#[test]
+	#[ignore = "RSS: peak resident set of the one-row ModMul<4096> — run in its OWN process"]
+	fn rss_modmul_one_row() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2047usize; // the one-row gadget's maximum at W=4096 (needs 2n+1 ≤ W)
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+		let mut rng = StdRng::seed_from_u64(0x8551);
+		let m = rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8);
+		let a = rand_below(&mut rng, n) % &m;
+		let b = rand_below(&mut rng, n) % &m;
+		let row = honest_row::<W>(&a, &b, &m);
+
+		let allocator = Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mm = ModMul::<W>::build(&mut cs, &to_bits::<W>(&m), n);
+		let st = Statement { boundaries: vec![], table_sizes: vec![1] };
+		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		{
+			let tw = wit.init_table(mm.table_id, 1).unwrap();
+			let mut seg = tw.full_segment();
+			mm.populate(&mut seg, &[row]).unwrap();
+		}
+		let ccs = cs.compile(&st).unwrap();
+		let widx = wit.into_multilinear_extension_index();
+		let rss_witness = crate::b256_sha3::peak_rss_bytes();
+		let t = Instant::now();
+		let _p = binius_core::constraint_system::prove::<
+			U256,
+			B256TowerFamily,
+			Sha256,
+			Sha256Compression,
+			HasherChallenger<Sha256>,
+			_,
+		>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend())
+		.unwrap();
+		let ms = t.elapsed().as_millis();
+		let rss_total = crate::b256_sha3::peak_rss_bytes();
+		println!(
+			"\n  RSS one-row ModMul<{W}> (n={n}, {} cores; process-scoped high-water):\n\
+			 \x20   after witness: {:.0} MiB   after prove: {:.0} MiB   prove {ms} ms",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			mib(rss_witness),
+			mib(rss_total),
+		);
+	}
+
+	/// PEAK RSS, tall `ModMul<4096>`. Same rules as [`rss_modmul_one_row`] — own process. Set
+	/// `TALL_BLK` to vary the blocking factor (default 16); each blk needs its own process too.
+	#[test]
+	#[ignore = "RSS: peak resident set of the tall ModMul<4096> — run in its OWN process"]
+	fn rss_modmul_tall() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize;
+		let blk: usize = std::env::var("TALL_BLK").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+		let mut rng = StdRng::seed_from_u64(0x8552);
+		let m = (rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << n) - 1u8);
+		let a = rand_below(&mut rng, n) % &m;
+		let b = rand_below(&mut rng, n) % &m;
+		let (q, r) = (&a * &b / &m, &a * &b % &m);
+
+		let allocator = Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk);
+		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		mm.populate(
+			&mut wit,
+			&big_to_bits::<W>(&a),
+			&big_to_bits::<W>(&b),
+			&big_to_bits::<W>(&q),
+			&big_to_bits::<W>(&r),
+		)
+		.unwrap();
+		let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+		let ccs = cs.compile(&st).unwrap();
+		let widx = wit.into_multilinear_extension_index();
+		let rss_witness = crate::b256_sha3::peak_rss_bytes();
+		let t = Instant::now();
+		let _p = binius_core::constraint_system::prove::<
+			U256,
+			B256TowerFamily,
+			Sha256,
+			Sha256Compression,
+			HasherChallenger<Sha256>,
+			_,
+		>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend())
+		.unwrap();
+		let ms = t.elapsed().as_millis();
+		let rss_total = crate::b256_sha3::peak_rss_bytes();
+		println!(
+			"\n  RSS tall ModMul<{W}> (n={n}, blk={blk}, rows={}, {} cores; process-scoped high-water):\n\
+			 \x20   after witness: {:.0} MiB   after prove: {:.0} MiB   prove {ms} ms",
+			n / blk,
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			mib(rss_witness),
+			mib(rss_total),
+		);
+	}
+
 	/// THE REDUCTION GATE — `q·m + r`, now the dominant term in `ModMul` after the multiply was
 	/// re-laid-out (117 s = ~85 s multiply + ~32 s reduction; the multiply is now ~9.7 s).
 	///
