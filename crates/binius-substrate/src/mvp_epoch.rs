@@ -635,8 +635,13 @@ mod tests {
 	/// matches the paper's §6.3 decider claim (16× records ⇒ 1.38× verify).
 	///
 	/// `n_names` delegations ⇒ `N = 2·n_names` records (n_names positive + n_names chain intervals).
-	/// Publishing is done here for each N (fast on a big box); the SCALING is architecture-
-	/// independent, so a Mac sweep establishes the curves and the Pi confirms a point or two.
+	/// ★MONOLITHIC CEILING (measured, and it is NOT RAM): the NSEC3 completeness gadget encodes the
+	/// chain with step `2^(W-16)`, so it caps at `n_names ≤ 2^15 = 32768`, i.e. `N ≤ 65536` records,
+	/// at the current W. Beyond that a single epoch cannot be proved and the chain must be SHARDED
+	/// (≤65536-record shards, folded) — the fleet path. That is the operator's problem; the
+	/// RESOLVER's per-shard + per-query verify is the polylog cost measured here. So this sweep
+	/// covers home/IoT and CORPORATE zones (≤10^5) monolithically end-to-end; TLD scale (.se ~1.4M,
+	/// .com ~30M) is the same per-shard verify times a polylog fold.
 	/// Run: `cargo test --release --lib --features parallel epoch_verify_scaling -- --ignored --nocapture`
 	#[test]
 	#[ignore = "verify-scaling sweep: separates decider (polylog) / completeness (O(N)) / per-query (flat)"]
@@ -646,6 +651,18 @@ mod tests {
 		let sweep: Vec<usize> =
 			std::env::var("SCALE_SWEEP").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
 				.unwrap_or_else(|| vec![32, 128, 512, 2048]);
+		// n_names ≤ 2^15 is the completeness gadget's hard cap (chain step 2^(W-16)); drop any
+		// larger request with a note rather than panicking mid-sweep.
+		let sweep: Vec<usize> = sweep
+			.into_iter()
+			.filter(|&nn| {
+				let ok = nn <= 32768;
+				if !ok {
+					println!("  (skipping n_names={nn}: exceeds the monolithic completeness cap 2^15; needs sharding)");
+				}
+				ok
+			})
+			.collect();
 		let reps = 30u32;
 
 		println!(
