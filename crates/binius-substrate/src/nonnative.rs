@@ -4824,8 +4824,7 @@ mod tests {
 		use bumpalo::Bump;
 
 		const W: usize = 512;
-		let n = 128usize; // 2n = 256 ≤ W; rows = n/blk = 8
-		let blk = 16usize;
+		let n = 128usize; // 2n = 256 ≤ W
 		let mut rng = StdRng::seed_from_u64(0x70DD);
 
 		#[derive(Clone, Copy, PartialEq)]
@@ -4837,7 +4836,7 @@ mod tests {
 			Product,
 		}
 
-		let run = |bad: Bad| -> (bool, BigUint, BigUint) {
+		let run = |blk: usize, bad: Bad| -> (bool, BigUint, BigUint) {
 			let m = (rand_below(&mut rng.clone(), n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
 				& ((BigUint::from(1u8) << n) - 1u8);
 			let mut r2 = StdRng::seed_from_u64(0x70DE);
@@ -4884,23 +4883,28 @@ mod tests {
 			(ok, rv, &a * &b % &m)
 		};
 
-		let (ok, r_in, r_ref) = run(Bad::None);
-		assert!(ok, "honest tall ModMul witness must validate");
-		assert_eq!(r_in, r_ref, "tall ModMul r != num-bigint a·b mod m");
-		for (bad, what) in [
-			(Bad::Quotient, "a wrong quotient"),
-			(Bad::Unreduced, "an unreduced remainder r >= m"),
-			(Bad::BigOperand, "an operand a >= m"),
-			(Bad::Product, "a prod disagreeing with the multiply chain"),
-		] {
-			let (ok, _, _) = run(bad);
-			assert!(!ok, "{what} must be REJECTED");
+		// Swept across the blocking factor, NOT fixed at one: shrinking blk multiplies the row
+		// count (and so the flush count), and the seam is the thing carrying the soundness here.
+		// Rejection at blk=16/rows=8 says little about blk=2/rows=64.
+		for blk in [2usize, 4, 8, 16] {
+			let (ok, r_in, r_ref) = run(blk, Bad::None);
+			assert!(ok, "blk={blk}: honest tall ModMul witness must validate");
+			assert_eq!(r_in, r_ref, "blk={blk}: tall ModMul r != num-bigint a·b mod m");
+			for (bad, what) in [
+				(Bad::Quotient, "a wrong quotient"),
+				(Bad::Unreduced, "an unreduced remainder r >= m"),
+				(Bad::BigOperand, "an operand a >= m"),
+				(Bad::Product, "a prod disagreeing with the multiply chain"),
+			] {
+				let (ok, _, _) = run(blk, bad);
+				assert!(!ok, "blk={blk} (rows={}): {what} must be REJECTED", n / blk);
+			}
 		}
 		println!(
-			"TALL ModMul<{W}> (n={n}, blk={blk}, rows={}) validates, r == num-bigint a·b mod m, and \
-			 rejects: a wrong quotient, r >= m, a >= m, and a prod disagreeing with the multiply chain \
-			 (the identity a·b == q·m+r, enforced by the shared pulled column).",
-			n / blk
+			"TALL ModMul<{W}> (n={n}) validates and r == num-bigint a·b mod m at blk ∈ {{2,4,8,16}} \
+			 (rows 64/32/16/8), and at EVERY one of them rejects: a wrong quotient, r >= m, a >= m, \
+			 and a prod disagreeing with the multiply chain (the identity a·b == q·m+r, enforced by \
+			 the shared pulled column rather than by an assertion)."
 		);
 	}
 
@@ -4995,6 +4999,147 @@ mod tests {
 			base_ms as f64 / tall_ms as f64,
 			17.0 * base_ms as f64 / 60000.0,
 			17.0 * tall_ms as f64 / 60000.0,
+		);
+	}
+
+	/// SOUNDNESS ACCOUNTING ACROSS THE BLOCKING FACTOR — `κ_sys` must hold at every blk we might
+	/// deploy, and shrinking blk is exactly what inflates the term that could threaten it.
+	///
+	/// WHAT DOES *NOT* VARY WITH blk (argued, then tested by `tall_modmul_matches_num_bigint`):
+	///  * Operand bounds. `a_r = a << (r·blk)` peaks at `a << (n-blk) < 2^{2n-blk} <= 2^W`, and the
+	///    drained `a << n < 2^{2n} = 2^W`; the accumulator is `< 2^{2n}`. All blk-independent.
+	///  * The `b_r >> n == 0` range check: `b` shifts right by `blk` per row over `n/blk` rows, so
+	///    the total shift is `n` whatever the split.
+	///  * NO DISJOINT-CYCLE ATTACK. The channel is a multiset, so a prover could in principle
+	///    balance it with a path PLUS disjoint cycles instead of one path. A cycle of length `L`
+	///    needs positions `p, p+1, …, p+L-1, p`, i.e. `L ≡ 0 mod 2^64`. With `rows <= 1024 << 2^64`
+	///    that is impossible, at any blk. (Permuting which PHYSICAL row holds which step is not an
+	///    attack: the table is a set of rows and the flush multiset is unchanged.)
+	///
+	/// WHAT DOES VARY: the channel's multiset argument runs over `2·rows·2 + 4` tuples of arity
+	/// `1 + 2·la + lb`, and `rows = n/blk` grows as blk shrinks. Its error is bounded by
+	/// `(tuples · (arity+1)) / |F|` for challenges drawn from `F = B_256` after the trace
+	/// commitment, giving `κ_flush = 256 - log2(tuples·(arity+1))`.
+	///
+	/// `κ_sys = min(κ_IT, κ_bind, κ_FS, κ_flush)`. The first three are fixed by the prove
+	/// parameters (`security_bits = 128` at L1, SHA-256 Merkle binding, SHA-256 Fiat–Shamir) and
+	/// are unaffected by the layout — binius adapts its FRI query count to the trace size to HOLD
+	/// `κ_IT`, so a bigger trace costs more time rather than less soundness. This test's job is to
+	/// show `κ_flush` never becomes the binding term.
+	#[test]
+	fn tall_modmul_soundness_accounting() {
+		const W: usize = 4096;
+		let n = 2048usize;
+		let (la, lb) = (W / 64, n.div_ceil(64));
+		let arity = 1 + 2 * la + lb; // pos + a-lanes + b-lanes + acc-lanes
+		println!(
+			"\n  TALL ModMul SOUNDNESS vs BLOCKING FACTOR (W={W}, n={n}, L1 over B_256)\n\
+			 \x20  flush tuple arity = 1 + 2·{la} + {lb} = {arity}; challenges drawn from |F| = 2^256\n\
+			 \x20     blk    rows   flush tuples   κ_flush   κ_sys = min(κ_IT,κ_bind,κ_FS,κ_flush)"
+		);
+		for blk in [2usize, 4, 8, 16, 32, 128] {
+			let rows = n / blk;
+			let tuples = 2 * rows * 2 + 4; // two chains, pull+push per row, plus the closer's four
+			let work = (tuples * (arity + 1)) as f64;
+			let kappa_flush = 256.0 - work.log2();
+			// κ_IT / κ_bind / κ_FS are all 128 at L1 and are layout-independent.
+			let kappa_sys = kappa_flush.min(128.0);
+			println!("     {blk:>5}  {rows:>6}   {tuples:>12}   {kappa_flush:>7.1}   {kappa_sys:>7.1}");
+			assert!(
+				kappa_flush > 128.0,
+				"blk={blk}: κ_flush={kappa_flush:.1} would become the binding term below L1"
+			);
+		}
+		println!(
+			"    κ_flush stays ~2^{{-100}} clear of the L1 target across a 64x range of blk, so\n\
+			 \x20   κ_sys = 128 is set by κ_IT/κ_bind/κ_FS at EVERY blocking factor — the blocking\n\
+			 \x20   factor is a pure time/memory knob with no soundness price. Reported alongside the\n\
+			 \x20   RSS figures per the standing rule that κ accompanies every RSS number."
+		);
+	}
+
+	/// BRACKET THE BLOCKING FACTOR. Every gate so far reported its best at the SMALLEST blk it
+	/// tried, so the optimum was never actually bracketed — `blk=16` was the edge of the sweep on
+	/// the multiply, and only the reduction gate (which did test 8) hinted at a turnover. This
+	/// sweeps the FULL `TallModMul` from blk=2 up, so the minimum is interior and demonstrated
+	/// rather than assumed.
+	///
+	/// The two costs that trade off: per row the chain contributes ~7·blk wide columns while the
+	/// seam contributes a fixed ~644 lane columns regardless of blk, and the seam is paid `n/blk`
+	/// times. Small blk therefore drowns in seam; large blk keeps the per-column cost the whole
+	/// re-layout was meant to escape.
+	/// Run: `cargo test --release --lib --features parallel tall_modmul_blk_sweep -- --ignored --nocapture`
+	#[test]
+	#[ignore = "sweep: bracket the tall ModMul blocking factor from blk=2 upward"]
+	fn tall_modmul_blk_sweep() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize;
+
+		let mut rng = StdRng::seed_from_u64(0x81C0);
+		let m = (rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << n) - 1u8);
+		let a = rand_below(&mut rng, n) % &m;
+		let b = rand_below(&mut rng, n) % &m;
+		let (q, r) = (&a * &b / &m, &a * &b % &m);
+		let (m_b, a_b, b_b, q_b, r_b) = (
+			big_to_bits::<W>(&m),
+			big_to_bits::<W>(&a),
+			big_to_bits::<W>(&b),
+			big_to_bits::<W>(&q),
+			big_to_bits::<W>(&r),
+		);
+
+		// The one-row baseline is NOT re-run here (it is ~2 min); it was measured twice in this
+		// same configuration by tall_modmul_gate and rss_modmul_one_row: 117476 and 118332 ms.
+		const BASE_MS: f64 = 117476.0;
+		println!(
+			"\n  TALL ModMul BLOCKING SWEEP (W={W}, n={n}, L1/B256, {} cores)\n\
+			 \x20  one-row baseline (measured previously, not re-run): {BASE_MS:.0} ms\n\
+			 \x20     blk    rows   tall ms   speedup",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0)
+		);
+		let mut best = (0usize, u128::MAX);
+		for blk in [2usize, 4, 8, 16, 32] {
+			let allocator = Bump::new();
+			let mut cs = ConstraintSystem::<OurB256>::new();
+			let mm = TallModMul::<W>::build(&mut cs, &m_b, n, blk);
+			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+			mm.populate(&mut wit, &a_b, &b_b, &q_b, &r_b).unwrap();
+			let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+			let ccs = cs.compile(&st).unwrap();
+			let widx = wit.into_multilinear_extension_index();
+			binius_core::constraint_system::validate::validate_witness(&ccs, &[], &widx).unwrap();
+			let t = Instant::now();
+			let _p = binius_core::constraint_system::prove::<
+				U256,
+				B256TowerFamily,
+				Sha256,
+				Sha256Compression,
+				HasherChallenger<Sha256>,
+				_,
+			>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend())
+			.unwrap();
+			let ms = t.elapsed().as_millis();
+			println!("     {blk:>5}  {:>6}  {ms:>8}    {:>5.2}x", n / blk, BASE_MS / ms as f64);
+			if ms < best.1 {
+				best = (blk, ms);
+			}
+		}
+		println!(
+			"\n    Best: blk={} at {} ms ⇒ {:.1}x. Optimum is {} — the seam is a fixed ~644 lane\n\
+			 \x20   columns per row paid n/blk times, so small blk drowns in it while large blk keeps\n\
+			 \x20   the per-column cost the re-layout exists to escape.",
+			best.0,
+			best.1,
+			BASE_MS / best.1 as f64,
+			if best.0 == 2 || best.0 == 32 { "STILL AT THE SWEEP EDGE — widen it" } else { "INTERIOR, so genuinely bracketed" },
 		);
 	}
 
