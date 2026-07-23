@@ -5387,6 +5387,82 @@ mod tests {
 		);
 	}
 
+	/// PEAK RSS OF ONE SEAMED STRAND — the number the apex's deployment claim actually needs.
+	/// Because every strand of the modexp chain is an INDEPENDENT proof, the whole apex's peak
+	/// resident set IS one strand's; measuring a single strand therefore measures the chain.
+	/// Own process (getrusage is process-monotonic).
+	/// Run: `cargo test --release --lib --features parallel rss_tall_strand -- --ignored --nocapture`
+	#[test]
+	#[ignore = "RSS: one seamed tall strand = the apex chain's peak — run in its OWN process"]
+	fn rss_tall_strand() {
+		use binius_core::constraint_system::channel::FlushDirection;
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{Boundary, ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let np = 2048usize;
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+		let mut rng = StdRng::seed_from_u64(0xA771);
+		let m = (rand_below(&mut rng, np) | (BigUint::from(1u8) << (np - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << np) - 1u8);
+		let a = rand_below(&mut rng, np) % &m;
+		let (q, r) = (&a * &a / &m, &a * &a % &m);
+		let nl = np.div_ceil(64);
+		let lanes = |x: &BigUint| -> Vec<OurB256> {
+			let mut b = x.to_bytes_le();
+			b.resize(nl * 8, 0);
+			(0..nl)
+				.map(|i| OurB256::from(B64::new(u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))))
+				.collect()
+		};
+
+		let allocator = Bump::new();
+		let mut cs = ConstraintSystem::<OurB256>::new();
+		let cha = cs.add_channel("chA");
+		let chout = cs.add_channel("chOut");
+		let mm = TallModMul::<W>::build_seamed(
+			&mut cs, &big_to_bits::<W>(&m), np, 16, 1, Some(cha), Some(cha), Some(chout),
+		);
+		let boundaries = vec![
+			Boundary { values: lanes(&a), channel_id: cha, direction: FlushDirection::Push, multiplicity: 2 },
+			Boundary { values: lanes(&r), channel_id: chout, direction: FlushDirection::Pull, multiplicity: 1 },
+		];
+		let st = Statement { boundaries, table_sizes: mm.table_sizes() };
+		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+		mm.populate(&mut wit, &big_to_bits::<W>(&a), &big_to_bits::<W>(&a), &big_to_bits::<W>(&q), &big_to_bits::<W>(&r))
+			.unwrap();
+		let ccs = cs.compile(&st).unwrap();
+		let widx = wit.into_multilinear_extension_index();
+		let rss_wit = crate::b256_sha3::peak_rss_bytes();
+		let t0 = Instant::now();
+		let pf = binius_core::constraint_system::prove::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _,
+		>(&ccs, 1, 128, &st.boundaries, widx, &binius_hal::make_portable_backend())
+		.unwrap();
+		let p = t0.elapsed().as_secs_f64();
+		let rss_prove = crate::b256_sha3::peak_rss_bytes();
+		let t1 = Instant::now();
+		binius_core::constraint_system::verify::<
+			U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>,
+		>(&ccs, 1, 128, &st.boundaries, pf)
+		.unwrap();
+		println!(
+			"\n  ONE SEAMED TALL STRAND (W={W}, np={np}, blk=16, {} cores; process-scoped high-water)\n\
+			 \x20   after witness {:.0} MiB   after prove {:.0} MiB   peak overall {:.0} MiB\n\
+			 \x20   prove {p:.1}s  verify {:.1}s\n\
+			 \x20   Every apex strand is an independent proof, so this IS the 17-strand chain's peak.",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+			mib(rss_wit),
+			mib(rss_prove),
+			mib(crate::b256_sha3::peak_rss_bytes()),
+			t1.elapsed().as_secs_f64(),
+		);
+	}
+
 	/// SOUNDNESS ACCOUNTING ACROSS THE BLOCKING FACTOR — `κ_sys` must hold at every blk we might
 	/// deploy, and shrinking blk is exactly what inflates the term that could threaten it.
 	///
