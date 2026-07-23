@@ -407,19 +407,59 @@ pub(crate) struct TallRawMul<const W: usize> {
 	posinc: Adder<64>,
 	mul_bits: Vec<MulBit<W>>,
 	adders: Vec<Adder<W>>,
+	/// Radix-4 only: `a<<1` and the `3a = a + 2a` adder, computed ONCE per row and then shifted
+	/// per digit, so the `3a` multiple costs O(1) rather than O(blk).
+	a_shl1: Option<Col<B1, W>>,
+	t3: Option<Adder<W>>,
+	digits: Vec<MulDigit4<W>>,
 	sel_pull: Vec<Col<B1, 64>>,
 	sel_push: Vec<Col<B1, 64>>,
 	n: usize,
 	blk: usize,
+	bpd: usize,
 	la: usize,
 	lb: usize,
 }
 
+/// One radix-4 digit group: two bits of `b` select a multiple of `A = a << base` from
+/// `{0, A, 2A, 3A}` with a single degree-3 mux, so two bit positions cost ONE accumulator step
+/// instead of two. 11 columns per two bits against radix-2's 14.
+struct MulDigit4<const W: usize> {
+	/// `A = a << base`; `None` at base 0, where it ALIASES `a_in` — m3 rejects a zero shift offset,
+	/// exactly as the radix-2 path aliases `a_in` at `j == 0`.
+	a_shl: Option<Col<B1, W>>,
+	a2_shl: Col<B1, W>, // 2A  = a << (base+1)
+	/// `3A = 3a << base`; `None` at base 0, aliasing the `3a` adder's sum for the same reason.
+	a3_shl: Option<Col<B1, W>>,
+	bc0: Col<B1, W>,
+	bc0_rot: Col<B1, W>,
+	bc0_l0: Col<B1, 1>,
+	b0: Col<B1, 1>,
+	bc1: Col<B1, W>,
+	bc1_rot: Col<B1, W>,
+	bc1_l0: Col<B1, 1>,
+	b1: Col<B1, 1>,
+	pp: Col<B1, W>,
+}
+
 impl<const W: usize> TallRawMul<W> {
 	/// `n` = operand bit-length (must be a multiple of `blk`); `rows = n/blk`.
-	pub(crate) fn build(cs: &mut ConstraintSystem<OurB256>, name: &str, n: usize, blk: usize, chan: ChannelId) -> Self {
+	/// `bpd` = bits of `b` consumed per accumulator step: 1 = radix-2 (one partial product per bit),
+	/// 2 = radix-4 (two bits select a multiple of `A` from `{0,A,2A,3A}` through one degree-3 mux,
+	/// halving the accumulator steps). `blk` counts BIT POSITIONS per row either way, so the two
+	/// radices are directly comparable at equal `blk`.
+	pub(crate) fn build(
+		cs: &mut ConstraintSystem<OurB256>,
+		name: &str,
+		n: usize,
+		blk: usize,
+		bpd: usize,
+		chan: ChannelId,
+	) -> Self {
 		assert!(2 * n <= W, "product 2n bits must fit W (n={n}, W={W})");
 		assert!(blk >= 1 && n % blk == 0, "n must be a multiple of the blocking factor");
+		assert!(bpd == 1 || bpd == 2, "bits-per-digit must be 1 (radix-2) or 2 (radix-4)");
+		assert!(blk % bpd == 0, "blk must divide into whole digits (blk={blk}, bpd={bpd})");
 		// `n/blk` MUST be a power of two. m3 pads a table up to one, and a padding row is not
 		// harmless here: the `one` constant oracle is `Repeating`, so it must hold 1 on padded rows
 		// as well (a partly-filled table fails with `VirtualOracleEvalMismatch{ oracle: "Repeating:
@@ -450,28 +490,74 @@ impl<const W: usize> TallRawMul<W> {
 		let one = t.add_constant("one", one_arr);
 		let posinc = Adder::<64>::build(&mut t, pos_in, one, "posinc");
 
-		// blk partial products of THIS row, accumulated onto acc_in.
-		let mut mul_bits = Vec::with_capacity(blk);
-		let mut adders = Vec::with_capacity(blk);
+		// blk bit positions of THIS row, accumulated onto acc_in.
+		let mut mul_bits = Vec::new();
+		let mut digits = Vec::new();
+		let mut adders = Vec::with_capacity(blk / bpd);
 		let mut acc = acc_in;
-		for j in 0..blk {
-			let a_shl = if j == 0 {
-				None
+		// radix-4 needs 3a; built ONCE per row and then shifted per digit, so it is O(1) not O(blk).
+		let (a_shl1, t3) = if bpd == 2 {
+			let s1 = t.add_shifted("a_shl1", a_in, logw, 1, ShiftVariant::LogicalLeft);
+			(Some(s1), Some(Adder::<W>::build(&mut t, a_in, s1, "t3")))
+		} else {
+			(None, None)
+		};
+		for d in 0..blk / bpd {
+			let base = d * bpd;
+			if bpd == 1 {
+				let a_shl = if base == 0 {
+					None
+				} else {
+					Some(t.add_shifted(format!("a_shl{base}"), a_in, logw, base, ShiftVariant::LogicalLeft))
+				};
+				let sa = a_shl.unwrap_or(a_in);
+				let bcast = t.add_committed::<B1, W>(format!("bcast{base}"));
+				let bcast_rot =
+					t.add_shifted(format!("bcast{base}_rot"), bcast, logw, 1, ShiftVariant::CircularLeft);
+				t.assert_zero(format!("bcast{base}_eq"), bcast - bcast_rot);
+				let bcast_lane0 = t.add_selected(format!("bcast{base}_lane0"), bcast, 0);
+				let b_bit = t.add_selected(format!("b_bit{base}"), b_in, base);
+				t.assert_zero(format!("bcast{base}_bind"), bcast_lane0 - b_bit);
+				let pp = t.add_computed(format!("pp{base}"), bcast * sa);
+				let ad = Adder::<W>::build(&mut t, acc, pp, &format!("acc{base}"));
+				acc = ad.sum;
+				mul_bits.push(MulBit { a_shl, bcast, bcast_rot, bcast_lane0, b_bit, pp });
+				adders.push(ad);
 			} else {
-				Some(t.add_shifted(format!("a_shl{j}"), a_in, logw, j, ShiftVariant::LogicalLeft))
-			};
-			let sa = a_shl.unwrap_or(a_in);
-			let bcast = t.add_committed::<B1, W>(format!("bcast{j}"));
-			let bcast_rot = t.add_shifted(format!("bcast{j}_rot"), bcast, logw, 1, ShiftVariant::CircularLeft);
-			t.assert_zero(format!("bcast{j}_eq"), bcast - bcast_rot);
-			let bcast_lane0 = t.add_selected(format!("bcast{j}_lane0"), bcast, 0);
-			let b_bit = t.add_selected(format!("b_bit{j}"), b_in, j);
-			t.assert_zero(format!("bcast{j}_bind"), bcast_lane0 - b_bit);
-			let pp = t.add_computed(format!("pp{j}"), bcast * sa);
-			let ad = Adder::<W>::build(&mut t, acc, pp, &format!("acc{j}"));
-			acc = ad.sum;
-			mul_bits.push(MulBit { a_shl, bcast, bcast_rot, bcast_lane0, b_bit, pp });
-			adders.push(ad);
+				// A = a<<base, 2A = a<<(base+1), 3A = (3a)<<base. At base 0 the two zero-shifts are
+				// aliases, not columns — m3 rejects a shift offset of 0.
+				let a_shl = (base > 0)
+					.then(|| t.add_shifted(format!("A{base}"), a_in, logw, base, ShiftVariant::LogicalLeft));
+				let a2_shl = t.add_shifted(format!("A2_{base}"), a_in, logw, base + 1, ShiftVariant::LogicalLeft);
+				let a3_shl = (base > 0).then(|| {
+					t.add_shifted(format!("A3_{base}"), t3.unwrap().sum, logw, base, ShiftVariant::LogicalLeft)
+				});
+				let sa = a_shl.unwrap_or(a_in);
+				let s3 = a3_shl.unwrap_or(t3.unwrap().sum);
+				let mut bit = |t: &mut TableBuilder<OurB256>, k: usize| {
+					let bc = t.add_committed::<B1, W>(format!("bc{base}_{k}"));
+					let rot = t.add_shifted(format!("bc{base}_{k}_rot"), bc, logw, 1, ShiftVariant::CircularLeft);
+					t.assert_zero(format!("bc{base}_{k}_eq"), bc - rot);
+					let l0 = t.add_selected(format!("bc{base}_{k}_l0"), bc, 0);
+					let bb = t.add_selected(format!("b_bit{}", base + k), b_in, base + k);
+					t.assert_zero(format!("bc{base}_{k}_bind"), l0 - bb);
+					(bc, rot, l0, bb)
+				};
+				let (bc0, bc0_rot, bc0_l0, b0) = bit(&mut t, 0);
+				let (bc1, bc1_rot, bc1_l0, b1) = bit(&mut t, 1);
+				// pp = d·A for d = b0 + 2·b1, as one degree-3 mux over the three precomputed
+				// multiples — this is the whole radix-4 saving: ONE accumulator step per two bits.
+				let pp = t.add_computed(
+					format!("pp{base}"),
+					bc0 * (bc1 + B1::ONE) * sa + (bc0 + B1::ONE) * bc1 * a2_shl + bc0 * bc1 * s3,
+				);
+				let ad = Adder::<W>::build(&mut t, acc, pp, &format!("acc{base}"));
+				acc = ad.sum;
+				digits.push(MulDigit4 {
+					a_shl, a2_shl, a3_shl, bc0, bc0_rot, bc0_l0, b0, bc1, bc1_rot, bc1_l0, b1, pp,
+				});
+				adders.push(ad);
+			}
 		}
 		let acc_out = acc;
 
@@ -499,7 +585,7 @@ impl<const W: usize> TallRawMul<W> {
 
 		Self {
 			table_id: t.id(),
-			a_in, b_in, acc_in, a_out, b_out, b_rng, pos_in, one, posinc,
+			a_in, b_in, acc_in, a_out, b_out, b_rng, pos_in, one, posinc, a_shl1, t3, digits, bpd,
 			mul_bits, adders, sel_pull, sel_push, n, blk, la, lb,
 		}
 	}
@@ -534,18 +620,54 @@ impl<const W: usize> TallRawMul<W> {
 			self.posinc.populate(seg, row, &u64_lebits(row as u64), &u64_lebits(1))?;
 
 			let acc_before = acc.clone();
+			// radix-4 per-row precompute: 3a = a + 2a.
+			let a3 = if let (Some(s1), Some(t3)) = (self.a_shl1, self.t3.as_ref()) {
+				let s1v = shl(&a_r, 1);
+				write_col::<W>(seg, s1, row, &s1v)?;
+				t3.populate(seg, row, &a_r, &s1v)?
+			} else {
+				vec![false; W]
+			};
+			let mut uni = |seg: &mut TableWitnessSegment<OurB256>,
+			               bc: Col<B1, W>,
+			               rot: Col<B1, W>,
+			               l0: Col<B1, 1>,
+			               bb: Col<B1, 1>,
+			               v: bool|
+			 -> Result<()> {
+				let u = if v { vec![true; W] } else { vec![false; W] };
+				write_col::<W>(seg, bc, row, &u)?;
+				write_col::<W>(seg, rot, row, &u)?; // rotate of a uniform column is itself
+				write_bit(seg, l0, row, v)?;
+				write_bit(seg, bb, row, v)?;
+				Ok(())
+			};
 			for (j, mb) in self.mul_bits.iter().enumerate() {
 				if let Some(a_shl) = mb.a_shl {
 					write_col::<W>(seg, a_shl, row, &shl(&a_r, j))?;
 				}
-				let uniform = if b_r[j] { vec![true; W] } else { vec![false; W] };
-				write_col::<W>(seg, mb.bcast, row, &uniform)?;
-				write_col::<W>(seg, mb.bcast_rot, row, &uniform)?;
-				write_bit(seg, mb.bcast_lane0, row, b_r[j])?;
-				write_bit(seg, mb.b_bit, row, b_r[j])?;
+				uni(seg, mb.bcast, mb.bcast_rot, mb.bcast_lane0, mb.b_bit, b_r[j])?;
 				let pp = if b_r[j] { shl(&a_r, j) } else { vec![false; W] };
 				write_col::<W>(seg, mb.pp, row, &pp)?;
 				acc = self.adders[j].populate(seg, row, &acc, &pp)?;
+			}
+			for (d, dg) in self.digits.iter().enumerate() {
+				let base = d * self.bpd;
+				let (av, a2v, a3v) = (shl(&a_r, base), shl(&a_r, base + 1), shl(&a3, base));
+				if let Some(c) = dg.a_shl { write_col::<W>(seg, c, row, &av)?; }
+				write_col::<W>(seg, dg.a2_shl, row, &a2v)?;
+				if let Some(c) = dg.a3_shl { write_col::<W>(seg, c, row, &a3v)?; }
+				let (v0, v1) = (b_r[base], b_r[base + 1]);
+				uni(seg, dg.bc0, dg.bc0_rot, dg.bc0_l0, dg.b0, v0)?;
+				uni(seg, dg.bc1, dg.bc1_rot, dg.bc1_l0, dg.b1, v1)?;
+				let pp = match (v0, v1) {
+					(false, false) => vec![false; W],
+					(true, false) => av,
+					(false, true) => a2v,
+					(true, true) => a3v,
+				};
+				write_col::<W>(seg, dg.pp, row, &pp)?;
+				acc = self.adders[d].populate(seg, row, &acc, &pp)?;
 			}
 			let _ = acc_before;
 
@@ -696,7 +818,7 @@ impl<const W: usize> TallModMul<W> {
 			.collect()
 	}
 
-	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize, blk: usize) -> Self {
+	pub fn build(cs: &mut ConstraintSystem<OurB256>, m_bits: &[bool], n: usize, blk: usize, bpd: usize) -> Self {
 		assert_eq!(m_bits.len(), W, "modulus must be W bits wide");
 		assert!(2 * n <= W, "q·m + r < m² < 2^{{2n}} must fit W (n={n}, W={W})");
 		let logw = W.trailing_zeros() as usize;
@@ -705,8 +827,8 @@ impl<const W: usize> TallModMul<W> {
 
 		let chan_ab = cs.add_channel("tmm_ab");
 		let chan_qm = cs.add_channel("tmm_qm");
-		let ab = TallRawMul::<W>::build(cs, "tmm_ab", n, blk, chan_ab);
-		let qm = TallRawMul::<W>::build(cs, "tmm_qm", n, blk, chan_qm);
+		let ab = TallRawMul::<W>::build(cs, "tmm_ab", n, blk, bpd, chan_ab);
+		let qm = TallRawMul::<W>::build(cs, "tmm_qm", n, blk, bpd, chan_qm);
 
 		let mut t = cs.add_table(format!("tall modmul closer (n={n}, blk={blk}, W={W})"));
 		let a = t.add_committed::<B1, W>("a");
@@ -4659,7 +4781,7 @@ mod tests {
 			let allocator = Bump::new();
 			let mut cs = ConstraintSystem::<OurB256>::new();
 			let chan = cs.add_channel("tall_seam");
-			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, chan);
+			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, 1, chan);
 			let rows = n / blk;
 			let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 			let (ab, bb) = (big_to_bits::<W>(av), big_to_bits::<W>(bv));
@@ -4782,7 +4904,7 @@ mod tests {
 			let allocator = Bump::new();
 			let mut cs = ConstraintSystem::<OurB256>::new();
 			let chan = cs.add_channel("tall_seam");
-			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, chan);
+			let tm = TallRawMul::<W>::build(&mut cs, "tm", n, blk, 1, chan);
 			let rows = n / blk;
 			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 			let product = {
@@ -4836,7 +4958,7 @@ mod tests {
 			Product,
 		}
 
-		let run = |blk: usize, bad: Bad| -> (bool, BigUint, BigUint) {
+		let run = |blk: usize, bpd: usize, bad: Bad| -> (bool, BigUint, BigUint) {
 			let m = (rand_below(&mut rng.clone(), n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
 				& ((BigUint::from(1u8) << n) - 1u8);
 			let mut r2 = StdRng::seed_from_u64(0x70DE);
@@ -4853,7 +4975,7 @@ mod tests {
 			}
 			let allocator = Bump::new();
 			let mut cs = ConstraintSystem::<OurB256>::new();
-			let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk);
+			let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk, bpd);
 			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 			let _ = mm
 				.populate(
@@ -4886,23 +5008,23 @@ mod tests {
 		// Swept across the blocking factor, NOT fixed at one: shrinking blk multiplies the row
 		// count (and so the flush count), and the seam is the thing carrying the soundness here.
 		// Rejection at blk=16/rows=8 says little about blk=2/rows=64.
-		for blk in [2usize, 4, 8, 16] {
-			let (ok, r_in, r_ref) = run(blk, Bad::None);
-			assert!(ok, "blk={blk}: honest tall ModMul witness must validate");
-			assert_eq!(r_in, r_ref, "blk={blk}: tall ModMul r != num-bigint a·b mod m");
+		for (blk, bpd) in [(2usize, 1usize), (4, 1), (8, 1), (16, 1), (2, 2), (4, 2), (8, 2), (16, 2)] {
+			let (ok, r_in, r_ref) = run(blk, bpd, Bad::None);
+			assert!(ok, "blk={blk} bpd={bpd}: honest tall ModMul witness must validate");
+			assert_eq!(r_in, r_ref, "blk={blk} bpd={bpd}: tall ModMul r != num-bigint a·b mod m");
 			for (bad, what) in [
 				(Bad::Quotient, "a wrong quotient"),
 				(Bad::Unreduced, "an unreduced remainder r >= m"),
 				(Bad::BigOperand, "an operand a >= m"),
 				(Bad::Product, "a prod disagreeing with the multiply chain"),
 			] {
-				let (ok, _, _) = run(blk, bad);
-				assert!(!ok, "blk={blk} (rows={}): {what} must be REJECTED", n / blk);
+				let (ok, _, _) = run(blk, bpd, bad);
+				assert!(!ok, "blk={blk} bpd={bpd} (rows={}): {what} must be REJECTED", n / blk);
 			}
 		}
 		println!(
 			"TALL ModMul<{W}> (n={n}) validates and r == num-bigint a·b mod m at blk ∈ {{2,4,8,16}} \
-			 (rows 64/32/16/8), and at EVERY one of them rejects: a wrong quotient, r >= m, a >= m, \
+			 (rows 64/32/16/8) x radix ∈ {{2,4}}, and at EVERY one of the eight rejects: a wrong quotient, r >= m, a >= m, \
 			 and a prod disagreeing with the multiply chain (the identity a·b == q·m+r, enforced by \
 			 the shared pulled column rather than by an assertion)."
 		);
@@ -4925,6 +5047,7 @@ mod tests {
 		const W: usize = 4096;
 		let n = 2048usize;
 		let blk = 16usize;
+		const BPD: usize = 1;
 
 		fn prove(cs: &ConstraintSystem<OurB256>, st: &Statement<OurB256>, wit: WitnessIndex<OurB256>) -> u128 {
 			let ccs = cs.compile(st).unwrap();
@@ -4974,7 +5097,7 @@ mod tests {
 
 		let allocator = Bump::new();
 		let mut cs = ConstraintSystem::<OurB256>::new();
-		let mm = TallModMul::<W>::build(&mut cs, &m_bits, n, blk);
+		let mm = TallModMul::<W>::build(&mut cs, &m_bits, n, blk, BPD);
 		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 		mm.populate(
 			&mut wit,
@@ -4999,6 +5122,109 @@ mod tests {
 			base_ms as f64 / tall_ms as f64,
 			17.0 * base_ms as f64 / 60000.0,
 			17.0 * tall_ms as f64 / 60000.0,
+		);
+	}
+
+	/// RADIX-4 GATE — does the degree-3 mux pay for itself?
+	///
+	/// COLUMN ACCOUNTING, counted carefully rather than estimated (an earlier hand-wave of "~35%"
+	/// was wrong). Radix-2 over two bit positions: `2 x (a_shl + bcast + bcast_rot + pp + 3 adder)`
+	/// = 14 columns. Radix-4 over the same two positions, as ONE digit: `A`, `2A`, `3A` (3 shifted)
+	/// + 4 broadcast + 1 mux + 3 adder = 11. So 5.5 columns per bit against 7 — a **21% ceiling**,
+	/// not 35%. (`3a` is built once per row and shifted per digit, so it is O(1), not O(blk).
+	/// Radix-8 works out at 5.67 columns/bit — WORSE — so radix-4 is the sweet spot.)
+	///
+	/// The ceiling is 21% because `modmul_cost_model_calibration` S2 measured prove as LINEAR in
+	/// column count. What could eat it: the mux is degree 3 where radix-2's `pp` is degree 2, and
+	/// zerocheck cost grows with composition degree. That trade is the whole question, and it is
+	/// not something the column count can answer — hence measuring both radices at several blk.
+	/// Run: `cargo test --release --lib --features parallel tall_modmul_radix_gate -- --ignored --nocapture`
+	#[test]
+	#[ignore = "gate: radix-4 (degree-3 mux, half the accumulator steps) vs radix-2"]
+	fn tall_modmul_radix_gate() {
+		use binius_core::fiat_shamir::HasherChallenger;
+		use binius_hash::sha2::Sha256Compression;
+		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
+		use bumpalo::Bump;
+		use sha2::Sha256;
+		use std::time::Instant;
+
+		const W: usize = 4096;
+		let n = 2048usize;
+
+		let mut rng = StdRng::seed_from_u64(0x8AD4);
+		let m = (rand_below(&mut rng, n) | (BigUint::from(1u8) << (n - 1)) | BigUint::from(1u8))
+			& ((BigUint::from(1u8) << n) - 1u8);
+		let a = rand_below(&mut rng, n) % &m;
+		let b = rand_below(&mut rng, n) % &m;
+		let (q, r) = (&a * &b / &m, &a * &b % &m);
+		let expect = &a * &b % &m;
+		let (m_b, a_b, b_b, q_b, r_b) = (
+			big_to_bits::<W>(&m),
+			big_to_bits::<W>(&a),
+			big_to_bits::<W>(&b),
+			big_to_bits::<W>(&q),
+			big_to_bits::<W>(&r),
+		);
+
+		println!(
+			"\n  RADIX GATE (W={W}, n={n}, L1/B256, {} cores) — 21% is the column-count ceiling\n\
+			 \x20     blk   radix   rows   prove ms",
+			std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0)
+		);
+		let mut r2 = std::collections::HashMap::new();
+		let mut best = (0usize, 0usize, u128::MAX);
+		for blk in [8usize, 16, 32] {
+			for bpd in [1usize, 2] {
+				let allocator = Bump::new();
+				let mut cs = ConstraintSystem::<OurB256>::new();
+				let mm = TallModMul::<W>::build(&mut cs, &m_b, n, blk, bpd);
+				let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
+				mm.populate(&mut wit, &a_b, &b_b, &q_b, &r_b).unwrap();
+				let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
+				let ccs = cs.compile(&st).unwrap();
+				let widx = wit.into_multilinear_extension_index();
+				binius_core::constraint_system::validate::validate_witness(&ccs, &[], &widx).unwrap();
+				let t = Instant::now();
+				let _p = binius_core::constraint_system::prove::<
+					U256,
+					B256TowerFamily,
+					Sha256,
+					Sha256Compression,
+					HasherChallenger<Sha256>,
+					_,
+				>(&ccs, 1, 128, &[], widx, &binius_hal::make_portable_backend())
+				.unwrap();
+				let ms = t.elapsed().as_millis();
+				let tag = if bpd == 1 { "  2" } else { "  4" };
+				match bpd {
+					1 => {
+						r2.insert(blk, ms);
+						println!("     {blk:>5}  {tag}   {:>5}   {ms:>8}", n / blk);
+					}
+					_ => {
+						let base = r2[&blk] as f64;
+						println!(
+							"     {blk:>5}  {tag}   {:>5}   {ms:>8}   {:>+5.1}% vs radix-2",
+							n / blk,
+							100.0 * (ms as f64 - base) / base
+						);
+					}
+				}
+				if ms < best.2 {
+					best = (blk, bpd, ms);
+				}
+			}
+		}
+		assert_eq!(expect, &a * &b % &m, "reference sanity");
+		println!(
+			"\n    Best overall: blk={} radix-{} at {} ms (vs 20248 ms for the radix-2 blk=16 optimum\n\
+			 \x20   and 117476 ms one-row). Correctness at radix-4 is covered by\n\
+			 \x20   tall_modmul_matches_num_bigint, which sweeps blk x radix and requires all four\n\
+			 \x20   cheat paths to reject at each of the eight combinations.",
+			best.0,
+			if best.1 == 1 { 2 } else { 4 },
+			best.2,
 		);
 	}
 
@@ -5072,6 +5298,7 @@ mod tests {
 	#[test]
 	#[ignore = "sweep: bracket the tall ModMul blocking factor from blk=2 upward"]
 	fn tall_modmul_blk_sweep() {
+		const BPD: usize = 1;
 		use binius_core::fiat_shamir::HasherChallenger;
 		use binius_hash::sha2::Sha256Compression;
 		use binius_m3::builder::{ConstraintSystem, Statement, WitnessIndex};
@@ -5109,7 +5336,7 @@ mod tests {
 		for blk in [2usize, 4, 8, 16, 32] {
 			let allocator = Bump::new();
 			let mut cs = ConstraintSystem::<OurB256>::new();
-			let mm = TallModMul::<W>::build(&mut cs, &m_b, n, blk);
+			let mm = TallModMul::<W>::build(&mut cs, &m_b, n, blk, BPD);
 			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 			mm.populate(&mut wit, &a_b, &b_b, &q_b, &r_b).unwrap();
 			let st = Statement { boundaries: vec![], table_sizes: mm.table_sizes() };
@@ -5221,6 +5448,8 @@ mod tests {
 		const W: usize = 4096;
 		let n = 2048usize;
 		let blk: usize = std::env::var("TALL_BLK").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+		let bpd: usize = std::env::var("TALL_BPD").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+		let bpd_env: usize = std::env::var("TALL_BPD").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 
 		let mut rng = StdRng::seed_from_u64(0x8552);
@@ -5232,7 +5461,7 @@ mod tests {
 
 		let allocator = Bump::new();
 		let mut cs = ConstraintSystem::<OurB256>::new();
-		let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk);
+		let mm = TallModMul::<W>::build(&mut cs, &big_to_bits::<W>(&m), n, blk, bpd);
 		let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 		mm.populate(
 			&mut wit,
@@ -5386,7 +5615,7 @@ mod tests {
 			let allocator = Bump::new();
 			let mut cs = ConstraintSystem::<OurB256>::new();
 			let chan = cs.add_channel("qm_seam");
-			let tm = TallRawMul::<W>::build(&mut cs, "qm", n, blk, chan);
+			let tm = TallRawMul::<W>::build(&mut cs, "qm", n, blk, 1, chan);
 			let rows = n / blk;
 			let mut wit = WitnessIndex::<OurB256>::new(&cs, &allocator);
 			let out = {
