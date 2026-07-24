@@ -1555,6 +1555,62 @@ mod tests {
 		);
 	}
 
+	/// GATE chained-fold-tree SCALE — the payoff of the collapse: the ONE-PROOF, pi-bound fold tree
+	/// verifies in time POLYLOG in the leaf count N (one FRI proof over N−1 rows, width constant but
+	/// for the log-N growth of the fold degree d = inner + log N), NOT O(N) like `run_ivc`'s N
+	/// separate step-verifies. Sweeps N = 4…64 and reports the verify exponent.
+	#[test]
+	#[ignore = "scale sweep (~2 min): collapsed one-proof fold-tree verify vs N=4..64"]
+	fn chained_fold_tree_scale() {
+		use super::prove_chained_fold_tree_bound;
+		use super::ChainTamper;
+		use rand::{RngCore, SeedableRng};
+		use sha3::{Digest, Sha3_256};
+		let inner = 6usize;
+		let pi: [u8; 32] = Sha3_256::digest(b"scale pi").into();
+		let rstar: [u8; 32] = Sha3_256::digest(b"scale R*").into();
+		println!("\n  COLLAPSED FOLD-TREE VERIFY vs N (one pi-bound proof; inner={inner})");
+		println!("     N   rows   d   prove ms   VERIFY ms   proof KiB");
+		let mut rows: Vec<(usize, u128)> = Vec::new();
+		for &n in &[4usize, 8, 16, 32, 64] {
+			let m = n.trailing_zeros() as usize;
+			let d = inner + m;
+			let mut rng = rand::rngs::StdRng::from_seed([0x7f; 32]);
+			let full = 1usize << d;
+			let p: Vec<OurB256> = (0..full)
+				.map(|_| OurB256::from(binius_field::BinaryField128b::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128)))
+				.collect();
+			let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
+				.map(|i| {
+					let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, d)
+						.into_iter()
+						.map(crate::decider::lift_b128_to_b256)
+						.collect();
+					let v = mle256(&p, &pt);
+					(pt, v)
+				})
+				.collect();
+			let challenges: Vec<OurB256> = (0..n - 1)
+				.map(|k| crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(&pi, &rstar, k)))
+				.collect();
+			let (ok, dec, pms, vms, sz) =
+				prove_chained_fold_tree_bound(&p, &leaves, &challenges, ChainTamper::None, Some((pi, rstar, pi))).unwrap();
+			assert!(ok && dec, "N={n}: collapsed pi-bound fold tree must verify");
+			println!("     {n:>3}  {:>4}  {d:>2}   {pms:>8}   {vms:>9}   {:>8.1}", n - 1, sz as f64 / 1024.0);
+			rows.push((n, vms));
+		}
+		let (n0, v0) = rows[0];
+		let (n1, v1) = *rows.last().unwrap();
+		let pexp = (v1 as f64 / v0.max(1) as f64).log2() / (n1 as f64 / n0 as f64).log2();
+		println!(
+			"\n    over N:{n0}→{n1} (16× leaves): VERIFY exponent p={pexp:+.2} ⇒ {} — the collapsed\n\
+			 \x20   one-proof fold-tree verify does NOT grow O(N); it is polylog in the leaf count (the\n\
+			 \x20   log-N growth of the fold degree d). The committed-decider opening on top is O(1) in N.",
+			if pexp < 0.5 { "POLYLOG ✓" } else { "steeper than expected" }
+		);
+		assert!(pexp < 0.6, "collapsed fold-tree verify should be polylog in N; measured p={pexp:.2}");
+	}
+
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
 	/// through N−1 narrow fold-verify STEPS (each a real proven circuit), and the final
 	/// accumulated claim HOLDS on the interleaved polynomial (end-to-end soundness). The
