@@ -781,6 +781,110 @@ mod tests {
 		assert!(pb < 0.9, "(B) completeness proof-verify should be sublinear here; measured p={pb:.2}");
 	}
 
+	/// ML-DSA-SIGNED EPOCH, END-TO-END — closes the PQ gap the ECDSA demo left: the epoch root R* is
+	/// signed with a POST-QUANTUM ML-DSA-44 key (FIPS 204), and the resolver's trust anchor is that
+	/// ML-DSA public key, not a bare pin. So the authenticity of the whole epoch — every record it
+	/// commits, and its denials — rests on ML-DSA + SHA-3 STARK, both PQ-safe; a quantum adversary who
+	/// forged a classical RRSIG cannot substitute a different epoch, because that needs the ML-DSA
+	/// secret key (PQ-hard). Two roles / two processes:
+	///   MVP_ROLE=prove   publish the A-record epoch, ML-DSA-sign (R* ‖ zone ‖ epoch), ship package +
+	///                    ML-DSA public key (the PQ anchor) + signature.
+	///   MVP_ROLE=verify  NATIVELY verify the ML-DSA signature over R* against the anchor pk FIRST
+	///                    (the PQ gate), THEN validate the epoch + resolve; a tampered R* is rejected
+	///                    by the ML-DSA verify (no valid signature exists for a substituted root).
+	#[test]
+	#[ignore = "end-to-end ML-DSA-signed epoch: MVP_ROLE=prove|verify, MVP_PKG=<path>"]
+	fn mvp_mldsa_epoch_demo() {
+		use fips204::ml_dsa_44;
+		use fips204::traits::{SerDes, Signer, Verifier};
+		let role = std::env::var("MVP_ROLE").unwrap_or_default();
+		let path = std::env::var("MVP_PKG").unwrap_or_else(|_| "/tmp/mvp_pq.pkg".into());
+		let hex8 = |b: &[u8]| b.iter().take(8).map(|x| format!("{x:02x}")).collect::<String>();
+		let sites: Vec<(String, String)> = [
+			("api.example.se", "192.0.2.70"), ("blog.example.se", "192.0.2.40"),
+			("cdn.example.se", "192.0.2.80"), ("docs.example.se", "192.0.2.50"),
+			("mail.example.se", "192.0.2.30"), ("news.example.se", "192.0.2.60"),
+			("shop.example.se", "192.0.2.20"), ("www.example.se", "192.0.2.10"),
+		].iter().map(|(n, i)| (n.to_string(), i.to_string())).collect();
+		let binding = |rstar: &[u8; 32], zone: &str, epoch: u64| -> Vec<u8> {
+			let mut m = b"STARK-DNS-EPOCH-MLDSA-v1".to_vec();
+			m.extend_from_slice(rstar);
+			m.extend_from_slice(zone.as_bytes());
+			m.extend_from_slice(&epoch.to_le_bytes());
+			m
+		};
+
+		match role.as_str() {
+			"prove" => {
+				let (pkg, pin) = publish_website_epoch("example.se", 42, &sites).expect("publish");
+				let (pk, sk) = ml_dsa_44::try_keygen().expect("ML-DSA-44 keygen");
+				let msg = binding(&pkg.epoch_proof.rstar, &pkg.zone, pkg.epoch);
+				let sig = sk.try_sign(&msg, b"").expect("ML-DSA sign R*");
+				assert!(pk.verify(&msg, &sig, b""), "operator self-verify");
+				let bytes = pkg.to_bytes();
+				std::fs::write(&path, &bytes).unwrap();
+				std::fs::write(format!("{path}.pin"), &pin).unwrap();
+				std::fs::write(format!("{path}.mldsa_pk"), pk.into_bytes()).unwrap();
+				std::fs::write(format!("{path}.mldsa_sig"), sig).unwrap();
+				let sites_tsv: String = sites.iter().map(|(n, i)| format!("{n}\t{i}\n")).collect();
+				std::fs::write(format!("{path}.sites"), sites_tsv).unwrap();
+				println!(
+					"\n  [OPERATOR / prove]  zone example.se, {} A-records, epoch 42\n\
+					 \x20  epoch root R* = {}…  signed with ML-DSA-44 (FIPS 204, POST-QUANTUM)\n\
+					 \x20  ML-DSA public key (the PQ trust anchor) {} B, signature {} B → shipped\n\
+					 \x20  package {:.1} KiB + pin + anchor pk + PQ signature → {path}",
+					sites.len(), hex8(&pkg.epoch_proof.rstar),
+					ml_dsa_44::PK_LEN, ml_dsa_44::SIG_LEN, bytes.len() as f64 / 1024.0,
+				);
+			}
+			"verify" => {
+				let bytes = std::fs::read(&path).expect("read package");
+				let pin = std::fs::read(format!("{path}.pin")).unwrap();
+				let pk_bytes: [u8; ml_dsa_44::PK_LEN] =
+					std::fs::read(format!("{path}.mldsa_pk")).unwrap().try_into().expect("pk len");
+				let sig: [u8; ml_dsa_44::SIG_LEN] =
+					std::fs::read(format!("{path}.mldsa_sig")).unwrap().try_into().expect("sig len");
+				let sites_tsv = std::fs::read_to_string(format!("{path}.sites")).unwrap();
+				let recv_sites: Vec<(String, String)> = sites_tsv.lines()
+					.filter_map(|l| l.split_once('\t').map(|(n, i)| (n.to_string(), i.to_string()))).collect();
+				let pkg = EpochPackage::from_bytes(&bytes);
+				let anchor = ml_dsa_44::PublicKey::try_from_bytes(pk_bytes).expect("anchor pk");
+
+				println!("\n  [RESOLVER / verify on this device]  zone {}, epoch {}", pkg.zone, pkg.epoch);
+				let msg = binding(&pkg.epoch_proof.rstar, &pkg.zone, pkg.epoch);
+				let t0 = std::time::Instant::now();
+				let pq_ok = anchor.verify(&msg, &sig, b"");
+				let pq_us = t0.elapsed().as_micros();
+				assert!(pq_ok, "ML-DSA signature over R* must verify against the anchor");
+				println!("  ── POST-QUANTUM ANCHOR ({pq_us} µs) ──\n\
+					 \x20   ML-DSA-44 signature over R* vs anchor pk: ✓ VALID  (R* is authentic under a PQ key)");
+				let mut bad = pkg.epoch_proof.rstar;
+				bad[0] ^= 1;
+				assert!(!anchor.verify(&binding(&bad, &pkg.zone, pkg.epoch), &sig, b""),
+					"a substituted epoch root must FAIL the ML-DSA anchor");
+				println!("  \x20   (a substituted R* has no valid ML-DSA signature ⇒ REJECTED — forging the anchor is PQ-hard)");
+
+				let (epoch_ok, comp_ok) = verify_epoch_package(&pkg, &pin).expect("verify");
+				assert!(epoch_ok && comp_ok);
+				println!("  ── EPOCH VALIDATION ── epoch-agg vs R* ✓  +  NSEC3 completeness + pin ✓");
+				println!("  ── DNS RESOLUTION (offline, PQ-anchored) ──");
+				for (name, ip) in &recv_sites {
+					if let Answer::Exists { index } = resolve(&pkg, name, comp_ok).unwrap() {
+						assert!(site_record_matches(&pkg, index, name, ip), "leaf binds {name}→{ip}");
+						println!("     {name:<18} → A {ip:<12} ✓ authentic (under a PQ-signed epoch)");
+					}
+				}
+				match resolve(&pkg, "notregistered.example.se", comp_ok).unwrap() {
+					Answer::NxDomain { interval } => println!("     notregistered.example.se → NXDOMAIN ✓ proved absent (interval {interval})"),
+					_ => panic!("should be absent"),
+				}
+				println!("  ── VERIFIER PEAK RSS {:.0} MiB (witness-free) ──",
+					crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0));
+			}
+			other => panic!("set MVP_ROLE=prove or verify (got {other:?})"),
+		}
+	}
+
 	/// END-TO-END WEBSITE DEMO — prove a signed A-record epoch on a big box, ship it, and resolve
 	/// real websites on an IoT device against the shipped proof. Two roles / two processes:
 	///   MVP_ROLE=prove   publish a `.se` zone of A-records (name→ip), each ECDSA-signed; serialize
