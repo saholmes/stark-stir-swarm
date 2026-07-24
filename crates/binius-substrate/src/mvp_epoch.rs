@@ -321,9 +321,8 @@ pub fn rrsig_record_len(include_pq: bool) -> usize {
 /// The deterministic RRSIG signing input (RFC 4034 §3.1.8.1: RRSIG_RDATA(no sig) ‖ canonical RRset)
 /// for record `i` under `zone` with algorithm `alg` — the exact bytes a signature is computed over,
 /// and the signature-independent prefix a resolver reconstructs to bind a served record to a name.
-fn rrsig_signing_input_for(zone: &str, i: usize, alg: u8) -> (String, Vec<u8>) {
+fn rrsig_signing_input_for(zone: &str, name: &str, i: usize, alg: u8) -> Vec<u8> {
 	use crate::dns_stark::{rrsig_signing_input, CanonicalRr, RrsigFields};
-	let name = format!("host{i:07}.se");
 	let ip = [198u8, 51, 100, (i % 256) as u8];
 	let rrsig = RrsigFields {
 		type_covered: 1, // A
@@ -335,8 +334,32 @@ fn rrsig_signing_input_for(zone: &str, i: usize, alg: u8) -> (String, Vec<u8>) {
 		key_tag: 0x4d2u16.wrapping_add(i as u16),
 		signer_name: zone.to_string(),
 	};
-	let rr = CanonicalRr { name: name.clone(), rr_type: 1, class: 1, orig_ttl: 3600, rdata: ip.to_vec() };
-	(name, rrsig_signing_input(&rrsig, std::slice::from_ref(&rr)))
+	let rr = CanonicalRr { name: name.to_string(), rr_type: 1, class: 1, orig_ttl: 3600, rdata: ip.to_vec() };
+	rrsig_signing_input(&rrsig, std::slice::from_ref(&rr))
+}
+
+/// Synthetic per-index name for the default RRSIG sweep. Real-corpus runs supply their own names.
+fn synth_rrsig_name(i: usize) -> String {
+	format!("host{i:07}.se")
+}
+
+/// Load up to `limit` real `.se` names from the shipped Tranco list (already-captured public data;
+/// no live probing). Returns the first `limit` distinct `.se` names in file order.
+pub fn load_se_names(limit: usize) -> Result<Vec<String>> {
+	let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/data/se-domains-tranco.txt");
+	let text = std::fs::read_to_string(path).map_err(|e| anyhow!("read Tranco `.se` list {path}: {e}"))?;
+	let mut names: Vec<String> = Vec::with_capacity(limit);
+	for line in text.lines() {
+		let n = line.trim();
+		if n.ends_with(".se") && !n.is_empty() {
+			names.push(n.to_string());
+			if names.len() == limit {
+				break;
+			}
+		}
+	}
+	anyhow::ensure!(names.len() == limit, "Tranco list has {} `.se` names, need {limit}", names.len());
+	Ok(names)
 }
 
 /// ROLE 1 (real-RRSIG variant) — publish an epoch whose every committed leaf is a COMPLETE signed
@@ -352,12 +375,39 @@ pub fn publish_rrsig_epoch(
 	n: usize,
 	include_pq: bool,
 ) -> Result<(EpochPackage, ZonePin)> {
+	let names: Vec<String> = (0..n).map(synth_rrsig_name).collect();
+	publish_rrsig_epoch_named(zone, epoch, &names, rrsig_algs(include_pq))
+}
+
+/// Real-`.se`-corpus variant — build the RRSIG epoch over the first `n` real `.se` names from the
+/// shipped Tranco list, signed with the REAL `.se` ZSK algorithm (ECDSA-P256, DNSSEC alg 13). This
+/// upgrades the record-composition cost from measured-on-synthetic to measured-on-`.se`. (No PQ:
+/// no production TLD deploys ML-DSA, so the PQ record size is necessarily synthetic/projected.)
+pub fn publish_se_rrsig_epoch(zone: &str, epoch: u64, n: usize) -> Result<(EpochPackage, ZonePin)> {
+	let names = load_se_names(n)?;
+	publish_rrsig_epoch_named(zone, epoch, &names, &[13])
+}
+
+/// Core builder over an explicit name list and algorithm set (round-robin). Every leaf is the
+/// complete signed record (canonical RRSIG signing input ‖ REAL signature), each signature verified
+/// natively before admission (Model A). Records are one uniform width sized to the largest algorithm
+/// present ([`rrsig_record_len`]); NSEC3 chain intervals are padded to that width.
+pub fn publish_rrsig_epoch_named(
+	zone: &str,
+	epoch: u64,
+	names: &[String],
+	algs: &[u8],
+) -> Result<(EpochPackage, ZonePin)> {
 	use ed25519_dalek::{Signer as _, Verifier as _};
 	use fips204::ml_dsa_44;
 	use fips204::traits::{Signer as _, Verifier as _};
 	use rand::{rngs::StdRng, SeedableRng};
-	assert!(n.is_power_of_two() && n >= 2, "record count must be a power of two >= 2");
-	let algs = rrsig_algs(include_pq);
+	let n = names.len();
+	// The record count need NOT be a power of two: the epoch is padded to pow2 with inert sentinel
+	// records below, and the NSEC3 completeness AIR trace-pads its own chain. Both paddings are
+	// provably inert, so an arbitrary zone size (e.g. the full 3822-name `.se` corpus) is admissible.
+	assert!(n >= 2, "need at least two records");
+	let include_pq = algs.contains(&17);
 	let record_len = rrsig_record_len(include_pq);
 
 	// Real keys, generated once. RSA keygen is the slow part; ML-DSA/EC/Ed are cheap.
@@ -372,11 +422,11 @@ pub fn publish_rrsig_epoch(
 	let rsa_vk = rsa::RsaPublicKey::from(&rsa_sk);
 	let (mldsa_pk, mldsa_sk) = ml_dsa_44::try_keygen().map_err(|e| anyhow!("ml-dsa keygen: {e:?}"))?;
 
-	let mut names = Vec::with_capacity(n);
+	let mut out_names = Vec::with_capacity(n);
 	let mut records = Vec::with_capacity(n);
-	for i in 0..n {
+	for (i, name) in names.iter().enumerate() {
 		let alg = algs[i % algs.len()];
-		let (name, si) = rrsig_signing_input_for(zone, i, alg);
+		let si = rrsig_signing_input_for(zone, name, i, alg);
 		let sig: Vec<u8> = match alg {
 			8 => rsa_sk
 				.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(&si))
@@ -416,12 +466,12 @@ pub fn publish_rrsig_epoch(
 			return Err(anyhow!("record {} B exceeds uniform record_len {} B", bytes.len(), record_len * 16));
 		}
 		records.push(pack_bytes_to_fields(&bytes, record_len));
-		names.push(name);
+		out_names.push(name.clone());
 	}
 
 	// NSEC3 completeness over the zone's own names; chain intervals join as records, padded to the
 	// uniform record length so P is a single equal-width interleave.
-	let chain = nsec3_chain_from_names(&names)
+	let chain = nsec3_chain_from_names(&out_names)
 		.ok_or_else(|| anyhow!("two names collide under the NSEC3 hash; chain not strictly ascending"))?;
 	let c = prove_chain_over(&chain)?;
 	let pin: ZonePin = c.commitment_prefix.clone();
@@ -431,13 +481,20 @@ pub fn publish_rrsig_epoch(
 		cr.resize(record_len, F::ZERO);
 		records.push(cr);
 	}
+	// Pad the epoch's record count to a power of two with INERT sentinel records (all-zero). They
+	// are committed in R* so the interleaved P is well-formed, but they carry no name (`out_names`
+	// holds only the real names) and are never opened by resolution (a query resolves by name to a
+	// real index, or to NXDOMAIN via NSEC3), so no sentinel can ever produce a membership answer.
+	// When 2*n is already a power of two (the sweep's pow2 zones) this is a no-op.
+	let target = records.len().next_power_of_two();
+	records.resize(target, vec![F::ZERO; record_len]);
 	let epoch_proof = prove_epoch(&records, zone, epoch);
 	Ok((
 		EpochPackage {
 			zone: zone.to_string(),
 			epoch,
 			epoch_proof,
-			names,
+			names: out_names,
 			completeness_proof: c.transcript,
 			chain,
 			chain_base,
@@ -451,11 +508,11 @@ pub fn publish_rrsig_epoch(
 /// input for `name`/`alg` and check the served record's leading fields encode it. The signature
 /// tail is separately bound to R* by [`crate::epoch_trustless::verify_record`], so this pins the
 /// served record to the exact name, type, TTL, algorithm and key tag the resolver asked about.
-pub fn rrsig_record_binds(pkg: &EpochPackage, index: usize, zone: &str, i: usize, alg: u8) -> bool {
+pub fn rrsig_record_binds(pkg: &EpochPackage, index: usize, zone: &str, name: &str, i: usize, alg: u8) -> bool {
 	if index >= pkg.records.len() {
 		return false;
 	}
-	let (_name, si) = rrsig_signing_input_for(zone, i, alg);
+	let si = rrsig_signing_input_for(zone, name, i, alg);
 	let mut bytes = si;
 	while bytes.len() % 16 != 0 {
 		bytes.push(0);
@@ -1360,6 +1417,9 @@ mod tests {
 		// 4 KiB by the ML-DSA-44 signature. See publish_rrsig_epoch.
 		let rrsig = std::env::var("MVP_RRSIG").ok().map(|s| s.to_lowercase());
 		let include_pq = rrsig.as_deref() == Some("pq");
+		// MVP_SE_EXACT overrides the per-iteration count for the `.se` mode, so a single run can
+		// publish the FULL non-power-of-two corpus (e.g. all 3822 names) rather than a 2^n slice.
+		let se_exact = std::env::var("MVP_SE_EXACT").ok().and_then(|s| s.parse::<usize>().ok());
 		assert!(minlog >= 1 && maxlog >= minlog, "need 1 <= MVP_MINLOG <= MVP_MAXLOG");
 
 		// Deterministic zone: name/ip/algorithm depend only on the index, so the verifier
@@ -1369,12 +1429,14 @@ mod tests {
 		let record_kind = match rrsig.as_deref() {
 			Some("pq") => "complete RRSIG record, mixed RSA/ECDSA/Ed25519/ML-DSA (real sigs, 4 KiB leaf)",
 			Some("classical") => "complete RRSIG record, mixed RSA/ECDSA/Ed25519 (real sigs, 512 B leaf)",
+			Some("se") => "complete RRSIG record over REAL .se names, ECDSA-P256 (real .se ZSK alg, 512 B leaf)",
 			_ => "name->ip A-record leaf (512 B; sig verified off-circuit at publish)",
 		};
 		let build = |count: usize| -> (EpochPackage, ZonePin) {
 			match rrsig.as_deref() {
 				Some("classical") => publish_rrsig_epoch("se", 42, count, false).expect("publish rrsig"),
 				Some("pq") => publish_rrsig_epoch("se", 42, count, true).expect("publish rrsig-pq"),
+				Some("se") => publish_se_rrsig_epoch("se", 42, se_exact.unwrap_or(count)).expect("publish rrsig-se"),
 				_ => {
 					let sites: Vec<(String, String)> = (0..count).map(|i| (name_of(i), ip_of(i))).collect();
 					publish_website_epoch("se", 42, &sites).expect("publish")
@@ -1400,9 +1462,10 @@ mod tests {
 				}
 				assert!(ok, "N={count}: verify_record must hold for index {idx}");
 				let bound = match rrsig.as_deref() {
-					Some(_) => {
-						let algs = rrsig_algs(include_pq);
-						rrsig_record_binds(pkg, idx, &pkg.zone, idx, algs[idx % algs.len()])
+					Some(m) => {
+						let algs: &[u8] = if m == "se" { &[13] } else { rrsig_algs(include_pq) };
+						let name = pkg.names[idx].clone();
+						rrsig_record_binds(pkg, idx, &pkg.zone, &name, idx, algs[idx % algs.len()])
 					}
 					None => site_record_matches(pkg, idx, &pkg.names[idx], &ip_of(idx)),
 				};
@@ -1413,12 +1476,6 @@ mod tests {
 			let state_kib = (32 + ep.batch_proof.len() + ep.zone.len() + 24) as f64 / 1024.0;
 			(per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1], state_kib)
 		};
-		let header = || println!(
-			"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n records; resolver-side verify_record x{reps} reps/index)\n\
-			 \x20  record = {record_kind}\n\
-			 \x20  n      N       total-recs   per-query VERIFY min/med/max      resolver STATE\n\
-			 \x20  ---   ------   ----------   ------------------------------   -------------"
-		);
 		let footer = |first_med: f64, last_med: f64, first_n: usize, last_n: usize, on: &str| {
 			let span = last_n as f64 / first_n as f64;
 			let growth = last_med / first_med.max(1e-9);
@@ -1440,28 +1497,49 @@ mod tests {
 				for n in minlog..=maxlog {
 					let count = 1usize << n;
 					let t0 = std::time::Instant::now();
-					let (pkg, _pin) = build(count);
+					let (pkg, pin) = build(count);
 					let bytes = pkg.to_bytes();
 					std::fs::write(format!("{dir}/n{n}.pkg"), &bytes).expect("write pkg");
+					std::fs::write(format!("{dir}/n{n}.pin"), &pin).expect("write pin");
 					println!(
-						"    n={n:>2}  N={count:>6}  prove {:>7.2} s  package {:>7.1} KiB",
+						"    n={n:>2}  N={:>6}  total-recs={:>6}  prove {:>7.2} s  package {:>7.1} KiB (+ {}-B pin)",
+						pkg.names.len(),
+						pkg.records.len(),
 						t0.elapsed().as_secs_f64(),
-						bytes.len() as f64 / 1024.0
+						bytes.len() as f64 / 1024.0,
+						pin.len()
 					);
 				}
 			}
 			// RESOLVER: load each serialized zone and measure per-query verify. This is the process
 			// that runs on the IoT device; it proved nothing, so its cost IS the resolver's cost.
 			"verify" => {
-				header();
+				println!(
+					"\n  FULL EPOCH PACKAGE VERIFY (resolver, this device)  record = {record_kind}\n\
+					 \x20  verify-once = epoch aggregation vs R* + NSEC3 completeness vs 32-B pin (once/epoch)\n\
+					 \x20  n      N      total-recs   verify-once (epoch+NSEC3)   per-query VERIFY min/med/max   resolver STATE\n\
+					 \x20  ---   ------   ----------   ------------------------   ---------------------------   -------------"
+				);
 				let (mut first_med, mut first_n, mut last_med, mut last_n) = (0f64, 0usize, 0f64, 0usize);
 				for n in minlog..=maxlog {
 					let bytes = std::fs::read(format!("{dir}/n{n}.pkg"))
 						.unwrap_or_else(|_| panic!("missing {dir}/n{n}.pkg — run MVP_ROLE=prove first"));
+					let pin = std::fs::read(format!("{dir}/n{n}.pin"))
+						.unwrap_or_else(|_| panic!("missing {dir}/n{n}.pin — run MVP_ROLE=prove first"));
 					let pkg = EpochPackage::from_bytes(&bytes);
+					// FULL verify-once: the complete package (epoch aggregation vs R* AND the NSEC3
+					// completeness proof vs the out-of-band 32-B pin), timed as one once/epoch cost.
+					let tvo = std::time::Instant::now();
+					let (epoch_ok, comp_ok) = verify_epoch_package(&pkg, &pin).expect("verify-once");
+					let vonce_ms = tvo.elapsed().as_secs_f64() * 1e3;
+					assert!(
+						epoch_ok && comp_ok,
+						"N={}: full package (epoch aggregation + NSEC3 completeness + pin) must verify",
+						pkg.names.len()
+					);
 					let (mn, med, mx, state_kib) = measure(&pkg);
 					println!(
-						"  {n:>3}   {:>6}   {:>10}   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms      {state_kib:>8.1} KiB",
+						"  {n:>3}   {:>6}   {:>10}   {vonce_ms:>18.1} ms   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms   {state_kib:>8.1} KiB",
 						pkg.names.len(),
 						pkg.records.len()
 					);
@@ -1489,8 +1567,10 @@ mod tests {
 					let (pkg, _pin) = build(count);
 					let prove_s = t0.elapsed().as_secs_f64();
 					let (mn, med, mx, state_kib) = measure(&pkg);
+					let _ = count;
 					println!(
-						"  {n:>3}   {count:>6}   {:>10}   {prove_s:>10.2} s   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms      {state_kib:>8.1} KiB",
+						"  {n:>3}   {:>6}   {:>10}   {prove_s:>10.2} s   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms      {state_kib:>8.1} KiB",
+						pkg.names.len(),
 						pkg.records.len()
 					);
 					if n == minlog {

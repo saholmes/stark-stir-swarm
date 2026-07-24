@@ -106,6 +106,10 @@ pub(crate) struct TilingCols<const W: usize> {
 	pub owner: Col<B1, W>,
 	pub next: Col<B1, W>,
 	pub wrap: Col<B1, 1>,
+	/// Trace-padding selector: 1 on real chain rows, 0 on rows that pad the table to a power of
+	/// two. It gates every channel flush (hashes, leaf set) so padding rows are provably inert ---
+	/// they inject no hash and no leaf, and the channel balances force exactly the real rows.
+	pub is_real: Col<B1, 1>,
 	pub bc: Col<B1, W>,
 	pub bcr: Col<B1, W>,
 	pub bc0: Col<B1, 1>,
@@ -145,6 +149,10 @@ pub(crate) fn build_tiling_table<const W: usize>(
 	let owner = t.add_committed::<B1, W>("owner");
 	let next = t.add_committed::<B1, W>("next");
 	let wrap = t.add_committed::<B1, 1>("wrap");
+	// Trace-padding selector (see struct doc). Padding rows carry a VALID interval (owner=0,
+	// next=1) so the C1--C4 and adder constraints hold unconditionally; this selector removes them
+	// from the channels, so they can neither inject nor omit a leaf without unbalancing a channel.
+	let is_real = t.add_committed::<B1, 1>("is_real");
 	// broadcast wrap to all W lanes (all-lanes-equal + lane0 == wrap)
 	let bc = t.add_committed::<B1, W>("bc");
 	let bcr =
@@ -175,20 +183,20 @@ pub(crate) fn build_tiling_table<const W: usize>(
 	let owner_b64: Vec<Col<B64, 1>> = (0..lanes)
 		.map(|i| t.add_packed::<B1, 64, B64, 1>(format!("o_b64{i}"), owner_sel[i]))
 		.collect();
-	t.push(hchan, owner_b64.clone());
+	t.push_with_opts(hchan, owner_b64.clone(), FlushOpts { multiplicity: 1, selector: Some(is_real) });
 	let next_sel: Vec<Col<B1, 64>> = (0..lanes)
 		.map(|i| t.add_selected_block::<B1, W, 64>(format!("n_sel{i}"), next, i))
 		.collect();
 	let next_b64: Vec<Col<B64, 1>> = (0..lanes)
 		.map(|i| t.add_packed::<B1, 64, B64, 1>(format!("n_b64{i}"), next_sel[i]))
 		.collect();
-	t.pull(hchan, next_b64.clone());
+	t.pull_with_opts(hchan, next_b64.clone(), FlushOpts { multiplicity: 1, selector: Some(is_real) });
 	t.push_with_opts(wchan, [tok], FlushOpts { multiplicity: 1, selector: Some(wrap) });
 
 	if let Some(lc) = leafchan {
 		let leaf_out: Vec<Col<B64, 1>> =
 			owner_b64.iter().chain(next_b64.iter()).copied().collect();
-		t.push(lc, leaf_out);
+		t.push_with_opts(lc, leaf_out, FlushOpts { multiplicity: 1, selector: Some(is_real) });
 	}
 
 	TilingCols {
@@ -197,6 +205,7 @@ pub(crate) fn build_tiling_table<const W: usize>(
 		owner,
 		next,
 		wrap,
+		is_real,
 		bc,
 		bcr,
 		bc0,
@@ -397,6 +406,11 @@ pub enum BindTamper {
 	/// One chain record omitted from the leaf table (a duplicate padded in its place), i.e.
 	/// censorship applied at the commitment rather than in the chain.
 	OmitOneLeaf,
+	/// PADDING-ABUSE — set `is_real = 0` on a REAL tiling row, trying to drop it from the cover via
+	/// the trace-padding selector instead of the data. Must REJECT: the row then pushes neither its
+	/// owner (hash channel breaks, the cycle cannot close) nor its leaf (leaf channel unbalances
+	/// against the still-honest leaf table). This is the attack the padding mechanism must not open.
+	PadHideRow,
 }
 
 fn to_bits(x: &BigUint) -> Vec<bool> {
@@ -577,8 +591,15 @@ fn build_bound_chain_over(
 	verify_against: Option<(&[u8], &[u8])>,
 	chain: Option<&[(BigUint, BigUint)]>,
 ) -> Result<(bool, Option<BoundChainCost>)> {
-	assert!(n.is_power_of_two(), "n must be a power of two (selector-flushed wrap count)");
-	assert!(n <= 1 << 15, "chain must fit W bits: n <= 2^15 for step = 2^(W-16)");
+	// The LOGICAL chain has `n_real` owners; the M3 tables must be a power of two, so we pad the
+	// trace to `n_pad` with rows that are removed from every channel by the `is_real` selector.
+	// The logical cover, the pinned leaf set, and the wrap count are all over the real rows only,
+	// so padding changes nothing a verifier sees. When n_real is already a power of two there is no
+	// padding and this is byte-identical to the previous behaviour.
+	let n_real = n;
+	assert!(n_real >= 2, "chain must have at least two owners");
+	let n_pad = n_real.next_power_of_two();
+	assert!(n_pad <= 1 << 15, "chain must fit W bits: padded count <= 2^15 for step = 2^(W-16)");
 
 	let allocator = bumpalo::Bump::new();
 	let mut cs = ConstraintSystem::<OurB256>::new();
@@ -598,7 +619,7 @@ fn build_bound_chain_over(
 			c.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>(),
 			c.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(),
 		),
-		None => synth_chain(n, tiling_salt),
+		None => synth_chain(n_real, tiling_salt),
 	};
 
 	// ---- table A: the C1--C4 tiling AIR, plus a push of each row onto `leafchan` -------------
@@ -612,12 +633,17 @@ fn build_bound_chain_over(
 	// pulling them here is what makes "the committed leaves" and "the constrained chain" the
 	// same object rather than two things that merely look alike.
 	let mut lt = cs.add_table("NSEC3 raw chain leaves");
+	lt.require_power_of_two_size();
+	// The leaf table's own padding selector: it must match the tiling table's `is_real` (1 on the
+	// real leaves, 0 on padding), or the leaf channel cannot balance — so an adversary cannot use a
+	// mismatched selector to hide or inject a leaf.
+	let leaf_is_real = lt.add_committed::<B1, 1>("leaf_is_real");
 	let leaf_cols: Vec<Col<B64, 1>> =
 		(0..LEAF_LANES).map(|i| lt.add_committed::<B64, 1>(format!("leaf{i}"))).collect();
-	lt.pull(leafchan, leaf_cols.clone());
+	lt.pull_with_opts(leafchan, leaf_cols.clone(), FlushOpts { multiplicity: 1, selector: Some(leaf_is_real) });
 	// W3: re-export every committed leaf so the verifier's boundaries can pin the whole set.
 	if binding != RootBinding::None {
-		lt.push(rootchan, leaf_cols.clone());
+		lt.push_with_opts(rootchan, leaf_cols.clone(), FlushOpts { multiplicity: 1, selector: Some(leaf_is_real) });
 	}
 	let leaf_id = lt.id();
 
@@ -636,9 +662,9 @@ fn build_bound_chain_over(
 				c.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>(),
 				c.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(),
 			),
-			None => synth_chain(n, salt),
+			None => synth_chain(n_real, salt),
 		};
-		for i in 0..n {
+		for i in 0..n_real {
 			let mut values: Vec<OurB256> = Vec::with_capacity(LEAF_LANES);
 			for l in lanes_of(&po[i]) {
 				values.push(OurB256::from(B64::new(l)));
@@ -655,7 +681,7 @@ fn build_bound_chain_over(
 		}
 	}
 
-	let statement = binius_m3::builder::Statement { boundaries, table_sizes: vec![n, n] };
+	let statement = binius_m3::builder::Statement { boundaries, table_sizes: vec![n_pad, n_pad] };
 
 	// W5.2 RESOLVER PATH — no witness is built at all: the verifier holds only the proof and its
 	// pin. Both checks below are its own, so their conjunction is what the resolver relies on.
@@ -698,7 +724,7 @@ fn build_bound_chain_over(
 
 	// ---- fill table A (honest chain always: the tamper lives in the LEAF set) ----------------
 	{
-		let tw = witness.init_table(tiling_id, n)?;
+		let tw = witness.init_table(tiling_id, n_pad)?;
 		let mut seg = tw.full_segment();
 		{
 			let mut tv = seg.get_scalars_mut(tc.tok)?;
@@ -706,8 +732,20 @@ fn build_bound_chain_over(
 				*v = B64::new(1);
 			}
 		}
-		for i in 0..n {
-			fill_tiling_row::<W>(&mut seg, &tc, i, &owners[i], &nexts[i], None)?;
+		let (zero, one) = (BigUint::from(0u32), BigUint::from(1u32));
+		for i in 0..n_pad {
+			// is_real: 1 on real chain rows, 0 on padding — removes padding rows from the hash and
+			// leaf channels. PadHideRow drops a REAL row via this selector (must reject downstream).
+			let real = i < n_real && !(tamper == BindTamper::PadHideRow && i == n_real / 2);
+			write_bit(&mut seg, tc.is_real, i, real)?;
+			if i < n_real {
+				fill_tiling_row::<W>(&mut seg, &tc, i, &owners[i], &nexts[i], None)?;
+			} else {
+				// Padding row: a VALID ascending interval (0 < 1), wrap = 0. Every C1--C4 and adder
+				// constraint holds; is_real = 0 keeps it off the hash channel (so it is not part of
+				// the cycle) and off the leaf channel (so it commits no leaf).
+				fill_tiling_row::<W>(&mut seg, &tc, i, &zero, &one, None)?;
+			}
 		}
 	}
 
@@ -718,26 +756,38 @@ fn build_bound_chain_over(
 		let (lo_owners, lo_nexts) = match tamper {
 			// SwapWholeChain: tiling constrains chain 0, leaves carry the alternate chain.
 			// NoneAlternateChain: BOTH are the alternate chain, so this must validate.
-			BindTamper::SwapWholeChain => synth_chain(n, ALT_SALT),
-			BindTamper::NoneAlternateChain if chain.is_none() => synth_chain(n, ALT_SALT),
+			BindTamper::SwapWholeChain => synth_chain(n_real, ALT_SALT),
+			BindTamper::NoneAlternateChain if chain.is_none() => synth_chain(n_real, ALT_SALT),
 			_ => (owners.clone(), nexts.clone()),
 		};
-		let tw = witness.init_table(leaf_id, n)?;
+		let tw = witness.init_table(leaf_id, n_pad)?;
 		let mut seg: TableWitnessSegment<OurB256> = tw.full_segment();
+		for i in 0..n_pad {
+			// leaf_is_real must match the tiling table's is_real, or the leaf channel unbalances.
+			write_bit(&mut seg, leaf_is_real, i, i < n_real)?;
+		}
 		let mut cols: Vec<_> = Vec::with_capacity(LEAF_LANES);
 		for c in &leaf_cols {
 			cols.push(seg.get_scalars_mut(*c)?);
 		}
-		for i in 0..n {
-			// OmitOneLeaf: row `n/2` repeats row 0, so one record never appears in the leaf set.
-			let src = if tamper == BindTamper::OmitOneLeaf && i == n / 2 { 0 } else { i };
+		for i in 0..n_pad {
+			if i >= n_real {
+				// Padding leaf row: zeros. is_real = 0 keeps it off both channels, so it neither
+				// pulls a phantom leaf nor pushes one to the pinned set.
+				for l in 0..LEAF_LANES {
+					cols[l][i] = B64::new(0);
+				}
+				continue;
+			}
+			// OmitOneLeaf: row `n_real/2` repeats row 0, so one record never appears in the leaf set.
+			let src = if tamper == BindTamper::OmitOneLeaf && i == n_real / 2 { 0 } else { i };
 			let o_lanes = lanes_of(&lo_owners[src]);
 			let x_lanes = lanes_of(&lo_nexts[src]);
 			for l in 0..LANES {
 				cols[l][i] = B64::new(o_lanes[l]);
 				cols[LANES + l][i] = B64::new(x_lanes[l]);
 			}
-			if tamper == BindTamper::AlterOneLeaf && i == n / 3 {
+			if tamper == BindTamper::AlterOneLeaf && i == n_real / 3 {
 				// flip one lane so this leaf is no longer any constrained row
 				cols[0][i] = B64::new(o_lanes[0] ^ 1);
 			}
@@ -1015,6 +1065,51 @@ mod tests {
 			 leaf, and omitted leaf are each REJECTED. No in-circuit hashing (raw leaves). \
 			 NOT YET load-bearing end to end: chain root is not a public boundary (W3) and epoch \
 			 aggregation is still modelled (W4)."
+		);
+	}
+
+	/// PADDING GATE — a NON-power-of-two chain (200 owners, trace padded to 256) must validate when
+	/// honest AND still reject every tamper, so trace padding adds no soundness hole. This is the
+	/// regression proof for the `is_real` selector: the completeness argument must survive padding.
+	#[test]
+	fn nsec3_padding_to_pow2_preserves_soundness() {
+		const N: usize = 200; // n_pad = 256, so 56 rows are padding
+		assert!(!N.is_power_of_two(), "the point of this test is a non-power-of-two owner count");
+		// (1) an honest non-pow2 chain VALIDATES — the padding rows are inert.
+		assert!(
+			validate_bound_chain(N, BindTamper::None).expect("honest non-pow2"),
+			"a non-power-of-two chain must VALIDATE under trace padding"
+		);
+		// (2) every semantic tamper STILL REJECTS with padding present — padding did not weaken the
+		//     completeness/binding argument.
+		assert!(
+			!validate_bound_chain(N, BindTamper::SwapWholeChain).expect("swap"),
+			"swap-whole-chain must REJECT under padding"
+		);
+		assert!(
+			!validate_bound_chain(N, BindTamper::AlterOneLeaf).expect("alter"),
+			"altered leaf must REJECT under padding"
+		);
+		assert!(
+			!validate_bound_chain(N, BindTamper::OmitOneLeaf).expect("omit"),
+			"omitted leaf must REJECT under padding"
+		);
+		// (3) the NEW attack surface: dropping a REAL row via the padding selector (is_real=0) must
+		//     REJECT — the hash channel cannot close the cycle and the leaf channel unbalances.
+		assert!(
+			!validate_bound_chain(N, BindTamper::PadHideRow).expect("pad-hide"),
+			"★ hiding a real row via the is_real selector must REJECT — else padding is a censorship hole"
+		);
+		// (4) padding also must not rescue a pow2 hide-attempt: PadHideRow rejects at pow2 too.
+		assert!(
+			!validate_bound_chain(256, BindTamper::PadHideRow).expect("pad-hide pow2"),
+			"is_real omission must REJECT even when n is already a power of two"
+		);
+		println!(
+			"PADDING GATE nsec3: N={N} (non-pow2) trace-padded to 256 VALIDATES honestly; \
+			 swap/alter/omit and is_real-omission (PadHideRow) each REJECT. Trace padding is inert: \
+			 the channel balances force exactly the {N} real rows, so the completeness argument is \
+			 unchanged by padding."
 		);
 	}
 
