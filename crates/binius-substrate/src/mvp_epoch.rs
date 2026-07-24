@@ -864,22 +864,64 @@ mod tests {
 					"a substituted epoch root must FAIL the ML-DSA anchor");
 				println!("  \x20   (a substituted R* has no valid ML-DSA signature ⇒ REJECTED — forging the anchor is PQ-hard)");
 
-				let (epoch_ok, comp_ok) = verify_epoch_package(&pkg, &pin).expect("verify");
+				// EPOCH VALIDATION, timed per component (once per epoch).
+				let te = std::time::Instant::now();
+				let epoch_ok = verify_epoch(&pkg.epoch_proof, &pkg.zone);
+				let epoch_ms = te.elapsed().as_secs_f64() * 1e3;
+				let tc = std::time::Instant::now();
+				let comp_ok = crate::nsec3_bind::verify_chain_over(&pkg.chain, &pkg.completeness_proof, &pin).unwrap();
+				let comp_ms = tc.elapsed().as_secs_f64() * 1e3;
 				assert!(epoch_ok && comp_ok);
-				println!("  ── EPOCH VALIDATION ── epoch-agg vs R* ✓  +  NSEC3 completeness + pin ✓");
+				println!(
+					"  ── EPOCH VALIDATION (once/epoch) ──\n\
+					 \x20   epoch aggregation vs R*    : ✓  {epoch_ms:.1} ms\n\
+					 \x20   NSEC3 completeness + pin   : ✓  {comp_ms:.1} ms"
+				);
+
 				println!("  ── DNS RESOLUTION (offline, PQ-anchored) ──");
+				// Per query the OPERATOR precomputes the O(N) opening once; the RESOLVER's steady-state
+				// cost is the flat verify_record. Time them separately, and the leaf-binding check.
+				let reps = 20u32;
+				let mut last_verify_ms = 0f64;
 				for (name, ip) in &recv_sites {
-					if let Answer::Exists { index } = resolve(&pkg, name, comp_ok).unwrap() {
-						assert!(site_record_matches(&pkg, index, name, ip), "leaf binds {name}→{ip}");
-						println!("     {name:<18} → A {ip:<12} ✓ authentic (under a PQ-signed epoch)");
+					let index = pkg.names.iter().position(|n| n == name).unwrap();
+					let op = open_record(&pkg.records, index, &pkg.epoch_proof); // operator side (O(N))
+					let tv = std::time::Instant::now();
+					let mut ok = true;
+					for _ in 0..reps {
+						ok &= verify_record(&pkg.epoch_proof, &op);
 					}
+					let verify_ms = tv.elapsed().as_secs_f64() * 1e3 / reps as f64;
+					last_verify_ms = verify_ms;
+					let tb = std::time::Instant::now();
+					let bound = site_record_matches(&pkg, index, name, ip);
+					let bind_us = tb.elapsed().as_micros();
+					assert!(ok && bound, "membership + leaf binding must hold for {name}");
+					println!("     {name:<18} → A {ip:<12} ✓  membership verify {verify_ms:>6.1} ms + leaf-bind {bind_us:>3} µs");
 				}
-				match resolve(&pkg, "notregistered.example.se", comp_ok).unwrap() {
-					Answer::NxDomain { interval } => println!("     notregistered.example.se → NXDOMAIN ✓ proved absent (interval {interval})"),
+				// NXDOMAIN: covering-interval lookup + covering-leaf verify.
+				let tn = std::time::Instant::now();
+				let nx = resolve(&pkg, "notregistered.example.se", comp_ok).unwrap();
+				let nx_us = tn.elapsed().as_micros();
+				match nx {
+					Answer::NxDomain { interval } => println!(
+						"     {:<18} → NXDOMAIN     ✓  proved absent (interval {interval}, covering-leaf verify {nx_us} µs)",
+						"notregistered"
+					),
 					_ => panic!("should be absent"),
 				}
-				println!("  ── VERIFIER PEAK RSS {:.0} MiB (witness-free) ──",
-					crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0));
+
+				let total_ms = pq_us as f64 / 1e3 + epoch_ms + comp_ms;
+				println!(
+					"  ── TIMING SUMMARY (this device, Cortex-A53) ──\n\
+					 \x20   once/epoch : PQ anchor {:.1} ms + epoch-agg {epoch_ms:.0} ms + completeness {comp_ms:.0} ms ≈ {total_ms:.0} ms\n\
+					 \x20                (completeness dominates; both STARK verifies are POLYLOG in N)\n\
+					 \x20   per query  : membership verify {last_verify_ms:.0} ms (FLAT in N) + leaf-bind ~0.1 ms;\n\
+					 \x20                the operator's O(N) open is OFF-DEVICE (not the resolver's cost)\n\
+					 \x20   PEAK RSS {:.0} MiB (witness-free)",
+					pq_us as f64 / 1e3,
+					crate::b256_sha3::peak_rss_bytes() as f64 / (1024.0 * 1024.0)
+				);
 			}
 			other => panic!("set MVP_ROLE=prove or verify (got {other:?})"),
 		}
