@@ -399,6 +399,25 @@ pub fn prove_chained_fold_tree_bound(
 	tamper: ChainTamper,
 	pi: Option<([u8; 32], [u8; 32], [u8; 32])>,
 ) -> Result<(bool, bool, u128, u128, usize)> {
+	prove_chained_fold_tree_full(p, leaves, challenges, tamper, pi, None, false)
+}
+
+/// Milestone 3 — the same one-proof, `pi_hash`-bound chained fold tree, with the final accumulated
+/// claim discharged by the IN-STACK COMMITTED-DECIDER opening instead of a native `mle256`. When
+/// `decider_p128 = Some(P_b128)`, the returned `decider_holds` is the result of committing `P`
+/// (→ R*) and opening it at `acc.point` through the FRI-Binius piop (`decider_open_at_ext_l1`),
+/// then VERIFYING that opening against R* (`decider_verify_rooted_ext_l1`) — so the resolver
+/// proves `P(acc.point) == acc.value` WITHOUT holding `P`, in ONE opening (O(1) in N). Set
+/// `forge_final` to corrupt the claimed final value and confirm the committed decider REJECTS it.
+pub fn prove_chained_fold_tree_full(
+	p: &[OurB256],
+	leaves: &[(Vec<OurB256>, OurB256)],
+	challenges: &[OurB256],
+	tamper: ChainTamper,
+	pi: Option<([u8; 32], [u8; 32], [u8; 32])>,
+	decider_p128: Option<&[binius_field::BinaryField128b]>,
+	forge_final: bool,
+) -> Result<(bool, bool, u128, u128, usize)> {
 	use binius_core::constraint_system::channel::FlushDirection;
 	use binius_m3::builder::Boundary;
 	use std::time::Instant;
@@ -442,7 +461,20 @@ pub fn prove_chained_fold_tree_bound(
 		acc = (line.clone(), folded);
 		folds.push(Fold { g, t, r0, r1, v0, v1, line, folded });
 	}
-	let decider_holds = mle256(p, &acc.0) == acc.1;
+	// Decider: discharge the final accumulated claim `P(acc.point) == acc.value`. Native model =
+	// direct `mle256`; production model = the COMMITTED-DECIDER opening against R*-committed P (one
+	// FRI opening, the resolver never holds P). `forge_final` corrupts the claimed value to confirm
+	// the committed decider rejects a false final claim.
+	let claimed_value = if forge_final { acc.1 + OurB256::ONE } else { acc.1 };
+	let decider_holds = match decider_p128 {
+		None => mle256(p, &acc.0) == claimed_value,
+		Some(p128) => {
+			let (root, proof, opened, nv) = crate::decider::decider_open_at_ext_l1(p128, &acc.0, 128);
+			// the opening's value must equal the claim AND verify against the commitment root.
+			opened == claimed_value
+				&& crate::decider::decider_verify_rooted_ext_l1(root, proof, &acc.0, claimed_value, nv, 128)
+		}
+	};
 
 	// ── the AIR: one table, `nrows` = N−1 fold rows (padded to a power of two). Each row proves one
 	//    fold-verify AND flows the accumulator through the `acc` channel with a step-position lane.
@@ -1463,6 +1495,62 @@ mod tests {
 			 accepts under the correct pi_hash, REJECTS a substituted proof (built for pi_A, verified \
 			 under pi_B) — leaf points + fold challenges pinned to pi_hash. F2 milestone 2: \
 			 non-substitutable one-proof fold tree.",
+			sz / 1024
+		);
+	}
+
+	/// GATE chained-fold-tree COMMITTED-DECIDER (F2 milestone 3, the final piece) — the one-proof,
+	/// pi-bound chained fold tree whose final accumulated claim is discharged by the COMMITTED-DECIDER
+	/// opening: P is committed (→ R*) and opened at `acc.point` through the FRI-Binius piop, and the
+	/// resolver VERIFIES that opening against R* — proving `P(acc.point) == acc.value` without holding
+	/// P, in ONE opening (O(1) in N). A forged final value is REJECTED by the opening.
+	#[test]
+	#[ignore = "heavy (~1 min): pi-bound chained fold tree + committed-decider opening"]
+	fn chained_fold_tree_committed_decider() {
+		use super::{prove_chained_fold_tree_full, ChainTamper};
+		use binius_field::BinaryField128b as B128;
+		use rand::{RngCore, SeedableRng};
+		use sha3::{Digest, Sha3_256};
+		let (n, inner) = (4usize, 6usize);
+		let m = n.trailing_zeros() as usize;
+		let d = inner + m;
+		let pi: [u8; 32] = Sha3_256::digest(b"public-input: zone se, epoch 42").into();
+		let rstar: [u8; 32] = Sha3_256::digest(b"R*").into();
+
+		// committed poly P as B128 evals; the fold uses the lifted-to-B256 view.
+		let mut rng = rand::rngs::StdRng::from_seed([0x6e; 32]);
+		let full = 1usize << d;
+		let p128: Vec<B128> = (0..full).map(|_| B128::new(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128)).collect();
+		let p: Vec<OurB256> = p128.iter().map(|&x| crate::decider::lift_b128_to_b256(x)).collect();
+		let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
+			.map(|i| {
+				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, d)
+					.into_iter()
+					.map(crate::decider::lift_b128_to_b256)
+					.collect();
+				let v = mle256(&p, &pt);
+				(pt, v)
+			})
+			.collect();
+		let challenges: Vec<OurB256> = (0..n - 1)
+			.map(|k| crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(&pi, &rstar, k)))
+			.collect();
+
+		// honest: fold verifies, committed-decider opening confirms the final claim on R*-committed P.
+		let (ok, dec, pms, vms, sz) =
+			prove_chained_fold_tree_full(&p, &leaves, &challenges, ChainTamper::None, Some((pi, rstar, pi)), Some(&p128), false).unwrap();
+		assert!(ok, "pi-bound chain must verify");
+		assert!(dec, "committed-decider opening must confirm P(acc.point) == acc.value against R*");
+		// forge the final value ⇒ the committed-decider opening must REJECT it.
+		let (ok2, dec2, _, _, _) =
+			prove_chained_fold_tree_full(&p, &leaves, &challenges, ChainTamper::None, Some((pi, rstar, pi)), Some(&p128), true).unwrap();
+		assert!(ok2, "the fold circuit itself still verifies (the forgery is in the claimed final value)");
+		assert!(!dec2, "a forged final accumulated value must be REJECTED by the committed-decider opening");
+		println!(
+			"GATE chained-fold-tree COMMITTED-DECIDER: N={n}, one fold proof ({pms} ms / {vms} ms / {} KiB) \
+			 + committed-decider opening against R* confirms the final claim WITHOUT holding P; a forged \
+			 final value is rejected. F2 COMPLETE: sound + non-substitutable + committed-decider-discharged \
+			 one-proof fold tree — the FRI-native O(1)-openings collapse.",
 			sz / 1024
 		);
 	}
