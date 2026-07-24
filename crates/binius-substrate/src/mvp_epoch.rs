@@ -286,6 +286,185 @@ pub fn site_record_matches(pkg: &EpochPackage, index: usize, name: &str, ip: &st
 	index < pkg.records.len() && pkg.records[index] == name_record(name, &website_leaf(name, ip))
 }
 
+/// Pack raw bytes little-endian into `record_len` B128 field values (16 bytes each), zero-padded.
+fn pack_bytes_to_fields(bytes: &[u8], record_len: usize) -> Vec<F> {
+	let mut rec = vec![F::ZERO; record_len];
+	for (slot, chunk) in bytes.chunks(16).enumerate().take(record_len) {
+		let mut buf = [0u8; 16];
+		buf[..chunk.len()].copy_from_slice(chunk);
+		rec[slot] = F::new(u128::from_le_bytes(buf));
+	}
+	rec
+}
+
+/// Algorithms in a realistic DNSSEC zone (IANA numbers): RSA/SHA-256 (8), ECDSA-P256 (13),
+/// Ed25519 (15), and — when `include_pq` — ML-DSA (17). Records round-robin over these.
+pub fn rrsig_algs(include_pq: bool) -> &'static [u8] {
+	if include_pq {
+		&[8, 13, 15, 17]
+	} else {
+		&[8, 13, 15]
+	}
+}
+
+/// Uniform record length (B128 values) for a real-RRSIG epoch: sized to hold the largest
+/// algorithm's complete record. Classical (RSA-2048 the largest, 256-B sig) fits 32 values
+/// (512 B); a PQ mix (ML-DSA-44, 2420-B sig) needs 256 values (4 KiB).
+pub fn rrsig_record_len(include_pq: bool) -> usize {
+	if include_pq {
+		256
+	} else {
+		32
+	}
+}
+
+/// The deterministic RRSIG signing input (RFC 4034 §3.1.8.1: RRSIG_RDATA(no sig) ‖ canonical RRset)
+/// for record `i` under `zone` with algorithm `alg` — the exact bytes a signature is computed over,
+/// and the signature-independent prefix a resolver reconstructs to bind a served record to a name.
+fn rrsig_signing_input_for(zone: &str, i: usize, alg: u8) -> (String, Vec<u8>) {
+	use crate::dns_stark::{rrsig_signing_input, CanonicalRr, RrsigFields};
+	let name = format!("host{i:07}.se");
+	let ip = [198u8, 51, 100, (i % 256) as u8];
+	let rrsig = RrsigFields {
+		type_covered: 1, // A
+		algorithm: alg,
+		labels: 2,
+		orig_ttl: 3600,
+		sig_expiration: 1_735_689_600,
+		sig_inception: 1_704_067_200,
+		key_tag: 0x4d2u16.wrapping_add(i as u16),
+		signer_name: zone.to_string(),
+	};
+	let rr = CanonicalRr { name: name.clone(), rr_type: 1, class: 1, orig_ttl: 3600, rdata: ip.to_vec() };
+	(name, rrsig_signing_input(&rrsig, std::slice::from_ref(&rr)))
+}
+
+/// ROLE 1 (real-RRSIG variant) — publish an epoch whose every committed leaf is a COMPLETE signed
+/// record: the canonical RRSIG signing input concatenated with the REAL signature bytes, over a
+/// realistic algorithm mix (RSA/ECDSA/Ed25519 and, with `include_pq`, ML-DSA). Every signature is
+/// verified natively before admission (Model A). Records are a single uniform length — sized to the
+/// largest algorithm present ([`rrsig_record_len`]) — which is why mixing PQ ML-DSA with classical
+/// inflates *every* record to the PQ size in one interleaved P (a real cost of a single-width epoch;
+/// algorithm-sharded epochs avoid it).
+pub fn publish_rrsig_epoch(
+	zone: &str,
+	epoch: u64,
+	n: usize,
+	include_pq: bool,
+) -> Result<(EpochPackage, ZonePin)> {
+	use ed25519_dalek::{Signer as _, Verifier as _};
+	use fips204::ml_dsa_44;
+	use fips204::traits::{Signer as _, Verifier as _};
+	use rand::{rngs::StdRng, SeedableRng};
+	assert!(n.is_power_of_two() && n >= 2, "record count must be a power of two >= 2");
+	let algs = rrsig_algs(include_pq);
+	let record_len = rrsig_record_len(include_pq);
+
+	// Real keys, generated once. RSA keygen is the slow part; ML-DSA/EC/Ed are cheap.
+	let mut rng = StdRng::seed_from_u64(0x5152_5349_475f_4b59);
+	let ec_seed: [u8; 32] = Sha256::digest(b"rrsig-ec-seed").into();
+	let ec = SigningKey::from_slice(&ec_seed).map_err(|e| anyhow!("ec key: {e}"))?;
+	let ec_vk = VerifyingKey::from(&ec);
+	let ed_seed: [u8; 32] = Sha256::digest(b"rrsig-ed-seed").into();
+	let ed = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+	let ed_vk = ed.verifying_key();
+	let rsa_sk = rsa::RsaPrivateKey::new(&mut rng, 2048).map_err(|e| anyhow!("rsa keygen: {e}"))?;
+	let rsa_vk = rsa::RsaPublicKey::from(&rsa_sk);
+	let (mldsa_pk, mldsa_sk) = ml_dsa_44::try_keygen().map_err(|e| anyhow!("ml-dsa keygen: {e:?}"))?;
+
+	let mut names = Vec::with_capacity(n);
+	let mut records = Vec::with_capacity(n);
+	for i in 0..n {
+		let alg = algs[i % algs.len()];
+		let (name, si) = rrsig_signing_input_for(zone, i, alg);
+		let sig: Vec<u8> = match alg {
+			8 => rsa_sk
+				.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(&si))
+				.map_err(|e| anyhow!("rsa sign: {e}"))?,
+			13 => {
+				let s: Signature = ec.sign(&si);
+				s.to_bytes().to_vec()
+			}
+			15 => ed.sign(&si).to_bytes().to_vec(),
+			17 => mldsa_sk.try_sign(&si, b"").map_err(|e| anyhow!("ml-dsa sign: {e:?}"))?.to_vec(),
+			_ => unreachable!(),
+		};
+		// ADMISSION GATE — a signature that does not verify natively never enters the epoch.
+		let admitted = match alg {
+			8 => rsa_vk
+				.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(&si), &sig)
+				.is_ok(),
+			13 => Signature::from_slice(&sig).map(|s| ec_vk.verify(&si, &s).is_ok()).unwrap_or(false),
+			15 => ed25519_dalek::Signature::from_slice(&sig)
+				.map(|s| ed_vk.verify(&si, &s).is_ok())
+				.unwrap_or(false),
+			17 => <[u8; ml_dsa_44::SIG_LEN]>::try_from(sig.as_slice())
+				.map(|a| mldsa_pk.verify(&si, &a, b""))
+				.unwrap_or(false),
+			_ => false,
+		};
+		if !admitted {
+			return Err(anyhow!("record {name} (alg {alg}) failed native verify before admission"));
+		}
+		// Complete record bytes = 16-aligned signing input ‖ signature, packed into record_len fields.
+		let mut bytes = si;
+		while bytes.len() % 16 != 0 {
+			bytes.push(0);
+		}
+		bytes.extend_from_slice(&sig);
+		if bytes.len() > record_len * 16 {
+			return Err(anyhow!("record {} B exceeds uniform record_len {} B", bytes.len(), record_len * 16));
+		}
+		records.push(pack_bytes_to_fields(&bytes, record_len));
+		names.push(name);
+	}
+
+	// NSEC3 completeness over the zone's own names; chain intervals join as records, padded to the
+	// uniform record length so P is a single equal-width interleave.
+	let chain = nsec3_chain_from_names(&names)
+		.ok_or_else(|| anyhow!("two names collide under the NSEC3 hash; chain not strictly ascending"))?;
+	let c = prove_chain_over(&chain)?;
+	let pin: ZonePin = c.commitment_prefix.clone();
+	let chain_base = records.len();
+	for (o, x) in &chain {
+		let mut cr = chain_record(o, x);
+		cr.resize(record_len, F::ZERO);
+		records.push(cr);
+	}
+	let epoch_proof = prove_epoch(&records, zone, epoch);
+	Ok((
+		EpochPackage {
+			zone: zone.to_string(),
+			epoch,
+			epoch_proof,
+			names,
+			completeness_proof: c.transcript,
+			chain,
+			chain_base,
+			records,
+		},
+		pin,
+	))
+}
+
+/// RESOLVER-side binding for a real-RRSIG record: reconstruct the (signature-independent) signing
+/// input for `name`/`alg` and check the served record's leading fields encode it. The signature
+/// tail is separately bound to R* by [`crate::epoch_trustless::verify_record`], so this pins the
+/// served record to the exact name, type, TTL, algorithm and key tag the resolver asked about.
+pub fn rrsig_record_binds(pkg: &EpochPackage, index: usize, zone: &str, i: usize, alg: u8) -> bool {
+	if index >= pkg.records.len() {
+		return false;
+	}
+	let (_name, si) = rrsig_signing_input_for(zone, i, alg);
+	let mut bytes = si;
+	while bytes.len() % 16 != 0 {
+		bytes.push(0);
+	}
+	let si_fields = bytes.len() / 16;
+	let expected = pack_bytes_to_fields(&bytes, si_fields);
+	pkg.records[index].len() >= si_fields && pkg.records[index][..si_fields] == expected[..]
+}
+
 /// ROLE 2 — RESOLVER, once per epoch. Verifies the package against a pin held out of band.
 ///
 /// Returns the two verdicts separately so a caller cannot conflate them: the epoch aggregation
@@ -1175,15 +1354,32 @@ mod tests {
 		let reps = env_usize("MVP_REPS", 40) as u32;
 		let role = std::env::var("MVP_ROLE").unwrap_or_default();
 		let dir = std::env::var("MVP_DIR").unwrap_or_else(|_| "/tmp/mvp-sweep".into());
+		// MVP_RRSIG selects what each record IS: unset -> a 512-B name->ip leaf (signature verified
+		// off-circuit at publish); "classical" -> a COMPLETE signed record (signing input ‖ real
+		// RSA/ECDSA/Ed25519 signature, 512 B); "pq" -> the same plus ML-DSA, records inflated to
+		// 4 KiB by the ML-DSA-44 signature. See publish_rrsig_epoch.
+		let rrsig = std::env::var("MVP_RRSIG").ok().map(|s| s.to_lowercase());
+		let include_pq = rrsig.as_deref() == Some("pq");
 		assert!(minlog >= 1 && maxlog >= minlog, "need 1 <= MVP_MINLOG <= MVP_MAXLOG");
 
-		// Deterministic zone: name/ip depend only on the index, so the verifier reconstructs the
-		// A-record for the leaf-binding check without being told it.
+		// Deterministic zone: name/ip/algorithm depend only on the index, so the verifier
+		// reconstructs the record for the leaf-binding check without being told it.
 		let ip_of = |i: usize| format!("198.51.100.{}", i % 256);
 		let name_of = |i: usize| format!("host{i:07}.se");
+		let record_kind = match rrsig.as_deref() {
+			Some("pq") => "complete RRSIG record, mixed RSA/ECDSA/Ed25519/ML-DSA (real sigs, 4 KiB leaf)",
+			Some("classical") => "complete RRSIG record, mixed RSA/ECDSA/Ed25519 (real sigs, 512 B leaf)",
+			_ => "name->ip A-record leaf (512 B; sig verified off-circuit at publish)",
+		};
 		let build = |count: usize| -> (EpochPackage, ZonePin) {
-			let sites: Vec<(String, String)> = (0..count).map(|i| (name_of(i), ip_of(i))).collect();
-			publish_website_epoch("se", 42, &sites).expect("publish")
+			match rrsig.as_deref() {
+				Some("classical") => publish_rrsig_epoch("se", 42, count, false).expect("publish rrsig"),
+				Some("pq") => publish_rrsig_epoch("se", 42, count, true).expect("publish rrsig-pq"),
+				_ => {
+					let sites: Vec<(String, String)> = (0..count).map(|i| (name_of(i), ip_of(i))).collect();
+					publish_website_epoch("se", 42, &sites).expect("publish")
+				}
+			}
 		};
 		// RESOLVER-side per-query measurement: open (operator, untimed) then time verify_record only.
 		// Returns (min, median, max) ms and the resolver STATE (R* + batch proof) in KiB.
@@ -1203,10 +1399,14 @@ mod tests {
 					ok &= verify_record(ep, &op);
 				}
 				assert!(ok, "N={count}: verify_record must hold for index {idx}");
-				assert!(
-					site_record_matches(pkg, idx, &pkg.names[idx], &ip_of(idx)),
-					"N={count}: leaf binding must hold for index {idx}"
-				);
+				let bound = match rrsig.as_deref() {
+					Some(_) => {
+						let algs = rrsig_algs(include_pq);
+						rrsig_record_binds(pkg, idx, &pkg.zone, idx, algs[idx % algs.len()])
+					}
+					None => site_record_matches(pkg, idx, &pkg.names[idx], &ip_of(idx)),
+				};
+				assert!(bound, "N={count}: leaf binding must hold for index {idx}");
 				per_q.push(tv.elapsed().as_secs_f64() * 1e3 / reps as f64);
 			}
 			per_q.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1214,7 +1414,8 @@ mod tests {
 			(per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1], state_kib)
 		};
 		let header = || println!(
-			"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n A-records; resolver-side verify_record x{reps} reps/index)\n\
+			"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n records; resolver-side verify_record x{reps} reps/index)\n\
+			 \x20  record = {record_kind}\n\
 			 \x20  n      N       total-recs   per-query VERIFY min/med/max      resolver STATE\n\
 			 \x20  ---   ------   ----------   ------------------------------   -------------"
 		);
@@ -1276,7 +1477,8 @@ mod tests {
 			// DEFAULT: single process — build and measure inline (prove cost shown too).
 			_ => {
 				println!(
-					"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n A-records; verify_record x{reps} reps/index)\n\
+					"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n records; verify_record x{reps} reps/index)\n\
+					 \x20  record = {record_kind}\n\
 					 \x20  n      N       total-recs   operator prove   per-query VERIFY min/med/max      resolver STATE\n\
 					 \x20  ---   ------   ----------   --------------   ------------------------------   -------------"
 				);
