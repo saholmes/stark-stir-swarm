@@ -238,6 +238,54 @@ pub fn publish_epoch(zone: &str, epoch: u64, n_names: usize) -> Result<(EpochPac
 	))
 }
 
+/// The committed leaf for a real A-record `name → ip`: the RRSIG-style message the epoch binds.
+/// (documentation IPs per RFC 5737; the demo does not resolve live third-party zones.)
+pub fn website_leaf(name: &str, ip: &str) -> [u8; 32] {
+	Sha3_256::digest(format!("A {name} {ip} 3600 IN").as_bytes()).into()
+}
+
+/// ROLE 1 (website variant) — publish an epoch of real A-records `name → ip`. Each A-record is
+/// ECDSA-signed and verified before admission (as a real ZSK would), its `name → ip` bound into the
+/// committed leaf via [`website_leaf`], and the NSEC3 chain proves the zone's exact membership. The
+/// returned package is the whole artefact a resolver needs; it never sees the zone.
+pub fn publish_website_epoch(zone: &str, epoch: u64, sites: &[(String, String)]) -> Result<(EpochPackage, ZonePin)> {
+	assert!(sites.len().is_power_of_two() && sites.len() >= 2, "site count must be a power of two >= 2");
+	let seed: [u8; 32] = Sha256::digest(b"mvp-epoch-zsk-seed-v1").into();
+	let zsk = SigningKey::from_slice(&seed).map_err(|e| anyhow!("zsk: {e}"))?;
+	let vk = VerifyingKey::from(&zsk);
+
+	let mut names = Vec::with_capacity(sites.len());
+	let mut records = Vec::with_capacity(sites.len());
+	for (name, ip) in sites {
+		let msg = format!("A {name} {ip} 3600 IN").into_bytes();
+		let sig: Signature = zsk.sign(&msg);
+		vk.verify(&msg, &sig).map_err(|e| anyhow!("A-record {name} failed native verify: {e}"))?;
+		let leaf = website_leaf(name, ip);
+		records.push(name_record(name, &leaf));
+		names.push(name.clone());
+	}
+	let chain = nsec3_chain_from_names(&names)
+		.ok_or_else(|| anyhow!("two names collide under the NSEC3 hash; chain not strictly ascending"))?;
+	let c = prove_chain_over(&chain)?;
+	let pin: ZonePin = c.commitment_prefix.clone();
+	let chain_base = records.len();
+	for (o, x) in &chain {
+		records.push(chain_record(o, x));
+	}
+	let epoch_proof = prove_epoch(&records, zone, epoch);
+	Ok((
+		EpochPackage { zone: zone.to_string(), epoch, epoch_proof, names, completeness_proof: c.transcript, chain, chain_base, records },
+		pin,
+	))
+}
+
+/// RESOLVER-side A-record binding check: after `resolve` proves the name is committed at `index`,
+/// confirm the committed record is exactly `name → ip` — so the IP the resolver displays is bound
+/// to the epoch proof, not trusted. Returns true iff `pkg.records[index] == name_record(name, A(name,ip))`.
+pub fn site_record_matches(pkg: &EpochPackage, index: usize, name: &str, ip: &str) -> bool {
+	index < pkg.records.len() && pkg.records[index] == name_record(name, &website_leaf(name, ip))
+}
+
 /// ROLE 2 — RESOLVER, once per epoch. Verifies the package against a pin held out of band.
 ///
 /// Returns the two verdicts separately so a caller cannot conflate them: the epoch aggregation
@@ -731,6 +779,116 @@ mod tests {
 		assert!(pa < 0.6, "(A) decider should be sublinear/polylog; measured p={pa:.2}");
 		assert!(pc < 0.6, "(C) per-query should be ~flat in N; measured p={pc:.2}");
 		assert!(pb < 0.9, "(B) completeness proof-verify should be sublinear here; measured p={pb:.2}");
+	}
+
+	/// END-TO-END WEBSITE DEMO — prove a signed A-record epoch on a big box, ship it, and resolve
+	/// real websites on an IoT device against the shipped proof. Two roles / two processes:
+	///   MVP_ROLE=prove   publish a `.se` zone of A-records (name→ip), each ECDSA-signed; serialize
+	///                    the epoch package (R* + batch proof = the committed "signed merkle tree"
+	///                    and its proof), the pin, and the plaintext A-records; print R*.
+	///   MVP_ROLE=verify  load them; VALIDATE the package (epoch aggregation + NSEC3 completeness +
+	///                    pin); then per query RESOLVE a name — prove membership (opening + record
+	///                    lookup), confirm the committed leaf binds THIS name→ip, and DISPLAY the
+	///                    resolved website; a name not in the zone returns a PROVED NXDOMAIN.
+	/// Run: prove on Mac, verify on the Pi (MVP_PKG shared over scp).
+	#[test]
+	#[ignore = "end-to-end website demo: MVP_ROLE=prove|verify, MVP_PKG=<path>"]
+	fn mvp_website_demo() {
+		let role = std::env::var("MVP_ROLE").unwrap_or_default();
+		let path = std::env::var("MVP_PKG").unwrap_or_else(|_| "/tmp/mvp_site.pkg".into());
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+		let hex8 = |b: &[u8]| b.iter().take(8).map(|x| format!("{x:02x}")).collect::<String>();
+		// documentation IPs (RFC 5737) — the demo never resolves live third-party zones.
+		let sites: Vec<(String, String)> = [
+			("api.example.se", "192.0.2.70"),
+			("blog.example.se", "192.0.2.40"),
+			("cdn.example.se", "192.0.2.80"),
+			("docs.example.se", "192.0.2.50"),
+			("mail.example.se", "192.0.2.30"),
+			("news.example.se", "192.0.2.60"),
+			("shop.example.se", "192.0.2.20"),
+			("www.example.se", "192.0.2.10"),
+		]
+		.iter()
+		.map(|(n, i)| (n.to_string(), i.to_string()))
+		.collect();
+
+		match role.as_str() {
+			"prove" => {
+				let t0 = std::time::Instant::now();
+				let (pkg, pin) = publish_website_epoch("example.se", 42, &sites).expect("publish");
+				let ms = t0.elapsed().as_millis();
+				let bytes = pkg.to_bytes();
+				let rt = EpochPackage::from_bytes(&bytes);
+				assert_eq!(rt.epoch_proof.rstar, pkg.epoch_proof.rstar, "serialization round-trip");
+				std::fs::write(&path, &bytes).expect("write package");
+				std::fs::write(format!("{path}.pin"), &pin).expect("write pin");
+				let sites_tsv: String = sites.iter().map(|(n, i)| format!("{n}\t{i}\n")).collect();
+				std::fs::write(format!("{path}.sites"), sites_tsv).expect("write sites");
+				println!(
+					"\n  [OPERATOR / prove]  zone example.se, {} A-records, epoch 42\n\
+					 \x20  signed-merkle-tree root  R* = {}…  (FRI commitment over the interleaved records)\n\
+					 \x20  signed proof  = {} B batch proof + {} B NSEC3 completeness proof\n\
+					 \x20  zone pin (out-of-band trust anchor) = {}…  ({} B)\n\
+					 \x20  publish {ms} ms, package {:.1} KiB → {path}",
+					sites.len(),
+					hex8(&pkg.epoch_proof.rstar),
+					pkg.epoch_proof.batch_proof.len(),
+					pkg.completeness_proof.len(),
+					hex8(&pin),
+					pin.len(),
+					bytes.len() as f64 / 1024.0,
+				);
+			}
+			"verify" => {
+				let bytes = std::fs::read(&path).expect("read package (run MVP_ROLE=prove first)");
+				let pin = std::fs::read(format!("{path}.pin")).expect("read pin");
+				let sites_tsv = std::fs::read_to_string(format!("{path}.sites")).expect("read sites");
+				let recv_sites: Vec<(String, String)> = sites_tsv
+					.lines()
+					.filter_map(|l| l.split_once('\t').map(|(n, i)| (n.to_string(), i.to_string())))
+					.collect();
+				let pkg = EpochPackage::from_bytes(&bytes);
+
+				println!("\n  [RESOLVER / verify on this device]  zone {}, epoch {}", pkg.zone, pkg.epoch);
+				let t1 = std::time::Instant::now();
+				let (epoch_ok, comp_ok) = verify_epoch_package(&pkg, &pin).expect("verify");
+				let vms = t1.elapsed().as_millis();
+				assert!(epoch_ok && comp_ok, "package must validate");
+				println!(
+					"  ── PACKAGE VALIDATION ({vms} ms) ──\n\
+					 \x20   epoch aggregation vs R* : {}\n\
+					 \x20   NSEC3 completeness + pin: {}   (this zone's exact membership, gap-free)",
+					if epoch_ok { "✓ VALID" } else { "✗" },
+					if comp_ok { "✓ VALID" } else { "✗" }
+				);
+
+				println!("  ── DNS RESOLUTION (per query, offline against the verified epoch) ──");
+				for (name, ip) in &recv_sites {
+					let ans = resolve(&pkg, name, comp_ok).expect("resolve");
+					match ans {
+						Answer::Exists { index } => {
+							let bound = site_record_matches(&pkg, index, name, ip);
+							assert!(bound, "committed leaf must bind {name}→{ip}");
+							println!("     {name:<20} → A {ip:<12}  ✓ PROVED authentic (member #{index}, leaf binds name→ip)");
+						}
+						Answer::NxDomain { .. } => panic!("{name} should exist"),
+					}
+				}
+				let absent = "notregistered.example.se";
+				match resolve(&pkg, absent, comp_ok).expect("resolve absent") {
+					Answer::NxDomain { interval } => {
+						println!("     {absent:<20} → NXDOMAIN   ✓ PROVED absent (covered by chain interval {interval})");
+					}
+					Answer::Exists { .. } => panic!("{absent} should be absent"),
+				}
+				println!(
+					"  ── VERIFIER PEAK RSS {:.0} MiB (witness-free; this process never proved) ──",
+					mib(crate::b256_sha3::peak_rss_bytes())
+				);
+			}
+			other => panic!("set MVP_ROLE=prove or verify (got {other:?})"),
+		}
 	}
 
 	/// FEASIBILITY — the deployment asymmetry: prover anywhere, verifier on ONE IoT device.
