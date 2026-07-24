@@ -381,6 +381,24 @@ pub fn prove_chained_fold_tree(
 	challenges: &[OurB256],
 	tamper: ChainTamper,
 ) -> Result<(bool, bool, u128, u128, usize)> {
+	prove_chained_fold_tree_bound(p, leaves, challenges, tamper, None)
+}
+
+/// Milestone 2 — the same chained one-proof fold tree, additionally BOUND to a public input
+/// `pi_hash`. `pi = Some((build_pi, rstar, verify_pi))`: every leaf POINT and every fold CHALLENGE
+/// is pinned by a boundary to its `pi_hash`-derived value (`derive_point`/`derive_challenge`), so a
+/// verifier reconstructing the boundaries from a DIFFERENT `pi_hash` (`verify_pi != build_pi`) gets
+/// different points ⇒ the proof, built for `build_pi`, no longer balances ⇒ REJECT. This is the
+/// non-substitutability anchor from `seam_aggregation`: the binding lives in the CLAIMS' points,
+/// FS-derived from `pi_hash`. Values (P-evaluations) stay — they are the claims being proven and
+/// are checked by the decider. `pi = None` reproduces milestone 1.
+pub fn prove_chained_fold_tree_bound(
+	p: &[OurB256],
+	leaves: &[(Vec<OurB256>, OurB256)],
+	challenges: &[OurB256],
+	tamper: ChainTamper,
+	pi: Option<([u8; 32], [u8; 32], [u8; 32])>,
+) -> Result<(bool, bool, u128, u128, usize)> {
 	use binius_core::constraint_system::channel::FlushDirection;
 	use binius_m3::builder::Boundary;
 	use std::time::Instant;
@@ -432,6 +450,7 @@ pub fn prove_chained_fold_tree(
 	let allocator = bumpalo::Bump::new();
 	let mut cs = ConstraintSystem::<OurB256>::new();
 	let acc_ch = cs.add_channel("acc-chain");
+	let pub_ch = pi.map(|_| cs.add_channel("pi-bound-leaf-challenge"));
 	let mut tb = cs.add_table("chained fold tree");
 	let beta_col = tb.add_committed::<B64, 1>("beta");
 	let cg: Vec<C4> = (0..=dg).map(|i| col4(&mut tb, &format!("g{i}"))).collect();
@@ -501,6 +520,16 @@ pub fn prove_chained_fold_tree(
 	push_t.extend_from_slice(&folded_col);
 	tb.pull(acc_ch, pull_t);
 	tb.push(acc_ch, push_t);
+	// pi-binding: PUSH each row's (leaf point r1 ‖ challenge t) to the public channel; boundaries
+	// PULL the pi_hash-derived values, so a wrong-pi verifier's pulls mismatch the pushed columns.
+	if let Some(pc) = pub_ch {
+		let mut pub_push: Vec<Col<B64, 1>> = Vec::with_capacity(4 * dg + 4);
+		for k in 0..dg {
+			pub_push.extend_from_slice(&cr1[k]);
+		}
+		pub_push.extend_from_slice(&ct);
+		tb.push(pc, pub_push);
+	}
 	let table_id = tb.id();
 
 	let nrows = (nlv - 1).next_power_of_two();
@@ -520,11 +549,50 @@ pub fn prove_chained_fold_tree(
 		drain.extend(lanes256(*c));
 	}
 	drain.extend(lanes256(acc.1));
-	let boundaries = vec![
-		Boundary { values: seed, channel_id: acc_ch, direction: FlushDirection::Push, multiplicity: 1 },
-		Boundary { values: drain, channel_id: acc_ch, direction: FlushDirection::Pull, multiplicity: 1 },
-	];
-	let statement = Statement { boundaries, table_sizes: vec![nrows] };
+	// pi-bound pub-channel PULL boundaries, derived from a given pi_hash: for real fold i pull
+	// (leaf_{i+1} point ‖ challenge i) = (derive_point(pi,i+1), derive_challenge(pi,rstar,i)); for
+	// each padding row pull (derive_point(pi,0) ‖ ONE) matching the padding self-fold's push.
+	let pub_boundaries = |ph: &[u8; 32], rstar: &[u8; 32]| -> Vec<Boundary<OurB256>> {
+		let mut bs = Vec::with_capacity(nrows);
+		for row in 0..nrows {
+			let (pt, ch) = if row < folds.len() {
+				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(ph, row + 1, dg)
+					.into_iter()
+					.map(crate::decider::lift_b128_to_b256)
+					.collect();
+				(pt, crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(ph, rstar, row)))
+			} else {
+				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(ph, 0, dg)
+					.into_iter()
+					.map(crate::decider::lift_b128_to_b256)
+					.collect();
+				(pt, OurB256::ONE)
+			};
+			let mut vals = Vec::with_capacity(4 * dg + 4);
+			for c in &pt {
+				vals.extend(lanes256(*c));
+			}
+			vals.extend(lanes256(ch));
+			bs.push(Boundary { values: vals, channel_id: pub_ch.unwrap(), direction: FlushDirection::Pull, multiplicity: 1 });
+		}
+		bs
+	};
+	let mk_boundaries = |ph: Option<&[u8; 32]>, rstar: Option<&[u8; 32]>| -> Vec<Boundary<OurB256>> {
+		let mut b = vec![
+			Boundary { values: seed.clone(), channel_id: acc_ch, direction: FlushDirection::Push, multiplicity: 1 },
+			Boundary { values: drain.clone(), channel_id: acc_ch, direction: FlushDirection::Pull, multiplicity: 1 },
+		];
+		if let (Some(ph), Some(rs)) = (ph, rstar) {
+			b.extend(pub_boundaries(ph, rs));
+		}
+		b
+	};
+	let (build_pi, rstar, verify_pi) = match &pi {
+		Some((b, r, v)) => (Some(*b), Some(*r), Some(*v)),
+		None => (None, None, None),
+	};
+	let prove_boundaries = mk_boundaries(build_pi.as_ref(), rstar.as_ref());
+	let statement = Statement { boundaries: prove_boundaries.clone(), table_sizes: vec![nrows] };
 
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
 	{
@@ -589,19 +657,22 @@ pub fn prove_chained_fold_tree(
 	}
 	let ccs = cs.compile(&statement).unwrap();
 	let widx = witness.into_multilinear_extension_index();
-	let chain_valid = binius_core::constraint_system::validate::validate_witness(&ccs, &statement.boundaries, &widx).is_ok();
+	let chain_valid = binius_core::constraint_system::validate::validate_witness(&ccs, &prove_boundaries, &widx).is_ok();
 	if !chain_valid {
 		return Ok((false, decider_holds, 0, 0, 0));
 	}
 	let t0 = Instant::now();
 	let proof = binius_core::constraint_system::prove::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>, _>(
-		&ccs, 1, 128, &statement.boundaries, widx, &make_portable_backend(),
+		&ccs, 1, 128, &prove_boundaries, widx, &make_portable_backend(),
 	)?;
 	let prove_ms = t0.elapsed().as_millis();
 	let sz = proof.get_proof_size();
+	// Verify against boundaries reconstructed from `verify_pi` — the substitution test: if it
+	// differs from `build_pi`, the pi-derived leaf points/challenges mismatch the proof ⇒ reject.
+	let verify_boundaries = mk_boundaries(verify_pi.as_ref(), rstar.as_ref());
 	let t1 = Instant::now();
 	let vok = binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
-		&ccs, 1, 128, &statement.boundaries, proof,
+		&ccs, 1, 128, &verify_boundaries, proof,
 	)
 	.is_ok();
 	Ok((vok, decider_holds, prove_ms, t1.elapsed().as_millis(), sz))
@@ -1338,6 +1409,60 @@ mod tests {
 			 {} KiB), decider holds; a forged intermediate accumulator AND a re-ordered chain are both \
 			 rejected by the accumulator channel + position lane. F2 collapse milestone 1: sound chaining \
 			 in one proof (pi_hash public-input binding is milestone 2).",
+			sz / 1024
+		);
+	}
+
+	/// GATE chained-fold-tree pi-BOUND (F2 milestone 2) — the one-proof chained fold tree bound to a
+	/// public input `pi_hash`: leaf points and fold challenges are pinned to their pi-derived values,
+	/// so an honest verifier (same pi) accepts, but a verifier using a DIFFERENT pi (a substituted
+	/// proof) REJECTS — the non-substitutability the epoch needs.
+	#[test]
+	#[ignore = "heavy (~1 min): pi_hash-bound one-proof fold tree + substitution"]
+	fn chained_fold_tree_pi_bound() {
+		use super::{prove_chained_fold_tree_bound, ChainTamper};
+		use sha3::{Digest, Sha3_256};
+		let (n, inner) = (4usize, 6usize);
+		let m = n.trailing_zeros() as usize;
+		let d = inner + m;
+		// public input → pi_hash; a second, different public input → pi_hash_B.
+		let pi_a: [u8; 32] = Sha3_256::digest(b"public-input-A: zone se, epoch 42").into();
+		let pi_b: [u8; 32] = Sha3_256::digest(b"public-input-B: zone se, epoch 43").into();
+		let rstar: [u8; 32] = Sha3_256::digest(b"canonical-root-R*").into();
+
+		// build a committed poly P and the leaves AT pi_a-derived points (values = P at those points).
+		use rand::{RngCore, SeedableRng};
+		let mut rng = rand::rngs::StdRng::from_seed([0x5d; 32]);
+		let rf = |r: &mut rand::rngs::StdRng| OurB256::from(binius_field::BinaryField128b::new(((r.next_u64() as u128) << 64) | r.next_u64() as u128));
+		let full = 1usize << d;
+		let p: Vec<OurB256> = (0..full).map(|_| rf(&mut rng)).collect();
+		let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
+			.map(|i| {
+				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi_a, i, d)
+					.into_iter()
+					.map(crate::decider::lift_b128_to_b256)
+					.collect();
+				let v = mle256(&p, &pt);
+				(pt, v)
+			})
+			.collect();
+		let challenges: Vec<OurB256> = (0..n - 1)
+			.map(|k| crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(&pi_a, &rstar, k)))
+			.collect();
+
+		// honest: verify with the SAME pi ⇒ accept.
+		let (ok, dec, pms, vms, sz) =
+			prove_chained_fold_tree_bound(&p, &leaves, &challenges, ChainTamper::None, Some((pi_a, rstar, pi_a))).unwrap();
+		assert!(ok && dec, "pi-bound chain must verify + decider hold under the correct pi");
+		// substitution: build under pi_a, verify under pi_b ⇒ REJECT.
+		let (bad, _, _, _, _) =
+			prove_chained_fold_tree_bound(&p, &leaves, &challenges, ChainTamper::None, Some((pi_a, rstar, pi_b))).unwrap();
+		assert!(!bad, "a proof built for pi_A must be REJECTED by a pi_B verifier (non-substitutable)");
+		println!(
+			"GATE chained-fold-tree pi-BOUND: N={n}, one proof ({pms} ms / {vms} ms verify / {} KiB), \
+			 accepts under the correct pi_hash, REJECTS a substituted proof (built for pi_A, verified \
+			 under pi_B) — leaf points + fold challenges pinned to pi_hash. F2 milestone 2: \
+			 non-substitutable one-proof fold tree.",
 			sz / 1024
 		);
 	}
