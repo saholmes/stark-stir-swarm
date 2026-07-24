@@ -584,21 +584,26 @@ pub fn prove_chained_fold_tree_full(
 	// pi-bound pub-channel PULL boundaries, derived from a given pi_hash: for real fold i pull
 	// (leaf_{i+1} point ‖ challenge i) = (derive_point(pi,i+1), derive_challenge(pi,rstar,i)); for
 	// each padding row pull (derive_point(pi,0) ‖ ONE) matching the padding self-fold's push.
-	let pub_boundaries = |ph: &[u8; 32], rstar: &[u8; 32]| -> Vec<Boundary<OurB256>> {
+	// leaf point reconstruction: LIFTED form point = derive_point(pi, idx, inner) ++ bits(idx),
+	// matching `accumulation::lifted_claim`. `inner` (= dg − log N) is taken from the pi tuple.
+	let mlog = nlv.trailing_zeros() as usize;
+	let lifted_pt = |ph: &[u8; 32], idx: usize, inner: usize| -> Vec<OurB256> {
+		let mut pt: Vec<OurB256> = crate::seam_aggregation::derive_point(ph, idx, inner)
+			.into_iter()
+			.map(crate::decider::lift_b128_to_b256)
+			.collect();
+		for b in 0..mlog {
+			pt.push(if (idx >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO });
+		}
+		pt
+	};
+	let pub_boundaries = |ph: &[u8; 32], rstar: &[u8; 32], inner: usize| -> Vec<Boundary<OurB256>> {
 		let mut bs = Vec::with_capacity(nrows);
 		for row in 0..nrows {
 			let (pt, ch) = if row < folds.len() {
-				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(ph, row + 1, dg)
-					.into_iter()
-					.map(crate::decider::lift_b128_to_b256)
-					.collect();
-				(pt, crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(ph, rstar, row)))
+				(lifted_pt(ph, row + 1, inner), crate::decider::lift_b128_to_b256(crate::seam_aggregation::derive_challenge(ph, rstar, row)))
 			} else {
-				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(ph, 0, dg)
-					.into_iter()
-					.map(crate::decider::lift_b128_to_b256)
-					.collect();
-				(pt, OurB256::ONE)
+				(lifted_pt(ph, 0, inner), OurB256::ONE)
 			};
 			let mut vals = Vec::with_capacity(4 * dg + 4);
 			for c in &pt {
@@ -609,21 +614,21 @@ pub fn prove_chained_fold_tree_full(
 		}
 		bs
 	};
-	let mk_boundaries = |ph: Option<&[u8; 32]>, rstar: Option<&[u8; 32]>| -> Vec<Boundary<OurB256>> {
+	let mk_boundaries = |ph: Option<&[u8; 32]>, rstar: Option<&[u8; 32]>, inner: usize| -> Vec<Boundary<OurB256>> {
 		let mut b = vec![
 			Boundary { values: seed.clone(), channel_id: acc_ch, direction: FlushDirection::Push, multiplicity: 1 },
 			Boundary { values: drain.clone(), channel_id: acc_ch, direction: FlushDirection::Pull, multiplicity: 1 },
 		];
 		if let (Some(ph), Some(rs)) = (ph, rstar) {
-			b.extend(pub_boundaries(ph, rs));
+			b.extend(pub_boundaries(ph, rs, inner));
 		}
 		b
 	};
-	let (build_pi, rstar, verify_pi) = match &pi {
-		Some((b, r, v)) => (Some(*b), Some(*r), Some(*v)),
-		None => (None, None, None),
+	let (build_pi, rstar, verify_pi, inner_dim) = match &pi {
+		Some((b, r, v)) => (Some(*b), Some(*r), Some(*v), dg - mlog),
+		None => (None, None, None, dg),
 	};
-	let prove_boundaries = mk_boundaries(build_pi.as_ref(), rstar.as_ref());
+	let prove_boundaries = mk_boundaries(build_pi.as_ref(), rstar.as_ref(), inner_dim);
 	let statement = Statement { boundaries: prove_boundaries.clone(), table_sizes: vec![nrows] };
 
 	let mut witness = WitnessIndex::<OurB256>::new(&cs, &allocator);
@@ -701,7 +706,7 @@ pub fn prove_chained_fold_tree_full(
 	let sz = proof.get_proof_size();
 	// Verify against boundaries reconstructed from `verify_pi` — the substitution test: if it
 	// differs from `build_pi`, the pi-derived leaf points/challenges mismatch the proof ⇒ reject.
-	let verify_boundaries = mk_boundaries(verify_pi.as_ref(), rstar.as_ref());
+	let verify_boundaries = mk_boundaries(verify_pi.as_ref(), rstar.as_ref(), inner_dim);
 	let t1 = Instant::now();
 	let vok = binius_core::constraint_system::verify::<U256, B256TowerFamily, Sha256, Sha256Compression, HasherChallenger<Sha256>>(
 		&ccs, 1, 128, &verify_boundaries, proof,
@@ -1470,10 +1475,12 @@ mod tests {
 		let p: Vec<OurB256> = (0..full).map(|_| rf(&mut rng)).collect();
 		let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
 			.map(|i| {
-				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi_a, i, d)
+				let inner_v = d - m;
+				let mut pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi_a, i, inner_v)
 					.into_iter()
 					.map(crate::decider::lift_b128_to_b256)
 					.collect();
+				for b in 0..m { pt.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO }); }
 				let v = mle256(&p, &pt);
 				(pt, v)
 			})
@@ -1524,10 +1531,12 @@ mod tests {
 		let p: Vec<OurB256> = p128.iter().map(|&x| crate::decider::lift_b128_to_b256(x)).collect();
 		let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
 			.map(|i| {
-				let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, d)
+				let inner_v = d - m;
+				let mut pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, inner_v)
 					.into_iter()
 					.map(crate::decider::lift_b128_to_b256)
 					.collect();
+				for b in 0..m { pt.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO }); }
 				let v = mle256(&p, &pt);
 				(pt, v)
 			})
@@ -1582,10 +1591,14 @@ mod tests {
 				.collect();
 			let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
 				.map(|i| {
-					let pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, d)
+					let inner_v = d - m;
+					let mut pt: Vec<OurB256> = crate::seam_aggregation::derive_point(&pi, i, inner_v)
 						.into_iter()
 						.map(crate::decider::lift_b128_to_b256)
 						.collect();
+					for b in 0..m {
+						pt.push(if (i >> b) & 1 == 1 { OurB256::ONE } else { OurB256::ZERO });
+					}
 					let v = mle256(&p, &pt);
 					(pt, v)
 				})
@@ -1609,6 +1622,115 @@ mod tests {
 			if pexp < 0.5 { "POLYLOG ✓" } else { "steeper than expected" }
 		);
 		assert!(pexp < 0.6, "collapsed fold-tree verify should be polylog in N; measured p={pexp:.2}");
+	}
+
+	/// GATE real-RRSIG collapse — the F2 collapse on GENUINE DNSSEC data: N records whose `evals`
+	/// encode real `rrsig_sha256_message` digests (a mixed RSA / ECDSA-P256 / Ed25519 / ML-DSA zone),
+	/// interleaved into the committed poly P, their pi-bound OOD claims folded into ONE proof, the
+	/// final claim discharged by the committed-decider opening against R*. Honest verifies; serving a
+	/// record whose RRSIG was tampered (its digest no longer matches the committed P) is REJECTED.
+	#[test]
+	#[ignore = "heavy (~1 min): F2 collapse over real DNSSEC RRSIG claims"]
+	fn real_rrsig_claims_collapse() {
+		use super::{prove_chained_fold_tree_full, ChainTamper};
+		use crate::accumulation::{interleave, lifted_claim, mle_eval, EvalClaim, Record};
+		use crate::dns_stark::{rrsig_sha256_message, CanonicalRr, RrsigFields};
+		use crate::seam_aggregation::{canonical_root, derive_challenge, derive_point};
+		use binius_field::BinaryField128b as B128;
+		use sha3::{Digest, Sha3_256};
+
+		let (n, inner) = (4usize, 4usize);
+		let m = n.trailing_zeros() as usize;
+		let d = inner + m;
+		let pi: [u8; 32] = Sha3_256::digest(b"zone se, epoch 42, mixed classical+PQ").into();
+
+		// real DNSSEC RRSIG-message digests → record evals (2^inner B128 each).
+		let alg_of = |i: usize| -> u8 { [8u8, 13, 15, 17][i % 4] }; // RSA, ECDSA, Ed25519, ML-DSA
+		let digest_to_evals = |dg: [u8; 32]| -> Vec<B128> {
+			let lo = u128::from_le_bytes(dg[0..16].try_into().unwrap());
+			let hi = u128::from_le_bytes(dg[16..32].try_into().unwrap());
+			let mut e = vec![B128::new(0); 1 << inner];
+			e[0] = B128::new(lo);
+			e[1] = B128::new(hi);
+			e
+		};
+		let mk_digest = |i: usize, tampered: bool| -> [u8; 32] {
+			let rrsig = RrsigFields {
+				type_covered: 1,
+				algorithm: alg_of(i),
+				labels: 3,
+				orig_ttl: 3600,
+				sig_expiration: 1_735_689_600,
+				sig_inception: 1_704_067_200,
+				key_tag: 0x4d2u16.wrapping_add(i as u16),
+				signer_name: "example.com".to_string(),
+			};
+			let ip = if tampered { [10, 0, 0, 1] } else { [93, 184, 216, (i % 256) as u8] };
+			let rec = CanonicalRr { name: format!("r{i}.example.com"), rr_type: 1, class: 1, orig_ttl: 3600, rdata: ip.to_vec() };
+			rrsig_sha256_message(&rrsig, std::slice::from_ref(&rec))
+		};
+
+		// build records + pi-bound OOD claims (point = derive_point(pi,i,inner), value = mle_eval).
+		let build = |serve_wrong_at: Option<usize>| -> (Vec<B128>, Vec<(Vec<OurB256>, OurB256)>, Vec<OurB256>, [u8; 32]) {
+			let mut records = Vec::with_capacity(n);
+			let mut subroots = Vec::with_capacity(n);
+			for i in 0..n {
+				let evals = digest_to_evals(mk_digest(i, false));
+				let pt = derive_point(&pi, i, inner);
+				let v = mle_eval(&evals, &pt);
+				let mut sh = Sha3_256::new();
+				sh.update(pi);
+				sh.update((i as u64).to_le_bytes());
+				for &e in &evals {
+					sh.update(u128::from(binius_field::underlier::WithUnderlier::to_underlier(e)).to_le_bytes());
+				}
+				subroots.push(<[u8; 32]>::from(sh.finalize()));
+				records.push(Record { evals, claim: EvalClaim { point: pt, value: v } });
+			}
+			let rstar = canonical_root(&subroots);
+			let p_b128 = interleave(&records);
+			// leaves = lifted claims; optionally serve a WRONG record (tampered digest) at one leaf,
+			// so its claimed value no longer matches the committed P ⇒ the fold's g(1)==v1 rejects.
+			let leaves: Vec<(Vec<OurB256>, OurB256)> = (0..n)
+				.map(|i| {
+					let lc: EvalClaim = lifted_claim(&records[i], i, m);
+					let pt: Vec<OurB256> = lc.point.iter().map(|&x| crate::decider::lift_b128_to_b256(x)).collect();
+					let val = if serve_wrong_at == Some(i) {
+						let wrong = mle_eval(&digest_to_evals(mk_digest(i, true)), &records[i].claim.point);
+						crate::decider::lift_b128_to_b256(wrong)
+					} else {
+						crate::decider::lift_b128_to_b256(lc.value)
+					};
+					(pt, val)
+				})
+				.collect();
+			let challenges: Vec<OurB256> = (0..n - 1)
+				.map(|k| crate::decider::lift_b128_to_b256(derive_challenge(&pi, &rstar, k)))
+				.collect();
+			(p_b128, leaves, challenges, rstar)
+		};
+
+		let (p128, leaves, challenges, rstar) = build(None);
+		let p: Vec<OurB256> = p128.iter().map(|&x| crate::decider::lift_b128_to_b256(x)).collect();
+		let (ok, dec, pms, vms, sz) =
+			prove_chained_fold_tree_full(&p, &leaves, &challenges, ChainTamper::None, Some((pi, rstar, pi)), Some(&p128), false).unwrap();
+		assert!(ok, "real-RRSIG chain must verify in one proof");
+		assert!(dec, "committed-decider opening must confirm the final claim on the R*-committed real records");
+
+		// serve-wrong-record: a tampered RRSIG at leaf 2 whose digest is not what P commits ⇒ REJECT.
+		let (p128b, leaves_bad, challenges_b, rstar_b) = build(Some(2));
+		let p_bad: Vec<OurB256> = p128b.iter().map(|&x| crate::decider::lift_b128_to_b256(x)).collect();
+		let (okb, _, _, _, _) =
+			prove_chained_fold_tree_full(&p_bad, &leaves_bad, &challenges_b, ChainTamper::None, Some((pi, rstar_b, pi)), Some(&p128b), false).unwrap();
+		assert!(!okb, "serving a record whose tampered RRSIG digest ≠ the committed P must be REJECTED");
+
+		println!(
+			"GATE real-RRSIG collapse: a mixed RSA/ECDSA-P256/Ed25519/ML-DSA zone of N={n} records \
+			 (real rrsig_sha256_message digests) folds into ONE pi-bound proof ({pms} ms / {vms} ms verify \
+			 / {} KiB) + committed-decider opening against R*; serving a record whose tampered RRSIG no \
+			 longer matches the committed P is rejected. F2 collapse wired onto REAL DNSSEC claims.",
+			sz / 1024
+		);
 	}
 
 	/// GATE ivc-e2e — the IVC loop runs END-TO-END: N records fold into ONE accumulator
