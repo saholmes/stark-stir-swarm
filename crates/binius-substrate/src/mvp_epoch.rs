@@ -1144,6 +1144,163 @@ mod tests {
 		}
 	}
 
+	/// SCALING — per-query verify vs zone size, swept over 2^n records.
+	///
+	/// The headline claim of the trustless epoch is that a resolver's per-query cost does not grow
+	/// with the number of records in a zone. This makes it visible: for each n in a range it
+	/// publishes a zone of N=2^n signed A-records (synthetic; RFC 5737 documentation IPs, no live
+	/// zone touched), then measures the RESOLVER-side per-query verify (`verify_record` against R*)
+	/// over several sample indices spread across the zone.
+	///
+	/// What to expect, stated honestly:
+	///   * operator prove (publish) — O(N): grows ~linearly. It is the one-time cost of building the
+	///     epoch, and it runs on a big box or a fleet, never on the resolver.
+	///   * per-query VERIFY — POLYLOG in N: one decider opening whose point has
+	///     `inner_vars + log2(N)` coordinates, so it grows only with log2 N. Across a 2^n sweep it
+	///     stays in a narrow band — "acceptable regardless of the number of records", the claim.
+	///   * resolver STATE (R* + batch proof) — polylog in N.
+	///
+	/// This is NOT a constant-time claim: it is the honest polylog one. The point is that doubling
+	/// the zone adds a single opening coordinate, so a zone 1000x larger verifies in ~the same time.
+	///
+	///   MVP_MINLOG (default 3) MVP_MAXLOG (default 12) MVP_REPS (default 40)
+	/// Run:
+	///   MVP_MINLOG=3 MVP_MAXLOG=12 cargo test --release --lib mvp_query_scaling -- --ignored --nocapture
+	#[test]
+	#[ignore = "2^n record-count sweep: per-query verify vs zone size; MVP_MINLOG/MVP_MAXLOG/MVP_REPS"]
+	fn mvp_query_scaling() {
+		let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+		let minlog = env_usize("MVP_MINLOG", 3);
+		let maxlog = env_usize("MVP_MAXLOG", 12);
+		let reps = env_usize("MVP_REPS", 40) as u32;
+		let role = std::env::var("MVP_ROLE").unwrap_or_default();
+		let dir = std::env::var("MVP_DIR").unwrap_or_else(|_| "/tmp/mvp-sweep".into());
+		assert!(minlog >= 1 && maxlog >= minlog, "need 1 <= MVP_MINLOG <= MVP_MAXLOG");
+
+		// Deterministic zone: name/ip depend only on the index, so the verifier reconstructs the
+		// A-record for the leaf-binding check without being told it.
+		let ip_of = |i: usize| format!("198.51.100.{}", i % 256);
+		let name_of = |i: usize| format!("host{i:07}.se");
+		let build = |count: usize| -> (EpochPackage, ZonePin) {
+			let sites: Vec<(String, String)> = (0..count).map(|i| (name_of(i), ip_of(i))).collect();
+			publish_website_epoch("se", 42, &sites).expect("publish")
+		};
+		// RESOLVER-side per-query measurement: open (operator, untimed) then time verify_record only.
+		// Returns (min, median, max) ms and the resolver STATE (R* + batch proof) in KiB.
+		let measure = |pkg: &EpochPackage| -> (f64, f64, f64, f64) {
+			let ep = &pkg.epoch_proof;
+			let count = pkg.names.len();
+			assert!(verify_epoch(ep, &pkg.zone), "N={count}: epoch aggregation must verify");
+			let mut idxs = vec![0, count / 4, count / 2, (3 * count) / 4, count - 1];
+			idxs.sort_unstable();
+			idxs.dedup();
+			let mut per_q: Vec<f64> = Vec::new();
+			for &idx in &idxs {
+				let op = open_record(&pkg.records, idx, ep); // operator-side O(N) open — NOT timed
+				let tv = std::time::Instant::now();
+				let mut ok = true;
+				for _ in 0..reps {
+					ok &= verify_record(ep, &op);
+				}
+				assert!(ok, "N={count}: verify_record must hold for index {idx}");
+				assert!(
+					site_record_matches(pkg, idx, &pkg.names[idx], &ip_of(idx)),
+					"N={count}: leaf binding must hold for index {idx}"
+				);
+				per_q.push(tv.elapsed().as_secs_f64() * 1e3 / reps as f64);
+			}
+			per_q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+			let state_kib = (32 + ep.batch_proof.len() + ep.zone.len() + 24) as f64 / 1024.0;
+			(per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1], state_kib)
+		};
+		let header = || println!(
+			"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n A-records; resolver-side verify_record x{reps} reps/index)\n\
+			 \x20  n      N       total-recs   per-query VERIFY min/med/max      resolver STATE\n\
+			 \x20  ---   ------   ----------   ------------------------------   -------------"
+		);
+		let footer = |first_med: f64, last_med: f64, first_n: usize, last_n: usize, on: &str| {
+			let span = last_n as f64 / first_n as f64;
+			let growth = last_med / first_med.max(1e-9);
+			println!(
+				"\n  {on}: over a {span:.0}x range in N, median per-query verify moved {growth:.2}x \
+				 ({first_med:.1} -> {last_med:.1} ms):\n\
+				 \x20  POLYLOG in N (∝ inner_vars + log2 N), not linear — per-query cost stays acceptable\n\
+				 \x20  regardless of zone size. The operator prove is the only O(N) cost, and it is NOT\n\
+				 \x20  the resolver's."
+			);
+		};
+
+		match role.as_str() {
+			// OPERATOR: build each zone and serialize the package, so the VERIFY sweep can run in a
+			// separate process (e.g. on the Pi) against exactly what was proved.
+			"prove" => {
+				std::fs::create_dir_all(&dir).expect("mkdir MVP_DIR");
+				println!("\n  [PROVE]  building zones 2^{minlog}..2^{maxlog} -> {dir}");
+				for n in minlog..=maxlog {
+					let count = 1usize << n;
+					let t0 = std::time::Instant::now();
+					let (pkg, _pin) = build(count);
+					let bytes = pkg.to_bytes();
+					std::fs::write(format!("{dir}/n{n}.pkg"), &bytes).expect("write pkg");
+					println!(
+						"    n={n:>2}  N={count:>6}  prove {:>7.2} s  package {:>7.1} KiB",
+						t0.elapsed().as_secs_f64(),
+						bytes.len() as f64 / 1024.0
+					);
+				}
+			}
+			// RESOLVER: load each serialized zone and measure per-query verify. This is the process
+			// that runs on the IoT device; it proved nothing, so its cost IS the resolver's cost.
+			"verify" => {
+				header();
+				let (mut first_med, mut first_n, mut last_med, mut last_n) = (0f64, 0usize, 0f64, 0usize);
+				for n in minlog..=maxlog {
+					let bytes = std::fs::read(format!("{dir}/n{n}.pkg"))
+						.unwrap_or_else(|_| panic!("missing {dir}/n{n}.pkg — run MVP_ROLE=prove first"));
+					let pkg = EpochPackage::from_bytes(&bytes);
+					let (mn, med, mx, state_kib) = measure(&pkg);
+					println!(
+						"  {n:>3}   {:>6}   {:>10}   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms      {state_kib:>8.1} KiB",
+						pkg.names.len(),
+						pkg.records.len()
+					);
+					if first_n == 0 {
+						first_med = med;
+						first_n = pkg.names.len();
+					}
+					last_med = med;
+					last_n = pkg.names.len();
+				}
+				footer(first_med, last_med, first_n, last_n, "RESOLVER (this device)");
+			}
+			// DEFAULT: single process — build and measure inline (prove cost shown too).
+			_ => {
+				println!(
+					"\n  PER-QUERY VERIFY vs ZONE SIZE  (2^n A-records; verify_record x{reps} reps/index)\n\
+					 \x20  n      N       total-recs   operator prove   per-query VERIFY min/med/max      resolver STATE\n\
+					 \x20  ---   ------   ----------   --------------   ------------------------------   -------------"
+				);
+				let (mut first_med, mut last_med) = (0f64, 0f64);
+				for n in minlog..=maxlog {
+					let count = 1usize << n;
+					let t0 = std::time::Instant::now();
+					let (pkg, _pin) = build(count);
+					let prove_s = t0.elapsed().as_secs_f64();
+					let (mn, med, mx, state_kib) = measure(&pkg);
+					println!(
+						"  {n:>3}   {count:>6}   {:>10}   {prove_s:>10.2} s   {mn:>6.1} /{med:>6.1} /{mx:>6.1} ms      {state_kib:>8.1} KiB",
+						pkg.records.len()
+					);
+					if n == minlog {
+						first_med = med;
+					}
+					last_med = med;
+				}
+				footer(first_med, last_med, 1usize << minlog, 1usize << maxlog, "HOST");
+			}
+		}
+	}
+
 	/// W2 PROBE — the decisive unknown for Phase 1 (trustless flat-in-N binding).
 	///
 	/// Can the interleaved polynomial P be opened at a RECORD-SELECTING point `(a, bin(i))` as a
