@@ -522,6 +522,135 @@ pub fn rrsig_record_binds(pkg: &EpochPackage, index: usize, zone: &str, name: &s
 	pkg.records[index].len() >= si_fields && pkg.records[index][..si_fields] == expected[..]
 }
 
+// =====================================================================================
+// SYNTHETIC TLD + SHARD-AND-FOLD — simulate a zone larger than the 2^15 monolithic circuit cap.
+// A single epoch's NSEC3 completeness AIR caps at 2^15 names; to reach TLD scale we shard into
+// power-of-two shards (each a monolithic trustless epoch with its own R*) and fold their roots into
+// ONE master trustless epoch. A resolver verifies the master once, then per query performs TWO
+// O(1)/polylog openings: the covering shard's root from the master, and the record from that shard's
+// root. Per-query cost is therefore flat in the TOTAL zone size (2x the monolithic per-query verify),
+// which is the measured TLD-scale story (prove the shards on a big box, verify on the edge).
+// =====================================================================================
+
+/// Generate `count` distinct synthetic names for `tld`, numbered from `base` --- a stand-in TLD zone.
+/// Names are `n<hex-index>.<tld>` so a resolver recovers the global index (hence the shard) from the
+/// name; distinct indices give distinct NSEC3 owners by construction.
+pub fn synth_zone_names(tld: &str, base: usize, count: usize) -> Vec<String> {
+	(0..count).map(|i| format!("n{:09x}.{tld}", base + i)).collect()
+}
+
+/// Recover the global index encoded in a synthetic name (`n<hex>.<tld>`), if it is one.
+fn synth_name_index(name: &str) -> Option<usize> {
+	let hex = name.strip_prefix('n')?.split('.').next()?;
+	usize::from_str_radix(hex, 16).ok()
+}
+
+/// Domain-separated packing of a shard's epoch root (and index) into one master record, so the
+/// master epoch commits every shard's R*.
+fn shard_root_record(rstar: &[u8; 32], shard: usize) -> Vec<F> {
+	let mut h = Sha3_256::new();
+	sha3::Digest::update(&mut h, b"SHARD-ROOT-V1");
+	sha3::Digest::update(&mut h, (shard as u64).to_le_bytes());
+	sha3::Digest::update(&mut h, rstar);
+	let d: [u8; 32] = sha3::Digest::finalize(h).into();
+	let mut bytes = d.to_vec();
+	bytes.extend_from_slice(rstar); // the raw root too, so the record is a total function of R*
+	pack_bytes_to_fields(&bytes, RECORD_LEN)
+}
+
+/// A sharded synthetic zone (see module note): `shards` each a monolithic trustless epoch, `master`
+/// the trustless epoch over their roots.
+pub struct ShardedZone {
+	pub tld: String,
+	pub epoch: u64,
+	pub shard_size: usize,
+	pub n_shards: usize,
+	pub shards: Vec<EpochPackage>,
+	pub master: TrustlessEpoch,
+	master_records: Vec<Vec<F>>,
+}
+
+/// A per-query sharded opening: the covering shard plus the two openings a resolver verifies.
+pub struct ShardedOpening {
+	pub shard: usize,
+	master_open: RecordProof,
+	shard_open: RecordProof,
+}
+
+/// OPERATOR (big box) --- shard a `total_n`-name synthetic zone into full `shard_size`-name epochs
+/// (rounding up to whole shards), prove each (≤ the 2^15 circuit cap), and fold their roots into one
+/// master epoch. `include_pq` adds ML-DSA to each shard's mix; default is ECDSA-P256 (the real `.se`
+/// algorithm), which keeps large-N operator signing tractable.
+pub fn shard_and_fold(
+	tld: &str,
+	epoch: u64,
+	total_n: usize,
+	shard_size: usize,
+	include_pq: bool,
+) -> Result<ShardedZone> {
+	assert!(shard_size.is_power_of_two() && shard_size >= 2, "shard_size must be a power of two >= 2");
+	assert!(shard_size <= 1 << 15, "shard must fit the 2^15 NSEC3 circuit cap");
+	assert!(total_n >= 1, "need at least one name");
+	let algs: &[u8] = if include_pq { &[8, 13, 15, 17] } else { &[13] };
+	let n_shards = total_n.div_ceil(shard_size);
+	let mut shards = Vec::with_capacity(n_shards);
+	let mut master_records = Vec::with_capacity(n_shards);
+	for s in 0..n_shards {
+		let names = synth_zone_names(tld, s * shard_size, shard_size); // a full power-of-two shard
+		let (pkg, _pin) = publish_rrsig_epoch_named(tld, epoch.wrapping_add(s as u64 + 1), &names, algs)?;
+		master_records.push(shard_root_record(&pkg.epoch_proof.rstar, s));
+		shards.push(pkg);
+	}
+	// pad shard-root records to a power of two with inert sentinels, then commit the master epoch.
+	let rlen = master_records[0].len();
+	let target = master_records.len().next_power_of_two().max(2);
+	master_records.resize(target, vec![F::ZERO; rlen]);
+	let master = prove_epoch(&master_records, tld, epoch);
+	Ok(ShardedZone {
+		tld: tld.to_string(),
+		epoch,
+		shard_size,
+		n_shards,
+		shards,
+		master,
+		master_records,
+	})
+}
+
+/// RESOLVER (once/epoch): verify the master epoch commits every shard root.
+pub fn verify_sharded_master(z: &ShardedZone) -> bool {
+	verify_epoch(&z.master, &z.tld)
+}
+
+/// OPERATOR (per query, O(N) opens): produce the two openings for `name` --- the shard root from the
+/// master, and the record from that shard's root. The resolver-side verify is [`verify_sharded_query`].
+pub fn open_sharded(z: &ShardedZone, name: &str) -> Result<ShardedOpening> {
+	let idx = synth_name_index(name).ok_or_else(|| anyhow!("not a synthetic zone name: {name}"))?;
+	let shard = idx / z.shard_size;
+	if shard >= z.n_shards {
+		return Err(anyhow!("{name} maps to shard {shard} beyond the zone"));
+	}
+	let master_open = open_record(&z.master_records, shard, &z.master);
+	let spkg = &z.shards[shard];
+	let sidx = spkg.names.iter().position(|n| n == name).ok_or_else(|| anyhow!("{name} absent from shard {shard}"))?;
+	let shard_open = open_record(&spkg.records, sidx, &spkg.epoch_proof);
+	Ok(ShardedOpening { shard, master_open, shard_open })
+}
+
+/// RESOLVER (per query, O(1)/polylog verify): verify the two openings. (1) the shard root is
+/// committed under the master AND equals this shard's actual R*; (2) the record is committed under
+/// that shard's R*. Their conjunction proves the record is in the sharded zone without trusting the
+/// operator on any shard.
+pub fn verify_sharded_query(z: &ShardedZone, op: &ShardedOpening) -> bool {
+	if !verify_record(&z.master, &op.master_open) {
+		return false;
+	}
+	if op.master_open.record != shard_root_record(&z.shards[op.shard].epoch_proof.rstar, op.shard) {
+		return false;
+	}
+	verify_record(&z.shards[op.shard].epoch_proof, &op.shard_open)
+}
+
 /// ROLE 2 — RESOLVER, once per epoch. Verifies the package against a pin held out of band.
 ///
 /// Returns the two verdicts separately so a caller cannot conflate them: the epoch aggregation
@@ -1581,6 +1710,71 @@ mod tests {
 				footer(first_med, last_med, 1usize << minlog, 1usize << maxlog, "HOST");
 			}
 		}
+	}
+
+	/// SHARD-AND-FOLD — a synthetic TLD larger than the 2^15 monolithic circuit cap, proved as
+	/// power-of-two shards folded under one master epoch, resolved with two O(1) openings per query.
+	///
+	/// The point is the TLD-scale deployment shape: prove the shards on a big box (an AWS instance),
+	/// verify the master + per-query openings on the edge. Per-query verify is flat in the TOTAL zone
+	/// size (2x the monolithic per-query), so a device resolves against a multi-million-name zone at
+	/// the same cost as a small one.
+	///
+	///   SHARD_TOTAL (default 4096) SHARD_SIZE (default 1024, pow2 <= 2^15) MVP_RRSIG=pq for PQ mix
+	///   SHARD_REPS (default 20)
+	/// Run: SHARD_TOTAL=32768 SHARD_SIZE=4096 cargo test --release --lib mvp_shard_fold_demo -- --ignored --nocapture
+	#[test]
+	#[ignore = "sharded synthetic TLD: SHARD_TOTAL/SHARD_SIZE/SHARD_REPS, MVP_RRSIG=pq; prove+fold+resolve"]
+	fn mvp_shard_fold_demo() {
+		use std::time::Instant;
+		let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+		let total = env("SHARD_TOTAL", 4096);
+		let shard_size = env("SHARD_SIZE", 1024);
+		let reps = env("SHARD_REPS", 20) as u32;
+		let include_pq = std::env::var("MVP_RRSIG").ok().as_deref() == Some("pq");
+		let algs_label = if include_pq { "RSA/ECDSA/Ed25519/ML-DSA" } else { "ECDSA-P256" };
+
+		let t0 = Instant::now();
+		let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
+		let prove_s = t0.elapsed().as_secs_f64();
+		let eff_total = z.n_shards * z.shard_size;
+
+		let tm = Instant::now();
+		assert!(verify_sharded_master(&z), "master epoch must verify");
+		let master_ms = tm.elapsed().as_secs_f64() * 1e3;
+
+		// per-query: open (operator, untimed) then time the two-level verify across sampled names.
+		let samples = [0usize, eff_total / 4, eff_total / 2, (3 * eff_total) / 4, eff_total - 1];
+		let mut per_q: Vec<f64> = Vec::new();
+		for &g in &samples {
+			let name = format!("n{g:09x}.tld");
+			let op = open_sharded(&z, &name).expect("open");
+			let tv = Instant::now();
+			let mut ok = true;
+			for _ in 0..reps {
+				ok &= verify_sharded_query(&z, &op);
+			}
+			assert!(ok, "sharded query verify must hold for {name} (shard {})", op.shard);
+			per_q.push(tv.elapsed().as_secs_f64() * 1e3 / reps as f64);
+		}
+		per_q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+		let master_state = 32 + z.master.batch_proof.len() + z.tld.len() + 24;
+		let per_shard_state = 32 + z.shards[0].epoch_proof.batch_proof.len();
+
+		println!(
+			"\n  SHARD-AND-FOLD synthetic TLD (record = complete RRSIG, {algs_label})\n\
+			 \x20  total names {eff_total} = {} shards x {shard_size}  (each shard a monolithic epoch, folded under one master)\n\
+			 \x20  operator PROVE (all shards + master, once)   : {prove_s:>8.2} s\n\
+			 \x20  resolver MASTER verify (once/epoch)          : {master_ms:>8.1} ms\n\
+			 \x20  resolver PER-QUERY verify (master-open + shard-open, 2 openings, min/med/max):\n\
+			 \x20      {:>6.1} / {:>6.1} / {:>6.1} ms   (FLAT in total zone size)\n\
+			 \x20  resolver STATE: master R*+proof {:.1} KiB + one shard R*+proof {:.1} KiB = polylog in shards\n\
+			 \x20  ⇒ prove on a big box, verify on the edge at TLD scale.",
+			z.n_shards,
+			per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1],
+			master_state as f64 / 1024.0,
+			per_shard_state as f64 / 1024.0,
+		);
 	}
 
 	/// W2 PROBE — the decisive unknown for Phase 1 (trustless flat-in-N binding).
