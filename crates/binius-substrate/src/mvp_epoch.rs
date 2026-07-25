@@ -879,6 +879,69 @@ impl EpochPackage {
 	}
 }
 
+impl ShardedZone {
+	/// Serialize the whole sharded zone (master epoch + every shard package) so a verifier in another
+	/// process --- e.g. the Pi --- can load it and resolve. A production resolver would hold only the
+	/// master and shard roots and fetch openings per query; this ships everything so the verifier can
+	/// open locally, exactly as the monolithic two-process demo does.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		use codec::W;
+		let mut w = W(Vec::new());
+		w.bytes(self.tld.as_bytes());
+		w.u64(self.epoch);
+		w.u64(self.shard_size as u64);
+		w.u64(self.n_shards as u64);
+		let p = &self.master;
+		w.h32(&p.rstar);
+		w.bytes(p.zone.as_bytes());
+		w.u64(p.epoch);
+		w.u64(p.inner_vars as u64);
+		w.u64(p.log_n as u64);
+		w.b256(&p.batch_value);
+		w.bytes(&p.batch_proof);
+		w.u64(self.master_records.len() as u64);
+		for r in &self.master_records {
+			w.u64(r.len() as u64);
+			for v in r {
+				w.f(v);
+			}
+		}
+		w.u64(self.shards.len() as u64);
+		for pkg in &self.shards {
+			w.bytes(&pkg.to_bytes());
+		}
+		w.0
+	}
+
+	/// Inverse of [`to_bytes`], for the verifier process.
+	pub fn from_bytes(buf: &[u8]) -> Self {
+		use codec::R;
+		let mut r = R(buf, 0);
+		let tld = String::from_utf8(r.bytes()).unwrap();
+		let epoch = r.u64();
+		let shard_size = r.u64() as usize;
+		let n_shards = r.u64() as usize;
+		let rstar = r.h32();
+		let mz = String::from_utf8(r.bytes()).unwrap();
+		let mep = r.u64();
+		let inner_vars = r.u64() as usize;
+		let log_n = r.u64() as usize;
+		let batch_value = r.b256();
+		let batch_proof = r.bytes();
+		let master = TrustlessEpoch { rstar, zone: mz, epoch: mep, inner_vars, log_n, batch_value, batch_proof };
+		let n_mrec = r.u64() as usize;
+		let master_records = (0..n_mrec)
+			.map(|_| {
+				let l = r.u64() as usize;
+				(0..l).map(|_| r.f()).collect()
+			})
+			.collect();
+		let n_sh = r.u64() as usize;
+		let shards = (0..n_sh).map(|_| EpochPackage::from_bytes(&r.bytes())).collect();
+		ShardedZone { tld, epoch, shard_size, n_shards, shards, master, master_records }
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1733,10 +1796,42 @@ mod tests {
 		let reps = env("SHARD_REPS", 20) as u32;
 		let include_pq = std::env::var("MVP_RRSIG").ok().as_deref() == Some("pq");
 		let algs_label = if include_pq { "RSA/ECDSA/Ed25519/ML-DSA" } else { "ECDSA-P256" };
+		// SHARD_ROLE=prove writes the serialized sharded zone (run on a big box / AWS); SHARD_ROLE=verify
+		// loads it and resolves (run on the Pi); unset = single process. SHARD_PKG = the file path.
+		let role = std::env::var("SHARD_ROLE").unwrap_or_default();
+		let pkg_path = std::env::var("SHARD_PKG").unwrap_or_else(|_| "/tmp/sharded.pkg".into());
 
-		let t0 = Instant::now();
-		let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
-		let prove_s = t0.elapsed().as_secs_f64();
+		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+		if role == "prove" {
+			let t0 = Instant::now();
+			let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
+			let prove_s = t0.elapsed().as_secs_f64();
+			let bytes = z.to_bytes();
+			// round-trip check so the verifier loads exactly what was proved.
+			assert_eq!(ShardedZone::from_bytes(&bytes).master.rstar, z.master.rstar, "serialization round-trip");
+			std::fs::write(&pkg_path, &bytes).expect("write sharded pkg");
+			println!(
+				"\n  [PROVE]  {} names = {} shards x {shard_size} ({algs_label})  prove {prove_s:.2} s  \
+				 package {:.1} MiB -> {pkg_path}",
+				z.n_shards * z.shard_size,
+				z.n_shards,
+				bytes.len() as f64 / (1024.0 * 1024.0),
+			);
+			return;
+		}
+
+		let tb = Instant::now();
+		let z = if role == "verify" {
+			let bytes = std::fs::read(&pkg_path).expect("read sharded pkg (run SHARD_ROLE=prove first)");
+			ShardedZone::from_bytes(&bytes)
+		} else {
+			shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold")
+		};
+		let prove_note = if role == "verify" {
+			format!("loaded {:.1} MiB", mib(std::fs::metadata(&pkg_path).map(|m| m.len()).unwrap_or(0)))
+		} else {
+			format!("prove {:.2} s", tb.elapsed().as_secs_f64())
+		};
 		let eff_total = z.n_shards * z.shard_size;
 
 		let tm = Instant::now();
@@ -1761,15 +1856,18 @@ mod tests {
 		let master_state = 32 + z.master.batch_proof.len() + z.tld.len() + 24;
 		let per_shard_state = 32 + z.shards[0].epoch_proof.batch_proof.len();
 
+		let rss = mib(crate::b256_sha3::peak_rss_bytes());
 		println!(
-			"\n  SHARD-AND-FOLD synthetic TLD (record = complete RRSIG, {algs_label})\n\
+			"\n  SHARD-AND-FOLD synthetic TLD (record = complete RRSIG, {algs_label})  [{}]\n\
 			 \x20  total names {eff_total} = {} shards x {shard_size}  (each shard a monolithic epoch, folded under one master)\n\
-			 \x20  operator PROVE (all shards + master, once)   : {prove_s:>8.2} s\n\
+			 \x20  operator/build                               : {prove_note}\n\
 			 \x20  resolver MASTER verify (once/epoch)          : {master_ms:>8.1} ms\n\
 			 \x20  resolver PER-QUERY verify (master-open + shard-open, 2 openings, min/med/max):\n\
 			 \x20      {:>6.1} / {:>6.1} / {:>6.1} ms   (FLAT in total zone size)\n\
 			 \x20  resolver STATE: master R*+proof {:.1} KiB + one shard R*+proof {:.1} KiB = polylog in shards\n\
+			 \x20  verifier PEAK RSS {rss:.0} MiB\n\
 			 \x20  ⇒ prove on a big box, verify on the edge at TLD scale.",
+			std::env::consts::ARCH,
 			z.n_shards,
 			per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1],
 			master_state as f64 / 1024.0,
