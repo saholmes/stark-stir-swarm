@@ -623,6 +623,71 @@ pub fn shard_and_fold(
 	})
 }
 
+/// OPERATOR (STREAMING) --- build the [`ResolverPackage`] for `query_names` at TLD scale WITHOUT ever
+/// holding the full zone. Each shard is proved, its root + master record extracted, the openings for
+/// any queries in that shard captured, and then its records are DROPPED --- so peak RAM is bounded by
+/// the concurrent-prove working set (a handful of shards), not the accumulated zone. This is what
+/// lets a 32 GB box prove hundreds of shards (a real ccTLD). Shards are proved in parallel.
+pub fn shard_fold_streaming(
+	tld: &str,
+	epoch: u64,
+	total_n: usize,
+	shard_size: usize,
+	include_pq: bool,
+	query_names: &[String],
+) -> Result<ResolverPackage> {
+	use rayon::prelude::*;
+	assert!(shard_size.is_power_of_two() && shard_size >= 2, "shard_size must be a power of two >= 2");
+	assert!(shard_size <= 1 << 15, "shard must fit the 2^15 NSEC3 circuit cap");
+	let algs: &[u8] = if include_pq { &[8, 13, 15, 17] } else { &[13] };
+	let n_shards = total_n.div_ceil(shard_size);
+	// per shard: (stripped root, master record, [(query index, shard-open)]); the shard package is
+	// dropped at the end of the closure so its records never accumulate.
+	type ShardOut = (TrustlessEpoch, Vec<F>, Vec<(usize, RecordProof)>);
+	let per_shard: Vec<ShardOut> = (0..n_shards)
+		.into_par_iter()
+		.map(|s| -> Result<ShardOut> {
+			let names = synth_zone_names(tld, s * shard_size, shard_size);
+			let (pkg, _pin) = publish_rrsig_epoch_named(tld, epoch.wrapping_add(s as u64 + 1), &names, algs)?;
+			let root = TrustlessEpoch { batch_proof: Vec::new(), ..pkg.epoch_proof.clone() };
+			let mrec = shard_root_record(&pkg.epoch_proof.rstar, s);
+			let mut opens = Vec::new();
+			for (qi, name) in query_names.iter().enumerate() {
+				if synth_name_index(name).map(|idx| idx / shard_size) == Some(s) {
+					if let Some(sidx) = pkg.names.iter().position(|n| n == name) {
+						opens.push((qi, open_record(&pkg.records, sidx, &pkg.epoch_proof)));
+					}
+				}
+			}
+			Ok((root, mrec, opens)) // `pkg` (records) dropped here — RAM released
+		})
+		.collect::<Result<Vec<_>>>()?;
+
+	let shard_roots: Vec<TrustlessEpoch> = per_shard.iter().map(|(r, _, _)| r.clone()).collect();
+	let mut master_records: Vec<Vec<F>> = per_shard.iter().map(|(_, m, _)| m.clone()).collect();
+	let mut shard_opens: Vec<Option<RecordProof>> = vec![None; query_names.len()];
+	for (_, _, opens) in &per_shard {
+		for (qi, op) in opens {
+			shard_opens[*qi] = Some(op.clone());
+		}
+	}
+	// commit the master over the shard roots, then open each query's covering shard root.
+	let rlen = master_records[0].len();
+	let target = master_records.len().next_power_of_two().max(2);
+	master_records.resize(target, vec![F::ZERO; rlen]);
+	let master = prove_epoch(&master_records, tld, epoch);
+
+	let mut queries = Vec::with_capacity(query_names.len());
+	for (qi, name) in query_names.iter().enumerate() {
+		let idx = synth_name_index(name).ok_or_else(|| anyhow!("not a synthetic name: {name}"))?;
+		let shard = idx / shard_size;
+		let master_open = open_record(&master_records, shard, &master);
+		let shard_open = shard_opens[qi].clone().ok_or_else(|| anyhow!("no shard-open for {name}"))?;
+		queries.push((name.clone(), ShardedOpening { shard, master_open, shard_open }));
+	}
+	Ok(ResolverPackage { tld: tld.to_string(), epoch, shard_size, n_shards, master, shard_roots, queries })
+}
+
 /// RESOLVER (once/epoch): verify the master epoch commits every shard root.
 pub fn verify_sharded_master(z: &ShardedZone) -> bool {
 	verify_epoch(&z.master, &z.tld)
@@ -1967,35 +2032,44 @@ mod tests {
 		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 		let rpkg_path = std::env::var("SHARD_RPKG").unwrap_or_else(|_| "/tmp/sharded.rpkg".into());
 		if role == "prove" {
-			let t0 = Instant::now();
-			let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
-			let prove_s = t0.elapsed().as_secs_f64();
-			// PROVE PEAK RSS: shards prove sequentially in shard_and_fold, so this is one shard's peak
-			// (the number that sizes the AWS instance's per-shard RAM).
-			let prove_rss = mib(crate::b256_sha3::peak_rss_bytes());
-			let eff_total = z.n_shards * z.shard_size;
+			let n_shards0 = total.div_ceil(shard_size);
+			let eff_total = n_shards0 * shard_size;
 			let samples: Vec<String> = [0usize, eff_total / 4, eff_total / 2, (3 * eff_total) / 4, eff_total - 1]
 				.iter()
 				.map(|&g| format!("n{g:09x}.tld"))
 				.collect();
-			// full zone (the verifier opens locally) ...
-			let full = z.to_bytes();
-			assert_eq!(ShardedZone::from_bytes(&full).master.rstar, z.master.rstar, "full round-trip");
-			std::fs::write(&pkg_path, &full).expect("write full zone");
-			// ... and the PRODUCTION resolver package (master + roots + sample openings, NO records).
-			let rpkg = build_resolver_package(&z, &samples).expect("resolver package");
+			// SHARD_STREAM=1 builds the resolver package WITHOUT materialising the full zone (bounded RAM,
+			// tiny disk) — the path for real ccTLD scale. Otherwise the full-zone path (also writes it).
+			let stream = std::env::var("SHARD_STREAM").is_ok();
+			let t0 = Instant::now();
+			let (rpkg, full_mib, n_shards) = if stream {
+				let rp = shard_fold_streaming("tld", 42, total, shard_size, include_pq, &samples).expect("stream");
+				let ns = rp.n_shards;
+				(rp, None, ns)
+			} else {
+				let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
+				let full = z.to_bytes();
+				assert_eq!(ShardedZone::from_bytes(&full).master.rstar, z.master.rstar, "full round-trip");
+				std::fs::write(&pkg_path, &full).expect("write full zone");
+				let ns = z.n_shards;
+				(build_resolver_package(&z, &samples).expect("resolver package"), Some(full.len() as f64 / (1024.0 * 1024.0)), ns)
+			};
+			let prove_s = t0.elapsed().as_secs_f64();
+			let prove_rss = mib(crate::b256_sha3::peak_rss_bytes());
 			let rbytes = rpkg.to_bytes();
-			assert_eq!(ResolverPackage::from_bytes(&rbytes).master.rstar, z.master.rstar, "rpkg round-trip");
+			assert_eq!(ResolverPackage::from_bytes(&rbytes).master.rstar, rpkg.master.rstar, "rpkg round-trip");
 			std::fs::write(&rpkg_path, &rbytes).expect("write resolver pkg");
+			let full_note = match full_mib {
+				Some(m) => format!("full zone {m:.1} MiB -> {pkg_path}"),
+				None => "full zone NOT materialised (streaming)".to_string(),
+			};
 			println!(
-				"\n  [PROVE {}]  {eff_total} names = {} shards x {shard_size} ({algs_label})  prove {prove_s:.2} s  \
-				 PROVE PEAK RSS {prove_rss:.0} MiB (one shard)\n\
-				 \x20   full zone {:.1} MiB -> {pkg_path}\n\
-				 \x20   RESOLVER pkg (master + {} roots + {} openings, NO records) {:.1} KiB -> {rpkg_path}  [state {:.1} KiB]",
+				"\n  [PROVE {} {}]  {eff_total} names = {n_shards} shards x {shard_size} ({algs_label})  \
+				 prove {prove_s:.2} s  PROVE PEAK RSS {prove_rss:.0} MiB\n\
+				 \x20   {full_note}\n\
+				 \x20   RESOLVER pkg (master + {n_shards} roots + {} openings, NO records) {:.1} KiB -> {rpkg_path}  [state {:.1} KiB]",
+				if stream { "stream" } else { "full" },
 				std::env::consts::ARCH,
-				z.n_shards,
-				full.len() as f64 / (1024.0 * 1024.0),
-				z.n_shards,
 				samples.len(),
 				rbytes.len() as f64 / 1024.0,
 				rpkg.state_bytes() as f64 / 1024.0,
