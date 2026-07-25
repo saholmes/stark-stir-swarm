@@ -38,9 +38,11 @@ ZIG_MCPU=""
 case "$BARE_TARGET" in
   aarch64-unknown-linux-musl)     ZIG_TARGET="aarch64-linux-musl" ;;
   aarch64-unknown-linux-gnu)      ZIG_TARGET="aarch64-linux-gnu"  ;;
+  x86_64-unknown-linux-musl)      ZIG_TARGET="x86_64-linux-musl" ;;
+  x86_64-unknown-linux-gnu)       ZIG_TARGET="x86_64-linux-gnu"  ;;
   armv7-unknown-linux-musleabihf) ZIG_TARGET="arm-linux-musleabihf"; ZIG_MCPU="cortex_a7" ;;
   armv7-unknown-linux-gnueabihf)  ZIG_TARGET="arm-linux-gnueabihf";  ZIG_MCPU="cortex_a7" ;;
-  *) echo "unsupported TARGET '$TARGET' (use aarch64-unknown-linux-{musl,gnu} or armv7-unknown-linux-{musl,gnu}eabihf)"; exit 1 ;;
+  *) echo "unsupported TARGET '$TARGET' (aarch64/x86_64-unknown-linux-{musl,gnu} or armv7-unknown-linux-{musl,gnu}eabihf)"; exit 1 ;;
 esac
 ZIG_TARGET="$ZIG_TARGET$GLIBC_SUFFIX"
 # python list fragment: ['zig','cc','-target','<t>'(,'-mcpu=<m>')]

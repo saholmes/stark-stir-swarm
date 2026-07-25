@@ -594,14 +594,19 @@ pub fn shard_and_fold(
 	assert!(total_n >= 1, "need at least one name");
 	let algs: &[u8] = if include_pq { &[8, 13, 15, 17] } else { &[13] };
 	let n_shards = total_n.div_ceil(shard_size);
-	let mut shards = Vec::with_capacity(n_shards);
-	let mut master_records = Vec::with_capacity(n_shards);
-	for s in 0..n_shards {
-		let names = synth_zone_names(tld, s * shard_size, shard_size); // a full power-of-two shard
-		let (pkg, _pin) = publish_rrsig_epoch_named(tld, epoch.wrapping_add(s as u64 + 1), &names, algs)?;
-		master_records.push(shard_root_record(&pkg.epoch_proof.rstar, s));
-		shards.push(pkg);
-	}
+	// Shards are independent, so prove them in PARALLEL (the embarrassingly-parallel operator model).
+	// `into_par_iter` over a range collects in order, so shard `s` lands at index `s` and the result
+	// (hence byte-identity) is identical to the sequential path. Nested rayon shares the global pool.
+	use rayon::prelude::*;
+	let shards: Vec<EpochPackage> = (0..n_shards)
+		.into_par_iter()
+		.map(|s| {
+			let names = synth_zone_names(tld, s * shard_size, shard_size); // a full power-of-two shard
+			publish_rrsig_epoch_named(tld, epoch.wrapping_add(s as u64 + 1), &names, algs).map(|(pkg, _)| pkg)
+		})
+		.collect::<Result<Vec<_>>>()?;
+	let mut master_records: Vec<Vec<F>> =
+		shards.iter().enumerate().map(|(s, pkg)| shard_root_record(&pkg.epoch_proof.rstar, s)).collect();
 	// pad shard-root records to a power of two with inert sentinels, then commit the master epoch.
 	let rlen = master_records[0].len();
 	let target = master_records.len().next_power_of_two().max(2);
