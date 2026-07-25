@@ -571,6 +571,7 @@ pub struct ShardedZone {
 }
 
 /// A per-query sharded opening: the covering shard plus the two openings a resolver verifies.
+#[derive(Clone)]
 pub struct ShardedOpening {
 	pub shard: usize,
 	master_open: RecordProof,
@@ -649,6 +650,121 @@ pub fn verify_sharded_query(z: &ShardedZone, op: &ShardedOpening) -> bool {
 		return false;
 	}
 	verify_record(&z.shards[op.shard].epoch_proof, &op.shard_open)
+}
+
+/// RESOLVER (per query) against just the master and the covering shard's ROOT (no full shard). Same
+/// checks as [`verify_sharded_query`] but takes the shard's [`TrustlessEpoch`] directly, so a resolver
+/// that holds only roots (not records) can verify an operator-supplied opening. This is the
+/// production edge model: state is the master + K shard roots (sub-MiB), openings arrive per query.
+pub fn verify_sharded_opening(
+	master: &TrustlessEpoch,
+	shard_root: &TrustlessEpoch,
+	shard: usize,
+	op: &ShardedOpening,
+) -> bool {
+	verify_record(master, &op.master_open)
+		&& op.master_open.record == shard_root_record(&shard_root.rstar, shard)
+		&& verify_record(shard_root, &op.shard_open)
+}
+
+/// The PRODUCTION edge artefact for a sharded zone: the master epoch, the K shard roots, and a set of
+/// pre-computed per-query openings. It carries NO shard records --- a resolver verifies the master
+/// once and each opening in O(1), holding only sub-MiB of roots regardless of the zone's total size.
+pub struct ResolverPackage {
+	pub tld: String,
+	pub epoch: u64,
+	pub shard_size: usize,
+	pub n_shards: usize,
+	pub master: TrustlessEpoch,
+	pub shard_roots: Vec<TrustlessEpoch>,
+	pub queries: Vec<(String, ShardedOpening)>,
+}
+
+/// OPERATOR --- distil a [`ShardedZone`] into the [`ResolverPackage`] a resolver actually needs: the
+/// master, the shard roots, and the openings for `query_names`. The heavy shard records stay with the
+/// operator.
+pub fn build_resolver_package(z: &ShardedZone, query_names: &[String]) -> Result<ResolverPackage> {
+	// A shard root the resolver keeps is just R* + shape (rstar, zone, epoch, inner_vars, log_n) --- it
+	// NEVER runs verify_epoch on a shard, because each per-query shard-open is a self-proving decider
+	// opening (it proves R*_shard commits a sound polynomial). So we strip the shard batch proof, which
+	// keeps the resolver state small (~R* per shard) instead of ~half a MiB per shard.
+	let shard_roots: Vec<TrustlessEpoch> = z
+		.shards
+		.iter()
+		.map(|p| TrustlessEpoch { batch_proof: Vec::new(), ..p.epoch_proof.clone() })
+		.collect();
+	let mut queries = Vec::with_capacity(query_names.len());
+	for name in query_names {
+		queries.push((name.clone(), open_sharded(z, name)?));
+	}
+	Ok(ResolverPackage {
+		tld: z.tld.clone(),
+		epoch: z.epoch,
+		shard_size: z.shard_size,
+		n_shards: z.n_shards,
+		master: z.master.clone(),
+		shard_roots,
+		queries,
+	})
+}
+
+/// RESOLVER (once/epoch): verify the master commits the shard roots.
+pub fn verify_resolver_master(r: &ResolverPackage) -> bool {
+	verify_epoch(&r.master, &r.tld)
+}
+
+impl ResolverPackage {
+	/// The resolver STATE size (bytes) --- master + shard roots, WITHOUT the per-query openings (which
+	/// arrive on demand). This is the number that must fit the edge; it is polylog in shard count.
+	pub fn state_bytes(&self) -> usize {
+		32 + self.master.batch_proof.len()
+			+ self.shard_roots.iter().map(|t| 32 + t.batch_proof.len()).sum::<usize>()
+	}
+
+	pub fn to_bytes(&self) -> Vec<u8> {
+		use codec::W;
+		let mut w = W(Vec::new());
+		w.bytes(self.tld.as_bytes());
+		w.u64(self.epoch);
+		w.u64(self.shard_size as u64);
+		w.u64(self.n_shards as u64);
+		codec::wr_te(&mut w, &self.master);
+		w.u64(self.shard_roots.len() as u64);
+		for t in &self.shard_roots {
+			codec::wr_te(&mut w, t);
+		}
+		w.u64(self.queries.len() as u64);
+		for (name, op) in &self.queries {
+			w.bytes(name.as_bytes());
+			w.u64(op.shard as u64);
+			codec::wr_rp(&mut w, &op.master_open);
+			codec::wr_rp(&mut w, &op.shard_open);
+		}
+		w.0
+	}
+
+	pub fn from_bytes(buf: &[u8]) -> Self {
+		use codec::R;
+		let mut r = R(buf, 0);
+		let tld = String::from_utf8(r.bytes()).unwrap();
+		let epoch = r.u64();
+		let shard_size = r.u64() as usize;
+		let n_shards = r.u64() as usize;
+		let master = codec::rd_te(&mut r);
+		let n_roots = r.u64() as usize;
+		let shard_roots = (0..n_roots).map(|_| codec::rd_te(&mut r)).collect();
+		let n_q = r.u64() as usize;
+		let queries = (0..n_q)
+			.map(|_| {
+				let name = String::from_utf8(r.bytes()).unwrap();
+				let shard = r.u64() as usize;
+				let master_open = codec::rd_rp(&mut r);
+				let shard_open = codec::rd_rp(&mut r);
+				(name, ShardedOpening { shard, master_open, shard_open })
+			})
+			.collect();
+		ResolverPackage { tld, epoch, shard_size, n_shards, master, shard_roots, queries }
+	}
 }
 
 /// ROLE 2 — RESOLVER, once per epoch. Verifies the package against a pin held out of band.
@@ -792,6 +908,48 @@ mod codec {
 		pub fn big(&mut self) -> BigUint {
 			BigUint::from_bytes_le(&self.bytes())
 		}
+	}
+
+	use crate::epoch_trustless::{RecordProof, TrustlessEpoch};
+
+	/// Serialize a `TrustlessEpoch` (the 7 fields; same layout `EpochPackage` uses inline).
+	pub fn wr_te(w: &mut W, t: &TrustlessEpoch) {
+		w.h32(&t.rstar);
+		w.bytes(t.zone.as_bytes());
+		w.u64(t.epoch);
+		w.u64(t.inner_vars as u64);
+		w.u64(t.log_n as u64);
+		w.b256(&t.batch_value);
+		w.bytes(&t.batch_proof);
+	}
+	pub fn rd_te(r: &mut R) -> TrustlessEpoch {
+		let rstar = r.h32();
+		let zone = String::from_utf8(r.bytes()).unwrap();
+		let epoch = r.u64();
+		let inner_vars = r.u64() as usize;
+		let log_n = r.u64() as usize;
+		let batch_value = r.b256();
+		let batch_proof = r.bytes();
+		TrustlessEpoch { rstar, zone, epoch, inner_vars, log_n, batch_value, batch_proof }
+	}
+
+	/// Serialize a per-record opening (`RecordProof`).
+	pub fn wr_rp(w: &mut W, rp: &RecordProof) {
+		w.u64(rp.index as u64);
+		w.u64(rp.record.len() as u64);
+		for v in &rp.record {
+			w.f(v);
+		}
+		w.b256(&rp.value);
+		w.bytes(&rp.proof);
+	}
+	pub fn rd_rp(r: &mut R) -> RecordProof {
+		let index = r.u64() as usize;
+		let len = r.u64() as usize;
+		let record = (0..len).map(|_| r.f()).collect();
+		let value = r.b256();
+		let proof = r.bytes();
+		RecordProof { index, record, value, proof }
 	}
 }
 
@@ -1802,20 +1960,77 @@ mod tests {
 		let pkg_path = std::env::var("SHARD_PKG").unwrap_or_else(|_| "/tmp/sharded.pkg".into());
 
 		let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+		let rpkg_path = std::env::var("SHARD_RPKG").unwrap_or_else(|_| "/tmp/sharded.rpkg".into());
 		if role == "prove" {
 			let t0 = Instant::now();
 			let z = shard_and_fold("tld", 42, total, shard_size, include_pq).expect("shard+fold");
 			let prove_s = t0.elapsed().as_secs_f64();
-			let bytes = z.to_bytes();
-			// round-trip check so the verifier loads exactly what was proved.
-			assert_eq!(ShardedZone::from_bytes(&bytes).master.rstar, z.master.rstar, "serialization round-trip");
-			std::fs::write(&pkg_path, &bytes).expect("write sharded pkg");
+			// PROVE PEAK RSS: shards prove sequentially in shard_and_fold, so this is one shard's peak
+			// (the number that sizes the AWS instance's per-shard RAM).
+			let prove_rss = mib(crate::b256_sha3::peak_rss_bytes());
+			let eff_total = z.n_shards * z.shard_size;
+			let samples: Vec<String> = [0usize, eff_total / 4, eff_total / 2, (3 * eff_total) / 4, eff_total - 1]
+				.iter()
+				.map(|&g| format!("n{g:09x}.tld"))
+				.collect();
+			// full zone (the verifier opens locally) ...
+			let full = z.to_bytes();
+			assert_eq!(ShardedZone::from_bytes(&full).master.rstar, z.master.rstar, "full round-trip");
+			std::fs::write(&pkg_path, &full).expect("write full zone");
+			// ... and the PRODUCTION resolver package (master + roots + sample openings, NO records).
+			let rpkg = build_resolver_package(&z, &samples).expect("resolver package");
+			let rbytes = rpkg.to_bytes();
+			assert_eq!(ResolverPackage::from_bytes(&rbytes).master.rstar, z.master.rstar, "rpkg round-trip");
+			std::fs::write(&rpkg_path, &rbytes).expect("write resolver pkg");
 			println!(
-				"\n  [PROVE]  {} names = {} shards x {shard_size} ({algs_label})  prove {prove_s:.2} s  \
-				 package {:.1} MiB -> {pkg_path}",
-				z.n_shards * z.shard_size,
+				"\n  [PROVE {}]  {eff_total} names = {} shards x {shard_size} ({algs_label})  prove {prove_s:.2} s  \
+				 PROVE PEAK RSS {prove_rss:.0} MiB (one shard)\n\
+				 \x20   full zone {:.1} MiB -> {pkg_path}\n\
+				 \x20   RESOLVER pkg (master + {} roots + {} openings, NO records) {:.1} KiB -> {rpkg_path}  [state {:.1} KiB]",
+				std::env::consts::ARCH,
 				z.n_shards,
-				bytes.len() as f64 / (1024.0 * 1024.0),
+				full.len() as f64 / (1024.0 * 1024.0),
+				z.n_shards,
+				samples.len(),
+				rbytes.len() as f64 / 1024.0,
+				rpkg.state_bytes() as f64 / 1024.0,
+			);
+			return;
+		}
+
+		if role == "verify-resolver" {
+			// PRODUCTION edge path: verify the resolver package (master + roots + openings), NO zone.
+			let bytes = std::fs::read(&rpkg_path).expect("read resolver pkg (run SHARD_ROLE=prove first)");
+			let rp = ResolverPackage::from_bytes(&bytes);
+			let tm = Instant::now();
+			assert!(verify_resolver_master(&rp), "master must verify");
+			let master_ms = tm.elapsed().as_secs_f64() * 1e3;
+			let mut per_q: Vec<f64> = Vec::new();
+			for (name, op) in &rp.queries {
+				let tv = Instant::now();
+				let mut ok = true;
+				for _ in 0..reps {
+					ok &= verify_sharded_opening(&rp.master, &rp.shard_roots[op.shard], op.shard, op);
+				}
+				assert!(ok, "resolver opening must verify for {name} (shard {})", op.shard);
+				per_q.push(tv.elapsed().as_secs_f64() * 1e3 / reps as f64);
+			}
+			per_q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+			let rss = mib(crate::b256_sha3::peak_rss_bytes());
+			println!(
+				"\n  RESOLVER-PACKAGE VERIFY (production edge model) [{}]\n\
+				 \x20  {} shards x {} ; loaded {:.1} KiB (master + roots + {} openings, NO records)\n\
+				 \x20  MASTER verify (once/epoch)   : {master_ms:>8.1} ms\n\
+				 \x20  PER-QUERY verify (2 openings): {:>6.1} / {:>6.1} / {:>6.1} ms  (flat in total zone size)\n\
+				 \x20  resolver STATE (master + {} roots): {:.1} KiB   verifier PEAK RSS {rss:.0} MiB",
+				std::env::consts::ARCH,
+				rp.n_shards,
+				rp.shard_size,
+				bytes.len() as f64 / 1024.0,
+				rp.queries.len(),
+				per_q[0], per_q[per_q.len() / 2], per_q[per_q.len() - 1],
+				rp.n_shards,
+				rp.state_bytes() as f64 / 1024.0,
 			);
 			return;
 		}
